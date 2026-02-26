@@ -43,4 +43,4 @@ packages/
 
 ## Requirements
 
-- [Bun](https://bun.sh) v1.0+
+Any TypeScript-capable runtime: [Bun](https://bun.sh), [tsx](https://github.com/privatenumber/tsx), [Deno](https://deno.land), etc.
