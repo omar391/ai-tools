@@ -27,11 +27,13 @@ alias codex-rotate='bun run /path/to/ai-tools/packages/codex-rotate/index.ts'
 source ~/.zshrc
 ```
 
+> **Note:** After running `codex-rotate next` or `prev`, **restart Codex** (re-open the IDE window) for it to pick up the new auth tokens. The rotation updates `~/.codex/auth.json` on disk, but the running Codex process caches the session in memory.
+
 ## Adding a new tool
 
 Create a new package under `packages/`:
 
-```
+```text
 packages/
   codex-rotate/
   my-new-tool/
