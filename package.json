@@ -1,0 +1,5 @@
+{
+  "name": "ai-tools",
+  "private": true,
+  "workspaces": ["packages/*"]
+}

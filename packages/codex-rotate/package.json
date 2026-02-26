@@ -1,0 +1,14 @@
+{
+  "name": "@ai-tools/codex-rotate",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "module": "index.ts",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^25.3.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
