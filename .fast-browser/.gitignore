@@ -1,0 +1,5 @@
+# fast-browser runtime data
+cache/
+catalog.db
+catalog.db-shm
+catalog.db-wal
