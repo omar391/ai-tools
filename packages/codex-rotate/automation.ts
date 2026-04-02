@@ -167,8 +167,15 @@ export interface FastBrowserRunResult {
   ok: boolean;
   status?: string;
   state?: FastBrowserState;
+  output?: Record<string, unknown> | null;
   pause?: FastBrowserPause | null;
   finalUrl?: string | null;
+  observability?: {
+    runId?: string | null;
+    runPath?: string | null;
+    statusPath?: string | null;
+    eventsPath?: string | null;
+  } | null;
 }
 
 export function buildTemporaryWorkflowProfileName(workflowRunStamp: string, key: string): string {
@@ -236,7 +243,25 @@ export interface ParsedCodexBrowserLoginCapture {
   callbackPort: number;
 }
 
-type BrowserCaptureMode = "none" | "headless_tmp" | "headed_tmp";
+export interface CodexRotateAuthFlowSummary {
+  stage?: string | null;
+  current_url?: string | null;
+  headline?: string | null;
+  callback_complete?: boolean;
+  success?: boolean;
+  account_ready?: boolean;
+  needs_email_verification?: boolean;
+  follow_up_step?: boolean;
+  add_phone_prompt?: boolean;
+  retryable_timeout?: boolean;
+  session_ended?: boolean;
+  existing_account_prompt?: boolean;
+  username_not_found?: boolean;
+  invalid_credentials?: boolean;
+  rate_limit_exceeded?: boolean;
+  anti_bot_gate?: boolean;
+  auth_prompt?: boolean;
+}
 
 function parseJson<T>(raw: string, fallbackMessage: string): T {
   try {
@@ -266,129 +291,12 @@ function createBrowserCaptureShim(): { scriptPath: string; outputPath: string; s
   const outputPath = join(shimDir, "browser-capture.log");
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const outputPath = process.env.CODEX_ROTATE_BROWSER_CAPTURE_OUT || "";
-const playwrightRequirePath = process.env.CODEX_ROTATE_PLAYWRIGHT_REQUIRE || "playwright";
-const viewerBin = process.env.FAST_BROWSER_CHROME_BIN || "";
-const captureMode = String(process.env.CODEX_ROTATE_BROWSER_CAPTURE_MODE || "none").trim().toLowerCase();
 const captureUrl = process.argv.slice(2).join(" ").trim();
-let context = null;
-let viewerRoot = null;
-let closed = false;
-let keepAliveTimer = null;
-
-function isParentAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(error && typeof error === "object" && "code" in error && error.code === "ESRCH");
-  }
-}
-
-async function closeAndExit(code) {
-  if (closed) {
-    return;
-  }
-  closed = true;
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
-  }
-  try {
-    if (context) {
-      await context.close();
-    }
-  } catch {}
-  try {
-    if (viewerRoot) {
-      fs.rmSync(viewerRoot, { recursive: true, force: true });
-    }
-  } catch {}
-  process.exit(code);
-}
-
-async function launchCaptureViewer() {
-  if (!captureUrl || captureMode === "none") {
-    return;
-  }
-  try {
-    const playwright = require(playwrightRequirePath);
-    viewerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-login-capture-"));
-    const userDataDir = path.join(viewerRoot, "profile");
-    fs.mkdirSync(userDataDir, { recursive: true });
-    context = await playwright.chromium.launchPersistentContext(userDataDir, {
-      headless: captureMode !== "headed_tmp",
-      executablePath: viewerBin || undefined,
-      viewport: null,
-      ignoreHTTPSErrors: true,
-      args: captureMode === "headed_tmp" ? ["--new-window", "--window-size=1120,840"] : [],
-    });
-    if (captureMode === "headless_tmp") {
-      const page = context.pages()[0] || await context.newPage();
-      const notice = [
-        "<title>Codex Login Capture</title>",
-        "<h1>Captured</h1>",
-        "<p>codex-rotate consumed the browser launch request in an isolated temporary browser.</p>",
-      ].join("");
-      await page.goto("data:text/html;charset=utf-8," + encodeURIComponent(notice), { waitUntil: "domcontentloaded" }).catch(() => {});
-    } else if (captureMode === "headed_tmp") {
-      const page = context.pages()[0] || await context.newPage();
-      const notice = [
-        "<title>Codex Login Capture</title>",
-        "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;line-height:1.4}code{word-break:break-all}</style>",
-        "<h1>Codex login URL captured</h1>",
-        "<p>This temporary browser window exists only to consume the browser-launch request safely.</p>",
-        "<p>codex-rotate continues the real login in the managed profile.</p>",
-        captureUrl ? "<details><summary>Captured URL</summary><code>" + captureUrl.replace(/[&<>]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char])) + "</code></details>" : "",
-      ].join("");
-      await page.goto("data:text/html;charset=utf-8," + encodeURIComponent(notice), { waitUntil: "domcontentloaded" }).catch(() => {});
-    }
-  } catch {}
-}
-
 if (outputPath && captureUrl) {
   fs.appendFileSync(outputPath, captureUrl + "\\n");
 }
-
-(async () => {
-  await launchCaptureViewer();
-  keepAliveTimer = setInterval(() => {
-    if (!isParentAlive(process.ppid)) {
-      void closeAndExit(0);
-    }
-  }, 500);
-})();
-
-process.on("SIGTERM", () => {
-  void closeAndExit(0);
-});
-process.on("SIGINT", () => {
-  void closeAndExit(0);
-});
-process.on("SIGHUP", () => {
-  void closeAndExit(0);
-});
-process.on("uncaughtException", () => {
-  void closeAndExit(1);
-});
-process.on("unhandledRejection", () => {
-  void closeAndExit(1);
-});
-
-setTimeout(() => {
-  void closeAndExit(0);
-}, 15 * 60 * 1000);
-
-if (!captureUrl) {
-  setTimeout(() => {
-    void closeAndExit(0);
-  }, 1000);
-}
+process.exit(0);
 `;
   writeExecutableScript(scriptPath, script);
 
@@ -1792,7 +1700,14 @@ export function resolveCreateBaseEmail(
   if (discoveredBaseEmail) {
     return normalizeBaseEmailFamily(discoveredBaseEmail);
   }
-  throw new Error("Could not determine the base email family for create.");
+  return normalizeBaseEmailFamily("dev.{N}@astronlab.com");
+}
+
+export function shouldUseDefaultCreateFamilyHint(baseEmail: string | null | undefined): boolean {
+  if (!baseEmail) {
+    return false;
+  }
+  return parseEmailFamily(baseEmail).mode !== "gmail_plus";
 }
 
 function getManagedProfileEntry(inspection: ManagedProfilesInspection, profileName: string): ManagedProfileEntry | null {
@@ -1884,50 +1799,6 @@ export async function discoverGmailBaseEmail(
   return normalizeGmailBaseEmail(selectedEmail);
 }
 
-export async function runOpenAiAccountCreation(
-  profileName: string,
-  email: string,
-  password: string,
-  workflowRunStamp?: string,
-  options?: {
-    artifactMode?: "minimal" | "full";
-  },
-): Promise<FastBrowserRunResult> {
-  return await runFastBrowserWorkflow(
-    CODEX_ROTATE_ACCOUNT_FLOW_WORKFLOW,
-    { mode: "signup", email, password },
-    profileName,
-    {
-      workflowRunStamp,
-      retainTemporaryProfilesOnSuccess: Boolean(workflowRunStamp),
-      artifactMode: options?.artifactMode ?? "minimal",
-    },
-  );
-}
-
-export async function runOpenAiEmailVerification(
-  profileName: string,
-  email: string,
-  password?: string,
-  workflowRunStamp?: string,
-  options?: {
-    artifactMode?: "minimal" | "full";
-  },
-): Promise<FastBrowserRunResult> {
-  return await runFastBrowserWorkflow(
-    CODEX_ROTATE_ACCOUNT_FLOW_WORKFLOW,
-    password
-      ? { mode: "resume_openai_setup", email, password }
-      : { mode: "resume_openai_setup", email },
-    profileName,
-    {
-      workflowRunStamp,
-      retainTemporaryProfilesOnSuccess: Boolean(workflowRunStamp),
-      artifactMode: options?.artifactMode ?? "minimal",
-    },
-  );
-}
-
 export async function runCodexBrowserLoginWorkflow(
   profileName: string,
   authUrl: string,
@@ -1983,6 +1854,20 @@ export function readWorkflowActionBoolean(
   return result.state?.steps?.[stepId]?.action?.[field] === true;
 }
 
+export function readWorkflowOutputRecord<T extends Record<string, unknown>>(
+  result: FastBrowserRunResult,
+): T | null {
+  const value = result.output;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as T;
+}
+
+export function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): CodexRotateAuthFlowSummary {
+  return readWorkflowOutputRecord<CodexRotateAuthFlowSummary>(result) ?? {};
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -2027,11 +1912,9 @@ export async function startCodexBrowserLoginSession(
       env: {
         ...process.env,
         PATH: `${browserCapture.shimDir}:${process.env.PATH ?? ""}`,
-        BROWSER: browserCapture.scriptPath,
+        BROWSER: "/usr/bin/false",
         CODEX_ROTATE_BROWSER_CAPTURE_SCRIPT: browserCapture.scriptPath,
         CODEX_ROTATE_BROWSER_CAPTURE_OUT: browserCapture.outputPath,
-        CODEX_ROTATE_PLAYWRIGHT_REQUIRE: FAST_BROWSER_PLAYWRIGHT_MODULE,
-        CODEX_ROTATE_BROWSER_CAPTURE_MODE: "headless_tmp" as BrowserCaptureMode,
       },
       stdio: ["pipe", "pipe", "pipe"],
     });

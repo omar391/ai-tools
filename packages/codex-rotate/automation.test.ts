@@ -6,6 +6,7 @@ import {
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
   normalizeBaseEmailFamily,
+  readCodexRotateAuthFlowSummary,
   normalizeCredentialStore,
   normalizeGmailBaseEmail,
   parseCodexBrowserLoginCapture,
@@ -13,6 +14,7 @@ import {
   resolveCreateBaseEmail,
   resolveManagedProfileNameFromCandidates,
   scoreEmailForManagedProfileName,
+  shouldUseDefaultCreateFamilyHint,
   selectBestEmailForManagedProfile,
   selectBestSystemChromeProfileMatch,
   selectPendingBaseEmailHintForProfile,
@@ -90,6 +92,21 @@ https://auth.openai.com/oauth/authorize?foo=bar&redirect_uri=http%3A%2F%2Flocalh
   test("returns null when no auth url is present", () => {
     expect(parseCodexBrowserLoginCapture("no login url here")).toBeNull();
   });
+
+  test("reads the flattened auth summary from workflow output", () => {
+    expect(readCodexRotateAuthFlowSummary({
+      ok: true,
+      output: {
+        stage: "oauth_consent",
+        current_url: "https://auth.openai.com/oauth/authorize",
+        callback_complete: false,
+      },
+    })).toEqual({
+      stage: "oauth_consent",
+      current_url: "https://auth.openai.com/oauth/authorize",
+      callback_complete: false,
+    });
+  });
 });
 
 describe("workflow metadata", () => {
@@ -141,6 +158,19 @@ describe("create resolution helpers", () => {
 
   test("uses the discovered profile email when no explicit base email is provided", () => {
     expect(resolveCreateBaseEmail(null, "Dev.User+4@gmail.com")).toBe("dev.user@gmail.com");
+  });
+
+  test("defaults to the Astronlab template when no hint is available", () => {
+    expect(resolveCreateBaseEmail(null, null)).toBe("dev.{n}@astronlab.com");
+  });
+
+  test("ignores legacy Gmail hints on the default create path", () => {
+    expect(shouldUseDefaultCreateFamilyHint("dev.user@gmail.com")).toBe(false);
+    expect(shouldUseDefaultCreateFamilyHint("dev.user+4@gmail.com")).toBe(false);
+  });
+
+  test("keeps templated hints on the default create path", () => {
+    expect(shouldUseDefaultCreateFamilyHint("dev.{N}@astronlab.com")).toBe(true);
   });
 
   test("accepts an explicit templated base email family", () => {

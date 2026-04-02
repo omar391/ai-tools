@@ -2,7 +2,7 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow
-  version: 1.0.1
+  version: 1.0.2
   summary: "Explicit managed-profile OpenAI account creation and Codex callback login flow for codex-rotate."
   metadata:
     preferredProfile: dev-1
@@ -1049,6 +1049,24 @@ use:
             };
 
             const initial = await detectState();
+            const clickVisibleContinue = async () => {
+              const submit = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]')
+                .filter({ hasText: /continue|next|create account|sign up|log in|sign in|submit|verify|authorize|allow|accept/i })
+                .first();
+              if ((await submit.count().catch(() => 0)) === 0) {
+                return null;
+              }
+              const label = await submit.evaluate((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).catch(() => null);
+              await submit.scrollIntoViewIfNeeded().catch(() => {});
+              await submit.click().catch(async () => {
+                await submit.click({ force: true }).catch(() => {});
+              });
+              return {
+                ok: true,
+                strategy: "locator-click",
+                label: label || null,
+              };
+            };
             const passwordField = page.locator('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]').first();
             const submitFormFromField = async () => {
               try {
@@ -1117,6 +1135,7 @@ use:
             };
 
             const attempts = [
+              async () => clickVisibleContinue(),
               async () => submitFormFromField(),
               async () => {
                 await passwordField.press("Enter").catch(() => {});
@@ -2164,3 +2183,22 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Flatten the final OpenAI/Codex callback state for codex-rotate."
+output:
+  as:
+    stage: "${state.steps.complete_login_or_consent?.action?.stage || state.steps.classify_after_signup_password_gate?.action?.stage || state.steps.classify_after_signup_password?.action?.stage || state.steps.classify_signup_complete?.action?.stage || null}"
+    current_url: "${state.steps.complete_login_or_consent?.action?.current_url || state.steps.classify_after_signup_password_gate?.action?.current_url || state.steps.classify_after_signup_password?.action?.current_url || state.steps.classify_signup_complete?.action?.current_url || null}"
+    headline: "${state.steps.complete_login_or_consent?.action?.headline || state.steps.classify_after_signup_password_gate?.action?.headline || state.steps.classify_after_signup_password?.action?.headline || state.steps.classify_signup_complete?.action?.headline || null}"
+    callback_complete: "${state.steps.complete_login_or_consent?.action?.callback_complete === true}"
+    success: "${state.steps.complete_login_or_consent?.action?.success === true}"
+    account_ready: "${state.steps.complete_login_or_consent?.action?.account_ready === true}"
+    needs_email_verification: "${state.steps.complete_login_or_consent?.action?.needs_email_verification === true || state.steps.complete_login_or_consent?.action?.stage === 'email_verification'}"
+    follow_up_step: "${state.steps.complete_login_or_consent?.action?.follow_up_step === true || state.steps.complete_login_or_consent?.action?.stage === 'about_you'}"
+    add_phone_prompt: "${state.steps.complete_login_or_consent?.action?.add_phone_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'add_phone' || state.steps.classify_signup_complete?.action?.stage === 'add_phone'}"
+    retryable_timeout: "${state.steps.complete_login_or_consent?.action?.retryable_timeout === true || state.steps.complete_login_or_consent?.action?.stage === 'retryable_timeout'}"
+    session_ended: "${state.steps.complete_login_or_consent?.action?.session_ended === true || state.steps.complete_login_or_consent?.action?.stage === 'session_ended'}"
+    existing_account_prompt: "${state.steps.complete_login_or_consent?.action?.existing_account_prompt === true || state.steps.classify_after_signup_password_gate?.action?.existing_account_prompt === true || state.steps.classify_after_signup_password?.action?.existing_account_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'existing_account_prompt'}"
+    username_not_found: "${state.steps.complete_login_or_consent?.action?.username_not_found === true}"
+    invalid_credentials: "${state.steps.complete_login_or_consent?.action?.invalid_credentials === true || state.steps.complete_login_or_consent?.action?.stage === 'invalid_credentials'}"
+    rate_limit_exceeded: "${state.steps.complete_login_or_consent?.action?.rate_limit_exceeded === true || state.steps.complete_login_or_consent?.action?.stage === 'rate_limit'}"
+    anti_bot_gate: "${state.steps.complete_login_or_consent?.action?.anti_bot_gate === true || state.steps.classify_before_consent?.action?.anti_bot_gate === true || state.steps.classify_after_oauth_consent?.action?.anti_bot_gate === true}"
+    auth_prompt: "${state.steps.complete_login_or_consent?.action?.auth_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'auth_prompt' || state.steps.complete_login_or_consent?.action?.stage === 'login_email' || state.steps.complete_login_or_consent?.action?.stage === 'login_password' || state.steps.complete_login_or_consent?.action?.stage === 'signup_email' || state.steps.complete_login_or_consent?.action?.stage === 'signup_password'}"

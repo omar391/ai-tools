@@ -24,22 +24,21 @@ import {
   buildGmailAliasEmail,
   cancelCodexBrowserLoginSession,
   computeNextGmailAliasSuffix,
-  discoverGmailBaseEmail,
   generatePassword,
   loadCredentialStore,
   makeCredentialFamilyKey,
   readLocalWorkflowMetadata,
   resolveManagedProfileName,
   resolveCreateBaseEmail,
+  readCodexRotateAuthFlowSummary,
   runCodexBrowserLoginWorkflow,
   saveCredentialStore,
+  shouldUseDefaultCreateFamilyHint,
   selectPendingBaseEmailHintForProfile,
   selectStoredBaseEmailHint,
   selectPendingCredentialForFamily,
   startCodexBrowserLoginSession,
   waitForCodexBrowserLoginExit,
-  readWorkflowActionBoolean,
-  readWorkflowActionString,
   type BrowserLoginSession,
   type CredentialStore,
   type PendingCredential,
@@ -1272,34 +1271,24 @@ async function runAutomatedCodexLogin(
             birthYear: options?.birthYear,
           },
         );
-        const finalStage = readWorkflowActionString(loginResult, "complete_login_or_consent", "stage");
-        const callbackComplete = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "callback_complete");
-        const success = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "success");
-        const invalidCredentials = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "invalid_credentials")
-          || finalStage === "invalid_credentials";
-        const needsEmailVerification = readWorkflowActionBoolean(
-          loginResult,
-          "complete_login_or_consent",
-          "needs_email_verification",
-        ) || finalStage === "email_verification";
-        const followUpStep = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "follow_up_step")
-          || finalStage === "about_you";
-        const addPhonePromptFlag = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "add_phone_prompt")
-          || finalStage === "add_phone";
-        const existingAccountPrompt = readWorkflowActionBoolean(loginResult, "classify_after_signup_password_gate", "existing_account_prompt")
-          || readWorkflowActionBoolean(loginResult, "classify_after_signup_password", "existing_account_prompt")
-          || finalStage === "existing_account_prompt";
-        const retryableTimeout = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "retryable_timeout")
-          || finalStage === "retryable_timeout";
-        const rateLimitExceeded = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "rate_limit_exceeded")
-          || finalStage === "rate_limit";
-        const authPrompt = readWorkflowActionBoolean(loginResult, "complete_login_or_consent", "auth_prompt")
+        const flow = readCodexRotateAuthFlowSummary(loginResult);
+        const finalStage = typeof flow.stage === "string" ? flow.stage : null;
+        const callbackComplete = flow.callback_complete === true;
+        const success = flow.success === true;
+        const invalidCredentials = flow.invalid_credentials === true || finalStage === "invalid_credentials";
+        const needsEmailVerification = flow.needs_email_verification === true || finalStage === "email_verification";
+        const followUpStep = flow.follow_up_step === true || finalStage === "about_you";
+        const addPhonePromptFlag = flow.add_phone_prompt === true || finalStage === "add_phone";
+        const existingAccountPrompt = flow.existing_account_prompt === true || finalStage === "existing_account_prompt";
+        const retryableTimeout = flow.retryable_timeout === true || finalStage === "retryable_timeout";
+        const rateLimitExceeded = flow.rate_limit_exceeded === true || finalStage === "rate_limit";
+        const authPrompt = flow.auth_prompt === true
           || finalStage === "auth_prompt"
           || finalStage === "login_email"
           || finalStage === "login_password"
           || finalStage === "signup_email"
           || finalStage === "signup_password";
-        const currentUrl = readWorkflowActionString(loginResult, "complete_login_or_consent", "current_url");
+        const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
         const addPhonePrompt = addPhonePromptFlag
           || (typeof currentUrl === "string" && /auth\.openai\.com\/add-phone(?:\/|$)?/i.test(currentUrl));
         const genericAuthPrompt = authPrompt
@@ -1386,19 +1375,26 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
     preferredProfileName: workflowMetadata.preferredProfileName,
     preferredProfileSource: workflowMetadata.filePath,
   });
-  const pendingBaseEmailHint = options.baseEmail
+  const pendingBaseEmailHintRaw = options.baseEmail
     ? null
     : selectPendingBaseEmailHintForProfile(store, profileName, options.alias ?? null);
-  const storedBaseEmailHint = selectStoredBaseEmailHint(store, profileName);
-  const discoveredBaseEmail = options.baseEmail
-    || pendingBaseEmailHint
-    ? null
-    : await discoverGmailBaseEmail(profileName, {
-      preferredBaseEmail: storedBaseEmailHint,
-    });
+  const storedBaseEmailHintRaw = selectStoredBaseEmailHint(store, profileName);
+  const pendingBaseEmailHint = shouldUseDefaultCreateFamilyHint(pendingBaseEmailHintRaw)
+    ? pendingBaseEmailHintRaw
+    : null;
+  const storedBaseEmailHint = shouldUseDefaultCreateFamilyHint(storedBaseEmailHintRaw)
+    ? storedBaseEmailHintRaw
+    : null;
+  if (!options.baseEmail) {
+    if (pendingBaseEmailHintRaw && !pendingBaseEmailHint) {
+      note(`Ignoring legacy Gmail pending create family hint ${pendingBaseEmailHintRaw} and defaulting to Astronlab template.`);
+    } else if (storedBaseEmailHintRaw && !storedBaseEmailHint) {
+      note(`Ignoring legacy Gmail stored create family hint ${storedBaseEmailHintRaw} and defaulting to Astronlab template.`);
+    }
+  }
   const baseEmail = resolveCreateBaseEmail(
     options.baseEmail ?? null,
-    pendingBaseEmailHint ?? discoveredBaseEmail ?? storedBaseEmailHint,
+    pendingBaseEmailHint ?? storedBaseEmailHint,
   );
   const pool = loadPool();
   const familyKey = makeCredentialFamilyKey(profileName, baseEmail);
