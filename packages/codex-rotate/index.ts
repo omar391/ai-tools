@@ -1017,7 +1017,7 @@ export function findNextCachedUsableAccountIndex(
 
 export function findNextImmediateRoundRobinIndex(
   activeIndex: number,
-  accounts: ReadonlyArray<{ last_quota_usable?: boolean | null }>,
+  accounts: ReadonlyArray<{ last_quota_usable?: boolean | null; last_quota_checked_at?: string | null }>,
 ): number | null {
   if (accounts.length <= 1) {
     return null;
@@ -1025,7 +1025,9 @@ export function findNextImmediateRoundRobinIndex(
 
   for (let offset = 1; offset < accounts.length; offset += 1) {
     const index = (activeIndex + offset) % accounts.length;
-    if (accounts[index]?.last_quota_usable !== false) {
+    const entry = accounts[index];
+    const hasCachedInspection = Boolean(entry?.last_quota_checked_at);
+    if (entry?.last_quota_usable === true || !hasCachedInspection) {
       return index;
     }
   }
@@ -1542,26 +1544,48 @@ async function cmdNext(): Promise<void> {
 
   const previousIndex = pool.active_index;
   const previous = pool.accounts[previousIndex]!;
-  const immediateCandidateIndex = findNextImmediateRoundRobinIndex(previousIndex, pool.accounts);
-  const hasLaterUnknownQuotaState = pool.accounts.some((entry, index) =>
-    index !== previousIndex
-    && (entry.last_quota_usable === null || entry.last_quota_usable === undefined),
-  );
+  let cursorIndex = previousIndex;
+  while (true) {
+    const immediateCandidateIndex = findNextImmediateRoundRobinIndex(cursorIndex, pool.accounts);
+    if (immediateCandidateIndex === null) {
+      break;
+    }
 
-  if (immediateCandidateIndex !== null) {
     const candidate = pool.accounts[immediateCandidateIndex]!;
-    pool.active_index = immediateCandidateIndex;
-    writeCodexAuth(candidate.auth);
-    savePool(pool);
+    if (candidate.last_quota_usable === true) {
+      pool.active_index = immediateCandidateIndex;
+      writeCodexAuth(candidate.auth);
+      savePool(pool);
 
-    const quotaSummary = formatCachedQuotaSummary(candidate);
-    const quotaMode = candidate.last_quota_usable === true ? "cached usable" : "unverified";
-    console.log(
-      `${GREEN}⟳${RESET} Rotated: ${DIM}${getAccountSelector(previous)}${RESET} (${previous.email}) → ${BOLD}${getAccountSelector(candidate)}${RESET} (${CYAN}${candidate.email}${RESET}, ${candidate.plan_type})\n`
-      + `${DIM}  [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · ${quotaMode}${RESET}`,
-    );
-    return;
+      const quotaSummary = formatCachedQuotaSummary(candidate);
+      console.log(
+        `${GREEN}⟳${RESET} Rotated: ${DIM}${getAccountSelector(previous)}${RESET} (${previous.email}) → ${BOLD}${getAccountSelector(candidate)}${RESET} (${CYAN}${candidate.email}${RESET}, ${candidate.plan_type})\n`
+        + `${DIM}  [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · cached${RESET}`,
+      );
+      return;
+    }
+
+    const inspection = await inspectAccount(candidate);
+    dirty = inspection.updated || dirty;
+    if (inspection.usage && hasUsableQuota(inspection.usage)) {
+      pool.active_index = immediateCandidateIndex;
+      writeCodexAuth(candidate.auth);
+      savePool(pool);
+
+      const quotaSummary = formatCompactQuota(inspection.usage);
+      console.log(
+        `${GREEN}⟳${RESET} Rotated: ${DIM}${getAccountSelector(previous)}${RESET} (${previous.email}) → ${BOLD}${getAccountSelector(candidate)}${RESET} (${CYAN}${candidate.email}${RESET}, ${candidate.plan_type})\n`
+        + `${DIM}  [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · checked now${RESET}`,
+      );
+      return;
+    }
+
+    cursorIndex = immediateCandidateIndex;
   }
+
+  const hasLaterUnknownQuotaState = pool.accounts.some((entry, index) =>
+    index !== previousIndex && !entry.last_quota_checked_at,
+  );
 
   if (previous.last_quota_usable === true && !hasLaterUnknownQuotaState) {
     if (dirty) savePool(pool);

@@ -163,15 +163,15 @@ describe("immediate next rotation", () => {
     expect(findNextImmediateRoundRobinIndex(1, [
       { last_quota_usable: null },
       { last_quota_usable: true },
-      { last_quota_usable: false },
+      { last_quota_usable: false, last_quota_checked_at: "2026-04-02T00:00:00.000Z" },
     ])).toBe(0);
   });
 
   test("returns null when every later account is already known unusable", () => {
     expect(findNextImmediateRoundRobinIndex(0, [
       { last_quota_usable: true },
-      { last_quota_usable: false },
-      { last_quota_usable: false },
+      { last_quota_usable: false, last_quota_checked_at: "2026-04-02T00:00:00.000Z" },
+      { last_quota_usable: false, last_quota_checked_at: "2026-04-02T00:00:00.000Z" },
     ])).toBeNull();
   });
 });
