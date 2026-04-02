@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import type { PendingCredential, StoredCredential } from "./automation.ts";
 import {
+  findNextImmediateRoundRobinIndex,
+  findNextCachedUsableAccountIndex,
   generateRandomAdultBirthDate,
   resolveCredentialBirthDate,
   shouldUseStoredCredentialRelogin,
@@ -119,5 +121,57 @@ describe("adult birth date generation", () => {
       birthDay: 14,
       birthYear: 1994,
     });
+  });
+});
+
+describe("cached next rotation", () => {
+  test("picks the next cached usable account in round-robin order", () => {
+    expect(findNextCachedUsableAccountIndex(0, [
+      { last_quota_usable: true },
+      { last_quota_usable: false },
+      { last_quota_usable: true },
+    ])).toBe(2);
+  });
+
+  test("wraps around when a later slot is not usable but an earlier one is", () => {
+    expect(findNextCachedUsableAccountIndex(2, [
+      { last_quota_usable: true },
+      { last_quota_usable: null },
+      { last_quota_usable: false },
+    ])).toBe(0);
+  });
+
+  test("returns null when no later cached account is marked usable", () => {
+    expect(findNextCachedUsableAccountIndex(1, [
+      { last_quota_usable: false },
+      { last_quota_usable: true },
+      { last_quota_usable: null },
+    ])).toBeNull();
+  });
+});
+
+describe("immediate next rotation", () => {
+  test("picks the next later account unless it is explicitly marked unusable", () => {
+    expect(findNextImmediateRoundRobinIndex(0, [
+      { last_quota_usable: true },
+      { last_quota_usable: null },
+      { last_quota_usable: true },
+    ])).toBe(1);
+  });
+
+  test("skips entries explicitly marked unusable and wraps around", () => {
+    expect(findNextImmediateRoundRobinIndex(1, [
+      { last_quota_usable: null },
+      { last_quota_usable: true },
+      { last_quota_usable: false },
+    ])).toBe(0);
+  });
+
+  test("returns null when every later account is already known unusable", () => {
+    expect(findNextImmediateRoundRobinIndex(0, [
+      { last_quota_usable: true },
+      { last_quota_usable: false },
+      { last_quota_usable: false },
+    ])).toBeNull();
   });
 });

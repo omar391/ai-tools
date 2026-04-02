@@ -29,6 +29,7 @@ input:
         auth_url: {}
         callback_url: {}
         callback_port: {}
+        device_code: {}
         codex_session_dir: {}
         codex_login_pid: {}
         codex_login_stdout_path: {}
@@ -198,6 +199,185 @@ use:
               }
               throw error;
             }
+    detect_codex_device_code_entry:
+      metadata:
+        description: "Detect whether the current managed OpenAI surface is waiting for a Codex device-auth code."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const result = await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden='true']")) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const href = location.href;
+              let path = "";
+              try {
+                path = new URL(href).pathname;
+              } catch {}
+              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              const codeInputs = Array.from(document.querySelectorAll("input"))
+                .filter((node) => node instanceof HTMLInputElement)
+                .filter((node) => isVisible(node))
+                .filter((node) => {
+                  const input = node;
+                  const type = String(input.type || "text").toLowerCase();
+                  if (["hidden", "checkbox", "radio", "button", "submit"].includes(type)) {
+                    return false;
+                  }
+                  const hint = normalize(
+                    input.name
+                    || input.getAttribute("aria-label")
+                    || input.getAttribute("placeholder")
+                    || input.autocomplete
+                    || ""
+                  );
+                  return /code|device|one-time|one time/i.test(hint) || type === "text";
+                });
+              const deviceCodeEntry = /\/codex\/device(?:\/|$)/i.test(path)
+                && (codeInputs.length > 0 || /one-time code|device code|enter.*code/i.test(bodyText));
+              return {
+                ok: true,
+                device_code_entry: deviceCodeEntry,
+                current_url: href,
+                headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || null,
+                visible_code_inputs: codeInputs.length,
+              };
+            });
+            return result;
+    fill_codex_device_code_field:
+      metadata:
+        description: "Fill the Codex device-auth code on the managed OpenAI device login page."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const rawCode = String(
+              args.device_code
+              || state.vars?.codex_login?.device_code
+              || state.steps.capture_codex_login_url?.action?.value?.device_code
+              || ""
+            ).trim().toUpperCase();
+            if (!rawCode) {
+              throw new Error("codex-device-code-missing");
+            }
+            const compactCode = rawCode.replace(/[^A-Z0-9]/g, "");
+            const segments = rawCode.split("-").filter(Boolean);
+            const result = await page.evaluate(({ rawCode, compactCode, segments }) => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden='true']")) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const fillInput = (input, value) => {
+                input.focus();
+                input.value = "";
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.value = value;
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+              };
+              const allInputs = Array.from(document.querySelectorAll("input"))
+                .filter((node) => node instanceof HTMLInputElement)
+                .filter((node) => isVisible(node))
+                .filter((node) => {
+                  const input = node;
+                  const type = String(input.type || "text").toLowerCase();
+                  return !["hidden", "checkbox", "radio", "button", "submit"].includes(type);
+                });
+              const preferred = allInputs.filter((input) => {
+                const hint = normalize(
+                  input.name
+                  || input.getAttribute("aria-label")
+                  || input.getAttribute("placeholder")
+                  || input.autocomplete
+                  || ""
+                );
+                return /code|device|one-time|one time/i.test(hint);
+              });
+              const candidates = preferred.length > 0 ? preferred : allInputs;
+              if (candidates.length === 0) {
+                return { ok: false, error: "codex-device-code-input-not-found" };
+              }
+              const singleInput = candidates.find((input) => {
+                const maxLength = Number(input.maxLength || 0);
+                return maxLength <= 0 || maxLength >= rawCode.length || maxLength >= compactCode.length;
+              });
+              if (singleInput) {
+                fillInput(singleInput, rawCode);
+                return {
+                  ok: true,
+                  strategy: "single-input",
+                  filled_values: [singleInput.value],
+                };
+              }
+              const segmentInputs = candidates.filter((input) => Number(input.maxLength || 0) > 1);
+              if (segmentInputs.length >= segments.length) {
+                for (let index = 0; index < segments.length; index += 1) {
+                  fillInput(segmentInputs[index], segments[index]);
+                }
+                return {
+                  ok: true,
+                  strategy: "segmented-inputs",
+                  filled_values: segmentInputs.slice(0, segments.length).map((input) => input.value),
+                };
+              }
+              const characterInputs = candidates.filter((input) => {
+                const maxLength = Number(input.maxLength || 0);
+                return maxLength === 1 || maxLength === 0;
+              });
+              if (characterInputs.length >= compactCode.length) {
+                const chars = compactCode.split("");
+                for (let index = 0; index < chars.length; index += 1) {
+                  fillInput(characterInputs[index], chars[index]);
+                }
+                return {
+                  ok: true,
+                  strategy: "character-inputs",
+                  filled_values: characterInputs.slice(0, compactCode.length).map((input) => input.value),
+                };
+              }
+              fillInput(candidates[0], rawCode);
+              return {
+                ok: true,
+                strategy: "fallback-first-input",
+                filled_values: [candidates[0].value],
+              };
+            }, { rawCode, compactCode, segments });
+            if (result.ok) {
+              await page.waitForTimeout(150).catch(() => {});
+            }
+            return {
+              ...result,
+              device_code: rawCode,
+              current_url: page.url(),
+            };
     fill_openai_email_field:
       metadata:
         description: "Fill the OpenAI email field and dispatch the events needed to enable the primary submit action."
@@ -1477,9 +1657,9 @@ do:
             const stderrPath = path.join(sessionDir, "stderr.log");
             const exitPath = path.join(sessionDir, "exit.code");
             const quote = (value) => "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
-            const command = "BROWSER=/usr/bin/false "
+            const command = ""
               + quote(codexBin)
-              + " login >"
+              + " login --device-auth >"
               + quote(stdoutPath)
               + " 2>"
               + quote(stderrPath)
@@ -1507,7 +1687,7 @@ do:
   - capture_codex_login_url:
       if: "${String(inputs.mode || 'codex_login') === 'codex_login'}"
       metadata:
-        description: "Capture or normalize the Codex auth URL and callback session details for this workflow run."
+        description: "Capture or normalize the Codex device-auth URL, code, and session details for this workflow run."
       run:
         script:
           language: javascript
@@ -1516,6 +1696,7 @@ do:
             const { setTimeout: delay } = await import("node:timers/promises");
 
             const explicitAuthUrl = String(args.auth_url || "").trim();
+            const explicitDeviceCode = String(args.device_code || "").trim().toUpperCase() || null;
             const stdoutPath = String(
               args.codex_login_stdout_path
               || state.steps.start_codex_login_session?.action?.value?.stdout_path
@@ -1542,11 +1723,28 @@ do:
               || 0
             );
 
+            const stripAnsi = (raw) => String(raw || "").replace(/\u001b\[[0-9;]*m/g, "");
             const extractAuthUrl = (raw) => {
-              const match = String(raw || "").match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s"'<>]+/);
+              const match = stripAnsi(raw).match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s"'<>]+/);
               return match ? match[0] : null;
             };
-            const parseCapture = (authUrl) => {
+            const extractDeviceAuthUrl = (raw) => {
+              const match = stripAnsi(raw).match(/https:\/\/auth\.openai\.com\/codex\/device\b[^\s"'<>]*/);
+              return match ? match[0] : null;
+            };
+            const extractDeviceCode = (raw) => {
+              const match = stripAnsi(raw).match(/\b([A-Z0-9]{4,5}-[A-Z0-9]{4,6})\b/);
+              return match ? match[1] : null;
+            };
+            const parseCapture = (authUrl, deviceCode = null) => {
+              if (/\/codex\/device(?:\/|$|\?)/i.test(authUrl)) {
+                return {
+                  auth_url: authUrl,
+                  callback_url: null,
+                  callback_port: null,
+                  device_code: deviceCode,
+                };
+              }
               const parsedAuthUrl = new URL(authUrl);
               const callbackUrl = parsedAuthUrl.searchParams.get("redirect_uri") || "";
               if (!callbackUrl) {
@@ -1560,6 +1758,7 @@ do:
                 auth_url: authUrl,
                 callback_url: callbackUrl,
                 callback_port: callbackPort,
+                device_code: deviceCode,
               };
             };
             const readText = (filePath) => {
@@ -1577,7 +1776,7 @@ do:
               return {
                 ok: true,
                 reused: true,
-                ...parseCapture(explicitAuthUrl),
+                ...parseCapture(explicitAuthUrl, explicitDeviceCode),
                 session_dir: sessionDir,
                 pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
                 stdout_path: stdoutPath || null,
@@ -1590,12 +1789,12 @@ do:
             const startedAt = Date.now();
             while (Date.now() - startedAt < timeoutMs) {
               const combined = readText(stdoutPath) + "\n" + readText(stderrPath);
-              const authUrl = extractAuthUrl(combined);
+              const authUrl = extractAuthUrl(combined) || extractDeviceAuthUrl(combined);
               if (authUrl) {
                 return {
                   ok: true,
                   reused: false,
-                  ...parseCapture(authUrl),
+                  ...parseCapture(authUrl, extractDeviceCode(combined) || explicitDeviceCode),
                   session_dir: sessionDir,
                   pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
                   stdout_path: stdoutPath || null,
@@ -1638,8 +1837,37 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the entry state after any initial security gate handling."
+  - detect_entry_device_code:
+      metadata:
+        templateRef: detect_codex_device_code_entry
+        description: "Detect whether the initial Codex login page is waiting for the device-auth code."
+  - fill_entry_device_code:
+      if: "${state.steps.detect_entry_device_code?.action?.device_code_entry === true}"
+      metadata:
+        templateRef: fill_codex_device_code_field
+        description: "Fill the Codex device-auth code before continuing into the managed OpenAI auth flow."
+  - submit_entry_device_code:
+      if: "${state.steps.fill_entry_device_code?.action?.ok === true && state.steps.fill_entry_device_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: "Submit the Codex device-auth code entry step."
+  - wait_after_entry_device_code_submit:
+      if: "${state.steps.submit_entry_device_code?.action?.ok === true && state.steps.submit_entry_device_code?.action?.skipped !== true}"
+      metadata:
+        description: "Allow the Codex device-auth code submission to settle before branching into signup or login."
+      wait:
+        milliseconds: 900
+  - stabilize_entry_after_device_code:
+      if: "${state.steps.submit_entry_device_code?.action?.ok === true && state.steps.submit_entry_device_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: "Wait for the managed OpenAI auth page after submitting the Codex device-auth code."
+  - classify_entry_start:
+      metadata:
+        templateRef: classify_openai_surface
+        description: "Classify the initial managed OpenAI auth page after device-auth entry handling."
   - choose_signup_branch:
-      if: "${state.steps.classify_entry_ready?.action?.stage === 'login_email' && state.steps.classify_entry_ready?.action?.signup_cta_visible === true && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
+      if: "${state.steps.classify_entry_start?.action?.stage === 'login_email' && state.steps.classify_entry_start?.action?.signup_cta_visible === true && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
       metadata:
         templateRef: click_signup_button
         description: "Switch from the login shell to the signup page."
@@ -1902,8 +2130,39 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after any security gate handling."
+  - detect_replayed_device_code:
+      if: "${(state.steps.reopen_existing_account_auth_url?.action?.ok === true && state.steps.reopen_existing_account_auth_url?.action?.skipped !== true) || (state.steps.reopen_captured_auth_url?.action?.ok === true && state.steps.reopen_captured_auth_url?.action?.skipped !== true)}"
+      metadata:
+        templateRef: detect_codex_device_code_entry
+        description: "Detect whether the replayed Codex login page returned to the device-auth code screen."
+  - fill_replayed_device_code:
+      if: "${state.steps.detect_replayed_device_code?.action?.device_code_entry === true}"
+      metadata:
+        templateRef: fill_codex_device_code_field
+        description: "Refill the Codex device-auth code when a replayed login session returns to the device-auth entry screen."
+  - submit_replayed_device_code:
+      if: "${state.steps.fill_replayed_device_code?.action?.ok === true && state.steps.fill_replayed_device_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: "Submit the replayed Codex device-auth code entry step."
+  - wait_after_replayed_device_code_submit:
+      if: "${state.steps.submit_replayed_device_code?.action?.ok === true && state.steps.submit_replayed_device_code?.action?.skipped !== true}"
+      metadata:
+        description: "Allow the replayed Codex device-auth code submission to settle before entering login credentials."
+      wait:
+        milliseconds: 900
+  - stabilize_login_after_device_code:
+      if: "${state.steps.submit_replayed_device_code?.action?.ok === true && state.steps.submit_replayed_device_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: "Wait for the replayed OpenAI login page after submitting the Codex device-auth code."
+  - classify_login_start:
+      if: "${(state.steps.reopen_existing_account_auth_url?.action?.ok === true && state.steps.reopen_existing_account_auth_url?.action?.skipped !== true) || (state.steps.reopen_captured_auth_url?.action?.ok === true && state.steps.reopen_captured_auth_url?.action?.skipped !== true)}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: "Classify the replayed OpenAI auth page after device-auth entry handling."
   - fill_login_email:
-      if: "${state.steps.classify_login_ready?.action?.stage === 'login_email'}"
+      if: "${state.steps.classify_login_start?.action?.stage === 'login_email'}"
       metadata:
         templateRef: fill_openai_email_field
         description: "Fill the newly created email on the replayed OpenAI login page."
@@ -1917,7 +2176,7 @@ do:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]'));\nconst values = fields.map((field) => field.value || '');\nreturn {\n  ok: values.some((value) => value === String(args.email || '')),\n  values,\n};\n"
   - submit_login_email:
-      if: "${state.steps.classify_login_ready?.action?.stage === 'login_email' && state.steps.fill_login_email?.action?.ok === true}"
+      if: "${state.steps.classify_login_start?.action?.stage === 'login_email' && state.steps.fill_login_email?.action?.ok === true}"
       metadata:
         templateRef: submit_login_email_form
         description: "Submit the replayed OpenAI login email step."
@@ -2533,6 +2792,7 @@ do:
                 auth_url: session.auth_url || null,
                 callback_url: session.callback_url || null,
                 callback_port: session.callback_port ?? null,
+                device_code: session.device_code || null,
                 session_dir: session.session_dir || null,
                 pid: session.pid ?? null,
                 stdout_path: session.stdout_path || null,

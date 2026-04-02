@@ -79,6 +79,10 @@ interface AccountEntry {
   plan_type: string;
   auth: CodexAuth;
   added_at: string;
+  last_quota_usable?: boolean | null;
+  last_quota_summary?: string | null;
+  last_quota_blocker?: string | null;
+  last_quota_checked_at?: string | null;
 }
 
 interface Pool {
@@ -805,6 +809,31 @@ function describeQuotaBlocker(usage: UsageResponse): string {
   return "no usable quota";
 }
 
+function applyQuotaInspectionToAccount(
+  entry: AccountEntry,
+  inspection: Pick<AccountInspection, "usage" | "error">,
+  checkedAt = new Date().toISOString(),
+): boolean {
+  const nextUsable = inspection.usage ? hasUsableQuota(inspection.usage) : null;
+  const nextSummary = inspection.usage ? formatCompactQuota(inspection.usage) : null;
+  const nextBlocker = inspection.usage
+    ? (nextUsable ? null : describeQuotaBlocker(inspection.usage))
+    : (inspection.error ?? "quota unavailable");
+
+  const changed =
+    entry.last_quota_usable !== nextUsable
+    || entry.last_quota_summary !== nextSummary
+    || entry.last_quota_blocker !== nextBlocker
+    || entry.last_quota_checked_at !== checkedAt;
+
+  entry.last_quota_usable = nextUsable;
+  entry.last_quota_summary = nextSummary;
+  entry.last_quota_blocker = nextBlocker;
+  entry.last_quota_checked_at = checkedAt;
+
+  return changed;
+}
+
 function summarizeHttpError(body: string): string | null {
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
@@ -946,19 +975,75 @@ async function fetchUsageWithRecovery(auth: CodexAuth): Promise<{ auth: CodexAut
 }
 
 async function inspectAccount(entry: AccountEntry, options?: { persistIfCurrent?: boolean }): Promise<AccountInspection> {
+  const inspectedAt = new Date().toISOString();
   try {
     const { auth, usage } = await fetchUsageWithRecovery(entry.auth);
 
     let updated = applyAuthToAccount(entry, auth);
     updated = applyUsageToAccount(entry, usage) || updated;
+    updated = applyQuotaInspectionToAccount(entry, { usage, error: null }, inspectedAt) || updated;
     if (options?.persistIfCurrent) {
       updated = writeCodexAuthIfCurrentAccount(entry.account_id, entry.auth) || updated;
     }
 
     return { usage, error: null, updated };
   } catch (error) {
-    return { usage: null, error: getErrorMessage(error), updated: false };
+    const inspection = {
+      usage: null,
+      error: getErrorMessage(error),
+    };
+    const updated = applyQuotaInspectionToAccount(entry, inspection, inspectedAt);
+    return { ...inspection, updated };
   }
+}
+
+export function findNextCachedUsableAccountIndex(
+  activeIndex: number,
+  accounts: ReadonlyArray<{ last_quota_usable?: boolean | null }>,
+): number | null {
+  if (accounts.length <= 1) {
+    return null;
+  }
+
+  for (let offset = 1; offset < accounts.length; offset += 1) {
+    const index = (activeIndex + offset) % accounts.length;
+    if (accounts[index]?.last_quota_usable === true) {
+      return index;
+    }
+  }
+
+  return null;
+}
+
+export function findNextImmediateRoundRobinIndex(
+  activeIndex: number,
+  accounts: ReadonlyArray<{ last_quota_usable?: boolean | null }>,
+): number | null {
+  if (accounts.length <= 1) {
+    return null;
+  }
+
+  for (let offset = 1; offset < accounts.length; offset += 1) {
+    const index = (activeIndex + offset) % accounts.length;
+    if (accounts[index]?.last_quota_usable !== false) {
+      return index;
+    }
+  }
+
+  return null;
+}
+
+function formatCachedQuotaSummary(entry: AccountEntry): string {
+  if (entry.last_quota_summary) {
+    return entry.last_quota_summary;
+  }
+  if (entry.last_quota_usable === true) {
+    return "cached usable quota";
+  }
+  if (entry.last_quota_usable === null || entry.last_quota_usable === undefined) {
+    return "quota not checked yet";
+  }
+  return entry.last_quota_blocker ?? "quota unavailable";
 }
 
 async function findNextUsableAccount(pool: Pool): Promise<{ candidate: RotationCandidate | null; reasons: string[]; dirty: boolean }> {
@@ -1457,6 +1542,37 @@ async function cmdNext(): Promise<void> {
 
   const previousIndex = pool.active_index;
   const previous = pool.accounts[previousIndex]!;
+  const immediateCandidateIndex = findNextImmediateRoundRobinIndex(previousIndex, pool.accounts);
+  const hasLaterUnknownQuotaState = pool.accounts.some((entry, index) =>
+    index !== previousIndex
+    && (entry.last_quota_usable === null || entry.last_quota_usable === undefined),
+  );
+
+  if (immediateCandidateIndex !== null) {
+    const candidate = pool.accounts[immediateCandidateIndex]!;
+    pool.active_index = immediateCandidateIndex;
+    writeCodexAuth(candidate.auth);
+    savePool(pool);
+
+    const quotaSummary = formatCachedQuotaSummary(candidate);
+    const quotaMode = candidate.last_quota_usable === true ? "cached usable" : "unverified";
+    console.log(
+      `${GREEN}⟳${RESET} Rotated: ${DIM}${getAccountSelector(previous)}${RESET} (${previous.email}) → ${BOLD}${getAccountSelector(candidate)}${RESET} (${CYAN}${candidate.email}${RESET}, ${candidate.plan_type})\n`
+      + `${DIM}  [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · ${quotaMode}${RESET}`,
+    );
+    return;
+  }
+
+  if (previous.last_quota_usable === true && !hasLaterUnknownQuotaState) {
+    if (dirty) savePool(pool);
+    const quotaSummary = formatCachedQuotaSummary(previous);
+    console.log(
+      `${GREEN}⟳${RESET} Stayed on ${BOLD}${getAccountSelector(previous)}${RESET} (${CYAN}${previous.email}${RESET}, ${previous.plan_type})\n`
+      + `${DIM}  No later cached account is immediately usable · [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · cached${RESET}`,
+    );
+    return;
+  }
+
   const { candidate, reasons, dirty: candidateDirty } = await findNextUsableAccount(pool);
   dirty = candidateDirty || dirty;
 

@@ -226,6 +226,7 @@ export interface CodexRotateAuthFlowSession {
   auth_url?: string | null;
   callback_url?: string | null;
   callback_port?: number | null;
+  device_code?: string | null;
   session_dir?: string | null;
   pid?: number | null;
   stdout_path?: string | null;
@@ -1700,6 +1701,7 @@ async function runCodexBrowserLoginWorkflow(
       ...(options?.codexSession?.callback_port !== undefined && options.codexSession.callback_port !== null
         ? { callback_port: String(options.codexSession.callback_port) }
         : {}),
+      ...(options?.codexSession?.device_code ? { device_code: options.codexSession.device_code } : {}),
       ...(options?.codexSession?.session_dir ? { codex_session_dir: options.codexSession.session_dir } : {}),
       ...(options?.codexSession?.pid !== undefined && options.codexSession.pid !== null
         ? { codex_login_pid: String(options.codexSession.pid) }
