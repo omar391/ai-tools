@@ -36,7 +36,9 @@ import {
   selectPendingBaseEmailHintForProfile,
   selectStoredBaseEmailHint,
   selectPendingCredentialForFamily,
+  ensureBitwardenCliAccountSecretRef,
   type CredentialStore,
+  type CodexRotateSecretRef,
   type PendingCredential,
   type StoredCredential,
 } from "./automation.ts";
@@ -577,7 +579,12 @@ export function shouldUseStoredCredentialRelogin(
   storedCredential: StoredCredential | undefined,
   options: ReloginOptions,
 ): boolean {
-  return Boolean(storedCredential && !options.manualLogin && !options.deviceAuth);
+  return Boolean(
+    storedCredential
+    && !options.manualLogin
+    && !options.deviceAuth
+    && (storedCredential.account_secret_ref || storedCredential.legacy_password),
+  );
 }
 
 interface AdultBirthDate {
@@ -1035,28 +1042,26 @@ export function findNextImmediateRoundRobinIndex(
   return null;
 }
 
-function formatCachedQuotaSummary(entry: AccountEntry): string {
-  if (entry.last_quota_summary) {
-    return entry.last_quota_summary;
-  }
-  if (entry.last_quota_usable === true) {
-    return "cached usable quota";
-  }
-  if (entry.last_quota_usable === null || entry.last_quota_usable === undefined) {
-    return "quota not checked yet";
-  }
-  return entry.last_quota_blocker ?? "quota unavailable";
-}
-
-async function findNextUsableAccount(pool: Pool): Promise<{ candidate: RotationCandidate | null; reasons: string[]; dirty: boolean }> {
-  const reasons: string[] = [];
-  let dirty = false;
+async function findNextUsableAccount(
+  pool: Pool,
+  options?: {
+    reasons?: string[];
+    dirty?: boolean;
+    skipIndices?: ReadonlySet<number>;
+  },
+): Promise<{ candidate: RotationCandidate | null; reasons: string[]; dirty: boolean }> {
+  const reasons = options?.reasons ?? [];
+  let nextDirty = options?.dirty ?? false;
+  const skipIndices = options?.skipIndices ?? new Set<number>();
 
   for (let offset = 1; offset < pool.accounts.length; offset++) {
     const index = (pool.active_index + offset) % pool.accounts.length;
+    if (skipIndices.has(index)) {
+      continue;
+    }
     const entry = pool.accounts[index]!;
     const inspection = await inspectAccount(entry);
-    dirty = inspection.updated || dirty;
+    nextDirty = inspection.updated || nextDirty;
 
     if (!inspection.usage) {
       reasons.push(`${entry.label}: ${inspection.error ?? "unknown error"}`);
@@ -1071,14 +1076,14 @@ async function findNextUsableAccount(pool: Pool): Promise<{ candidate: RotationC
     return {
       candidate: { index, entry, inspection },
       reasons,
-      dirty,
+      dirty: nextDirty,
     };
   }
 
   const currentEntry = pool.accounts[pool.active_index];
   if (currentEntry) {
     const inspection = await inspectAccount(currentEntry, { persistIfCurrent: true });
-    dirty = inspection.updated || dirty;
+    nextDirty = inspection.updated || nextDirty;
 
     if (!inspection.usage) {
       reasons.push(`${currentEntry.label}: ${inspection.error ?? "unknown error"}`);
@@ -1086,14 +1091,14 @@ async function findNextUsableAccount(pool: Pool): Promise<{ candidate: RotationC
       return {
         candidate: { index: pool.active_index, entry: currentEntry, inspection },
         reasons,
-        dirty,
+        dirty: nextDirty,
       };
     } else {
       reasons.push(`${currentEntry.label}: ${describeQuotaBlocker(inspection.usage)}`);
     }
   }
 
-  return { candidate: null, reasons, dirty };
+  return { candidate: null, reasons, dirty: nextDirty };
 }
 
 function formatAccountMarker(isActive: boolean): string {
@@ -1318,11 +1323,13 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
       collectKnownAccountEmails(pool, store),
     );
   const createdEmail = existingPending?.email ?? buildGmailAliasEmail(baseEmail, suffix);
-  const password = existingPending?.password ?? generatePassword();
+  const accountSecretRef = await ensureCredentialAccountSecretRef(existingPending, createdEmail, profileName);
   const birthDate = resolveCredentialBirthDate(existingPending);
   const pending: PendingCredential = existingPending
     ? {
       ...existingPending,
+      account_secret_ref: accountSecretRef,
+      legacy_password: null,
       alias: existingPending.alias ?? options.alias ?? null,
       birth_month: existingPending.birth_month ?? birthDate.birthMonth,
       birth_day: existingPending.birth_day ?? birthDate.birthDay,
@@ -1331,7 +1338,7 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
     }
     : {
       email: createdEmail,
-      password,
+      account_secret_ref: accountSecretRef,
       profile_name: profileName,
       base_email: baseEmail,
       suffix,
@@ -1361,7 +1368,7 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
     await completeCodexLoginViaWorkflow(
       profileName,
       createdEmail,
-      password,
+      accountSecretRef,
       {
         codexBin: CODEX_BIN,
         workflowRunStamp: openAiWorkflowRunStamp,
@@ -1393,7 +1400,7 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
     delete store.pending[normalizeEmailKey(createdEmail)];
     store.accounts[normalizeEmailKey(createdEmail)] = {
       email: createdEmail,
-      password,
+      account_secret_ref: accountSecretRef,
       profile_name: profileName,
       base_email: baseEmail,
       suffix,
@@ -1545,6 +1552,7 @@ async function cmdNext(): Promise<void> {
   const previousIndex = pool.active_index;
   const previous = pool.accounts[previousIndex]!;
   let cursorIndex = previousIndex;
+  const inspectedLaterIndices = new Set<number>();
   while (true) {
     const immediateCandidateIndex = findNextImmediateRoundRobinIndex(cursorIndex, pool.accounts);
     if (immediateCandidateIndex === null) {
@@ -1552,21 +1560,9 @@ async function cmdNext(): Promise<void> {
     }
 
     const candidate = pool.accounts[immediateCandidateIndex]!;
-    if (candidate.last_quota_usable === true) {
-      pool.active_index = immediateCandidateIndex;
-      writeCodexAuth(candidate.auth);
-      savePool(pool);
-
-      const quotaSummary = formatCachedQuotaSummary(candidate);
-      console.log(
-        `${GREEN}⟳${RESET} Rotated: ${DIM}${getAccountSelector(previous)}${RESET} (${previous.email}) → ${BOLD}${getAccountSelector(candidate)}${RESET} (${CYAN}${candidate.email}${RESET}, ${candidate.plan_type})\n`
-        + `${DIM}  [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · cached${RESET}`,
-      );
-      return;
-    }
-
     const inspection = await inspectAccount(candidate);
     dirty = inspection.updated || dirty;
+    inspectedLaterIndices.add(immediateCandidateIndex);
     if (inspection.usage && hasUsableQuota(inspection.usage)) {
       pool.active_index = immediateCandidateIndex;
       writeCodexAuth(candidate.auth);
@@ -1583,21 +1579,11 @@ async function cmdNext(): Promise<void> {
     cursorIndex = immediateCandidateIndex;
   }
 
-  const hasLaterUnknownQuotaState = pool.accounts.some((entry, index) =>
-    index !== previousIndex && !entry.last_quota_checked_at,
-  );
-
-  if (previous.last_quota_usable === true && !hasLaterUnknownQuotaState) {
-    if (dirty) savePool(pool);
-    const quotaSummary = formatCachedQuotaSummary(previous);
-    console.log(
-      `${GREEN}⟳${RESET} Stayed on ${BOLD}${getAccountSelector(previous)}${RESET} (${CYAN}${previous.email}${RESET}, ${previous.plan_type})\n`
-      + `${DIM}  No later cached account is immediately usable · [${pool.active_index + 1}/${pool.accounts.length}] · ${quotaSummary} · cached${RESET}`,
-    );
-    return;
-  }
-
-  const { candidate, reasons, dirty: candidateDirty } = await findNextUsableAccount(pool);
+  const { candidate, reasons, dirty: candidateDirty } = await findNextUsableAccount(pool, {
+    reasons: [],
+    dirty,
+    skipIndices: inspectedLaterIndices,
+  });
   dirty = candidateDirty || dirty;
 
   if (!candidate) {
@@ -1797,12 +1783,24 @@ async function cmdRelogin(selector: string, options: ReloginOptions): Promise<vo
   const shouldUseStoredCredentials = shouldUseStoredCredentialRelogin(storedCredential, options);
 
   if (shouldUseStoredCredentials && storedCredential) {
-    note(`Using stored credentials for ${expectedEmail} in managed profile "${storedCredential.profile_name}".`);
+    const accountSecretRef = await ensureCredentialAccountSecretRef(
+      storedCredential,
+      storedCredential.email,
+      storedCredential.profile_name,
+    );
+    store.accounts[normalizeEmailKey(storedCredential.email)] = {
+      ...storedCredential,
+      account_secret_ref: accountSecretRef,
+      legacy_password: null,
+      updated_at: new Date().toISOString(),
+    };
+    saveCredentialStore(store);
+    note(`Using stored Bitwarden credentials for ${expectedEmail} in managed profile "${storedCredential.profile_name}".`);
     const previousAuth = loadCodexAuthIfExists();
     await completeCodexLoginViaWorkflow(
       storedCredential.profile_name,
       storedCredential.email,
-      storedCredential.password,
+      accountSecretRef,
       {
         codexBin: CODEX_BIN,
         onNote: note,
@@ -1906,7 +1904,7 @@ ${BOLD}WORKFLOW${RESET}
   8. Repair a dead entry:          ${DIM}codex-rotate relogin person@example.com_free${RESET}
 
 ${BOLD}RELOGIN FLAGS${RESET}
-  Default behavior uses stored credentials when available
+  Default behavior uses stored Bitwarden credentials when available
   ${DIM}--manual-login${RESET}       Force the legacy manual browser login flow
   ${DIM}--device-auth${RESET}        Use the device auth flow instead of browser login
   ${DIM}--keep-session${RESET}       Skip the pre-login ${DIM}codex logout${RESET} for manual relogins
@@ -1919,9 +1917,23 @@ ${BOLD}CREATE FLAGS${RESET}
 
 ${BOLD}FILES${RESET}
   Pool:  ${DIM}~/.codex-rotate/accounts.json${RESET}
-  Creds: ${DIM}~/.codex-rotate/credentials.json${RESET}
+  Creds: ${DIM}~/.codex-rotate/credentials.json${RESET} ${DIM}(metadata only after Bitwarden migration)${RESET}
   Auth:  ${DIM}~/.codex/auth.json${RESET}
 `);
+}
+
+async function ensureCredentialAccountSecretRef(
+  credential: Pick<StoredCredential, "account_secret_ref" | "legacy_password"> | null | undefined,
+  email: string,
+  profileName: string,
+): Promise<CodexRotateSecretRef> {
+  if (credential?.account_secret_ref) {
+    return credential.account_secret_ref;
+  }
+  if (typeof credential?.legacy_password === "string" && credential.legacy_password.length > 0) {
+    return await ensureBitwardenCliAccountSecretRef(profileName, email, credential.legacy_password);
+  }
+  return await ensureBitwardenCliAccountSecretRef(profileName, email, generatePassword());
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────

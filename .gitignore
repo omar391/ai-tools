@@ -34,3 +34,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 tmp/debug.md
 .fast-browser/cache
+packages/codex-rotate-app/src-tauri/target
+packages/codex-rotate-app/src-tauri/gen/
