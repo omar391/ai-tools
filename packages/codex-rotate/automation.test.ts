@@ -13,6 +13,7 @@ import {
   resolveCreateBaseEmail,
   resolveManagedProfileNameFromCandidates,
   scoreEmailForManagedProfileName,
+  serializeCredentialStore,
   shouldUseDefaultCreateFamilyHint,
   selectBestEmailForManagedProfile,
   selectBestSystemChromeProfileMatch,
@@ -20,6 +21,16 @@ import {
   selectPendingCredentialForFamily,
   selectStoredBaseEmailHint,
 } from "./automation.ts";
+
+function makeSecretRef(objectId: string) {
+  return {
+    type: "secret_ref" as const,
+    store: "bitwarden-cli" as const,
+    object_id: objectId,
+    field_path: null,
+    version: null,
+  };
+}
 
 describe("gmail alias helpers", () => {
   test("normalizes the Gmail base address before suffixing", () => {
@@ -205,6 +216,59 @@ describe("credential store normalization", () => {
     expect("defaults" in store).toBe(false);
     expect(Object.keys(store.families)).toEqual(["dev-1::dev.user@gmail.com"]);
   });
+
+  test("keeps legacy passwords in memory until the record is migrated", () => {
+    const store = normalizeCredentialStore({
+      accounts: {
+        "dev.user+1@gmail.com": {
+          email: "dev.user+1@gmail.com",
+          password: "pw-1",
+          profile_name: "dev-1",
+          base_email: "dev.user@gmail.com",
+          suffix: 1,
+          selector: "dev.user+1@gmail.com_free",
+          alias: null,
+          created_at: "2026-03-20T00:00:00.000Z",
+          updated_at: "2026-03-20T00:00:00.000Z",
+        },
+      },
+    });
+
+    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBe("pw-1");
+    expect(store.accounts["dev.user+1@gmail.com"]?.account_secret_ref).toBeNull();
+  });
+
+  test("drops legacy passwords from saved records once a Bitwarden ref exists", () => {
+    const store = normalizeCredentialStore({
+      accounts: {
+        "dev.user+1@gmail.com": {
+          email: "dev.user+1@gmail.com",
+          password: "pw-1",
+          account_secret_ref: makeSecretRef("bw-dev-user-1"),
+          profile_name: "dev-1",
+          base_email: "dev.user@gmail.com",
+          suffix: 1,
+          selector: "dev.user+1@gmail.com_free",
+          alias: null,
+          created_at: "2026-03-20T00:00:00.000Z",
+          updated_at: "2026-03-20T00:00:00.000Z",
+        },
+      },
+    });
+
+    const serialized = serializeCredentialStore(store);
+    expect(serialized.accounts["dev.user+1@gmail.com"]).toEqual({
+      email: "dev.user+1@gmail.com",
+      account_secret_ref: makeSecretRef("bw-dev-user-1"),
+      profile_name: "dev-1",
+      base_email: "dev.user@gmail.com",
+      suffix: 1,
+      selector: "dev.user+1@gmail.com_free",
+      alias: null,
+      created_at: "2026-03-20T00:00:00.000Z",
+      updated_at: "2026-03-20T00:00:00.000Z",
+    });
+  });
 });
 
 describe("pending credential reuse", () => {
@@ -213,7 +277,7 @@ describe("pending credential reuse", () => {
       pending: {
         "dev.user+1@gmail.com": {
           email: "dev.user+1@gmail.com",
-          password: "pw-1",
+          account_secret_ref: makeSecretRef("bw-dev-user-1"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 1,
@@ -225,7 +289,7 @@ describe("pending credential reuse", () => {
         },
         "dev.user+3@gmail.com": {
           email: "dev.user+3@gmail.com",
-          password: "pw-3",
+          account_secret_ref: makeSecretRef("bw-dev-user-3"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 3,
@@ -246,7 +310,7 @@ describe("pending credential reuse", () => {
       pending: {
         "dev.user+2@gmail.com": {
           email: "dev.user+2@gmail.com",
-          password: "pw-2",
+          account_secret_ref: makeSecretRef("bw-dev-user-2"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 2,
@@ -258,7 +322,7 @@ describe("pending credential reuse", () => {
         },
         "dev.user+3@gmail.com": {
           email: "dev.user+3@gmail.com",
-          password: "pw-3",
+          account_secret_ref: makeSecretRef("bw-dev-user-3"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 3,
@@ -279,7 +343,7 @@ describe("pending credential reuse", () => {
       pending: {
         "dev.user+1@gmail.com": {
           email: "dev.user+1@gmail.com",
-          password: "pw-1",
+          account_secret_ref: makeSecretRef("bw-dev-user-1"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 1,
@@ -291,7 +355,7 @@ describe("pending credential reuse", () => {
         },
         "dev.user+2@gmail.com": {
           email: "dev.user+2@gmail.com",
-          password: "pw-2",
+          account_secret_ref: makeSecretRef("bw-dev-user-2"),
           profile_name: "dev-1",
           base_email: "dev.user@gmail.com",
           suffix: 2,
@@ -312,7 +376,7 @@ describe("pending credential reuse", () => {
       pending: {
         "1.dev.astronlab+1@gmail.com": {
           email: "1.dev.astronlab+1@gmail.com",
-          password: "pw-1",
+          account_secret_ref: makeSecretRef("bw-1-dev-astronlab-1"),
           profile_name: "dev-1",
           base_email: "1.dev.astronlab@gmail.com",
           suffix: 1,
@@ -324,7 +388,7 @@ describe("pending credential reuse", () => {
         },
         "arjuda.anjum+1@gmail.com": {
           email: "arjuda.anjum+1@gmail.com",
-          password: "pw-2",
+          account_secret_ref: makeSecretRef("bw-arjuda-1"),
           profile_name: "dev-1",
           base_email: "arjuda.anjum@gmail.com",
           suffix: 1,
@@ -357,7 +421,7 @@ describe("stored base-email hints", () => {
       accounts: {
         "1.dev.astronlab+3@gmail.com": {
           email: "1.dev.astronlab+3@gmail.com",
-          password: "pw",
+          account_secret_ref: makeSecretRef("bw-1-dev-astronlab-3"),
           profile_name: "dev-1",
           base_email: "1.dev.astronlab@gmail.com",
           suffix: 3,
@@ -370,7 +434,7 @@ describe("stored base-email hints", () => {
       pending: {
         "1.dev.astronlab+1@gmail.com": {
           email: "1.dev.astronlab+1@gmail.com",
-          password: "pw",
+          account_secret_ref: makeSecretRef("bw-1-dev-astronlab-1"),
           profile_name: "dev-1",
           base_email: "1.dev.astronlab@gmail.com",
           suffix: 1,

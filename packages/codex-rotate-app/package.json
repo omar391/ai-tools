@@ -1,0 +1,20 @@
+{
+  "name": "@ai-tools/codex-rotate-app",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "module": "index.ts",
+  "scripts": {
+    "tray:dev": "tauri dev",
+    "tray:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/bun": "latest",
+    "@types/node": "^25.3.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

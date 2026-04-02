@@ -11,7 +11,11 @@ import {
 
 const storedCredential: StoredCredential = {
   email: "dev.user+1@gmail.com",
-  password: "Password123!@#",
+  account_secret_ref: {
+    type: "secret_ref",
+    store: "bitwarden-cli",
+    object_id: "bw-dev-user-1",
+  },
   profile_name: "m-omar",
   base_email: "dev.user@gmail.com",
   suffix: 1,
@@ -23,7 +27,11 @@ const storedCredential: StoredCredential = {
 
 const pendingCredential: PendingCredential = {
   email: "dev.user+2@gmail.com",
-  password: "Password123!@#",
+  account_secret_ref: {
+    type: "secret_ref",
+    store: "bitwarden-cli",
+    object_id: "bw-dev-user-2",
+  },
   profile_name: "dev-1",
   base_email: "dev.user@gmail.com",
   suffix: 2,

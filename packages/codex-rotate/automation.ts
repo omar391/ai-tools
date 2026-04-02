@@ -42,6 +42,16 @@ const FAST_BROWSER_SCRIPT = process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST
 const FAST_BROWSER_RUNTIME = process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME
   ?? (process.versions.bun ? "node" : process.execPath);
 const FAST_BROWSER_PLAYWRIGHT_MODULE = join(REPO_ROOT, "node_modules", "playwright");
+const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(resolve(
+  REPO_ROOT,
+  "..",
+  "ai-rules",
+  "skills",
+  "fast-browser",
+  "lib",
+  "daemon",
+  "client.mjs",
+)).href;
 
 const CODEX_ROTATE_ACCOUNT_FLOW_ID = "workspace.web.auth-openai-com.codex-rotate-account-flow";
 export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
@@ -69,7 +79,8 @@ export interface CredentialFamily {
 
 export interface StoredCredential {
   email: string;
-  password: string;
+  account_secret_ref?: CodexRotateSecretRef | null;
+  legacy_password?: string | null;
   profile_name: string;
   base_email: string;
   suffix: number;
@@ -82,12 +93,20 @@ export interface StoredCredential {
   updated_at: string;
 }
 
+export interface CodexRotateSecretRef {
+  type: "secret_ref";
+  store: "bitwarden-cli";
+  object_id: string;
+  field_path?: string | null;
+  version?: string | null;
+}
+
 export interface PendingCredential extends StoredCredential {
   started_at: string;
 }
 
 export interface CredentialStore {
-  version: 1;
+  version: 2;
   families: Record<string, CredentialFamily>;
   accounts: Record<string, StoredCredential>;
   pending: Record<string, PendingCredential>;
@@ -289,11 +308,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function normalizeCredentialStore(raw: LegacyCredentialStore | null | undefined): CredentialStore {
   return {
-    version: 1,
+    version: 2,
     families: isRecord(raw?.families) ? raw.families as Record<string, CredentialFamily> : {},
-    accounts: isRecord(raw?.accounts) ? raw.accounts as Record<string, StoredCredential> : {},
-    pending: isRecord(raw?.pending) ? raw.pending as Record<string, PendingCredential> : {},
+    accounts: normalizeCredentialRecordMap(raw?.accounts),
+    pending: normalizeCredentialRecordMap(raw?.pending) as Record<string, PendingCredential>,
   };
+}
+
+export async function ensureBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+  password: string,
+): Promise<CodexRotateSecretRef> {
+  const normalizedProfileName = String(profileName || "").trim();
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedProfileName) {
+    throw new Error("Bitwarden account secrets require a managed profile name.");
+  }
+  if (!normalizedEmail) {
+    throw new Error("Bitwarden account secrets require a non-empty email.");
+  }
+  const normalizedPassword = String(password || "");
+  if (!normalizedPassword) {
+    throw new Error(`Bitwarden account secret for ${normalizedEmail} requires a non-empty password.`);
+  }
+
+  const { ensureDaemonLoginSecretRef } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  const response = await ensureDaemonLoginSecretRef({
+    profileName: normalizedProfileName,
+    store: "bitwarden-cli",
+    name: buildCodexRotateAccountSecretName(normalizedEmail),
+    username: normalizedEmail,
+    password: normalizedPassword,
+    notes: `Managed by codex-rotate for ${normalizedEmail}.`,
+    uris: [
+      "https://auth.openai.com",
+      "https://chatgpt.com",
+    ],
+  });
+  const ref = normalizeCodexRotateSecretRef(response?.ref);
+  if (!ref) {
+    throw new Error(`Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`);
+  }
+  return ref;
 }
 
 export function loadCredentialStore(): CredentialStore {
@@ -308,10 +365,10 @@ export function loadCredentialStore(): CredentialStore {
 
 export function saveCredentialStore(store: CredentialStore): void {
   writePrivateJson(CREDENTIALS_FILE, {
-    version: 1,
+    version: 2,
     families: store.families,
-    accounts: store.accounts,
-    pending: store.pending,
+    accounts: serializeCredentialRecordMap(store.accounts),
+    pending: serializeCredentialRecordMap(store.pending),
   });
 }
 
@@ -1270,7 +1327,7 @@ function emitFastBrowserProgressEvent(event: FastBrowserProgressEvent): void {
 
 async function runFastBrowserDaemonWorkflow(
   workflowRef: string,
-  inputs: Record<string, string>,
+  inputs: Record<string, unknown>,
   profileName: string,
   options?: {
     headed?: boolean;
@@ -1679,7 +1736,7 @@ async function discoverGmailBaseEmail(
 async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
-  password: string,
+  accountSecretRef: CodexRotateSecretRef,
   workflowRunStamp?: string,
   options?: {
     artifactMode?: "minimal" | "full";
@@ -1710,7 +1767,7 @@ async function runCodexBrowserLoginWorkflow(
       ...(options?.codexSession?.stderr_path ? { codex_login_stderr_path: options.codexSession.stderr_path } : {}),
       ...(options?.codexSession?.exit_path ? { codex_login_exit_path: options.codexSession.exit_path } : {}),
       email,
-      password,
+      account_secret: accountSecretRef,
       prefer_signup_recovery: options?.preferSignupRecovery === true ? "true" : "false",
       birth_month: String(options?.birthMonth ?? 1),
       birth_day: String(options?.birthDay ?? 1),
@@ -1728,7 +1785,7 @@ async function runCodexBrowserLoginWorkflow(
 export async function completeCodexLoginViaWorkflow(
   profileName: string,
   email: string,
-  password: string,
+  accountSecretRef: CodexRotateSecretRef,
   options?: {
     codexBin?: string;
     workflowRunStamp?: string;
@@ -1773,7 +1830,7 @@ export async function completeCodexLoginViaWorkflow(
         const loginResult = await runCodexBrowserLoginWorkflow(
           profileName,
           email,
-          password,
+          accountSecretRef,
           loginWorkflowRunStamp,
           {
             codexBin: options?.codexBin,
@@ -1857,6 +1914,113 @@ export async function completeCodexLoginViaWorkflow(
   throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
 }
 
+function normalizeCredentialRecordMap(raw: unknown): Record<string, StoredCredential> {
+  if (!isRecord(raw)) {
+    return {};
+  }
+  const entries = Object.entries(raw)
+    .map(([email, value]) => {
+      const normalized = normalizeCredentialRecord(value);
+      return normalized ? [email, normalized] as const : null;
+    })
+    .filter((entry): entry is readonly [string, StoredCredential] => Boolean(entry));
+  return Object.fromEntries(entries);
+}
+
+function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const normalized = { ...raw } as Record<string, unknown>;
+  const secretRef = normalizeCodexRotateSecretRef(normalized.account_secret_ref);
+  const legacyPassword = typeof normalized.password === "string" && normalized.password.length > 0
+    ? normalized.password
+    : null;
+  delete normalized.password;
+  return {
+    ...(normalized as unknown as StoredCredential),
+    account_secret_ref: secretRef,
+    legacy_password: secretRef ? null : legacyPassword,
+  };
+}
+
+function serializeCredentialRecordMap(raw: Record<string, StoredCredential>): Record<string, StoredCredential> {
+  return Object.fromEntries(
+    Object.entries(raw).map(([email, value]) => [email, serializeCredentialRecord(value)]),
+  );
+}
+
+export function serializeCredentialStore(store: CredentialStore): CredentialStore {
+  return {
+    version: 2,
+    families: store.families,
+    accounts: serializeCredentialRecordMap(store.accounts),
+    pending: serializeCredentialRecordMap(store.pending) as Record<string, PendingCredential>,
+  };
+}
+
+function serializeCredentialRecord(raw: StoredCredential): StoredCredential {
+  const serialized: Record<string, unknown> = {
+    email: raw.email,
+    profile_name: raw.profile_name,
+    base_email: raw.base_email,
+    suffix: raw.suffix,
+    selector: raw.selector,
+    alias: raw.alias,
+    created_at: raw.created_at,
+    updated_at: raw.updated_at,
+  };
+  if (typeof raw.birth_month === "number") {
+    serialized.birth_month = raw.birth_month;
+  }
+  if (typeof raw.birth_day === "number") {
+    serialized.birth_day = raw.birth_day;
+  }
+  if (typeof raw.birth_year === "number") {
+    serialized.birth_year = raw.birth_year;
+  }
+  if ("started_at" in raw && typeof (raw as PendingCredential).started_at === "string") {
+    serialized.started_at = (raw as PendingCredential).started_at;
+  }
+  const secretRef = normalizeCodexRotateSecretRef(raw.account_secret_ref);
+  if (secretRef) {
+    serialized.account_secret_ref = secretRef;
+  } else if (typeof raw.legacy_password === "string" && raw.legacy_password.length > 0) {
+    serialized.password = raw.legacy_password;
+  }
+  return serialized as unknown as StoredCredential;
+}
+
+function normalizeCodexRotateSecretRef(raw: unknown): CodexRotateSecretRef | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const objectId = typeof record.object_id === "string" ? record.object_id.trim() : "";
+  if (!objectId) {
+    return null;
+  }
+  const store = typeof record.store === "string" && record.store.trim() ? record.store.trim() : "bitwarden-cli";
+  if (store !== "bitwarden-cli") {
+    return null;
+  }
+  const type = record.type === undefined ? "secret_ref" : record.type;
+  if (type !== "secret_ref") {
+    return null;
+  }
+  return {
+    type: "secret_ref",
+    store: "bitwarden-cli",
+    object_id: objectId,
+    field_path: typeof record.field_path === "string" ? record.field_path : null,
+    version: typeof record.version === "string" ? record.version : null,
+  };
+}
+
+function buildCodexRotateAccountSecretName(email: string): string {
+  return `codex-rotate/openai/${String(email || "").trim().toLowerCase()}`;
+}
+
 function readWorkflowActionString(
   result: FastBrowserRunResult,
   stepId: string,
@@ -1867,7 +2031,7 @@ function readWorkflowActionString(
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-function readWorkflowOutputRecord<T extends Record<string, unknown>>(
+function readWorkflowOutputRecord<T>(
   result: FastBrowserRunResult,
 ): T | null {
   const value = result.output;
