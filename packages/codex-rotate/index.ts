@@ -31,15 +31,14 @@ import {
   resolveManagedProfileName,
   resolveCreateBaseEmail,
   readCodexRotateAuthFlowSummary,
+  readCodexRotateAuthFlowSession,
   runCodexBrowserLoginWorkflow,
   saveCredentialStore,
   shouldUseDefaultCreateFamilyHint,
   selectPendingBaseEmailHintForProfile,
   selectStoredBaseEmailHint,
   selectPendingCredentialForFamily,
-  startCodexBrowserLoginSession,
-  waitForCodexBrowserLoginExit,
-  type BrowserLoginSession,
+  type CodexRotateAuthFlowSession,
   type CredentialStore,
   type PendingCredential,
   type StoredCredential,
@@ -1244,10 +1243,9 @@ async function runAutomatedCodexLogin(
 ): Promise<CodexAuth> {
   let allowSignupRecovery = options?.preferSignupRecovery === true;
   for (let attempt = 1; attempt <= CODEX_LOGIN_MAX_ATTEMPTS; attempt += 1) {
-    let session: BrowserLoginSession | null = null;
+    let codexSession: CodexRotateAuthFlowSession | null = null;
 
     try {
-      session = await startCodexBrowserLoginSession(CODEX_BIN);
       note(
         attempt === 1
           ? `Completing Codex login in managed profile "${profileName}".`
@@ -1259,11 +1257,12 @@ async function runAutomatedCodexLogin(
           : undefined;
         const loginResult = await runCodexBrowserLoginWorkflow(
           profileName,
-          session.authUrl,
           email,
           password,
           loginWorkflowRunStamp,
           {
+            codexBin: CODEX_BIN,
+            codexSession,
             preferSignupRecovery: allowSignupRecovery,
             fullName: options?.fullName,
             birthMonth: options?.birthMonth,
@@ -1272,75 +1271,64 @@ async function runAutomatedCodexLogin(
           },
         );
         const flow = readCodexRotateAuthFlowSummary(loginResult);
-        const finalStage = typeof flow.stage === "string" ? flow.stage : null;
+        codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
         const callbackComplete = flow.callback_complete === true;
         const success = flow.success === true;
-        const invalidCredentials = flow.invalid_credentials === true || finalStage === "invalid_credentials";
-        const needsEmailVerification = flow.needs_email_verification === true || finalStage === "email_verification";
-        const followUpStep = flow.follow_up_step === true || finalStage === "about_you";
-        const addPhonePromptFlag = flow.add_phone_prompt === true || finalStage === "add_phone";
-        const existingAccountPrompt = flow.existing_account_prompt === true || finalStage === "existing_account_prompt";
-        const retryableTimeout = flow.retryable_timeout === true || finalStage === "retryable_timeout";
-        const rateLimitExceeded = flow.rate_limit_exceeded === true || finalStage === "rate_limit";
-        const authPrompt = flow.auth_prompt === true
-          || finalStage === "auth_prompt"
-          || finalStage === "login_email"
-          || finalStage === "login_password"
-          || finalStage === "signup_email"
-          || finalStage === "signup_password";
         const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
-        const addPhonePrompt = addPhonePromptFlag
-          || (typeof currentUrl === "string" && /auth\.openai\.com\/add-phone(?:\/|$)?/i.test(currentUrl));
-        const genericAuthPrompt = authPrompt
-          && typeof currentUrl === "string"
-          && /auth\.openai\.com\/(?:log-in(?:\/password)?|create-account)(?:\/|$)?/i.test(currentUrl);
+        const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
+        const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
+        const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
+        const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
+          ? flow.error_message.trim()
+          : null;
 
-        if (invalidCredentials) {
-          throw new Error(`OpenAI rejected the stored password for ${email}.`);
-        }
-        const replayableSetupState = addPhonePrompt || needsEmailVerification || followUpStep || genericAuthPrompt;
-        if (existingAccountPrompt || addPhonePrompt || needsEmailVerification || followUpStep) {
+        if (replayReason && replayReason !== "auth_prompt") {
           allowSignupRecovery = false;
         }
 
-        if (replayableSetupState && replayPass < CODEX_LOGIN_MAX_REPLAY_PASSES) {
-          const replayReason = addPhonePrompt
-            ? "add-phone"
-            : (needsEmailVerification ? "email verification" : (followUpStep ? "account setup" : "auth prompt"));
+        if (nextAction === "fail_invalid_credentials") {
+          throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
+        }
+
+        if (nextAction === "replay_auth_url" && replayPass < CODEX_LOGIN_MAX_REPLAY_PASSES) {
+          const replayReasonLabel = replayReason
+            ? replayReason.replace(/_/g, " ")
+            : "the next auth step";
           note(
-            `OpenAI still needs ${replayReason} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-            + `Replaying the captured Codex auth URL in managed profile "${profileName}" (${replayPass + 1}/${CODEX_LOGIN_MAX_REPLAY_PASSES}).`,
+            `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+            + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${CODEX_LOGIN_MAX_REPLAY_PASSES}).`,
           );
           await sleep(1000);
           continue;
         }
-        if (needsEmailVerification || followUpStep) {
-          throw new Error(`OpenAI requires additional account setup for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`);
-        }
-        if (rateLimitExceeded || retryableTimeout) {
+        if (nextAction === "retry_attempt") {
           restoreActiveAuth(previousAuth);
           if (attempt < CODEX_LOGIN_MAX_ATTEMPTS) {
             const delayMs = CODEX_LOGIN_RETRY_DELAYS_MS[Math.min(attempt - 1, CODEX_LOGIN_RETRY_DELAYS_MS.length - 1)] ?? 30_000;
-            const retryReason = rateLimitExceeded ? "rate-limited" : "timed out";
+            const retryReasonLabel = retryReason
+              ? retryReason.replace(/_/g, " ")
+              : "needs another retry";
             note(
-              `OpenAI ${retryReason} the Codex login for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+              `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
               + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
             );
             await sleep(delayMs);
             break;
           }
-          if (rateLimitExceeded) {
-            throw new Error(`OpenAI rate-limited the Codex login for ${email}.`);
-          }
-          throw new Error(`OpenAI timed out before completing the Codex login for ${email}.`);
+          throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
         }
         if (!callbackComplete && !success) {
-          if (authPrompt) {
-            throw new Error(`OpenAI remained on an auth prompt for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`);
-          }
-          throw new Error(`Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`);
+          throw new Error(
+            errorMessage
+            ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
+          );
         }
-        await waitForCodexBrowserLoginExit(session);
+        if (flow.codex_login_exit_ok === false) {
+          throw new Error(
+            `"codex login" did not exit cleanly for ${email}.`
+            + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
+          );
+        }
 
         const auth = loadCodexAuth();
         const loggedInEmail = extractEmailFromAuth(auth);
@@ -1356,8 +1344,8 @@ async function runAutomatedCodexLogin(
       restoreActiveAuth(previousAuth);
       throw error;
     } finally {
-      if (session) {
-        cancelCodexBrowserLoginSession(session);
+      if (codexSession) {
+        cancelCodexBrowserLoginSession(codexSession);
       }
     }
   }

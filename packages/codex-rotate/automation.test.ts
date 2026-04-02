@@ -6,10 +6,10 @@ import {
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
   normalizeBaseEmailFamily,
+  readCodexRotateAuthFlowSession,
   readCodexRotateAuthFlowSummary,
   normalizeCredentialStore,
   normalizeGmailBaseEmail,
-  parseCodexBrowserLoginCapture,
   readLocalWorkflowMetadata,
   resolveCreateBaseEmail,
   resolveManagedProfileNameFromCandidates,
@@ -75,24 +75,7 @@ describe("templated email family helpers", () => {
   });
 });
 
-describe("codex browser login capture parsing", () => {
-  test("extracts the auth URL and callback port from codex login output", () => {
-    const parsed = parseCodexBrowserLoginCapture(`
-Starting local login server on http://localhost:1455.
-If your browser did not open, navigate to this URL to authenticate:
-https://auth.openai.com/oauth/authorize?foo=bar&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback
-`);
-
-    expect(parsed).not.toBeNull();
-    expect(parsed?.authUrl).toContain("https://auth.openai.com/oauth/authorize?");
-    expect(parsed?.callbackUrl).toBe("http://localhost:1455/auth/callback");
-    expect(parsed?.callbackPort).toBe(1455);
-  });
-
-  test("returns null when no auth url is present", () => {
-    expect(parseCodexBrowserLoginCapture("no login url here")).toBeNull();
-  });
-
+describe("codex auth flow output helpers", () => {
   test("reads the flattened auth summary from workflow output", () => {
     expect(readCodexRotateAuthFlowSummary({
       ok: true,
@@ -100,11 +83,34 @@ https://auth.openai.com/oauth/authorize?foo=bar&redirect_uri=http%3A%2F%2Flocalh
         stage: "oauth_consent",
         current_url: "https://auth.openai.com/oauth/authorize",
         callback_complete: false,
+        next_action: "replay_auth_url",
+        replay_reason: "email_verification",
       },
     })).toEqual({
       stage: "oauth_consent",
       current_url: "https://auth.openai.com/oauth/authorize",
       callback_complete: false,
+      next_action: "replay_auth_url",
+      replay_reason: "email_verification",
+    });
+  });
+
+  test("reads the workflow-owned codex session from workflow output", () => {
+    expect(readCodexRotateAuthFlowSession({
+      ok: true,
+      output: {
+        codex_session: {
+          auth_url: "https://auth.openai.com/oauth/authorize?foo=bar",
+          callback_url: "http://localhost:1455/auth/callback",
+          callback_port: 1455,
+          pid: 12345,
+        },
+      },
+    })).toEqual({
+      auth_url: "https://auth.openai.com/oauth/authorize?foo=bar",
+      callback_url: "http://localhost:1455/auth/callback",
+      callback_port: 1455,
+      pid: 12345,
     });
   });
 });

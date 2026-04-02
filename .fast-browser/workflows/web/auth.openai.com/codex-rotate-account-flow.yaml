@@ -2,7 +2,7 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow
-  version: 1.0.2
+  version: 1.0.3
   summary: "Explicit managed-profile OpenAI account creation and Codex callback login flow for codex-rotate."
   metadata:
     preferredProfile: dev-1
@@ -24,7 +24,16 @@ input:
           default: true
         mode:
           default: codex_login
+        codex_bin:
+          default: codex
         auth_url: {}
+        callback_url: {}
+        callback_port: {}
+        codex_session_dir: {}
+        codex_login_pid: {}
+        codex_login_stdout_path: {}
+        codex_login_stderr_path: {}
+        codex_login_exit_path: {}
         email: {}
         password: {}
         full_name:
@@ -39,7 +48,6 @@ input:
           default: "true"
       required:
         - mode
-        - auth_url
         - email
         - password
 use:
@@ -128,7 +136,12 @@ use:
       with:
         body:
           script: |
-            const targetUrl = String(args.auth_url || "").trim();
+            const targetUrl = String(
+              args.auth_url
+              || state.vars?.codex_login?.auth_url
+              || state.steps.capture_codex_login_url?.action?.value?.auth_url
+              || ""
+            ).trim();
             if (!targetUrl) {
               throw new Error("captured-auth-url-missing");
             }
@@ -1443,6 +1456,167 @@ use:
             const finalState = await detectStage();
             throw new Error("about-you-submit-stuck:" + String(finalState.stage || "unknown") + ":" + String(finalState.current_url || page.url()));
 do:
+  - start_codex_login_session:
+      if: "${String(inputs.mode || 'codex_login') === 'codex_login' && !String(inputs.auth_url || '').trim()}"
+      metadata:
+        description: "Start a detached codex login session on the host and capture its stdout/stderr paths."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const path = await import("node:path");
+            const { spawn } = await import("node:child_process");
+
+            const shell = process.env.SHELL || "/bin/sh";
+            const codexBin = String(args.codex_bin || "codex").trim() || "codex";
+            const sessionRoot = path.join(env.projectArtifactsRoot, "codex-login-sessions");
+            fs.mkdirSync(sessionRoot, { recursive: true });
+            const sessionDir = fs.mkdtempSync(path.join(sessionRoot, String(env.workflowRunStamp || "run") + "-"));
+            const stdoutPath = path.join(sessionDir, "stdout.log");
+            const stderrPath = path.join(sessionDir, "stderr.log");
+            const exitPath = path.join(sessionDir, "exit.code");
+            const quote = (value) => "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+            const command = "BROWSER=/usr/bin/false "
+              + quote(codexBin)
+              + " login >"
+              + quote(stdoutPath)
+              + " 2>"
+              + quote(stderrPath)
+              + "; printf '%s' \"$?\" >"
+              + quote(exitPath);
+
+            const child = spawn(shell, ["-lc", command], {
+              cwd: env.workspaceRoot,
+              env: process.env,
+              detached: true,
+              stdio: "ignore",
+            });
+            child.unref();
+
+            return {
+              ok: true,
+              started: true,
+              codex_bin: codexBin,
+              session_dir: sessionDir,
+              pid: child.pid ?? null,
+              stdout_path: stdoutPath,
+              stderr_path: stderrPath,
+              exit_path: exitPath,
+            };
+  - capture_codex_login_url:
+      if: "${String(inputs.mode || 'codex_login') === 'codex_login'}"
+      metadata:
+        description: "Capture or normalize the Codex auth URL and callback session details for this workflow run."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const { setTimeout: delay } = await import("node:timers/promises");
+
+            const explicitAuthUrl = String(args.auth_url || "").trim();
+            const stdoutPath = String(
+              args.codex_login_stdout_path
+              || state.steps.start_codex_login_session?.action?.value?.stdout_path
+              || ""
+            ).trim();
+            const stderrPath = String(
+              args.codex_login_stderr_path
+              || state.steps.start_codex_login_session?.action?.value?.stderr_path
+              || ""
+            ).trim();
+            const exitPath = String(
+              args.codex_login_exit_path
+              || state.steps.start_codex_login_session?.action?.value?.exit_path
+              || ""
+            ).trim();
+            const sessionDir = String(
+              args.codex_session_dir
+              || state.steps.start_codex_login_session?.action?.value?.session_dir
+              || ""
+            ).trim() || null;
+            const pidValue = Number(
+              args.codex_login_pid
+              || state.steps.start_codex_login_session?.action?.value?.pid
+              || 0
+            );
+
+            const extractAuthUrl = (raw) => {
+              const match = String(raw || "").match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s"'<>]+/);
+              return match ? match[0] : null;
+            };
+            const parseCapture = (authUrl) => {
+              const parsedAuthUrl = new URL(authUrl);
+              const callbackUrl = parsedAuthUrl.searchParams.get("redirect_uri") || "";
+              if (!callbackUrl) {
+                throw new Error("captured-auth-url-missing-redirect-uri");
+              }
+              const callbackPort = Number.parseInt(new URL(callbackUrl).port, 10);
+              if (!Number.isInteger(callbackPort)) {
+                throw new Error("captured-auth-url-invalid-callback-port:" + callbackUrl);
+              }
+              return {
+                auth_url: authUrl,
+                callback_url: callbackUrl,
+                callback_port: callbackPort,
+              };
+            };
+            const readText = (filePath) => {
+              if (!filePath || !fs.existsSync(filePath)) {
+                return "";
+              }
+              return fs.readFileSync(filePath, "utf8");
+            };
+            const tail = (filePath, maxChars = 1200) => {
+              const text = readText(filePath);
+              return text.length > maxChars ? text.slice(-maxChars) : text;
+            };
+
+            if (explicitAuthUrl) {
+              return {
+                ok: true,
+                reused: true,
+                ...parseCapture(explicitAuthUrl),
+                session_dir: sessionDir,
+                pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
+                stdout_path: stdoutPath || null,
+                stderr_path: stderrPath || null,
+                exit_path: exitPath || null,
+              };
+            }
+
+            const timeoutMs = 45000;
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+              const combined = readText(stdoutPath) + "\n" + readText(stderrPath);
+              const authUrl = extractAuthUrl(combined);
+              if (authUrl) {
+                return {
+                  ok: true,
+                  reused: false,
+                  ...parseCapture(authUrl),
+                  session_dir: sessionDir,
+                  pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
+                  stdout_path: stdoutPath || null,
+                  stderr_path: stderrPath || null,
+                  exit_path: exitPath || null,
+                };
+              }
+              if (exitPath && fs.existsSync(exitPath)) {
+                const exitCodeRaw = readText(exitPath).trim();
+                throw new Error("codex-login-exited-before-auth-url:" + (exitCodeRaw || "unknown") + ":" + (tail(stderrPath) || tail(stdoutPath) || "no-output"));
+              }
+              await delay(250);
+            }
+
+            throw new Error("codex-login-auth-url-timeout:" + (tail(stderrPath) || tail(stdoutPath) || "no-output"));
+  - cache_codex_login_session:
+      if: "${state.steps.capture_codex_login_url?.action?.ok === true}"
+      metadata:
+        description: "Cache the current Codex login session metadata for later replay and exit handling."
+      set:
+        codex_login: "${state.steps.capture_codex_login_url?.action?.value || {}}"
   - open_codex_login_entry:
       metadata:
         templateRef: replay_captured_auth_url
@@ -2183,22 +2357,192 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Flatten the final OpenAI/Codex callback state for codex-rotate."
+  - wait_for_codex_login_exit:
+      if: "${(state.steps.complete_login_or_consent?.action?.callback_complete === true || state.steps.complete_login_or_consent?.action?.success === true) && (state.vars.codex_login?.exit_path || inputs.codex_login_exit_path)}"
+      metadata:
+        description: "Wait for the detached codex login process to exit after the callback completes."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const { setTimeout: delay } = await import("node:timers/promises");
+
+            const exitPath = String(state.vars?.codex_login?.exit_path || args.codex_login_exit_path || "").trim();
+            const stdoutPath = String(state.vars?.codex_login?.stdout_path || args.codex_login_stdout_path || "").trim();
+            const stderrPath = String(state.vars?.codex_login?.stderr_path || args.codex_login_stderr_path || "").trim();
+
+            if (!exitPath) {
+              return {
+                ok: true,
+                skipped: true,
+              };
+            }
+
+            const readText = (filePath) => {
+              if (!filePath || !fs.existsSync(filePath)) {
+                return "";
+              }
+              return fs.readFileSync(filePath, "utf8");
+            };
+            const tail = (filePath, maxChars = 1200) => {
+              const text = readText(filePath);
+              return text.length > maxChars ? text.slice(-maxChars) : text;
+            };
+
+            const timeoutMs = 15000;
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+              if (fs.existsSync(exitPath)) {
+                const raw = readText(exitPath).trim();
+                const parsed = raw === "" ? null : Number.parseInt(raw, 10);
+                const exitCode = Number.isInteger(parsed) ? parsed : null;
+                return {
+                  ok: exitCode === 0,
+                  exit_code: exitCode,
+                  stdout_tail: tail(stdoutPath) || null,
+                  stderr_tail: tail(stderrPath) || null,
+                };
+              }
+              await delay(250);
+            }
+
+            return {
+              ok: false,
+              timeout: true,
+              exit_code: null,
+              stdout_tail: tail(stdoutPath) || null,
+              stderr_tail: tail(stderrPath) || null,
+            };
+  - finalize_flow_summary:
+      metadata:
+        description: "Build the final codex-rotate auth summary from workflow state and detached session metadata."
+      run:
+        script:
+          language: javascript
+          code: |
+            const final = state.steps.complete_login_or_consent?.action || {};
+            const signupGate = state.steps.classify_after_signup_password_gate?.action || {};
+            const signupAfter = state.steps.classify_after_signup_password?.action || {};
+            const signupComplete = state.steps.classify_signup_complete?.action || {};
+            const exitResult = state.steps.wait_for_codex_login_exit?.action?.value || {};
+            const session = state.vars?.codex_login && typeof state.vars.codex_login === "object" && !Array.isArray(state.vars.codex_login)
+              ? state.vars.codex_login
+              : {};
+
+            const stage = final.stage || signupGate.stage || signupAfter.stage || signupComplete.stage || null;
+            const currentUrl = final.current_url || signupGate.current_url || signupAfter.current_url || signupComplete.current_url || null;
+            const headline = final.headline || signupGate.headline || signupAfter.headline || signupComplete.headline || null;
+
+            const callbackComplete = final.callback_complete === true;
+            const success = final.success === true;
+            const accountReady = final.account_ready === true;
+            const needsEmailVerification = final.needs_email_verification === true || stage === "email_verification";
+            const followUpStep = final.follow_up_step === true || stage === "about_you";
+            const addPhonePrompt = final.add_phone_prompt === true || stage === "add_phone" || signupComplete.stage === "add_phone";
+            const retryableTimeout = final.retryable_timeout === true || stage === "retryable_timeout";
+            const sessionEnded = final.session_ended === true || stage === "session_ended";
+            const existingAccountPrompt = final.existing_account_prompt === true
+              || signupGate.existing_account_prompt === true
+              || signupAfter.existing_account_prompt === true
+              || stage === "existing_account_prompt";
+            const usernameNotFound = final.username_not_found === true;
+            const invalidCredentials = final.invalid_credentials === true || stage === "invalid_credentials";
+            const rateLimitExceeded = final.rate_limit_exceeded === true || stage === "rate_limit";
+            const antiBotGate = final.anti_bot_gate === true
+              || state.steps.classify_before_consent?.action?.anti_bot_gate === true
+              || state.steps.classify_after_oauth_consent?.action?.anti_bot_gate === true;
+            const authPrompt = final.auth_prompt === true
+              || stage === "auth_prompt"
+              || stage === "login_email"
+              || stage === "login_password"
+              || stage === "signup_email"
+              || stage === "signup_password";
+
+            let nextAction = "fail_terminal";
+            let replayReason = null;
+            let retryReason = null;
+            let errorMessage = null;
+            if (callbackComplete || success) {
+              nextAction = "complete";
+            } else if (invalidCredentials) {
+              nextAction = "fail_invalid_credentials";
+              errorMessage = "OpenAI rejected the stored password for " + String(args.email || "the account") + ".";
+            } else if (rateLimitExceeded || retryableTimeout) {
+              nextAction = "retry_attempt";
+              retryReason = rateLimitExceeded ? "rate_limit" : "retryable_timeout";
+              errorMessage = rateLimitExceeded
+                ? "OpenAI rate-limited the Codex login."
+                : "OpenAI timed out before completing the Codex login.";
+            } else if (needsEmailVerification || followUpStep || addPhonePrompt || authPrompt) {
+              nextAction = "replay_auth_url";
+              replayReason = addPhonePrompt
+                ? "add_phone"
+                : (needsEmailVerification
+                    ? "email_verification"
+                    : (followUpStep ? "about_you" : "auth_prompt"));
+              errorMessage = addPhonePrompt
+                ? "OpenAI still requires phone setup before the Codex callback can complete."
+                : (needsEmailVerification
+                    ? "OpenAI still requires email verification before the Codex callback can complete."
+                    : (followUpStep
+                        ? "OpenAI still requires account setup before the Codex callback can complete."
+                        : "OpenAI remained on an auth prompt instead of reaching the Codex callback."));
+            } else if (existingAccountPrompt) {
+              nextAction = "replay_auth_url";
+              replayReason = "existing_account_prompt";
+              errorMessage = "OpenAI redirected signup into an existing-account prompt instead of completing the Codex callback.";
+            } else if (usernameNotFound) {
+              nextAction = "fail_terminal";
+              errorMessage = "OpenAI reported that the username was not found during recovery.";
+            } else if (sessionEnded) {
+              nextAction = "retry_attempt";
+              retryReason = "session_ended";
+              errorMessage = "OpenAI ended the auth session before the Codex callback completed.";
+            } else if (antiBotGate) {
+              nextAction = "retry_attempt";
+              retryReason = "anti_bot_gate";
+              errorMessage = "OpenAI remained behind a security gate before the Codex callback completed.";
+            } else {
+              errorMessage = "Codex browser login did not reach the callback.";
+            }
+
+            return {
+              stage,
+              current_url: currentUrl,
+              headline,
+              callback_complete: callbackComplete,
+              success,
+              account_ready: accountReady,
+              needs_email_verification: needsEmailVerification,
+              follow_up_step: followUpStep,
+              add_phone_prompt: addPhonePrompt,
+              retryable_timeout: retryableTimeout,
+              session_ended: sessionEnded,
+              existing_account_prompt: existingAccountPrompt,
+              username_not_found: usernameNotFound,
+              invalid_credentials: invalidCredentials,
+              rate_limit_exceeded: rateLimitExceeded,
+              anti_bot_gate: antiBotGate,
+              auth_prompt: authPrompt,
+              next_action: nextAction,
+              replay_reason: replayReason,
+              retry_reason: retryReason,
+              error_message: errorMessage,
+              codex_session: {
+                auth_url: session.auth_url || null,
+                callback_url: session.callback_url || null,
+                callback_port: session.callback_port ?? null,
+                session_dir: session.session_dir || null,
+                pid: session.pid ?? null,
+                stdout_path: session.stdout_path || null,
+                stderr_path: session.stderr_path || null,
+                exit_path: session.exit_path || null,
+              },
+              codex_login_exit_ok: exitResult.ok === true,
+              codex_login_exit_code: exitResult.exit_code ?? null,
+              codex_login_stdout_tail: exitResult.stdout_tail || null,
+              codex_login_stderr_tail: exitResult.stderr_tail || null,
+            };
 output:
-  as:
-    stage: "${state.steps.complete_login_or_consent?.action?.stage || state.steps.classify_after_signup_password_gate?.action?.stage || state.steps.classify_after_signup_password?.action?.stage || state.steps.classify_signup_complete?.action?.stage || null}"
-    current_url: "${state.steps.complete_login_or_consent?.action?.current_url || state.steps.classify_after_signup_password_gate?.action?.current_url || state.steps.classify_after_signup_password?.action?.current_url || state.steps.classify_signup_complete?.action?.current_url || null}"
-    headline: "${state.steps.complete_login_or_consent?.action?.headline || state.steps.classify_after_signup_password_gate?.action?.headline || state.steps.classify_after_signup_password?.action?.headline || state.steps.classify_signup_complete?.action?.headline || null}"
-    callback_complete: "${state.steps.complete_login_or_consent?.action?.callback_complete === true}"
-    success: "${state.steps.complete_login_or_consent?.action?.success === true}"
-    account_ready: "${state.steps.complete_login_or_consent?.action?.account_ready === true}"
-    needs_email_verification: "${state.steps.complete_login_or_consent?.action?.needs_email_verification === true || state.steps.complete_login_or_consent?.action?.stage === 'email_verification'}"
-    follow_up_step: "${state.steps.complete_login_or_consent?.action?.follow_up_step === true || state.steps.complete_login_or_consent?.action?.stage === 'about_you'}"
-    add_phone_prompt: "${state.steps.complete_login_or_consent?.action?.add_phone_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'add_phone' || state.steps.classify_signup_complete?.action?.stage === 'add_phone'}"
-    retryable_timeout: "${state.steps.complete_login_or_consent?.action?.retryable_timeout === true || state.steps.complete_login_or_consent?.action?.stage === 'retryable_timeout'}"
-    session_ended: "${state.steps.complete_login_or_consent?.action?.session_ended === true || state.steps.complete_login_or_consent?.action?.stage === 'session_ended'}"
-    existing_account_prompt: "${state.steps.complete_login_or_consent?.action?.existing_account_prompt === true || state.steps.classify_after_signup_password_gate?.action?.existing_account_prompt === true || state.steps.classify_after_signup_password?.action?.existing_account_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'existing_account_prompt'}"
-    username_not_found: "${state.steps.complete_login_or_consent?.action?.username_not_found === true}"
-    invalid_credentials: "${state.steps.complete_login_or_consent?.action?.invalid_credentials === true || state.steps.complete_login_or_consent?.action?.stage === 'invalid_credentials'}"
-    rate_limit_exceeded: "${state.steps.complete_login_or_consent?.action?.rate_limit_exceeded === true || state.steps.complete_login_or_consent?.action?.stage === 'rate_limit'}"
-    anti_bot_gate: "${state.steps.complete_login_or_consent?.action?.anti_bot_gate === true || state.steps.classify_before_consent?.action?.anti_bot_gate === true || state.steps.classify_after_oauth_consent?.action?.anti_bot_gate === true}"
-    auth_prompt: "${state.steps.complete_login_or_consent?.action?.auth_prompt === true || state.steps.complete_login_or_consent?.action?.stage === 'auth_prompt' || state.steps.complete_login_or_consent?.action?.stage === 'login_email' || state.steps.complete_login_or_consent?.action?.stage === 'login_password' || state.steps.complete_login_or_consent?.action?.stage === 'signup_email' || state.steps.complete_login_or_consent?.action?.stage === 'signup_password'}"
+  as: "${state.steps.finalize_flow_summary?.action?.value || {}}"

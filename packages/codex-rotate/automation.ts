@@ -2,7 +2,6 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   spawn,
   spawnSync,
-  type ChildProcessWithoutNullStreams,
   type SpawnSyncReturns,
 } from "node:child_process";
 import {
@@ -217,30 +216,15 @@ interface FastBrowserProgressEvent {
   details?: unknown;
 }
 
-export interface BrowserLoginSession {
-  child: ChildProcessWithoutNullStreams;
-  authUrl: string;
-  callbackUrl: string;
-  callbackPort: number;
-  buffers: {
-    stdout: string;
-    stderr: string;
-  };
-  exitPromise: Promise<CommandExit>;
-  browserCaptureScriptPath: string | null;
-  browserCaptureOutputPath: string | null;
-  browserCaptureShimDir: string | null;
-}
-
-interface CommandExit {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-}
-
-export interface ParsedCodexBrowserLoginCapture {
-  authUrl: string;
-  callbackUrl: string;
-  callbackPort: number;
+export interface CodexRotateAuthFlowSession {
+  auth_url?: string | null;
+  callback_url?: string | null;
+  callback_port?: number | null;
+  session_dir?: string | null;
+  pid?: number | null;
+  stdout_path?: string | null;
+  stderr_path?: string | null;
+  exit_path?: string | null;
 }
 
 export interface CodexRotateAuthFlowSummary {
@@ -261,6 +245,15 @@ export interface CodexRotateAuthFlowSummary {
   rate_limit_exceeded?: boolean;
   anti_bot_gate?: boolean;
   auth_prompt?: boolean;
+  next_action?: string | null;
+  replay_reason?: string | null;
+  retry_reason?: string | null;
+  error_message?: string | null;
+  codex_session?: CodexRotateAuthFlowSession | null;
+  codex_login_exit_ok?: boolean;
+  codex_login_exit_code?: number | null;
+  codex_login_stdout_tail?: string | null;
+  codex_login_stderr_tail?: string | null;
 }
 
 function parseJson<T>(raw: string, fallbackMessage: string): T {
@@ -274,87 +267,6 @@ function parseJson<T>(raw: string, fallbackMessage: string): T {
 function ensureRotateDir(): void {
   if (!existsSync(ROTATE_HOME)) {
     mkdirSync(ROTATE_HOME, { recursive: true });
-  }
-}
-
-function writeExecutableScript(filePath: string, contents: string): void {
-  writeFileSync(filePath, contents);
-  chmodSync(filePath, 0o700);
-}
-
-function createBrowserCaptureShim(): { scriptPath: string; outputPath: string; shimDir: string } {
-  ensureRotateDir();
-  const uniqueId = `${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
-  const shimDir = join(ROTATE_HOME, `codex-login-browser-shim-${uniqueId}`);
-  mkdirSync(shimDir, { recursive: true });
-  const scriptPath = join(shimDir, "browser-capture.js");
-  const outputPath = join(shimDir, "browser-capture.log");
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
-const outputPath = process.env.CODEX_ROTATE_BROWSER_CAPTURE_OUT || "";
-const captureUrl = process.argv.slice(2).join(" ").trim();
-if (outputPath && captureUrl) {
-  fs.appendFileSync(outputPath, captureUrl + "\\n");
-}
-process.exit(0);
-`;
-  writeExecutableScript(scriptPath, script);
-
-  const openerShim = `#!/usr/bin/env bash
-set -euo pipefail
-capture_script="\${CODEX_ROTATE_BROWSER_CAPTURE_SCRIPT:-}"
-if [[ -z "$capture_script" ]]; then
-  exit 0
-fi
-url=""
-for arg in "$@"; do
-  case "$arg" in
-    http://*|https://*)
-      url="$arg"
-      ;;
-  esac
-done
-if [[ -n "$url" ]]; then
-  exec "$capture_script" "$url"
-fi
-exec "$capture_script" "$@"
-`;
-
-  for (const name of ["open", "xdg-open", "x-www-browser", "sensible-browser"]) {
-    writeExecutableScript(join(shimDir, name), openerShim);
-  }
-
-  return { scriptPath, outputPath, shimDir };
-}
-
-function cleanupBrowserCaptureShim(
-  scriptPath: string | null | undefined,
-  outputPath: string | null | undefined,
-  shimDir: string | null | undefined,
-): void {
-  for (const targetPath of [scriptPath, outputPath]) {
-    if (!targetPath) {
-      continue;
-    }
-    try {
-      unlinkSync(targetPath);
-    } catch {}
-  }
-  if (shimDir) {
-    try {
-      rmSync(shimDir, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-function readBrowserCaptureOutput(outputPath: string | null | undefined): string {
-  if (!outputPath || !existsSync(outputPath)) {
-    return "";
-  }
-  try {
-    return readFileSync(outputPath, "utf8");
-  } catch {
-    return "";
   }
 }
 
@@ -1801,12 +1713,13 @@ export async function discoverGmailBaseEmail(
 
 export async function runCodexBrowserLoginWorkflow(
   profileName: string,
-  authUrl: string,
   email: string,
   password: string,
   workflowRunStamp?: string,
   options?: {
     artifactMode?: "minimal" | "full";
+    codexBin?: string;
+    codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
     fullName?: string;
     birthMonth?: number;
@@ -1818,7 +1731,19 @@ export async function runCodexBrowserLoginWorkflow(
     CODEX_ROTATE_ACCOUNT_FLOW_WORKFLOW,
     {
       mode: "codex_login",
-      auth_url: authUrl,
+      codex_bin: options?.codexBin ?? "codex",
+      ...(options?.codexSession?.auth_url ? { auth_url: options.codexSession.auth_url } : {}),
+      ...(options?.codexSession?.callback_url ? { callback_url: options.codexSession.callback_url } : {}),
+      ...(options?.codexSession?.callback_port !== undefined && options.codexSession.callback_port !== null
+        ? { callback_port: String(options.codexSession.callback_port) }
+        : {}),
+      ...(options?.codexSession?.session_dir ? { codex_session_dir: options.codexSession.session_dir } : {}),
+      ...(options?.codexSession?.pid !== undefined && options.codexSession.pid !== null
+        ? { codex_login_pid: String(options.codexSession.pid) }
+        : {}),
+      ...(options?.codexSession?.stdout_path ? { codex_login_stdout_path: options.codexSession.stdout_path } : {}),
+      ...(options?.codexSession?.stderr_path ? { codex_login_stderr_path: options.codexSession.stderr_path } : {}),
+      ...(options?.codexSession?.exit_path ? { codex_login_exit_path: options.codexSession.exit_path } : {}),
       email,
       password,
       prefer_signup_recovery: options?.preferSignupRecovery === true ? "true" : "false",
@@ -1868,186 +1793,30 @@ export function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): Co
   return readWorkflowOutputRecord<CodexRotateAuthFlowSummary>(result) ?? {};
 }
 
+export function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
+  const summary = readCodexRotateAuthFlowSummary(result);
+  const session = summary.codex_session;
+  if (!session || typeof session !== "object" || Array.isArray(session)) {
+    return null;
+  }
+  return session;
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function extractAuthUrl(output: string): string | null {
-  const match = output.match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s]+/);
-  return match?.[0] ?? null;
-}
-
-export function parseCodexBrowserLoginCapture(output: string): ParsedCodexBrowserLoginCapture | null {
-  const authUrl = extractAuthUrl(output);
-  if (!authUrl) {
-    return null;
-  }
-
-  const parsedAuthUrl = new URL(authUrl);
-  const callbackUrl = parsedAuthUrl.searchParams.get("redirect_uri") ?? "";
-  if (!callbackUrl) {
-    throw new Error(`Could not find redirect_uri in the captured Codex login URL.`);
-  }
-
-  const callbackPort = Number.parseInt(new URL(callbackUrl).port, 10);
-  if (!Number.isInteger(callbackPort)) {
-    throw new Error(`Could not determine the callback port from ${callbackUrl}.`);
-  }
-
-  return {
-    authUrl,
-    callbackUrl,
-    callbackPort,
-  };
-}
-
-export async function startCodexBrowserLoginSession(
-  codexBin: string,
-  timeoutMs = LOGIN_CAPTURE_TIMEOUT_MS,
-): Promise<BrowserLoginSession> {
-  return await new Promise<BrowserLoginSession>((resolvePromise, rejectPromise) => {
-    const browserCapture = createBrowserCaptureShim();
-    const child = spawn(codexBin, ["login"], {
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        PATH: `${browserCapture.shimDir}:${process.env.PATH ?? ""}`,
-        BROWSER: "/usr/bin/false",
-        CODEX_ROTATE_BROWSER_CAPTURE_SCRIPT: browserCapture.scriptPath,
-        CODEX_ROTATE_BROWSER_CAPTURE_OUT: browserCapture.outputPath,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    child.stdin.end();
-
-    const buffers = {
-      stdout: "",
-      stderr: "",
-    };
-
-    const exitPromise = new Promise<CommandExit>((resolveExit) => {
-      child.once("exit", (code, signal) => {
-        cleanupBrowserCaptureShim(browserCapture.scriptPath, browserCapture.outputPath, browserCapture.shimDir);
-        resolveExit({ code, signal });
-      });
-    });
-
-    let settled = false;
-
-    const finishReject = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      rejectPromise(error);
-    };
-
-    const maybeResolve = (): void => {
-      if (settled) return;
-
-      const combined = `${buffers.stdout}\n${buffers.stderr}\n${readBrowserCaptureOutput(browserCapture.outputPath)}`;
-      let parsedCapture: ParsedCodexBrowserLoginCapture | null;
-      try {
-        parsedCapture = parseCodexBrowserLoginCapture(combined);
-      } catch (error) {
-        finishReject(error instanceof Error ? error : new Error(String(error)));
-        return;
-      }
-
-      if (!parsedCapture) {
-        return;
-      }
-
-      settled = true;
-      clearTimeout(timer);
-      resolvePromise({
-        child,
-        authUrl: parsedCapture.authUrl,
-        callbackUrl: parsedCapture.callbackUrl,
-        callbackPort: parsedCapture.callbackPort,
-        buffers,
-        exitPromise,
-        browserCaptureScriptPath: browserCapture.scriptPath,
-        browserCaptureOutputPath: browserCapture.outputPath,
-        browserCaptureShimDir: browserCapture.shimDir,
-      });
-    };
-
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      buffers.stdout += chunk.toString();
-      maybeResolve();
-    });
-
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      buffers.stderr += chunk.toString();
-      maybeResolve();
-    });
-
-    child.once("error", (error) => {
-      cleanupBrowserCaptureShim(browserCapture.scriptPath, browserCapture.outputPath, browserCapture.shimDir);
-      finishReject(error instanceof Error ? error : new Error(String(error)));
-    });
-
-    child.once("exit", (code, signal) => {
-      if (settled) {
-        return;
-      }
-      const output = `${buffers.stdout}\n${buffers.stderr}`.trim();
-      finishReject(
-        new Error(
-          `Failed to capture the Codex browser login URL before "${codexBin} login" exited `
-          + `(${code ?? signal ?? "unknown"}).${output ? `\n${output}` : ""}`,
-        ),
-      );
-    });
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGTERM");
-      rejectPromise(new Error(`Timed out waiting for "${codexBin} login" to emit its browser URL.`));
-    }, timeoutMs);
-  });
-}
-
-export async function waitForCodexBrowserLoginExit(
-  session: BrowserLoginSession,
-  timeoutMs = 15_000,
-): Promise<void> {
-  const exit = await withTimeout(session.exitPromise, timeoutMs, () => cancelCodexBrowserLoginSession(session));
-
-  if (exit.code !== 0) {
-    const output = `${session.buffers.stdout}\n${session.buffers.stderr}`.trim();
-    throw new Error(
-      `"codex login" exited with ${exit.code ?? exit.signal ?? "an unknown status"}.`
-      + `${output ? `\n${output}` : ""}`,
-    );
-  }
-}
-
-export function cancelCodexBrowserLoginSession(session: BrowserLoginSession): void {
-  if (session.child.exitCode !== null || session.child.signalCode !== null) {
-    cleanupBrowserCaptureShim(session.browserCaptureScriptPath, session.browserCaptureOutputPath, session.browserCaptureShimDir);
+export function cancelCodexBrowserLoginSession(session: CodexRotateAuthFlowSession | null | undefined): void {
+  const pid = Number(session?.pid || 0);
+  if (!Number.isInteger(pid) || pid <= 1) {
     return;
   }
-
-  session.child.kill("SIGTERM");
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
-  let timeoutId: NodeJS.Timeout | null = null;
-
   try {
-    return await new Promise<T>((resolvePromise, rejectPromise) => {
-      timeoutId = setTimeout(() => {
-        onTimeout();
-        rejectPromise(new Error(`Timed out after ${timeoutMs}ms.`));
-      }, timeoutMs);
-
-      promise.then(resolvePromise, rejectPromise);
-    });
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
+    process.kill(pid, 0);
+  } catch {
+    return;
   }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {}
 }
