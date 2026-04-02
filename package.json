@@ -1,5 +1,8 @@
 {
   "name": "ai-tools",
   "private": true,
-  "workspaces": ["packages/*"]
+  "workspaces": ["packages/*"],
+  "devDependencies": {
+    "playwright": "^1.58.2"
+  }
 }
