@@ -4,8 +4,6 @@ import type { PendingCredential, StoredCredential } from "./automation.ts";
 import {
   generateRandomAdultBirthDate,
   resolveCredentialBirthDate,
-  shouldAttemptPasswordRecoveryAfterSignup,
-  shouldRecoverAfterPasswordVerificationError,
   shouldUseStoredCredentialRelogin,
 } from "./index.ts";
 
@@ -77,57 +75,6 @@ describe("relogin strategy selection", () => {
         manualLogin: false,
       }),
     ).toBe(false);
-  });
-});
-
-describe("pending account recovery strategy", () => {
-  test("tries password recovery after signup when OpenAI says the account already exists", () => {
-    expect(shouldAttemptPasswordRecoveryAfterSignup(pendingCredential, {
-      accountReady: false,
-      antiBotGate: false,
-      createAccountFailed: false,
-      existingAccountPrompt: true,
-      followUpStep: false,
-      invalidCredentials: false,
-      needsEmailVerification: false,
-      rateLimitExceeded: false,
-      sessionEnded: false,
-    })).toBe(true);
-  });
-
-  test("does not trigger password recovery for fresh signup states", () => {
-    expect(shouldAttemptPasswordRecoveryAfterSignup(pendingCredential, {
-      accountReady: false,
-      antiBotGate: false,
-      createAccountFailed: false,
-      existingAccountPrompt: false,
-      followUpStep: true,
-      invalidCredentials: false,
-      needsEmailVerification: true,
-      rateLimitExceeded: false,
-      sessionEnded: false,
-    })).toBe(false);
-  });
-
-  test("verifies and can recover even without an older pending credential record", () => {
-    expect(shouldAttemptPasswordRecoveryAfterSignup(undefined, {
-      accountReady: false,
-      antiBotGate: false,
-      createAccountFailed: false,
-      existingAccountPrompt: true,
-      followUpStep: false,
-      invalidCredentials: false,
-      needsEmailVerification: false,
-      rateLimitExceeded: false,
-      sessionEnded: false,
-    })).toBe(true);
-  });
-
-  test("recovery starts only for verification failures we can actually remediate", () => {
-    expect(shouldRecoverAfterPasswordVerificationError(new Error("OpenAI rejected the stored password for dev@example.com."))).toBe(true);
-    expect(shouldRecoverAfterPasswordVerificationError(new Error("OpenAI requires additional account setup for dev@example.com."))).toBe(true);
-    expect(shouldRecoverAfterPasswordVerificationError(new Error("OpenAI remained on an auth prompt for dev@example.com."))).toBe(true);
-    expect(shouldRecoverAfterPasswordVerificationError(new Error("OpenAI rate-limited the Codex login for dev@example.com."))).toBe(false);
   });
 });
 

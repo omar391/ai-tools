@@ -2,15 +2,14 @@ import { describe, expect, test } from "bun:test";
 
 import {
   buildAccountFamilyEmail,
+  CODEX_ROTATE_ACCOUNT_FLOW_FILE,
   buildCodexRotateOpenAiTempProfileName,
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
   normalizeBaseEmailFamily,
-  readCodexRotateAuthFlowSession,
-  readCodexRotateAuthFlowSummary,
   normalizeCredentialStore,
   normalizeGmailBaseEmail,
-  readLocalWorkflowMetadata,
+  readWorkflowFileMetadata,
   resolveCreateBaseEmail,
   resolveManagedProfileNameFromCandidates,
   scoreEmailForManagedProfileName,
@@ -75,49 +74,9 @@ describe("templated email family helpers", () => {
   });
 });
 
-describe("codex auth flow output helpers", () => {
-  test("reads the flattened auth summary from workflow output", () => {
-    expect(readCodexRotateAuthFlowSummary({
-      ok: true,
-      output: {
-        stage: "oauth_consent",
-        current_url: "https://auth.openai.com/oauth/authorize",
-        callback_complete: false,
-        next_action: "replay_auth_url",
-        replay_reason: "email_verification",
-      },
-    })).toEqual({
-      stage: "oauth_consent",
-      current_url: "https://auth.openai.com/oauth/authorize",
-      callback_complete: false,
-      next_action: "replay_auth_url",
-      replay_reason: "email_verification",
-    });
-  });
-
-  test("reads the workflow-owned codex session from workflow output", () => {
-    expect(readCodexRotateAuthFlowSession({
-      ok: true,
-      output: {
-        codex_session: {
-          auth_url: "https://auth.openai.com/oauth/authorize?foo=bar",
-          callback_url: "http://localhost:1455/auth/callback",
-          callback_port: 1455,
-          pid: 12345,
-        },
-      },
-    })).toEqual({
-      auth_url: "https://auth.openai.com/oauth/authorize?foo=bar",
-      callback_url: "http://localhost:1455/auth/callback",
-      callback_port: 1455,
-      pid: 12345,
-    });
-  });
-});
-
 describe("workflow metadata", () => {
   test("reads preferred_profile from the unified local codex-rotate workflow", () => {
-    const metadata = readLocalWorkflowMetadata("local:web:auth.openai.com:codex-rotate-account-flow");
+    const metadata = readWorkflowFileMetadata(CODEX_ROTATE_ACCOUNT_FLOW_FILE);
 
     expect(metadata.preferredProfileName).toBe("dev-1");
     expect(metadata.preferredEmail).toBeNull();

@@ -42,14 +42,20 @@ const FAST_BROWSER_SCRIPT = process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST
 const FAST_BROWSER_RUNTIME = process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME
   ?? (process.versions.bun ? "node" : process.execPath);
 const FAST_BROWSER_PLAYWRIGHT_MODULE = join(REPO_ROOT, "node_modules", "playwright");
-const LOGIN_CAPTURE_TIMEOUT_MS = 15_000;
 
-const CODEX_ROTATE_ACCOUNT_FLOW_WORKFLOW = "local:web:auth.openai.com:codex-rotate-account-flow";
-const GMAIL_CAPTURE_WORKFLOW = "global:web:mail.google.com:capture-active-account-email";
+const CODEX_ROTATE_ACCOUNT_FLOW_ID = "workspace.web.auth-openai-com.codex-rotate-account-flow";
+export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
+  REPO_ROOT,
+  ".fast-browser",
+  "workflows",
+  "web",
+  "auth.openai.com",
+  "codex-rotate-account-flow.yaml",
+);
+const GMAIL_CAPTURE_WORKFLOW_ID = "sys.web.mail-google-com.capture-active-account-email";
 export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
 
 export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
-export const FAST_BROWSER_WORKFLOWS_ROOT = join(REPO_ROOT, ".fast-browser", "workflows");
 const FAST_BROWSER_MANAGED_PROFILE_ARCHIVE_ROOT = join(FAST_BROWSER_PROFILES_HOME, "_archive");
 
 export interface CredentialFamily {
@@ -95,7 +101,7 @@ interface LegacyCredentialStore {
   pending?: unknown;
 }
 
-export interface LocalWorkflowMetadata {
+export interface WorkflowFileMetadata {
   filePath: string;
   preferredProfileName: string | null;
   preferredEmail: string | null;
@@ -1261,21 +1267,6 @@ function emitFastBrowserProgressEvent(event: FastBrowserProgressEvent): void {
   process.stderr.write(`[fast-browser] ${line}\n`);
 }
 
-async function runFastBrowserWorkflow(
-  workflowRef: string,
-  inputs: Record<string, string>,
-  profileName: string,
-  options?: {
-    headed?: boolean;
-    workflowRunStamp?: string;
-    retainTemporaryProfilesOnSuccess?: boolean;
-    artifactMode?: "minimal" | "full";
-    debugMode?: "off" | "step";
-  },
-): Promise<FastBrowserRunResult> {
-  return await runFastBrowserDaemonWorkflow(workflowRef, inputs, profileName, options);
-}
-
 async function runFastBrowserDaemonWorkflow(
   workflowRef: string,
   inputs: Record<string, string>,
@@ -1442,32 +1433,6 @@ export function inspectManagedProfiles(): ManagedProfilesInspection {
   );
 }
 
-function assertLocalWorkflowReference(workflowRef: string): { surface: string; target: string; name: string } {
-  const parts = workflowRef.trim().split(":");
-  if (parts.length !== 4 || parts[0] !== "local") {
-    throw new Error(`Expected a local workflow reference, got "${workflowRef}".`);
-  }
-
-  const [, surface, target, name] = parts;
-  const segmentPattern = /^[A-Za-z0-9._-]+$/;
-  if (!surface || !segmentPattern.test(surface)) {
-    throw new Error(`Invalid workflow surface in "${workflowRef}".`);
-  }
-  if (!target || !segmentPattern.test(target)) {
-    throw new Error(`Invalid workflow target in "${workflowRef}".`);
-  }
-  if (!name || !segmentPattern.test(name)) {
-    throw new Error(`Invalid workflow name in "${workflowRef}".`);
-  }
-
-  return { surface, target, name };
-}
-
-function localWorkflowReferenceToPath(workflowRef: string): string {
-  const parsed = assertLocalWorkflowReference(workflowRef);
-  return join(FAST_BROWSER_WORKFLOWS_ROOT, parsed.surface, parsed.target, `${parsed.name}.yaml`);
-}
-
 function normalizeWorkflowScalar(rawValue: string | null | undefined): string | null {
   const trimmed = rawValue?.trim();
   if (!trimmed) return null;
@@ -1515,7 +1480,7 @@ puts JSON.generate(data)
   }
 }
 
-export function parseLocalWorkflowMetadata(raw: string): Omit<LocalWorkflowMetadata, "filePath"> {
+export function parseWorkflowFileMetadata(raw: string): Omit<WorkflowFileMetadata, "filePath"> {
   const parsed = parseWorkflowYamlDocument(raw);
   const document = parsed?.document && typeof parsed.document === "object" && !Array.isArray(parsed.document)
     ? parsed.document as Record<string, unknown>
@@ -1529,16 +1494,15 @@ export function parseLocalWorkflowMetadata(raw: string): Omit<LocalWorkflowMetad
   };
 }
 
-export function readLocalWorkflowMetadata(workflowRef: string): LocalWorkflowMetadata {
-  const filePath = localWorkflowReferenceToPath(workflowRef);
+export function readWorkflowFileMetadata(filePath: string): WorkflowFileMetadata {
   if (!existsSync(filePath)) {
-    throw new Error(`Workflow "${workflowRef}" not found at ${filePath}.`);
+    throw new Error(`Workflow file was not found at ${filePath}.`);
   }
 
   const raw = readFileSync(filePath, "utf8");
   return {
     filePath,
-    ...parseLocalWorkflowMetadata(raw),
+    ...parseWorkflowFileMetadata(raw),
   };
 }
 
@@ -1669,7 +1633,7 @@ async function maybeBootstrapManagedProfileFromSystem(
   );
 }
 
-export async function discoverGmailBaseEmail(
+async function discoverGmailBaseEmail(
   profileName: string,
   options?: { preferredBaseEmail?: string | null },
 ): Promise<string> {
@@ -1697,7 +1661,7 @@ export async function discoverGmailBaseEmail(
   );
   if (!selectedEmail) {
     const result = await runFastBrowserDaemonWorkflow(
-      GMAIL_CAPTURE_WORKFLOW,
+      GMAIL_CAPTURE_WORKFLOW_ID,
       options?.preferredBaseEmail ? { preferred_email: options.preferredBaseEmail } : {},
       profileName,
     );
@@ -1711,7 +1675,7 @@ export async function discoverGmailBaseEmail(
   return normalizeGmailBaseEmail(selectedEmail);
 }
 
-export async function runCodexBrowserLoginWorkflow(
+async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
   password: string,
@@ -1721,14 +1685,13 @@ export async function runCodexBrowserLoginWorkflow(
     codexBin?: string;
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
-    fullName?: string;
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
   },
 ): Promise<FastBrowserRunResult> {
-  return await runFastBrowserWorkflow(
-    CODEX_ROTATE_ACCOUNT_FLOW_WORKFLOW,
+  return await runFastBrowserDaemonWorkflow(
+    CODEX_ROTATE_ACCOUNT_FLOW_ID,
     {
       mode: "codex_login",
       codex_bin: options?.codexBin ?? "codex",
@@ -1747,7 +1710,6 @@ export async function runCodexBrowserLoginWorkflow(
       email,
       password,
       prefer_signup_recovery: options?.preferSignupRecovery === true ? "true" : "false",
-      full_name: options?.fullName ?? "Dev Astronlab",
       birth_month: String(options?.birthMonth ?? 1),
       birth_day: String(options?.birthDay ?? 1),
       birth_year: String(options?.birthYear ?? 1990),
@@ -1761,7 +1723,139 @@ export async function runCodexBrowserLoginWorkflow(
   );
 }
 
-export function readWorkflowActionString(
+export async function completeCodexLoginViaWorkflow(
+  profileName: string,
+  email: string,
+  password: string,
+  options?: {
+    codexBin?: string;
+    workflowRunStamp?: string;
+    preferSignupRecovery?: boolean;
+    birthMonth?: number;
+    birthDay?: number;
+    birthYear?: number;
+    maxAttempts?: number;
+    maxReplayPasses?: number;
+    retryDelaysMs?: readonly number[];
+    onNote?: ((message: string) => void) | null;
+    restoreState?: (() => void) | null;
+  },
+): Promise<CodexRotateAuthFlowSummary> {
+  const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 3));
+  const maxReplayPasses = Math.max(1, Number(options?.maxReplayPasses ?? 5));
+  const retryDelaysMs = Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
+    ? options.retryDelaysMs
+    : [30_000, 60_000];
+  const note = typeof options?.onNote === "function" ? options.onNote : null;
+  const restoreState = typeof options?.restoreState === "function" ? options.restoreState : null;
+  let allowSignupRecovery = options?.preferSignupRecovery === true;
+
+  const sleep = async (milliseconds: number) => await new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let codexSession: CodexRotateAuthFlowSession | null = null;
+
+    try {
+      note?.(
+        attempt === 1
+          ? `Completing Codex login in managed profile "${profileName}".`
+          : `Retrying Codex login in managed profile "${profileName}" (attempt ${attempt}/${maxAttempts}).`,
+      );
+
+      for (let replayPass = 1; replayPass <= maxReplayPasses; replayPass += 1) {
+        const loginWorkflowRunStamp = options?.workflowRunStamp
+          ? `${options.workflowRunStamp}-codex-login-${attempt}-${replayPass}`
+          : undefined;
+        const loginResult = await runCodexBrowserLoginWorkflow(
+          profileName,
+          email,
+          password,
+          loginWorkflowRunStamp,
+          {
+            codexBin: options?.codexBin,
+            codexSession,
+            preferSignupRecovery: allowSignupRecovery,
+            birthMonth: options?.birthMonth,
+            birthDay: options?.birthDay,
+            birthYear: options?.birthYear,
+          },
+        );
+        const flow = readCodexRotateAuthFlowSummary(loginResult);
+        codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
+        const callbackComplete = flow.callback_complete === true;
+        const success = flow.success === true;
+        const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
+        const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
+        const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
+        const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
+        const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
+          ? flow.error_message.trim()
+          : null;
+
+        if (replayReason && replayReason !== "auth_prompt") {
+          allowSignupRecovery = false;
+        }
+        if (nextAction === "fail_invalid_credentials") {
+          throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
+        }
+        if (nextAction === "replay_auth_url" && replayPass < maxReplayPasses) {
+          const replayReasonLabel = replayReason
+            ? replayReason.replace(/_/g, " ")
+            : "the next auth step";
+          note?.(
+            `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+            + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${maxReplayPasses}).`,
+          );
+          await sleep(1000);
+          continue;
+        }
+        if (nextAction === "retry_attempt") {
+          restoreState?.();
+          if (attempt < maxAttempts) {
+            const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
+            const retryReasonLabel = retryReason
+              ? retryReason.replace(/_/g, " ")
+              : "needs another retry";
+            note?.(
+              `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+              + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
+            );
+            await sleep(delayMs);
+            break;
+          }
+          throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
+        }
+        if (!callbackComplete && !success) {
+          throw new Error(
+            errorMessage
+            ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
+          );
+        }
+        if (flow.codex_login_exit_ok === false) {
+          throw new Error(
+            `"codex login" did not exit cleanly for ${email}.`
+            + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
+          );
+        }
+        return flow;
+      }
+    } catch (error) {
+      restoreState?.();
+      throw error;
+    } finally {
+      if (codexSession) {
+        cancelCodexBrowserLoginSession(codexSession);
+      }
+    }
+  }
+
+  restoreState?.();
+  throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
+}
+
+function readWorkflowActionString(
   result: FastBrowserRunResult,
   stepId: string,
   field: string,
@@ -1771,15 +1865,7 @@ export function readWorkflowActionString(
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-export function readWorkflowActionBoolean(
-  result: FastBrowserRunResult,
-  stepId: string,
-  field: string,
-): boolean {
-  return result.state?.steps?.[stepId]?.action?.[field] === true;
-}
-
-export function readWorkflowOutputRecord<T extends Record<string, unknown>>(
+function readWorkflowOutputRecord<T extends Record<string, unknown>>(
   result: FastBrowserRunResult,
 ): T | null {
   const value = result.output;
@@ -1789,11 +1875,11 @@ export function readWorkflowOutputRecord<T extends Record<string, unknown>>(
   return value as T;
 }
 
-export function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): CodexRotateAuthFlowSummary {
+function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): CodexRotateAuthFlowSummary {
   return readWorkflowOutputRecord<CodexRotateAuthFlowSummary>(result) ?? {};
 }
 
-export function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
+function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
   const summary = readCodexRotateAuthFlowSummary(result);
   const session = summary.codex_session;
   if (!session || typeof session !== "object" || Array.isArray(session)) {
@@ -1806,7 +1892,7 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function cancelCodexBrowserLoginSession(session: CodexRotateAuthFlowSession | null | undefined): void {
+function cancelCodexBrowserLoginSession(session: CodexRotateAuthFlowSession | null | undefined): void {
   const pid = Number(session?.pid || 0);
   if (!Number.isInteger(pid) || pid <= 1) {
     return;

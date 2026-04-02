@@ -21,24 +21,21 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  CODEX_ROTATE_ACCOUNT_FLOW_FILE,
   buildGmailAliasEmail,
-  cancelCodexBrowserLoginSession,
+  completeCodexLoginViaWorkflow,
   computeNextGmailAliasSuffix,
   generatePassword,
   loadCredentialStore,
   makeCredentialFamilyKey,
-  readLocalWorkflowMetadata,
+  readWorkflowFileMetadata,
   resolveManagedProfileName,
   resolveCreateBaseEmail,
-  readCodexRotateAuthFlowSummary,
-  readCodexRotateAuthFlowSession,
-  runCodexBrowserLoginWorkflow,
   saveCredentialStore,
   shouldUseDefaultCreateFamilyHint,
   selectPendingBaseEmailHintForProfile,
   selectStoredBaseEmailHint,
   selectPendingCredentialForFamily,
-  type CodexRotateAuthFlowSession,
   type CredentialStore,
   type PendingCredential,
   type StoredCredential,
@@ -59,10 +56,6 @@ const OAUTH_TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? "https:/
 const WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_MS = 8000;
 const CODEX_BIN = process.env.CODEX_ROTATE_CODEX_BIN ?? "codex";
-const CREATE_DEFAULT_PROFILE_WORKFLOW = "local:web:auth.openai.com:codex-rotate-account-flow";
-const CODEX_LOGIN_MAX_ATTEMPTS = 3;
-const CODEX_LOGIN_MAX_REPLAY_PASSES = 5;
-const CODEX_LOGIN_RETRY_DELAYS_MS = [30_000, 60_000] as const;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -178,18 +171,6 @@ interface CreateCommandResult {
   createdEmail: string;
 }
 
-interface SignupStateSummary {
-  accountReady: boolean;
-  antiBotGate: boolean;
-  createAccountFailed: boolean;
-  existingAccountPrompt: boolean;
-  followUpStep: boolean;
-  invalidCredentials: boolean;
-  needsEmailVerification: boolean;
-  rateLimitExceeded: boolean;
-  sessionEnded: boolean;
-}
-
 class HttpError extends Error {
   status: number;
   body: string;
@@ -227,12 +208,6 @@ function warn(msg: string): void {
 
 function note(msg: string): void {
   console.log(`${DIM}${msg}${RESET}`);
-}
-
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
 }
 
 function parseJson<T>(raw: string, fallbackMessage: string): T {
@@ -599,19 +574,6 @@ export function shouldUseStoredCredentialRelogin(
   options: ReloginOptions,
 ): boolean {
   return Boolean(storedCredential && !options.manualLogin && !options.deviceAuth);
-}
-
-export function shouldAttemptPasswordRecoveryAfterSignup(
-  existingPending: PendingCredential | null | undefined,
-  signupState: SignupStateSummary,
-): boolean {
-  void existingPending;
-  return signupState.existingAccountPrompt;
-}
-
-export function shouldRecoverAfterPasswordVerificationError(error: unknown): boolean {
-  const message = getErrorMessage(error);
-  return /rejected the stored password|requires additional account setup|remained on an auth prompt/i.test(message);
 }
 
 interface AdultBirthDate {
@@ -1226,138 +1188,10 @@ function parseCreateOptions(args: string[]): CreateCommandOptions {
   };
 }
 
-async function runAutomatedCodexLogin(
-  profileName: string,
-  email: string,
-  password: string,
-  previousAuth: CodexAuth | null,
-  expectedEmail: string | null,
-  workflowRunStamp?: string,
-  options?: {
-    preferSignupRecovery?: boolean;
-    fullName?: string;
-    birthMonth?: number;
-    birthDay?: number;
-    birthYear?: number;
-  },
-): Promise<CodexAuth> {
-  let allowSignupRecovery = options?.preferSignupRecovery === true;
-  for (let attempt = 1; attempt <= CODEX_LOGIN_MAX_ATTEMPTS; attempt += 1) {
-    let codexSession: CodexRotateAuthFlowSession | null = null;
-
-    try {
-      note(
-        attempt === 1
-          ? `Completing Codex login in managed profile "${profileName}".`
-          : `Retrying Codex login in managed profile "${profileName}" (attempt ${attempt}/${CODEX_LOGIN_MAX_ATTEMPTS}).`,
-      );
-      for (let replayPass = 1; replayPass <= CODEX_LOGIN_MAX_REPLAY_PASSES; replayPass += 1) {
-        const loginWorkflowRunStamp = workflowRunStamp
-          ? `${workflowRunStamp}-codex-login-${attempt}-${replayPass}`
-          : undefined;
-        const loginResult = await runCodexBrowserLoginWorkflow(
-          profileName,
-          email,
-          password,
-          loginWorkflowRunStamp,
-          {
-            codexBin: CODEX_BIN,
-            codexSession,
-            preferSignupRecovery: allowSignupRecovery,
-            fullName: options?.fullName,
-            birthMonth: options?.birthMonth,
-            birthDay: options?.birthDay,
-            birthYear: options?.birthYear,
-          },
-        );
-        const flow = readCodexRotateAuthFlowSummary(loginResult);
-        codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
-        const callbackComplete = flow.callback_complete === true;
-        const success = flow.success === true;
-        const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
-        const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
-        const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
-        const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
-        const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
-          ? flow.error_message.trim()
-          : null;
-
-        if (replayReason && replayReason !== "auth_prompt") {
-          allowSignupRecovery = false;
-        }
-
-        if (nextAction === "fail_invalid_credentials") {
-          throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
-        }
-
-        if (nextAction === "replay_auth_url" && replayPass < CODEX_LOGIN_MAX_REPLAY_PASSES) {
-          const replayReasonLabel = replayReason
-            ? replayReason.replace(/_/g, " ")
-            : "the next auth step";
-          note(
-            `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-            + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${CODEX_LOGIN_MAX_REPLAY_PASSES}).`,
-          );
-          await sleep(1000);
-          continue;
-        }
-        if (nextAction === "retry_attempt") {
-          restoreActiveAuth(previousAuth);
-          if (attempt < CODEX_LOGIN_MAX_ATTEMPTS) {
-            const delayMs = CODEX_LOGIN_RETRY_DELAYS_MS[Math.min(attempt - 1, CODEX_LOGIN_RETRY_DELAYS_MS.length - 1)] ?? 30_000;
-            const retryReasonLabel = retryReason
-              ? retryReason.replace(/_/g, " ")
-              : "needs another retry";
-            note(
-              `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-              + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
-            );
-            await sleep(delayMs);
-            break;
-          }
-          throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
-        }
-        if (!callbackComplete && !success) {
-          throw new Error(
-            errorMessage
-            ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
-          );
-        }
-        if (flow.codex_login_exit_ok === false) {
-          throw new Error(
-            `"codex login" did not exit cleanly for ${email}.`
-            + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
-          );
-        }
-
-        const auth = loadCodexAuth();
-        const loggedInEmail = extractEmailFromAuth(auth);
-
-        if (expectedEmail && normalizeEmailKey(loggedInEmail) !== normalizeEmailKey(expectedEmail)) {
-          restoreActiveAuth(previousAuth);
-          throw new Error(`Expected ${expectedEmail}, but Codex logged into ${loggedInEmail}.`);
-        }
-
-        return auth;
-      }
-    } catch (error) {
-      restoreActiveAuth(previousAuth);
-      throw error;
-    } finally {
-      if (codexSession) {
-        cancelCodexBrowserLoginSession(codexSession);
-      }
-    }
-  }
-
-  restoreActiveAuth(previousAuth);
-  throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
-}
-
 async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateCommandResult> {
   const previousAuth = loadCodexAuthIfExists();
   const store = loadCredentialStore();
-  const workflowMetadata = readLocalWorkflowMetadata(CREATE_DEFAULT_PROFILE_WORKFLOW);
+  const workflowMetadata = readWorkflowFileMetadata(CODEX_ROTATE_ACCOUNT_FLOW_FILE);
   const profileName = resolveManagedProfileName({
     requestedProfileName: options.profileName,
     preferredProfileName: workflowMetadata.preferredProfileName,
@@ -1437,21 +1271,27 @@ async function executeCreateFlow(options: CreateCommandOptions): Promise<CreateC
         : `Creating ${createdEmail} in managed profile "${profileName}".`,
     );
     let auth: CodexAuth | null = null;
-    auth = await runAutomatedCodexLogin(
+    await completeCodexLoginViaWorkflow(
       profileName,
       createdEmail,
       password,
-      previousAuth,
-      createdEmail,
-      openAiWorkflowRunStamp,
       {
+        codexBin: CODEX_BIN,
+        workflowRunStamp: openAiWorkflowRunStamp,
         preferSignupRecovery: true,
-        fullName: "Dev Astronlab",
         birthMonth: pending.birth_month,
         birthDay: pending.birth_day,
         birthYear: pending.birth_year,
+        onNote: note,
+        restoreState: () => restoreActiveAuth(previousAuth),
       },
     );
+    auth = loadCodexAuth();
+    const loggedInEmail = extractEmailFromAuth(auth);
+    if (normalizeEmailKey(loggedInEmail) !== normalizeEmailKey(createdEmail)) {
+      restoreActiveAuth(previousAuth);
+      throw new Error(`Expected ${createdEmail}, but Codex logged into ${loggedInEmail}.`);
+    }
 
     shouldRestoreAuth = true;
     cmdAdd(options.alias);
@@ -1819,16 +1659,23 @@ async function cmdRelogin(selector: string, options: ReloginOptions): Promise<vo
   if (shouldUseStoredCredentials && storedCredential) {
     note(`Using stored credentials for ${expectedEmail} in managed profile "${storedCredential.profile_name}".`);
     const previousAuth = loadCodexAuthIfExists();
-    await runAutomatedCodexLogin(
+    await completeCodexLoginViaWorkflow(
       storedCredential.profile_name,
       storedCredential.email,
       storedCredential.password,
-      previousAuth,
-      options.allowEmailChange ? null : expectedEmail,
+      {
+        codexBin: CODEX_BIN,
+        onNote: note,
+        restoreState: () => restoreActiveAuth(previousAuth),
+      },
     );
-    cmdAdd(existing.alias);
-
     const auth = loadCodexAuth();
+    const loggedInEmail = extractEmailFromAuth(auth);
+    if (!options.allowEmailChange && normalizeEmailKey(loggedInEmail) !== normalizeEmailKey(expectedEmail)) {
+      restoreActiveAuth(previousAuth);
+      throw new Error(`Expected ${expectedEmail}, but Codex logged into ${loggedInEmail}.`);
+    }
+    cmdAdd(existing.alias);
     const updated = getStoredCredential(store, storedCredential.email);
     const inspected = await inspectPoolEntryByAccountId(extractAccountIdFromAuth(auth));
     if (updated && inspected) {
