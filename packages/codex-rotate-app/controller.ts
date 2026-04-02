@@ -49,6 +49,11 @@ export async function decideRotation(options?: { afterSignalId?: number | null }
   }
 }
 
+export async function readQuotaAssessment() {
+  const paths = resolveCodexRotateAppPaths();
+  return await inspectQuota(loadCodexAuth(paths.codexAuthFile));
+}
+
 export function rotateNow(): RotationResult {
   const paths = resolveCodexRotateAppPaths();
   return runRotateNext({

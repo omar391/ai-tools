@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { buildCurrentLoginRequest, decideRotation, rotateNow } from "./controller.ts";
+import { buildCurrentLoginRequest, decideRotation, readQuotaAssessment, rotateNow } from "./controller.ts";
 import { loadCodexAuth, summarizeCodexAuth } from "./auth.ts";
 import { readLiveAccount, switchLiveAccountToCurrentAuth } from "./hook.ts";
 import { ensureDebugCodexInstance } from "./launcher.ts";
@@ -24,6 +24,7 @@ Usage:
   codex-rotate-app build-login-request [--full]
   codex-rotate-app launch [--port <n>]
   codex-rotate-app account-read [--port <n>]
+  codex-rotate-app quota-read
   codex-rotate-app switch-live [--port <n>]
   codex-rotate-app rotate-next-and-switch [--port <n>]
   codex-rotate-app watch-live [--port <n>] [--interval-ms <n>] [--cooldown-ms <n>] [--once]
@@ -75,6 +76,11 @@ async function main(): Promise<void> {
     case "account-read": {
       const account = await readLiveAccount({ port: parseFlagNumber(rest, "--port") ?? 9333 });
       console.log(JSON.stringify(account, null, 2));
+      return;
+    }
+    case "quota-read": {
+      const assessment = await readQuotaAssessment();
+      console.log(JSON.stringify(assessment, null, 2));
       return;
     }
     case "switch-live": {
