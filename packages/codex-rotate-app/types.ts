@@ -75,6 +75,7 @@ export interface QuotaAssessment {
   usable: boolean;
   summary: string;
   blocker: string | null;
+  primaryQuotaLeftPercent: number | null;
 }
 
 export type CodexSignalKind = "rate_limits_updated" | "usage_limit_reached";
@@ -99,4 +100,6 @@ export interface RotationDecision {
   assessmentError: string | null;
   shouldRotate: boolean;
   reason: string | null;
+  rotationCommand: "next" | "create" | null;
+  rotationArgs: string[];
 }

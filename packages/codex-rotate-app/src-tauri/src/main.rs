@@ -17,34 +17,101 @@ const DEFAULT_PORT: u16 = 9333;
 const DEFAULT_INTERVAL_SECONDS: u64 = 15;
 const QUOTA_REFRESH_INTERVAL_SECONDS: u64 = 60;
 
-fn build_tray_icon() -> Image<'static> {
-    let width = 18u32;
-    let height = 18u32;
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
-    let center_x = 9.0f32;
-    let center_y = 9.0f32;
-    let outer_radius = 7.0f32;
-    let inner_radius = 4.0f32;
+fn clamp_unit(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
 
+fn rgba_offset(width: u32, x: u32, y: u32) -> usize {
+    ((y * width + x) * 4) as usize
+}
+
+fn paint_alpha(rgba: &mut [u8], width: u32, x: u32, y: u32, alpha: u8) {
+    let offset = rgba_offset(width, x, y);
+    rgba[offset] = 0;
+    rgba[offset + 1] = 0;
+    rgba[offset + 2] = 0;
+    rgba[offset + 3] = rgba[offset + 3].max(alpha);
+}
+
+fn ring_coverage(distance: f32, inner_radius: f32, outer_radius: f32) -> f32 {
+    let outer_alpha = clamp_unit(outer_radius + 0.75 - distance);
+    let inner_alpha = clamp_unit(distance - inner_radius + 0.75);
+    outer_alpha.min(inner_alpha)
+}
+
+fn ccw_distance_degrees(start_degrees: f32, current_degrees: f32) -> f32 {
+    (current_degrees - start_degrees).rem_euclid(360.0)
+}
+
+fn point_on_circle(center: f32, radius: f32, angle_degrees: f32) -> (f32, f32) {
+    let angle = angle_degrees.to_radians();
+    (center + radius * angle.cos(), center - radius * angle.sin())
+}
+
+fn paint_dot(rgba: &mut [u8], width: u32, height: u32, center_x: f32, center_y: f32, radius: f32) {
     for y in 0..height {
         for x in 0..width {
             let dx = x as f32 + 0.5 - center_x;
             let dy = y as f32 + 0.5 - center_y;
             let distance = (dx * dx + dy * dy).sqrt();
-            let angle = dy.atan2(dx).to_degrees();
-            let in_gap = angle > -40.0 && angle < 40.0;
-            let on_ring = distance <= outer_radius && distance >= inner_radius;
-            let arrow_head =
-                (x >= 11 && x <= 16) && (y >= 2 && y <= 7) && (x as i32 - y as i32 >= 8);
-
-            if (on_ring && !in_gap) || arrow_head {
-                let offset = ((y * width + x) * 4) as usize;
-                rgba[offset] = 0;
-                rgba[offset + 1] = 0;
-                rgba[offset + 2] = 0;
-                rgba[offset + 3] = 255;
+            let alpha = (clamp_unit(radius + 0.75 - distance) * 255.0).round() as u8;
+            if alpha > 0 {
+                paint_alpha(rgba, width, x, y, alpha);
             }
         }
+    }
+}
+
+fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
+    let width = 32u32;
+    let height = 32u32;
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let center = 16.0f32;
+    let outer_radius = 12.4f32;
+    let inner_radius = 8.6f32;
+    let start_degrees = 135.0f32;
+    let gauge_sweep = 270.0f32;
+    let progress_sweep = quota_percent
+        .map(|value| gauge_sweep * (value as f32 / 100.0))
+        .unwrap_or(0.0);
+    let active_radius = (inner_radius + outer_radius) / 2.0;
+
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - center;
+            let dy = center - (y as f32 + 0.5);
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = ring_coverage(distance, inner_radius, outer_radius);
+            if coverage <= 0.0 {
+                continue;
+            }
+
+            let mut angle = dy.atan2(dx).to_degrees();
+            if angle < 0.0 {
+                angle += 360.0;
+            }
+            let angle_distance = ccw_distance_degrees(start_degrees, angle);
+            if angle_distance > gauge_sweep {
+                continue;
+            }
+
+            let base_alpha = (coverage * 70.0).round() as u8;
+            let progress_alpha = if progress_sweep > 0.0 && angle_distance <= progress_sweep {
+                (coverage * 255.0).round() as u8
+            } else {
+                0
+            };
+            let alpha = base_alpha.max(progress_alpha);
+            if alpha > 0 {
+                paint_alpha(&mut rgba, width, x, y, alpha);
+            }
+        }
+    }
+
+    if let Some(percent) = quota_percent {
+        let end_angle = start_degrees + gauge_sweep * (percent as f32 / 100.0);
+        let (dot_x, dot_y) = point_on_circle(center, active_radius, end_angle);
+        paint_dot(&mut rgba, width, height, dot_x, dot_y, 2.2);
     }
 
     Image::new_owned(rgba, width, height)
@@ -69,6 +136,7 @@ struct StatusSnapshot {
     current_email: Option<String>,
     current_plan: Option<String>,
     current_quota: Option<String>,
+    current_quota_percent: Option<u8>,
     last_quota_checked_at_ms: Option<u64>,
     last_rotation_email: Option<String>,
     last_rotation_reason: Option<String>,
@@ -90,6 +158,8 @@ struct LiveAccount {
 #[derive(Debug, Deserialize)]
 struct QuotaSummaryEnvelope {
     summary: String,
+    #[serde(rename = "primaryQuotaLeftPercent")]
+    primary_quota_left_percent: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,17 +281,23 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn set_quota_summary(snapshot: &mut StatusSnapshot, summary: String) {
-    snapshot.current_quota = Some(summary);
+fn normalize_quota_percent(value: Option<f64>) -> Option<u8> {
+    value.map(|percent| percent.clamp(0.0, 100.0).round() as u8)
+}
+
+fn set_quota_summary(snapshot: &mut StatusSnapshot, assessment: &QuotaSummaryEnvelope) {
+    snapshot.current_quota = Some(assessment.summary.clone());
+    snapshot.current_quota_percent = normalize_quota_percent(assessment.primary_quota_left_percent);
     snapshot.last_quota_checked_at_ms = Some(current_timestamp_ms());
 }
 
 fn refresh_quota_summary(snapshot: &mut StatusSnapshot) {
     match read_quota_summary() {
-        Ok(assessment) => set_quota_summary(snapshot, assessment.summary),
+        Ok(assessment) => set_quota_summary(snapshot, &assessment),
         Err(_) => {
             if snapshot.current_quota.is_none() {
                 snapshot.current_quota = Some("unavailable".to_string());
+                snapshot.current_quota_percent = None;
             }
             snapshot.last_quota_checked_at_ms = Some(current_timestamp_ms());
         }
@@ -268,8 +344,17 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_title(None::<&str>);
-        let _ = tray.set_tooltip(Some("Codex Rotate\nClick for status"));
+        let tray_title = snapshot
+            .current_quota_percent
+            .map(|percent| format!("{percent}%"));
+        let tooltip = match snapshot.current_quota_percent {
+            Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
+            None => "Codex Rotate\nClick for status".to_string(),
+        };
+        let _ = tray.set_icon(Some(build_tray_icon(snapshot.current_quota_percent)));
+        let _ = tray.set_icon_as_template(true);
+        let _ = tray.set_title(tray_title);
+        let _ = tray.set_tooltip(Some(tooltip));
     }
 }
 
@@ -297,7 +382,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus) {
                 refresh_quota_summary(&mut snapshot);
             } else {
                 if let Some(assessment) = result.decision.assessment.as_ref() {
-                    set_quota_summary(&mut snapshot, assessment.summary.clone());
+                    set_quota_summary(&mut snapshot, assessment);
                 } else if should_refresh_quota(&snapshot) {
                     refresh_quota_summary(&mut snapshot);
                 }
@@ -425,7 +510,7 @@ fn main() {
             )?;
 
             TrayIconBuilder::with_id("main")
-                .icon(build_tray_icon())
+                .icon(build_tray_icon(None))
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)

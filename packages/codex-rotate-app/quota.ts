@@ -14,7 +14,7 @@ function formatPercent(value: number): string {
   return `${Math.max(0, Math.min(100, Math.round(value)))}%`;
 }
 
-function getQuotaLeft(window: UsageWindow | null | undefined): number | null {
+export function getQuotaLeft(window: UsageWindow | null | undefined): number | null {
   if (!window || typeof window.used_percent !== "number") {
     return null;
   }
@@ -26,6 +26,9 @@ function formatDuration(totalSeconds: number | null | undefined): string {
     return "unknown";
   }
   let remaining = Math.max(0, Math.floor(totalSeconds));
+  if (remaining === 0) {
+    return "0s";
+  }
   const units: Array<[string, number]> = [
     ["d", 86400],
     ["h", 3600],
@@ -34,11 +37,8 @@ function formatDuration(totalSeconds: number | null | undefined): string {
   ];
   const parts: string[] = [];
   for (const [label, unitSeconds] of units) {
-    if (remaining < unitSeconds && parts.length === 0 && label !== "s") {
-      continue;
-    }
     const amount = Math.floor(remaining / unitSeconds);
-    if (amount > 0 || parts.length > 0 || label === "s") {
+    if (amount > 0) {
       parts.push(`${amount}${label}`);
       remaining -= amount * unitSeconds;
     }
@@ -49,11 +49,29 @@ function formatDuration(totalSeconds: number | null | undefined): string {
   return parts.join(" ");
 }
 
-function formatUsageWindow(window: UsageWindow | null | undefined, label: string): string | null {
+function formatWindowLabel(window: UsageWindow | null | undefined, fallback: string): string {
+  const totalSeconds = window?.limit_window_seconds;
+  if (typeof totalSeconds !== "number" || !Number.isFinite(totalSeconds) || totalSeconds <= 0) {
+    return fallback;
+  }
+  if (totalSeconds % 86400 === 0) {
+    return `${totalSeconds / 86400}d`;
+  }
+  if (totalSeconds % 3600 === 0) {
+    return `${totalSeconds / 3600}h`;
+  }
+  if (totalSeconds % 60 === 0) {
+    return `${totalSeconds / 60}m`;
+  }
+  return formatDuration(totalSeconds);
+}
+
+function formatUsageWindow(window: UsageWindow | null | undefined, fallbackLabel: string): string | null {
   const left = getQuotaLeft(window);
   if (left === null) {
     return null;
   }
+  const label = formatWindowLabel(window, fallbackLabel);
   const resetText = typeof window?.reset_after_seconds === "number"
     ? `, ${formatDuration(window.reset_after_seconds)} reset`
     : "";
@@ -95,10 +113,11 @@ export function describeQuotaBlocker(usage: UsageResponse): string {
   const primary = usage.rate_limit?.primary_window;
   const primaryLeft = getQuotaLeft(primary);
   if (primaryLeft !== null && primaryLeft <= 0) {
+    const label = formatWindowLabel(primary, "current");
     const reset = typeof primary?.reset_after_seconds === "number"
       ? `, resets in ${formatDuration(primary.reset_after_seconds)}`
       : "";
-    return `5h quota exhausted${reset}`;
+    return `${label} quota exhausted${reset}`;
   }
   if (usage.rate_limit?.limit_reached || usage.rate_limit?.allowed === false) {
     return "usage limit reached";
@@ -108,8 +127,8 @@ export function describeQuotaBlocker(usage: UsageResponse): string {
 
 export function formatQuotaSummary(usage: UsageResponse): string {
   const parts = [
-    formatUsageWindow(usage.rate_limit?.primary_window, "5h"),
-    formatUsageWindow(usage.rate_limit?.secondary_window, "7d"),
+    formatUsageWindow(usage.rate_limit?.primary_window, "primary"),
+    formatUsageWindow(usage.rate_limit?.secondary_window, "secondary"),
     formatCredits(usage.credits),
   ].filter((value): value is string => Boolean(value));
   return parts.join(" | ") || "quota unavailable";
@@ -137,5 +156,6 @@ export async function inspectQuota(auth: CodexAuth): Promise<QuotaAssessment> {
     usable,
     summary: formatQuotaSummary(usage),
     blocker: usable ? null : describeQuotaBlocker(usage),
+    primaryQuotaLeftPercent: getQuotaLeft(usage.rate_limit?.primary_window),
   };
 }
