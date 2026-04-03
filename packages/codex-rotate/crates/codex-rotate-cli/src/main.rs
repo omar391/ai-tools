@@ -130,6 +130,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
         base_email,
         force,
         ignore_current,
+        restore_previous_auth_after_create: false,
         require_usable_quota: false,
         source: CreateCommandSource::Manual,
     })

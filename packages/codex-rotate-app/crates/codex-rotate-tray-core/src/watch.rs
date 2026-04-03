@@ -5,7 +5,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
-use codex_rotate_core::pool::{current_auth_summary, rotate_next_internal, NextResult};
+use codex_rotate_core::pool::{
+    current_auth_summary, other_usable_account_exists, rotate_next_internal, NextResult,
+};
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
@@ -150,6 +152,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         });
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
+        let mut refreshed_current = false;
         match decision.rotation_command {
             Some(RotationCommand::Next) => {
                 let next_result = rotate_next_internal()?;
@@ -162,21 +165,25 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             }
             Some(RotationCommand::Create) => {
                 cmd_create(CreateCommandOptions {
+                    force: true,
                     ignore_current: true,
+                    restore_previous_auth_after_create: true,
                     source: CreateCommandSource::Manual,
                     ..CreateCommandOptions::default()
                 })?;
-                rotation = Some(current_auth_summary()?);
+                refreshed_current = true;
             }
             None => {}
         }
-        live = Some(switch_live_account_to_current_auth(
-            Some(port),
-            false,
-            15_000,
-        )?);
+        if rotation.is_some() || refreshed_current {
+            live = Some(switch_live_account_to_current_auth(
+                Some(port),
+                false,
+                15_000,
+            )?);
+            quota_cache = Some(refresh_quota_cache(true, None)?);
+        }
         rotated = rotation.is_some();
-        quota_cache = Some(refresh_quota_cache(true, None)?);
     }
 
     let next_state = WatchState {
@@ -293,8 +300,14 @@ fn decide_rotation(
             primary_quota_left_percent: cache.primary_quota_left_percent,
         });
     let assessment_error = quota_cache.as_ref().and_then(|cache| cache.error.clone());
+    let has_usable_other_account = assessment
+        .as_ref()
+        .and_then(|value| value.primary_quota_left_percent)
+        .map(|value| value <= LOW_QUOTA_ROTATION_THRESHOLD_PERCENT)
+        .unwrap_or(false)
+        && other_usable_account_exists()?;
 
-    let plan = plan_rotation(assessment.as_ref(), &signals);
+    let plan = plan_rotation(assessment.as_ref(), &signals, has_usable_other_account);
     Ok((
         RotationDecision {
             last_signal_id,
@@ -337,6 +350,7 @@ fn quota_cache_invalidated(
 fn plan_rotation(
     assessment: Option<&DecisionQuotaAssessment>,
     signals: &[CodexLogSignal],
+    has_usable_other_account: bool,
 ) -> (bool, Option<String>, Option<RotationCommand>, Vec<String>) {
     let Some(assessment) = assessment else {
         return (
@@ -366,6 +380,16 @@ fn plan_rotation(
         .unwrap_or(false)
     {
         let percent = assessment.primary_quota_left_percent.unwrap();
+        if has_usable_other_account {
+            return (
+                false,
+                Some(format!(
+                    "quota low: {percent}% left, but another account already has usable quota"
+                )),
+                None,
+                Vec::new(),
+            );
+        }
         return (
             true,
             Some(format!("quota low: {percent}% left")),
@@ -406,7 +430,7 @@ mod tests {
             blocker: None,
             primary_quota_left_percent: Some(10),
         };
-        let plan = plan_rotation(Some(&assessment), &[]);
+        let plan = plan_rotation(Some(&assessment), &[], false);
         assert!(plan.0);
         assert_eq!(plan.2, Some(RotationCommand::Create));
         assert_eq!(plan.3, vec!["--ignore-current".to_string()]);
@@ -420,9 +444,22 @@ mod tests {
             blocker: Some("5h quota exhausted".to_string()),
             primary_quota_left_percent: Some(0),
         };
-        let plan = plan_rotation(Some(&assessment), &[]);
+        let plan = plan_rotation(Some(&assessment), &[], false);
         assert!(plan.0);
         assert_eq!(plan.2, Some(RotationCommand::Next));
+    }
+
+    #[test]
+    fn plan_rotation_skips_create_for_low_quota_when_other_account_is_usable() {
+        let assessment = DecisionQuotaAssessment {
+            summary: "5h 10% left".to_string(),
+            usable: true,
+            blocker: None,
+            primary_quota_left_percent: Some(10),
+        };
+        let plan = plan_rotation(Some(&assessment), &[], true);
+        assert!(!plan.0);
+        assert_eq!(plan.2, None);
     }
 
     #[test]

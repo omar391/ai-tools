@@ -45,6 +45,7 @@ pub struct CreateCommandOptions {
     pub base_email: Option<String>,
     pub force: bool,
     pub ignore_current: bool,
+    pub restore_previous_auth_after_create: bool,
     pub require_usable_quota: bool,
     pub source: CreateCommandSource,
 }
@@ -57,6 +58,7 @@ impl Default for CreateCommandOptions {
             base_email: None,
             force: false,
             ignore_current: false,
+            restore_previous_auth_after_create: false,
             require_usable_quota: false,
             source: CreateCommandSource::Manual,
         }
@@ -312,6 +314,12 @@ pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
 
     let result = execute_create_flow(&options)?;
     let quota_summary = summarize_quota_for_create(&result);
+    if options.restore_previous_auth_after_create {
+        return Ok(format!(
+            "{GREEN}OK{RESET} Created {} via \"{}\" from {}.\nQuota: {}\nCurrent session unchanged.",
+            result.entry.label, result.profile_name, result.base_email, quota_summary
+        ));
+    }
     Ok(format!(
         "{GREEN}OK{RESET} Created {} via \"{}\" from {}.\nQuota: {}",
         result.entry.label, result.profile_name, result.base_email, quota_summary
@@ -700,6 +708,10 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
                 ));
             }
         }
+    }
+
+    if options.restore_previous_auth_after_create {
+        restore_active_auth(previous_auth.as_ref())?;
     }
 
     Ok(CreateCommandResult {

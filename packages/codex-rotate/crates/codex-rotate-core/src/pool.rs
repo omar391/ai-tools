@@ -684,6 +684,35 @@ pub fn current_auth_summary() -> Result<AuthSummary> {
     Ok(summarize_codex_auth(&auth))
 }
 
+pub fn other_usable_account_exists() -> Result<bool> {
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+
+    if pool.accounts.len() <= 1 {
+        if dirty {
+            save_pool(&pool)?;
+        }
+        return Ok(false);
+    }
+
+    let mut reasons = Vec::new();
+    let skip_indices = HashSet::new();
+    let (candidate, candidate_dirty) = find_next_usable_account(
+        &mut pool,
+        &paths.codex_auth_file,
+        ReusableAccountProbeMode::OthersOnly,
+        &mut reasons,
+        dirty,
+        &skip_indices,
+    )?;
+    if candidate_dirty {
+        save_pool(&pool)?;
+    }
+    Ok(candidate.is_some())
+}
+
 pub fn load_pool() -> Result<Pool> {
     let paths = resolve_paths()?;
     if !paths.pool_file.exists() {
