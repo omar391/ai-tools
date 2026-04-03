@@ -6,14 +6,9 @@ import {
 } from "node:child_process";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
-  readdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -52,6 +47,7 @@ const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(resolve(
   "daemon",
   "client.mjs",
 )).href;
+const CODEX_LOGIN_MANAGED_BROWSER_OPENER = resolve(MODULE_DIR, "codex-login-managed-browser-opener.mjs");
 
 const CODEX_ROTATE_ACCOUNT_FLOW_ID = "workspace.web.auth-openai-com.codex-rotate-account-flow";
 export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
@@ -62,11 +58,9 @@ export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
   "auth.openai.com",
   "codex-rotate-account-flow.yaml",
 );
-const GMAIL_CAPTURE_WORKFLOW_ID = "sys.web.mail-google-com.capture-active-account-email";
 export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
 
 export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
-const FAST_BROWSER_MANAGED_PROFILE_ARCHIVE_ROOT = join(FAST_BROWSER_PROFILES_HOME, "_archive");
 
 export interface CredentialFamily {
   profile_name: string;
@@ -145,11 +139,6 @@ interface ChromeProfileAccountInfoEntry {
 
 interface ChromeProfilePreferences {
   account_info?: ChromeProfileAccountInfoEntry[];
-}
-
-interface SystemChromeProfileEntry {
-  directory: string;
-  name: string;
 }
 
 interface SystemChromeProfileMatch {
@@ -813,15 +802,6 @@ export function selectStoredBaseEmailHint(store: CredentialStore, profileName: s
     })[0]?.[0] ?? null;
 }
 
-function parseSystemChromeProfiles(rawProfiles: Array<Record<string, unknown>>): SystemChromeProfileEntry[] {
-  return rawProfiles
-    .map((profile) => ({
-      directory: typeof profile.directory === "string" ? profile.directory : "",
-      name: typeof profile.name === "string" ? profile.name : "",
-    }))
-    .filter((profile) => profile.directory && profile.name);
-}
-
 export function selectBestSystemChromeProfileMatch(
   profileName: string,
   profiles: Array<{ directory: string; name: string; emails: string[] }>,
@@ -860,14 +840,6 @@ export function selectBestSystemChromeProfileMatch(
     });
 
   return candidates[0] ?? null;
-}
-
-function directoryHasEntries(directoryPath: string): boolean {
-  try {
-    return readdirSync(directoryPath).length > 0;
-  } catch {
-    return false;
-  }
 }
 
 async function sleep(milliseconds: number): Promise<void> {
@@ -1042,62 +1014,6 @@ async function resetManagedProfileRuntime(profileName: string, socketPath?: stri
   } catch {}
 }
 
-function archiveManagedProfileDirectory(profileName: string, userDataDir: string): void {
-  if (!directoryHasEntries(userDataDir)) {
-    rmSync(userDataDir, { recursive: true, force: true });
-    return;
-  }
-
-  mkdirSync(FAST_BROWSER_MANAGED_PROFILE_ARCHIVE_ROOT, { recursive: true });
-  const archiveName = `${profileName}-system-bootstrap-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-  const archivePath = join(FAST_BROWSER_MANAGED_PROFILE_ARCHIVE_ROOT, archiveName);
-  renameSync(userDataDir, archivePath);
-}
-
-function runBootstrapRsync(sourcePath: string, destinationPath: string): void {
-  const result = spawnSync("rsync", [
-    "-a",
-    "--delete",
-    "--exclude=Cache",
-    "--exclude=Code Cache",
-    "--exclude=GPUCache",
-    "--exclude=DawnCache",
-    "--exclude=GrShaderCache",
-    "--exclude=ShaderCache",
-    "--exclude=Crashpad",
-    "--exclude=Singleton*",
-    sourcePath,
-    destinationPath,
-  ], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  if (result.error) {
-    throw result.error;
-  }
-  if (typeof result.status === "number" && result.status !== 0) {
-    const details = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    throw new Error(details || `rsync bootstrap failed for ${sourcePath}`);
-  }
-}
-
-async function bootstrapManagedProfileFromSystemProfile(
-  managedProfileName: string,
-  managedProfileDirectory: string,
-  managedUserDataDir: string,
-  chromeUserDataDir: string,
-  sourceProfileDirectory: string,
-): Promise<void> {
-  await resetManagedProfileRuntime(managedProfileName);
-  if (existsSync(managedUserDataDir)) {
-    archiveManagedProfileDirectory(managedProfileName, managedUserDataDir);
-  }
-
-  mkdirSync(managedUserDataDir, { recursive: true });
-  runBootstrapRsync(join(chromeUserDataDir, "Local State"), `${managedUserDataDir}/`);
-  runBootstrapRsync(join(chromeUserDataDir, sourceProfileDirectory), `${managedUserDataDir}/`);
-}
-
 function ensureFastBrowserScript(): void {
   if (!existsSync(FAST_BROWSER_SCRIPT)) {
     throw new Error(
@@ -1114,6 +1030,54 @@ function ensureFastBrowserPlaywright(): void {
       + 'Run "bun install" after adding the playwright dependency before using create/relogin automation.',
     );
   }
+}
+
+function ensureCodexLoginManagedBrowserOpener(): void {
+  if (!existsSync(CODEX_LOGIN_MANAGED_BROWSER_OPENER)) {
+    throw new Error(
+      `Managed Codex browser opener script not found at ${CODEX_LOGIN_MANAGED_BROWSER_OPENER}.`,
+    );
+  }
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function renderCodexLoginManagedBrowserWrapper(realCodexBin: string, profileName: string): string {
+  return [
+    "#!/bin/sh",
+    `export FAST_BROWSER_PROFILE=${shellSingleQuote(profileName)}`,
+    `export BROWSER=${shellSingleQuote(CODEX_LOGIN_MANAGED_BROWSER_OPENER)}`,
+    `exec ${shellSingleQuote(realCodexBin)} \"$@\"`,
+    "",
+  ].join("\n");
+}
+
+export function buildCodexLoginManagedBrowserWrapperPath(profileName: string, codexBin: string): string {
+  const profileToken = String(profileName || "default")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 32) || "default";
+  const hash = createHash("sha256")
+    .update(`${profileName}\n${codexBin}\n${CODEX_LOGIN_MANAGED_BROWSER_OPENER}`)
+    .digest("hex")
+    .slice(0, 12);
+  return join(ROTATE_HOME, "bin", `codex-login-${profileToken}-${hash}`);
+}
+
+export function ensureCodexLoginManagedBrowserWrapper(profileName: string, codexBin: string): string {
+  ensureCodexLoginManagedBrowserOpener();
+  mkdirSync(join(ROTATE_HOME, "bin"), { recursive: true });
+  const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(profileName, codexBin);
+  const content = renderCodexLoginManagedBrowserWrapper(codexBin, profileName);
+  const current = existsSync(wrapperPath) ? readFileSync(wrapperPath, "utf8") : null;
+  if (current !== content) {
+    writeFileSync(wrapperPath, content, { mode: 0o700 });
+  }
+  chmodSync(wrapperPath, 0o700);
+  return wrapperPath;
 }
 
 function runFastBrowserCommandSync(args: string[], options?: { requirePlaywright?: boolean }): SpawnSyncReturns<string> {
@@ -1134,57 +1098,6 @@ function runFastBrowserCommandSync(args: string[], options?: { requirePlaywright
   }
 
   return result;
-}
-
-function createFastBrowserOutputPath(): string {
-  mkdirSync(ROTATE_HOME, { recursive: true });
-  return join(
-    ROTATE_HOME,
-    `fast-browser-${Date.now()}-${randomBytes(6).toString("hex")}.json`,
-  );
-}
-
-async function runFastBrowserCommand(
-  args: string[],
-  options?: { requirePlaywright?: boolean },
-): Promise<FastBrowserCommandResult> {
-  ensureFastBrowserScript();
-  if (options?.requirePlaywright !== false) {
-    ensureFastBrowserPlaywright();
-  }
-
-  const outputPath = createFastBrowserOutputPath();
-  let stdoutFd = openSync(outputPath, "w");
-
-  try {
-    const child = spawn(FAST_BROWSER_RUNTIME, [FAST_BROWSER_SCRIPT, ...args], {
-      cwd: REPO_ROOT,
-      stdio: ["ignore", stdoutFd, "inherit"],
-    });
-    closeSync(stdoutFd);
-    stdoutFd = -1;
-
-    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code, signal) => {
-        resolve({ code, signal });
-      });
-    });
-
-    return {
-      status: exit.code,
-      signal: exit.signal,
-      stdout: existsSync(outputPath) ? readFileSync(outputPath, "utf8") : "",
-      stderr: "",
-    };
-  } finally {
-    if (stdoutFd !== -1) {
-      closeSync(stdoutFd);
-    }
-    try {
-      unlinkSync(outputPath);
-    } catch {}
-  }
 }
 
 function parseFastBrowserJson<T>(
@@ -1224,24 +1137,6 @@ function readFastBrowserResultFromError(error: unknown): FastBrowserRunResult | 
     return null;
   }
   return result as FastBrowserRunResult;
-}
-
-function formatDaemonBridgeResult(result: SpawnSyncReturns<string>): { status: number | null; stdout: string } {
-  if (typeof result.status === "number" && result.status !== 0) {
-    const combined = [result.stdout, result.stderr]
-      .filter((value) => typeof value === "string" && value.trim().length > 0)
-      .join("\n")
-      .trim();
-    return {
-      status: result.status,
-      stdout: combined,
-    };
-  }
-
-  return {
-    status: result.status,
-    stdout: result.stdout ?? "",
-  };
 }
 
 function parseFastBrowserProgressEventLine(line: string): FastBrowserProgressEvent | null {
@@ -1480,35 +1375,6 @@ async function runFastBrowserDaemonWorkflow(
   return response.result;
 }
 
-export async function deleteTemporaryFastBrowserProfile(profileName: string): Promise<void> {
-  const normalized = String(profileName || "").trim();
-  if (!normalized) {
-    return;
-  }
-  const browserProfilesModuleUrl = pathToFileURL(resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
-    "lib",
-    "browser-profiles.mjs",
-  )).href;
-  const bridgeScript = `
-    import { deleteManagedProfile } from ${JSON.stringify(browserProfilesModuleUrl)};
-    await deleteManagedProfile(${JSON.stringify(normalized)}, { allowDefault: false });
-    console.log(JSON.stringify({ ok: true }));
-  `;
-  const result = spawnSync("node", ["--input-type=module", "-e", bridgeScript], {
-    cwd: REPO_ROOT,
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || `Failed to delete temporary fast-browser profile "${normalized}".`);
-  }
-}
-
 async function resetStuckFastBrowserDaemon(profileName: string, output: string | null | undefined): Promise<boolean> {
   const match = output?.match(FAST_BROWSER_DAEMON_TIMEOUT_PATTERN);
   if (!match) {
@@ -1679,95 +1545,6 @@ export function shouldUseDefaultCreateFamilyHint(baseEmail: string | null | unde
   return parseEmailFamily(baseEmail).mode !== "gmail_plus";
 }
 
-function getManagedProfileEntry(inspection: ManagedProfilesInspection, profileName: string): ManagedProfileEntry | null {
-  return inspection.managedProfiles.profiles.find((profile) => profile.name === profileName) ?? null;
-}
-
-async function maybeBootstrapManagedProfileFromSystem(
-  inspection: ManagedProfilesInspection,
-  profileName: string,
-  preferredBaseEmail?: string | null,
-): Promise<string[]> {
-  const managedProfile = getManagedProfileEntry(inspection, profileName);
-  if (!managedProfile) {
-    return [];
-  }
-
-  const existingEmails = extractSupportedGmailEmails(
-    readChromeProfileAccountEmails(managedProfile.userDataDir, managedProfile.profileDirectory),
-  );
-  if (existingEmails.length > 0) {
-    return existingEmails;
-  }
-
-  const systemProfiles = parseSystemChromeProfiles(inspection.profiles)
-    .map((profile) => ({
-      ...profile,
-      emails: extractSupportedGmailEmails(
-        readChromeProfileAccountEmails(inspection.chromeUserDataDir, profile.directory),
-      ),
-    }));
-
-  const match = selectBestSystemChromeProfileMatch(profileName, systemProfiles, preferredBaseEmail);
-  if (!match) {
-    return [];
-  }
-
-  await bootstrapManagedProfileFromSystemProfile(
-    profileName,
-    managedProfile.profileDirectory,
-    managedProfile.userDataDir,
-    inspection.chromeUserDataDir,
-    match.directory,
-  );
-
-  return extractSupportedGmailEmails(
-    readChromeProfileAccountEmails(managedProfile.userDataDir, managedProfile.profileDirectory),
-  );
-}
-
-async function discoverGmailBaseEmail(
-  profileName: string,
-  options?: { preferredBaseEmail?: string | null },
-): Promise<string> {
-  const inspection = inspectManagedProfiles();
-  const managedProfile = getManagedProfileEntry(inspection, profileName);
-  if (!managedProfile) {
-    throw new Error(`Managed fast-browser profile "${profileName}" was not found.`);
-  }
-
-  let candidateEmails = extractSupportedGmailEmails(
-    readChromeProfileAccountEmails(managedProfile.userDataDir, managedProfile.profileDirectory),
-  );
-  if (candidateEmails.length === 0) {
-    candidateEmails = await maybeBootstrapManagedProfileFromSystem(
-      inspection,
-      profileName,
-      options?.preferredBaseEmail ?? null,
-    );
-  }
-
-  const selectedEmail = selectBestEmailForManagedProfile(
-    profileName,
-    candidateEmails,
-    options?.preferredBaseEmail ?? null,
-  );
-  if (!selectedEmail) {
-    const result = await runFastBrowserDaemonWorkflow(
-      GMAIL_CAPTURE_WORKFLOW_ID,
-      options?.preferredBaseEmail ? { preferred_email: options.preferredBaseEmail } : {},
-      profileName,
-    );
-    const capturedEmail = readWorkflowActionString(result, "capture_active_account", "email");
-    if (!capturedEmail) {
-      throw new Error(`Could not discover a Gmail address from managed profile "${profileName}".`);
-    }
-    return normalizeGmailBaseEmail(capturedEmail);
-  }
-
-  return normalizeGmailBaseEmail(selectedEmail);
-}
-
 async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
@@ -1781,13 +1558,17 @@ async function runCodexBrowserLoginWorkflow(
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
-  },
+    },
 ): Promise<FastBrowserRunResult> {
+  const codexBin = ensureCodexLoginManagedBrowserWrapper(
+    profileName,
+    String(options?.codexBin || "codex").trim() || "codex",
+  );
   return await runFastBrowserDaemonWorkflow(
     CODEX_ROTATE_ACCOUNT_FLOW_ID,
     {
       mode: "codex_login",
-      codex_bin: options?.codexBin ?? "codex",
+      codex_bin: codexBin,
       ...(options?.codexSession?.auth_url ? { auth_url: options.codexSession.auth_url } : {}),
       ...(options?.codexSession?.callback_url ? { callback_url: options.codexSession.callback_url } : {}),
       ...(options?.codexSession?.callback_port !== undefined && options.codexSession.callback_port !== null
