@@ -3,3 +3,4 @@ cache/
 catalog.db
 catalog.db-shm
 catalog.db-wal
+data/
