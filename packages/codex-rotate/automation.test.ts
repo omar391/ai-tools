@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  buildCodexLoginManagedBrowserWrapperPath,
   buildAccountFamilyEmail,
   CODEX_ROTATE_ACCOUNT_FLOW_FILE,
   buildCodexRotateOpenAiTempProfileName,
@@ -103,6 +104,20 @@ describe("temporary profile naming", () => {
   test("changes the retained OpenAI temp profile when the workflow run stamp changes", () => {
     expect(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"))
       .not.toBe(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:13.000Z"));
+  });
+});
+
+describe("codex login managed-browser wrapper", () => {
+  test("derives a stable wrapper path for the same profile and codex binary", () => {
+    expect(buildCodexLoginManagedBrowserWrapperPath("dev-1", "codex")).toBe(
+      buildCodexLoginManagedBrowserWrapperPath("dev-1", "codex"),
+    );
+  });
+
+  test("changes the wrapper path when the profile changes", () => {
+    expect(buildCodexLoginManagedBrowserWrapperPath("dev-1", "codex")).not.toBe(
+      buildCodexLoginManagedBrowserWrapperPath("dev-2", "codex"),
+    );
   });
 });
 
