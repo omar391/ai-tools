@@ -271,6 +271,8 @@ export interface CodexRotateAuthFlowSummary {
   rate_limit_exceeded?: boolean;
   anti_bot_gate?: boolean;
   auth_prompt?: boolean;
+  consent_blocked?: boolean;
+  consent_error?: string | null;
   next_action?: string | null;
   replay_reason?: string | null;
   retry_reason?: string | null;
@@ -333,7 +335,12 @@ export async function ensureBitwardenCliAccountSecretRef(
     throw new Error(`Bitwarden account secret for ${normalizedEmail} requires a non-empty password.`);
   }
 
-  const { ensureDaemonLoginSecretRef } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  const { ensureDaemonLoginSecretRef, ensureDaemonSecretStoreReadyInteractive } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  await ensureDaemonSecretStoreReadyInteractive({
+    profileName: normalizedProfileName,
+    store: "bitwarden-cli",
+    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
+  });
   const response = await ensureDaemonLoginSecretRef({
     profileName: normalizedProfileName,
     store: "bitwarden-cli",
@@ -346,6 +353,12 @@ export async function ensureBitwardenCliAccountSecretRef(
       "https://chatgpt.com",
     ],
   });
+  if (!response?.ok) {
+    throw new Error(
+      response?.error?.message
+      || `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
+    );
+  }
   const ref = normalizeCodexRotateSecretRef(response?.ref);
   if (!ref) {
     throw new Error(`Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`);
@@ -1191,6 +1204,28 @@ function parseFastBrowserJson<T>(
   return parseJson<T>(stdout, `${actionLabel} returned invalid JSON.`);
 }
 
+function buildFastBrowserWorkflowError(
+  workflowRef: string,
+  response: FastBrowserDaemonRunResponse | null | undefined,
+): Error {
+  const error = new Error(response?.error?.message || `fast-browser workflow ${workflowRef} failed.`);
+  if (response?.result && typeof response.result === "object") {
+    (error as Error & { fastBrowserResult?: FastBrowserRunResult }).fastBrowserResult = response.result;
+  }
+  return error;
+}
+
+function readFastBrowserResultFromError(error: unknown): FastBrowserRunResult | null {
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+  const result = (error as { fastBrowserResult?: unknown }).fastBrowserResult;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  return result as FastBrowserRunResult;
+}
+
 function formatDaemonBridgeResult(result: SpawnSyncReturns<string>): { status: number | null; stdout: string } {
   if (typeof result.status === "number" && result.status !== 0) {
     const combined = [result.stdout, result.stderr]
@@ -1433,7 +1468,7 @@ async function runFastBrowserDaemonWorkflow(
   );
 
   if (!response?.ok || !response.result) {
-    throw new Error(response?.error?.message || `fast-browser workflow ${workflowRef} failed.`);
+    throw buildFastBrowserWorkflowError(workflowRef, response);
   }
 
   if (response.result.status === "paused") {
@@ -1800,118 +1835,147 @@ export async function completeCodexLoginViaWorkflow(
     restoreState?: (() => void) | null;
   },
 ): Promise<CodexRotateAuthFlowSummary> {
-  const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 3));
+  const { ensureDaemonSecretStoreReadyInteractive } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  await ensureDaemonSecretStoreReadyInteractive({
+    profileName,
+    store: "bitwarden-cli",
+    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
+  });
+
+  const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 6));
   const maxReplayPasses = Math.max(1, Number(options?.maxReplayPasses ?? 5));
   const retryDelaysMs = Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
     ? options.retryDelaysMs
-    : [30_000, 60_000];
+    : [30_000, 60_000, 120_000, 240_000, 300_000];
   const note = typeof options?.onNote === "function" ? options.onNote : null;
   const restoreState = typeof options?.restoreState === "function" ? options.restoreState : null;
   let allowSignupRecovery = options?.preferSignupRecovery === true;
+  let codexSession: CodexRotateAuthFlowSession | null = null;
 
   const sleep = async (milliseconds: number) => await new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    let codexSession: CodexRotateAuthFlowSession | null = null;
-
-    try {
-      note?.(
-        attempt === 1
-          ? `Completing Codex login in managed profile "${profileName}".`
-          : `Retrying Codex login in managed profile "${profileName}" (attempt ${attempt}/${maxAttempts}).`,
-      );
-
-      for (let replayPass = 1; replayPass <= maxReplayPasses; replayPass += 1) {
-        const loginWorkflowRunStamp = options?.workflowRunStamp
-          ? `${options.workflowRunStamp}-codex-login-${attempt}-${replayPass}`
-          : undefined;
-        const loginResult = await runCodexBrowserLoginWorkflow(
-          profileName,
-          email,
-          accountSecretRef,
-          loginWorkflowRunStamp,
-          {
-            codexBin: options?.codexBin,
-            codexSession,
-            preferSignupRecovery: allowSignupRecovery,
-            birthMonth: options?.birthMonth,
-            birthDay: options?.birthDay,
-            birthYear: options?.birthYear,
-          },
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        note?.(
+          attempt === 1
+            ? `Completing Codex login in managed profile "${profileName}".`
+            : `Retrying Codex login in managed profile "${profileName}" (attempt ${attempt}/${maxAttempts}).`,
         );
-        const flow = readCodexRotateAuthFlowSummary(loginResult);
-        codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
-        const callbackComplete = flow.callback_complete === true;
-        const success = flow.success === true;
-        const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
-        const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
-        const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
-        const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
-        const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
-          ? flow.error_message.trim()
-          : null;
 
-        if (replayReason && replayReason !== "auth_prompt") {
-          allowSignupRecovery = false;
-        }
-        if (nextAction === "fail_invalid_credentials") {
-          throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
-        }
-        if (nextAction === "replay_auth_url" && replayPass < maxReplayPasses) {
-          const replayReasonLabel = replayReason
-            ? replayReason.replace(/_/g, " ")
-            : "the next auth step";
-          note?.(
-            `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-            + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${maxReplayPasses}).`,
+        for (let replayPass = 1; replayPass <= maxReplayPasses; replayPass += 1) {
+          const loginWorkflowRunStamp = options?.workflowRunStamp
+            ? `${options.workflowRunStamp}-codex-login-${attempt}-${replayPass}`
+            : undefined;
+          const loginResult = await runCodexBrowserLoginWorkflow(
+            profileName,
+            email,
+            accountSecretRef,
+            loginWorkflowRunStamp,
+            {
+              codexBin: options?.codexBin,
+              codexSession,
+              preferSignupRecovery: allowSignupRecovery,
+              birthMonth: options?.birthMonth,
+              birthDay: options?.birthDay,
+              birthYear: options?.birthYear,
+            },
           );
-          await sleep(1000);
+          const flow = readCodexRotateAuthFlowSummary(loginResult);
+          codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
+          const callbackComplete = flow.callback_complete === true;
+          const success = flow.success === true;
+          const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
+          const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
+          const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
+          const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
+          const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
+            ? flow.error_message.trim()
+            : null;
+          const sawOauthConsent = flow.saw_oauth_consent === true;
+          const existingAccountPrompt = flow.existing_account_prompt === true;
+
+          if (sawOauthConsent || existingAccountPrompt || (replayReason && replayReason !== "auth_prompt")) {
+            allowSignupRecovery = false;
+          }
+          if (nextAction === "fail_invalid_credentials") {
+            throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
+          }
+          if (nextAction === "replay_auth_url" && replayPass < maxReplayPasses) {
+            const replayReasonLabel = replayReason
+              ? replayReason.replace(/_/g, " ")
+              : "the next auth step";
+            note?.(
+              `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+              + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${maxReplayPasses}).`,
+            );
+            await sleep(1000);
+            continue;
+          }
+          if (nextAction === "retry_attempt") {
+            restoreState?.();
+            if (attempt < maxAttempts) {
+              const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
+              const retryReasonLabel = retryReason
+                ? retryReason.replace(/_/g, " ")
+                : "needs another retry";
+              if (retryReason === "retryable_timeout") {
+                codexSession = null;
+              }
+              note?.(
+                `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
+                + `${retryReason === "retryable_timeout" ? "Starting a fresh Codex auth session. " : ""}`
+                + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
+              );
+              await sleep(delayMs);
+              break;
+            }
+            throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
+          }
+          if (!callbackComplete && !success) {
+            throw new Error(
+              errorMessage
+              ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
+            );
+          }
+          if (flow.codex_login_exit_ok === false) {
+            throw new Error(
+              `"codex login" did not exit cleanly for ${email}.`
+              + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
+            );
+          }
+          return flow;
+        }
+      } catch (error) {
+        restoreState?.();
+        const failedResult = readFastBrowserResultFromError(error);
+        if (failedResult) {
+          codexSession = readCodexRotateAuthFlowSession(failedResult) ?? codexSession;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const deviceAuthRateLimited = /device code request failed with status 429|device auth failed with status 429|codex-login-exited-before-auth-url:.*429 Too Many Requests|429 Too Many Requests/i.test(message);
+        if (deviceAuthRateLimited && attempt < maxAttempts) {
+          const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
+          note?.(
+            `Codex device authorization is rate limited for ${email}. `
+            + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
+          );
+          await sleep(delayMs);
           continue;
         }
-        if (nextAction === "retry_attempt") {
-          restoreState?.();
-          if (attempt < maxAttempts) {
-            const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
-            const retryReasonLabel = retryReason
-              ? retryReason.replace(/_/g, " ")
-              : "needs another retry";
-            note?.(
-              `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-              + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
-            );
-            await sleep(delayMs);
-            break;
-          }
-          throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
-        }
-        if (!callbackComplete && !success) {
-          throw new Error(
-            errorMessage
-            ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
-          );
-        }
-        if (flow.codex_login_exit_ok === false) {
-          throw new Error(
-            `"codex login" did not exit cleanly for ${email}.`
-            + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
-          );
-        }
-        return flow;
-      }
-    } catch (error) {
-      restoreState?.();
-      throw error;
-    } finally {
-      if (codexSession) {
-        cancelCodexBrowserLoginSession(codexSession);
+        throw error;
       }
     }
-  }
 
-  restoreState?.();
-  throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
+    restoreState?.();
+    throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
+  } finally {
+    if (codexSession) {
+      cancelCodexBrowserLoginSession(codexSession);
+    }
+  }
 }
 
 function normalizeCredentialRecordMap(raw: unknown): Record<string, StoredCredential> {
@@ -2045,13 +2109,44 @@ function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): CodexRota
   return readWorkflowOutputRecord<CodexRotateAuthFlowSummary>(result) ?? {};
 }
 
-function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
-  const summary = readCodexRotateAuthFlowSummary(result);
-  const session = summary.codex_session;
-  if (!session || typeof session !== "object" || Array.isArray(session)) {
+function normalizeCodexRotateAuthFlowSession(raw: unknown): CodexRotateAuthFlowSession | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const callbackPort = raw.callback_port;
+  const pid = raw.pid;
+  const session: CodexRotateAuthFlowSession = {
+    auth_url: typeof raw.auth_url === "string" && raw.auth_url.trim() ? raw.auth_url.trim() : null,
+    callback_url: typeof raw.callback_url === "string" && raw.callback_url.trim() ? raw.callback_url.trim() : null,
+    callback_port: typeof callbackPort === "number"
+      ? callbackPort
+      : (typeof callbackPort === "string" && callbackPort.trim() ? Number.parseInt(callbackPort, 10) : null),
+    device_code: typeof raw.device_code === "string" && raw.device_code.trim() ? raw.device_code.trim() : null,
+    session_dir: typeof raw.session_dir === "string" && raw.session_dir.trim() ? raw.session_dir.trim() : null,
+    pid: typeof pid === "number"
+      ? pid
+      : (typeof pid === "string" && pid.trim() ? Number.parseInt(pid, 10) : null),
+    stdout_path: typeof raw.stdout_path === "string" && raw.stdout_path.trim() ? raw.stdout_path.trim() : null,
+    stderr_path: typeof raw.stderr_path === "string" && raw.stderr_path.trim() ? raw.stderr_path.trim() : null,
+    exit_path: typeof raw.exit_path === "string" && raw.exit_path.trim() ? raw.exit_path.trim() : null,
+  };
+  if (!session.auth_url && !session.session_dir && !session.stdout_path && !session.stderr_path && !session.exit_path) {
     return null;
   }
   return session;
+}
+
+function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
+  const summary = readCodexRotateAuthFlowSummary(result);
+  const summarySession = normalizeCodexRotateAuthFlowSession(summary.codex_session);
+  if (summarySession) {
+    return summarySession;
+  }
+  const startStepAction = result.state?.steps?.start_codex_login_session?.action;
+  if (isRecord(startStepAction)) {
+    return normalizeCodexRotateAuthFlowSession(startStepAction.value ?? startStepAction);
+  }
+  return null;
 }
 
 function escapeRegExp(value: string): string {
