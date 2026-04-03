@@ -9,6 +9,7 @@ pub fn run_legacy_cli_command(args: &[&str]) -> Result<String> {
     let output = Command::new(&paths.bun_bin)
         .arg(&paths.legacy_cli_entrypoint)
         .args(args)
+        .env("CODEX_ROTATE_INTERNAL_LEGACY", "1")
         .current_dir(&paths.repo_root)
         .output()
         .with_context(|| {

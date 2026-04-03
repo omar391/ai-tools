@@ -36,7 +36,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
         rotate_app_home: rotate_app_home.clone(),
         debug_profile_dir: rotate_app_home.join("profile"),
         session_file: rotate_app_home.join("session.json"),
-        legacy_cli_entrypoint: repo_root.join("packages").join("codex-rotate").join("legacy.ts"),
+        legacy_cli_entrypoint: repo_root.join("packages").join("codex-rotate").join("index.ts"),
         automation_bridge_entrypoint: repo_root
             .join("packages")
             .join("codex-rotate")
