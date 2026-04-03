@@ -11,18 +11,18 @@ Rotate Codex CLI OAuth tokens across multiple ChatGPT accounts.
 ```sh
 codex-rotate add              # Snapshot current ~/.codex/auth.json into pool using email_plan as the key
 codex-rotate add work         # Same, but also keep "work" as an optional alias
-codex-rotate create           # Resume the oldest unfinished managed account, or create a new one, then switch to it
+codex-rotate create           # Reuse a healthy account first; only create when needed, or force with --force
 codex-rotate next              # Swap to next account with usable quota
 codex-rotate prev              # Swap to previous account
 codex-rotate list              # Show all accounts with live quota info
-codex-rotate status            # Show current auth details and quota
+codex-rotate status            # Show current auth-file target details and quota
 codex-rotate relogin <selector> # Repair a dead entry; stored credentials are used automatically when available
 codex-rotate remove <selector>  # Remove account from pool
 ```
 
 `add` now defaults the pool key to `{email}_{plan-type}`. Old manual labels are preserved as optional aliases, and `relogin` / `remove` accept either the composite key, the alias, the full account id, the short account id shown in `list`, or the email when it is unique in the pool.
 
-`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. New account passwords are stored in `~/.codex-rotate/credentials.json` with `0600` permissions. `create` now defaults to the local workflow `preferred_profile` (`dev-1`), defaults the email family to `dev.{N}@astronlab.com` unless you override it with `--base-email`, and drains the oldest unfinished pending account in that family before allocating the next suffix. `next` now auto-creates one new account when the existing pool is fully exhausted or unavailable.
+`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. New account passwords are stored in `~/.codex-rotate/credentials.json` with `0600` permissions. `create` now defaults to the local workflow `preferred_profile` (`dev-1`), defaults the email family to `dev.{N}@astronlab.com` unless you override it with `--base-email`, drains the oldest unfinished pending account in that family before allocating the next suffix, and reuses a healthy pool account before creating a new one unless you pass `--force`. `next` still auto-creates one new account when the existing pool is fully exhausted or unavailable.
 
 `relogin` now prefers stored credentials. Use `--manual-login` to force the legacy browser flow, `--device-auth` for device auth, `--keep-session` to skip `codex logout` for manual relogins, or `--allow-email-change` if you intentionally want to replace the selected entry with a different signed-in email.
 
