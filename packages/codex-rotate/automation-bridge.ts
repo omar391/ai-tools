@@ -74,7 +74,9 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.accountSecretRef,
         {
           ...request.payload.options,
-          onNote: null,
+          onNote: (message) => {
+            process.stderr.write(`[codex-rotate] ${message}\n`);
+          },
           restoreState: null,
         },
       )) as CodexRotateAuthFlowSummary;

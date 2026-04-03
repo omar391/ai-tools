@@ -1,9 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import {
-  spawn,
-  spawnSync,
-  type SpawnSyncReturns,
-} from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -33,23 +29,35 @@ const FAST_BROWSER_SCRIPT_DEFAULT = resolve(
   "fast-browser.mjs",
 );
 
-const FAST_BROWSER_SCRIPT = process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST_BROWSER_SCRIPT_DEFAULT;
-const FAST_BROWSER_RUNTIME = process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME
-  ?? (process.versions.bun ? "node" : process.execPath);
-const FAST_BROWSER_PLAYWRIGHT_MODULE = join(REPO_ROOT, "node_modules", "playwright");
-const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(resolve(
+const FAST_BROWSER_SCRIPT =
+  process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST_BROWSER_SCRIPT_DEFAULT;
+const FAST_BROWSER_RUNTIME =
+  process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME ??
+  (process.versions.bun ? "node" : process.execPath);
+const FAST_BROWSER_PLAYWRIGHT_MODULE = join(
   REPO_ROOT,
-  "..",
-  "ai-rules",
-  "skills",
-  "fast-browser",
-  "lib",
-  "daemon",
-  "client.mjs",
-)).href;
-const CODEX_LOGIN_MANAGED_BROWSER_OPENER = resolve(MODULE_DIR, "codex-login-managed-browser-opener.mjs");
+  "node_modules",
+  "playwright",
+);
+const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
+  resolve(
+    REPO_ROOT,
+    "..",
+    "ai-rules",
+    "skills",
+    "fast-browser",
+    "lib",
+    "daemon",
+    "client.mjs",
+  ),
+).href;
+const CODEX_LOGIN_MANAGED_BROWSER_OPENER = resolve(
+  MODULE_DIR,
+  "codex-login-managed-browser-opener.mjs",
+);
 
-const CODEX_ROTATE_ACCOUNT_FLOW_ID = "workspace.web.auth-openai-com.codex-rotate-account-flow";
+const CODEX_ROTATE_ACCOUNT_FLOW_ID =
+  "workspace.web.auth-openai-com.codex-rotate-account-flow";
 export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
   REPO_ROOT,
   ".fast-browser",
@@ -191,7 +199,10 @@ export interface FastBrowserRunResult {
   } | null;
 }
 
-export function buildTemporaryWorkflowProfileName(workflowRunStamp: string, key: string): string {
+export function buildTemporaryWorkflowProfileName(
+  workflowRunStamp: string,
+  key: string,
+): string {
   const normalizedStamp = String(workflowRunStamp || "run")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -205,8 +216,13 @@ export function buildTemporaryWorkflowProfileName(workflowRunStamp: string, key:
   return `workflow-run-${normalizedStamp}-${createHash("sha256").update(normalizedKey).digest("hex").slice(0, 12)}`;
 }
 
-export function buildCodexRotateOpenAiTempProfileName(workflowRunStamp: string): string {
-  return buildTemporaryWorkflowProfileName(workflowRunStamp, CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY);
+export function buildCodexRotateOpenAiTempProfileName(
+  workflowRunStamp: string,
+): string {
+  return buildTemporaryWorkflowProfileName(
+    workflowRunStamp,
+    CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY,
+  );
 }
 
 interface FastBrowserDaemonRunResponse {
@@ -217,7 +233,8 @@ interface FastBrowserDaemonRunResponse {
   };
 }
 
-const FAST_BROWSER_DAEMON_TIMEOUT_PATTERN = /Timed out waiting for fast-browser daemon response from\s+(.+?\.sock)/i;
+const FAST_BROWSER_DAEMON_TIMEOUT_PATTERN =
+  /Timed out waiting for fast-browser daemon response from\s+(.+?\.sock)/i;
 const FAST_BROWSER_EVENT_PREFIX = "__FAST_BROWSER_EVENT__";
 
 interface FastBrowserProgressEvent {
@@ -297,12 +314,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-export function normalizeCredentialStore(raw: LegacyCredentialStore | null | undefined): CredentialStore {
+export function normalizeCredentialStore(
+  raw: LegacyCredentialStore | null | undefined,
+): CredentialStore {
   return {
     version: 2,
-    families: isRecord(raw?.families) ? raw.families as Record<string, CredentialFamily> : {},
+    families: isRecord(raw?.families)
+      ? (raw.families as Record<string, CredentialFamily>)
+      : {},
     accounts: normalizeCredentialRecordMap(raw?.accounts),
-    pending: normalizeCredentialRecordMap(raw?.pending) as Record<string, PendingCredential>,
+    pending: normalizeCredentialRecordMap(raw?.pending) as Record<
+      string,
+      PendingCredential
+    >,
   };
 }
 
@@ -312,19 +336,28 @@ export async function ensureBitwardenCliAccountSecretRef(
   password: string,
 ): Promise<CodexRotateSecretRef> {
   const normalizedProfileName = String(profileName || "").trim();
-  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const normalizedEmail = String(email || "")
+    .trim()
+    .toLowerCase();
   if (!normalizedProfileName) {
-    throw new Error("Bitwarden account secrets require a managed profile name.");
+    throw new Error(
+      "Bitwarden account secrets require a managed profile name.",
+    );
   }
   if (!normalizedEmail) {
     throw new Error("Bitwarden account secrets require a non-empty email.");
   }
   const normalizedPassword = String(password || "");
   if (!normalizedPassword) {
-    throw new Error(`Bitwarden account secret for ${normalizedEmail} requires a non-empty password.`);
+    throw new Error(
+      `Bitwarden account secret for ${normalizedEmail} requires a non-empty password.`,
+    );
   }
 
-  const { ensureDaemonLoginSecretRef, ensureDaemonSecretStoreReadyInteractive } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  const {
+    ensureDaemonLoginSecretRef,
+    ensureDaemonSecretStoreReadyInteractive,
+  } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
   await ensureDaemonSecretStoreReadyInteractive({
     profileName: normalizedProfileName,
     store: "bitwarden-cli",
@@ -337,20 +370,19 @@ export async function ensureBitwardenCliAccountSecretRef(
     username: normalizedEmail,
     password: normalizedPassword,
     notes: `Managed by codex-rotate for ${normalizedEmail}.`,
-    uris: [
-      "https://auth.openai.com",
-      "https://chatgpt.com",
-    ],
+    uris: ["https://auth.openai.com", "https://chatgpt.com"],
   });
   if (!response?.ok) {
     throw new Error(
-      response?.error?.message
-      || `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
+      response?.error?.message ||
+        `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
     );
   }
   const ref = normalizeCodexRotateSecretRef(response?.ref);
   if (!ref) {
-    throw new Error(`Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`);
+    throw new Error(
+      `Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`,
+    );
   }
   return ref;
 }
@@ -361,7 +393,10 @@ export function loadCredentialStore(): CredentialStore {
   }
 
   const raw = readFileSync(CREDENTIALS_FILE, "utf8");
-  const parsed = parseJson<LegacyCredentialStore>(raw, `Invalid credential store at ${CREDENTIALS_FILE}`);
+  const parsed = parseJson<LegacyCredentialStore>(
+    raw,
+    `Invalid credential store at ${CREDENTIALS_FILE}`,
+  );
   return normalizeCredentialStore(parsed);
 }
 
@@ -385,7 +420,10 @@ interface ParsedEmailFamily {
   templateSuffix?: string;
 }
 
-export function makeCredentialFamilyKey(profileName: string, baseEmail: string): string {
+export function makeCredentialFamilyKey(
+  profileName: string,
+  baseEmail: string,
+): string {
   return `${profileName}::${normalizeBaseEmailFamily(baseEmail)}`;
 }
 
@@ -407,7 +445,9 @@ function parseEmailFamily(value: string): ParsedEmailFamily {
     const templatePrefix = placeholderParts[0] ?? "";
     const templateSuffix = placeholderParts[1] ?? "";
     if ((templatePrefix + templateSuffix).trim().length === 0) {
-      throw new Error(`"${value}" must keep some stable local-part text around ${EMAIL_FAMILY_PLACEHOLDER}.`);
+      throw new Error(
+        `"${value}" must keep some stable local-part text around ${EMAIL_FAMILY_PLACEHOLDER}.`,
+      );
     }
     return {
       normalized: `${templatePrefix}${EMAIL_FAMILY_PLACEHOLDER}${templateSuffix}@${domainPart}`,
@@ -420,7 +460,9 @@ function parseEmailFamily(value: string): ParsedEmailFamily {
   }
 
   if (placeholderParts.length > 2) {
-    throw new Error(`"${value}" may only contain one ${EMAIL_FAMILY_PLACEHOLDER} placeholder.`);
+    throw new Error(
+      `"${value}" may only contain one ${EMAIL_FAMILY_PLACEHOLDER} placeholder.`,
+    );
   }
 
   if (domainPart !== "gmail.com") {
@@ -446,7 +488,10 @@ export function normalizeBaseEmailFamily(email: string): string {
   return parseEmailFamily(email).normalized;
 }
 
-export function buildAccountFamilyEmail(baseEmail: string, suffix: number): string {
+export function buildAccountFamilyEmail(
+  baseEmail: string,
+  suffix: number,
+): string {
   if (!Number.isInteger(suffix) || suffix < 1) {
     throw new Error(`Invalid email family suffix "${suffix}".`);
   }
@@ -458,19 +503,26 @@ export function buildAccountFamilyEmail(baseEmail: string, suffix: number): stri
   return `${parsed.localPart}+${suffix}@${parsed.domainPart}`;
 }
 
-export function extractAccountFamilySuffix(candidateEmail: string, baseEmail: string): number | null {
+export function extractAccountFamilySuffix(
+  candidateEmail: string,
+  baseEmail: string,
+): number | null {
   const parsed = parseEmailFamily(baseEmail);
   const normalizedCandidate = candidateEmail.trim().toLowerCase();
-  const match = parsed.mode === "template"
-    ? normalizedCandidate.match(
-      new RegExp(
-        `^${escapeRegExp(parsed.templatePrefix ?? "")}(\\d+)${escapeRegExp(parsed.templateSuffix ?? "")}@${escapeRegExp(parsed.domainPart)}$`,
-        "i",
-      ),
-    )
-    : normalizedCandidate.match(
-      new RegExp(`^${escapeRegExp(parsed.localPart)}\\+(\\d+)@${escapeRegExp(parsed.domainPart)}$`, "i"),
-    );
+  const match =
+    parsed.mode === "template"
+      ? normalizedCandidate.match(
+          new RegExp(
+            `^${escapeRegExp(parsed.templatePrefix ?? "")}(\\d+)${escapeRegExp(parsed.templateSuffix ?? "")}@${escapeRegExp(parsed.domainPart)}$`,
+            "i",
+          ),
+        )
+      : normalizedCandidate.match(
+          new RegExp(
+            `^${escapeRegExp(parsed.localPart)}\\+(\\d+)@${escapeRegExp(parsed.domainPart)}$`,
+            "i",
+          ),
+        );
   if (!match) {
     return null;
   }
@@ -504,11 +556,17 @@ export function normalizeGmailBaseEmail(email: string): string {
   return normalizeBaseEmailFamily(email);
 }
 
-export function buildGmailAliasEmail(baseEmail: string, suffix: number): string {
+export function buildGmailAliasEmail(
+  baseEmail: string,
+  suffix: number,
+): string {
   return buildAccountFamilyEmail(baseEmail, suffix);
 }
 
-export function extractGmailAliasSuffix(candidateEmail: string, baseEmail: string): number | null {
+export function extractGmailAliasSuffix(
+  candidateEmail: string,
+  baseEmail: string,
+): number | null {
   return extractAccountFamilySuffix(candidateEmail, baseEmail);
 }
 
@@ -517,7 +575,11 @@ export function computeNextGmailAliasSuffix(
   familyNextSuffix: number,
   knownEmails: Iterable<string>,
 ): number {
-  return computeNextAccountFamilySuffix(baseEmail, familyNextSuffix, knownEmails);
+  return computeNextAccountFamilySuffix(
+    baseEmail,
+    familyNextSuffix,
+    knownEmails,
+  );
 }
 
 function parseSortableTimestamp(value: string | null | undefined): number {
@@ -533,11 +595,13 @@ export function selectPendingCredentialForFamily(
 ): PendingCredential | null {
   const normalizedBaseEmail = normalizeBaseEmailFamily(baseEmail);
   const normalizedAlias = alias?.trim().toLowerCase() || null;
-  const matches = Object.values(store.pending).filter((entry) => (
-    entry.profile_name === profileName
-    && normalizeBaseEmailFamily(entry.base_email) === normalizedBaseEmail
-    && (!normalizedAlias || (entry.alias?.trim().toLowerCase() || null) === normalizedAlias)
-  ));
+  const matches = Object.values(store.pending).filter(
+    (entry) =>
+      entry.profile_name === profileName &&
+      normalizeBaseEmailFamily(entry.base_email) === normalizedBaseEmail &&
+      (!normalizedAlias ||
+        (entry.alias?.trim().toLowerCase() || null) === normalizedAlias),
+  );
 
   if (matches.length === 0) {
     return null;
@@ -549,13 +613,21 @@ export function selectPendingCredentialForFamily(
     if ((left.suffix || 0) !== (right.suffix || 0)) {
       return (left.suffix || 0) - (right.suffix || 0);
     }
-    const leftStartedAt = parseSortableTimestamp(left.started_at || left.created_at || left.updated_at);
-    const rightStartedAt = parseSortableTimestamp(right.started_at || right.created_at || right.updated_at);
+    const leftStartedAt = parseSortableTimestamp(
+      left.started_at || left.created_at || left.updated_at,
+    );
+    const rightStartedAt = parseSortableTimestamp(
+      right.started_at || right.created_at || right.updated_at,
+    );
     if (leftStartedAt !== rightStartedAt) {
       return leftStartedAt - rightStartedAt;
     }
-    const leftUpdatedAt = parseSortableTimestamp(left.updated_at || left.started_at);
-    const rightUpdatedAt = parseSortableTimestamp(right.updated_at || right.started_at);
+    const leftUpdatedAt = parseSortableTimestamp(
+      left.updated_at || left.started_at,
+    );
+    const rightUpdatedAt = parseSortableTimestamp(
+      right.updated_at || right.started_at,
+    );
     return leftUpdatedAt - rightUpdatedAt;
   });
 
@@ -568,26 +640,36 @@ export function selectPendingBaseEmailHintForProfile(
   alias?: string | null,
 ): string | null {
   const normalizedAlias = alias?.trim().toLowerCase() || null;
-  const matches = Object.values(store.pending).filter((entry) => (
-    entry.profile_name === profileName
-    && (!normalizedAlias || (entry.alias?.trim().toLowerCase() || null) === normalizedAlias)
-  ));
+  const matches = Object.values(store.pending).filter(
+    (entry) =>
+      entry.profile_name === profileName &&
+      (!normalizedAlias ||
+        (entry.alias?.trim().toLowerCase() || null) === normalizedAlias),
+  );
 
   if (matches.length === 0) {
     return null;
   }
 
   matches.sort((left, right) => {
-    const leftStartedAt = parseSortableTimestamp(left.started_at || left.created_at || left.updated_at);
-    const rightStartedAt = parseSortableTimestamp(right.started_at || right.created_at || right.updated_at);
+    const leftStartedAt = parseSortableTimestamp(
+      left.started_at || left.created_at || left.updated_at,
+    );
+    const rightStartedAt = parseSortableTimestamp(
+      right.started_at || right.created_at || right.updated_at,
+    );
     if (leftStartedAt !== rightStartedAt) {
       return leftStartedAt - rightStartedAt;
     }
     if ((left.suffix || 0) !== (right.suffix || 0)) {
       return (left.suffix || 0) - (right.suffix || 0);
     }
-    const leftUpdatedAt = parseSortableTimestamp(left.updated_at || left.started_at);
-    const rightUpdatedAt = parseSortableTimestamp(right.updated_at || right.started_at);
+    const leftUpdatedAt = parseSortableTimestamp(
+      left.updated_at || left.started_at,
+    );
+    const rightUpdatedAt = parseSortableTimestamp(
+      right.updated_at || right.started_at,
+    );
     return leftUpdatedAt - rightUpdatedAt;
   });
 
@@ -612,12 +694,9 @@ export function generatePassword(length = 18): string {
     throw new Error("Generated passwords must be at least 12 characters long.");
   }
 
-  const pick = (source: string): string => source[randomBytes(1)[0]! % source.length]!;
-  const chars = [
-    pick(uppercase),
-    pick(lowercase),
-    pick(digits),
-  ];
+  const pick = (source: string): string =>
+    source[randomBytes(1)[0]! % source.length]!;
+  const chars = [pick(uppercase), pick(lowercase), pick(digits)];
 
   while (chars.length < length) {
     chars.push(pick(alphabet));
@@ -638,7 +717,10 @@ function normalizeEmailCandidate(value: string): string | null {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(trimmed) ? trimmed : null;
 }
 
-function readChromeProfileAccountEmails(userDataDir: string, profileDirectory: string): string[] {
+function readChromeProfileAccountEmails(
+  userDataDir: string,
+  profileDirectory: string,
+): string[] {
   const preferencesPath = join(userDataDir, profileDirectory, "Preferences");
   if (!existsSync(preferencesPath)) {
     return [];
@@ -654,9 +736,15 @@ function readChromeProfileAccountEmails(userDataDir: string, profileDirectory: s
     return [];
   }
 
-  const rawEntries = Array.isArray(parsed.account_info) ? parsed.account_info : [];
+  const rawEntries = Array.isArray(parsed.account_info)
+    ? parsed.account_info
+    : [];
   const emails = rawEntries
-    .map((entry) => (typeof entry?.email === "string" ? normalizeEmailCandidate(entry.email) : null))
+    .map((entry) =>
+      typeof entry?.email === "string"
+        ? normalizeEmailCandidate(entry.email)
+        : null,
+    )
     .filter((value): value is string => Boolean(value));
 
   return [...new Set(emails)];
@@ -681,17 +769,23 @@ function tokenizeManagedProfileName(profileName: string): string[] {
     .filter((token) => token.length > 0);
 }
 
-export function scoreEmailForManagedProfileName(profileName: string, email: string): number {
+export function scoreEmailForManagedProfileName(
+  profileName: string,
+  email: string,
+): number {
   const normalizedEmail = normalizeEmailCandidate(email);
   if (!normalizedEmail) {
     return Number.NEGATIVE_INFINITY;
   }
 
-  const localPart = normalizedEmail.slice(0, normalizedEmail.indexOf("@")).split("+")[0] ?? "";
+  const localPart =
+    normalizedEmail.slice(0, normalizedEmail.indexOf("@")).split("+")[0] ?? "";
   const compactLocal = localPart.replace(/[^a-z0-9]/g, "");
   const localSegments = new Set(localPart.split(/[^a-z0-9]+/).filter(Boolean));
   const tokens = tokenizeManagedProfileName(profileName);
-  const significantTokens = tokens.filter((token) => token.length > 1 || /^\d+$/.test(token));
+  const significantTokens = tokens.filter(
+    (token) => token.length > 1 || /^\d+$/.test(token),
+  );
 
   let score = 0;
   for (const token of significantTokens) {
@@ -713,7 +807,10 @@ export function scoreEmailForManagedProfileName(profileName: string, email: stri
     if (compactLocal.includes(compactProfile)) {
       score += 80;
     } else {
-      const reversedCompactProfile = compactProfile.split("").reverse().join("");
+      const reversedCompactProfile = compactProfile
+        .split("")
+        .reverse()
+        .join("");
       if (compactLocal.includes(reversedCompactProfile)) {
         score += 40;
       }
@@ -740,7 +837,9 @@ export function selectBestEmailForManagedProfile(
     .map((email, index) => ({
       email,
       index,
-      exactPreferred: normalizedPreferred ? email === normalizedPreferred : false,
+      exactPreferred: normalizedPreferred
+        ? email === normalizedPreferred
+        : false,
       score: scoreEmailForManagedProfileName(profileName, email),
     }))
     .sort((left, right) => {
@@ -756,9 +855,15 @@ export function selectBestEmailForManagedProfile(
   return candidates[0]?.email ?? null;
 }
 
-export function selectStoredBaseEmailHint(store: CredentialStore, profileName: string): string | null {
+export function selectStoredBaseEmailHint(
+  store: CredentialStore,
+  profileName: string,
+): string | null {
   const candidates = new Map<string, { count: number; updatedAt: number }>();
-  const remember = (rawEmail: string | null | undefined, updatedAt: string | null | undefined): void => {
+  const remember = (
+    rawEmail: string | null | undefined,
+    updatedAt: string | null | undefined,
+  ): void => {
     if (!rawEmail) return;
     let baseEmail: string;
     try {
@@ -786,12 +891,15 @@ export function selectStoredBaseEmailHint(store: CredentialStore, profileName: s
   }
   for (const pending of Object.values(store.pending)) {
     if (pending.profile_name === profileName) {
-      remember(pending.base_email || pending.email, pending.updated_at || pending.started_at);
+      remember(
+        pending.base_email || pending.email,
+        pending.updated_at || pending.started_at,
+      );
     }
   }
 
-  return [...candidates.entries()]
-    .sort((left, right) => {
+  return (
+    [...candidates.entries()].sort((left, right) => {
       if (left[1].count !== right[1].count) {
         return right[1].count - left[1].count;
       }
@@ -799,7 +907,8 @@ export function selectStoredBaseEmailHint(store: CredentialStore, profileName: s
         return right[1].updatedAt - left[1].updatedAt;
       }
       return left[0].localeCompare(right[0]);
-    })[0]?.[0] ?? null;
+    })[0]?.[0] ?? null
+  );
 }
 
 export function selectBestSystemChromeProfileMatch(
@@ -817,7 +926,11 @@ export function selectBestSystemChromeProfileMatch(
   }
   const candidates = profiles
     .map((profile) => {
-      const matchedEmail = selectBestEmailForManagedProfile(profileName, profile.emails, preferredBaseEmail);
+      const matchedEmail = selectBestEmailForManagedProfile(
+        profileName,
+        profile.emails,
+        preferredBaseEmail,
+      );
       if (!matchedEmail) {
         return null;
       }
@@ -826,9 +939,10 @@ export function selectBestSystemChromeProfileMatch(
         name: profile.name,
         emails: extractSupportedGmailEmails(profile.emails),
         matchedEmail,
-        score: normalizedPreferred && matchedEmail === normalizedPreferred
-          ? 10_000
-          : scoreEmailForManagedProfileName(profileName, matchedEmail),
+        score:
+          normalizedPreferred && matchedEmail === normalizedPreferred
+            ? 10_000
+            : scoreEmailForManagedProfileName(profileName, matchedEmail),
       };
     })
     .filter((value): value is SystemChromeProfileMatch => Boolean(value))
@@ -865,32 +979,47 @@ function isProcessAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return !(error && typeof error === "object" && "code" in error && error.code === "ESRCH");
+    return !(
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ESRCH"
+    );
   }
 }
 
-async function requestFastBrowserDaemonShutdown(socketPath: string): Promise<boolean> {
-  const protocolModuleUrl = pathToFileURL(resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
-    "lib",
-    "daemon",
-    "protocol.mjs",
-  )).href;
+async function requestFastBrowserDaemonShutdown(
+  socketPath: string,
+): Promise<boolean> {
+  const protocolModuleUrl = pathToFileURL(
+    resolve(
+      REPO_ROOT,
+      "..",
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "daemon",
+      "protocol.mjs",
+    ),
+  ).href;
 
   try {
     const { sendDaemonRequest } = await import(protocolModuleUrl);
-    const response = await sendDaemonRequest(socketPath, { method: "shutdown" }, 10_000);
+    const response = await sendDaemonRequest(
+      socketPath,
+      { method: "shutdown" },
+      10_000,
+    );
     return response?.ok === true;
   } catch {
     return false;
   }
 }
 
-function findManagedChromeProcess(profileName: string): { pid: number; port: number | null } | null {
+function findManagedChromeProcess(
+  profileName: string,
+): { pid: number; port: number | null } | null {
   const userDataDir = join(FAST_BROWSER_PROFILES_HOME, profileName);
   const result = spawnSync("ps", ["-Ao", "pid=,command="], {
     encoding: "utf8",
@@ -917,22 +1046,26 @@ function findManagedChromeProcess(profileName: string): { pid: number; port: num
   return null;
 }
 
-async function requestManagedChromeShutdown(profileName: string): Promise<boolean> {
+async function requestManagedChromeShutdown(
+  profileName: string,
+): Promise<boolean> {
   const chrome = findManagedChromeProcess(profileName);
   if (!chrome?.port) {
     return false;
   }
 
-  const chromeModuleUrl = pathToFileURL(resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
-    "lib",
-    "backends",
-    "local-chrome-cdp.mjs",
-  )).href;
+  const chromeModuleUrl = pathToFileURL(
+    resolve(
+      REPO_ROOT,
+      "..",
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "backends",
+      "local-chrome-cdp.mjs",
+    ),
+  ).href;
 
   try {
     const { closeChromeBrowserViaCdp } = await import(chromeModuleUrl);
@@ -955,7 +1088,10 @@ function requestDaemonProcessTermination(pidPath: string): boolean {
   }
 }
 
-async function waitForManagedProfileShutdown(pidPath: string, timeoutMs: number): Promise<boolean> {
+async function waitForManagedProfileShutdown(
+  pidPath: string,
+  timeoutMs: number,
+): Promise<boolean> {
   const pid = readPidIfExists(pidPath);
   if (!pid || !isProcessAlive(pid)) {
     return true;
@@ -972,23 +1108,28 @@ async function waitForManagedProfileShutdown(pidPath: string, timeoutMs: number)
   return !isProcessAlive(pid);
 }
 
-async function resetManagedProfileRuntime(profileName: string, socketPath?: string | null): Promise<void> {
-  const resolvedSocketPath = socketPath?.trim() || join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
+async function resetManagedProfileRuntime(
+  profileName: string,
+  socketPath?: string | null,
+): Promise<void> {
+  const resolvedSocketPath =
+    socketPath?.trim() || join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
   const pidPath = join(FAST_BROWSER_DAEMON_DIR, `${profileName}.pid`);
   const hadSocket = existsSync(resolvedSocketPath);
   const hadPid = Boolean(readPidIfExists(pidPath));
 
   let shutdownAccepted = !hadSocket;
   if (hadSocket) {
-    shutdownAccepted = await requestFastBrowserDaemonShutdown(resolvedSocketPath);
+    shutdownAccepted =
+      await requestFastBrowserDaemonShutdown(resolvedSocketPath);
   }
 
   if (!shutdownAccepted) {
     await requestManagedChromeShutdown(profileName);
     if (!requestDaemonProcessTermination(pidPath) && hadPid) {
       throw new Error(
-        `Managed profile "${profileName}" did not accept a fast-browser shutdown request. `
-        + "Quit the managed browser normally and retry.",
+        `Managed profile "${profileName}" did not accept a fast-browser shutdown request. ` +
+          "Quit the managed browser normally and retry.",
       );
     }
   }
@@ -996,8 +1137,8 @@ async function resetManagedProfileRuntime(profileName: string, socketPath?: stri
   const exitedCleanly = await waitForManagedProfileShutdown(pidPath, 20_000);
   if (!exitedCleanly) {
     throw new Error(
-      `Managed profile "${profileName}" is still running after a normal shutdown request. `
-      + "Quit the managed browser normally and retry.",
+      `Managed profile "${profileName}" is still running after a normal shutdown request. ` +
+        "Quit the managed browser normally and retry.",
     );
   }
 
@@ -1017,8 +1158,8 @@ async function resetManagedProfileRuntime(profileName: string, socketPath?: stri
 function ensureFastBrowserScript(): void {
   if (!existsSync(FAST_BROWSER_SCRIPT)) {
     throw new Error(
-      `fast-browser script not found at ${FAST_BROWSER_SCRIPT}. `
-      + "Set CODEX_ROTATE_FAST_BROWSER_SCRIPT or install the shared fast-browser skill repo next to ai-tools.",
+      `fast-browser script not found at ${FAST_BROWSER_SCRIPT}. ` +
+        "Set CODEX_ROTATE_FAST_BROWSER_SCRIPT or install the shared fast-browser skill repo next to ai-tools.",
     );
   }
 }
@@ -1026,8 +1167,8 @@ function ensureFastBrowserScript(): void {
 function ensureFastBrowserPlaywright(): void {
   if (!existsSync(FAST_BROWSER_PLAYWRIGHT_MODULE)) {
     throw new Error(
-      `Playwright is not installed in ${REPO_ROOT}. `
-      + 'Run "bun install" after adding the playwright dependency before using create/relogin automation.',
+      `Playwright is not installed in ${REPO_ROOT}. ` +
+        'Run "bun install" after adding the playwright dependency before using create/relogin automation.',
     );
   }
 }
@@ -1044,7 +1185,10 @@ function shellSingleQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
-function renderCodexLoginManagedBrowserWrapper(realCodexBin: string, profileName: string): string {
+function renderCodexLoginManagedBrowserWrapper(
+  realCodexBin: string,
+  profileName: string,
+): string {
   return [
     "#!/bin/sh",
     `export FAST_BROWSER_PROFILE=${shellSingleQuote(profileName)}`,
@@ -1054,25 +1198,39 @@ function renderCodexLoginManagedBrowserWrapper(realCodexBin: string, profileName
   ].join("\n");
 }
 
-export function buildCodexLoginManagedBrowserWrapperPath(profileName: string, codexBin: string): string {
-  const profileToken = String(profileName || "default")
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 32) || "default";
+export function buildCodexLoginManagedBrowserWrapperPath(
+  profileName: string,
+  codexBin: string,
+): string {
+  const profileToken =
+    String(profileName || "default")
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 32) || "default";
   const hash = createHash("sha256")
-    .update(`${profileName}\n${codexBin}\n${CODEX_LOGIN_MANAGED_BROWSER_OPENER}`)
+    .update(
+      `${profileName}\n${codexBin}\n${CODEX_LOGIN_MANAGED_BROWSER_OPENER}`,
+    )
     .digest("hex")
     .slice(0, 12);
   return join(ROTATE_HOME, "bin", `codex-login-${profileToken}-${hash}`);
 }
 
-export function ensureCodexLoginManagedBrowserWrapper(profileName: string, codexBin: string): string {
+export function ensureCodexLoginManagedBrowserWrapper(
+  profileName: string,
+  codexBin: string,
+): string {
   ensureCodexLoginManagedBrowserOpener();
   mkdirSync(join(ROTATE_HOME, "bin"), { recursive: true });
-  const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(profileName, codexBin);
+  const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(
+    profileName,
+    codexBin,
+  );
   const content = renderCodexLoginManagedBrowserWrapper(codexBin, profileName);
-  const current = existsSync(wrapperPath) ? readFileSync(wrapperPath, "utf8") : null;
+  const current = existsSync(wrapperPath)
+    ? readFileSync(wrapperPath, "utf8")
+    : null;
   if (current !== content) {
     writeFileSync(wrapperPath, content, { mode: 0o700 });
   }
@@ -1080,18 +1238,25 @@ export function ensureCodexLoginManagedBrowserWrapper(profileName: string, codex
   return wrapperPath;
 }
 
-function runFastBrowserCommandSync(args: string[], options?: { requirePlaywright?: boolean }): SpawnSyncReturns<string> {
+function runFastBrowserCommandSync(
+  args: string[],
+  options?: { requirePlaywright?: boolean },
+): SpawnSyncReturns<string> {
   ensureFastBrowserScript();
   if (options?.requirePlaywright !== false) {
     ensureFastBrowserPlaywright();
   }
 
-  const result = spawnSync(FAST_BROWSER_RUNTIME, [FAST_BROWSER_SCRIPT, ...args], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+  const result = spawnSync(
+    FAST_BROWSER_RUNTIME,
+    [FAST_BROWSER_SCRIPT, ...args],
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  );
 
   if (result.error) {
     throw result.error;
@@ -1101,11 +1266,15 @@ function runFastBrowserCommandSync(args: string[], options?: { requirePlaywright
 }
 
 function parseFastBrowserJson<T>(
-  result: Pick<SpawnSyncReturns<string>, "status" | "stdout"> | FastBrowserCommandResult,
+  result:
+    | Pick<SpawnSyncReturns<string>, "status" | "stdout">
+    | FastBrowserCommandResult,
   actionLabel: string,
 ): T {
   if (typeof result.status === "number" && result.status !== 0) {
-    const summary = result.stdout?.trim() || `${actionLabel} exited with status ${result.status}.`;
+    const summary =
+      result.stdout?.trim() ||
+      `${actionLabel} exited with status ${result.status}.`;
     throw new Error(summary);
   }
 
@@ -1121,14 +1290,20 @@ function buildFastBrowserWorkflowError(
   workflowRef: string,
   response: FastBrowserDaemonRunResponse | null | undefined,
 ): Error {
-  const error = new Error(response?.error?.message || `fast-browser workflow ${workflowRef} failed.`);
+  const error = new Error(
+    response?.error?.message || `fast-browser workflow ${workflowRef} failed.`,
+  );
   if (response?.result && typeof response.result === "object") {
-    (error as Error & { fastBrowserResult?: FastBrowserRunResult }).fastBrowserResult = response.result;
+    (
+      error as Error & { fastBrowserResult?: FastBrowserRunResult }
+    ).fastBrowserResult = response.result;
   }
   return error;
 }
 
-function readFastBrowserResultFromError(error: unknown): FastBrowserRunResult | null {
+function readFastBrowserResultFromError(
+  error: unknown,
+): FastBrowserRunResult | null {
   if (!error || typeof error !== "object") {
     return null;
   }
@@ -1139,7 +1314,27 @@ function readFastBrowserResultFromError(error: unknown): FastBrowserRunResult | 
   return result as FastBrowserRunResult;
 }
 
-function parseFastBrowserProgressEventLine(line: string): FastBrowserProgressEvent | null {
+export function isRetryableCodexLoginWorkflowErrorMessage(
+  message: string,
+): boolean {
+  const normalized = String(message || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /(?:signup|login)-verification-code-missing\b/.test(normalized) ||
+    /(?:signup|login)-verification-submit-stuck:email_verification\b/.test(
+      normalized,
+    )
+  );
+}
+
+function parseFastBrowserProgressEventLine(
+  line: string,
+): FastBrowserProgressEvent | null {
   if (!line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
     return null;
   }
@@ -1154,7 +1349,9 @@ function parseFastBrowserProgressEventLine(line: string): FastBrowserProgressEve
   }
 }
 
-function formatFastBrowserProgressEvent(event: FastBrowserProgressEvent): string | null {
+function formatFastBrowserProgressEvent(
+  event: FastBrowserProgressEvent,
+): string | null {
   if (!event || typeof event !== "object") {
     return null;
   }
@@ -1165,9 +1362,12 @@ function formatFastBrowserProgressEvent(event: FastBrowserProgressEvent): string
   const status = typeof event.status === "string" ? event.status : null;
   const message = typeof event.message === "string" ? event.message : null;
   const time = typeof event.time === "string" ? event.time : null;
-  const details = (event.details && typeof event.details === "object" && !Array.isArray(event.details))
-    ? event.details as Record<string, unknown>
-    : null;
+  const details =
+    event.details &&
+    typeof event.details === "object" &&
+    !Array.isArray(event.details)
+      ? (event.details as Record<string, unknown>)
+      : null;
   if (shouldSuppressFastBrowserProgressEvent(phase, status)) {
     return null;
   }
@@ -1175,21 +1375,35 @@ function formatFastBrowserProgressEvent(event: FastBrowserProgressEvent): string
   const scope = [workflow, stepId].filter(Boolean).join("/");
   const state = formatFastBrowserEventState(phase, status);
   const detailParts: string[] = [];
-  const relayUrl = typeof details?.relay_url === "string" ? details.relay_url : null;
+  const relayUrl =
+    typeof details?.relay_url === "string" ? details.relay_url : null;
   const reason = typeof details?.reason === "string" ? details.reason : null;
-  const workflowStack = Array.isArray(details?.workflow_stack) ? details.workflow_stack : null;
-  const runPath = typeof details?.run_path === "string"
-    ? details.run_path
-    : (typeof details?.run_status_path === "string" ? details.run_status_path : null);
-  const currentUrl = typeof details?.current_url === "string" ? details.current_url : null;
+  const workflowStack = Array.isArray(details?.workflow_stack)
+    ? details.workflow_stack
+    : null;
+  const runPath =
+    typeof details?.run_path === "string"
+      ? details.run_path
+      : typeof details?.run_status_path === "string"
+        ? details.run_status_path
+        : null;
+  const currentUrl =
+    typeof details?.current_url === "string" ? details.current_url : null;
   const stage = typeof details?.stage === "string" ? details.stage : null;
-  const screenshotPath = typeof details?.screenshot_path === "string" ? details.screenshot_path : null;
-  const stepGoal = typeof details?.step_goal === "string" ? details.step_goal : null;
-  const actionKind = typeof details?.action_kind === "string" ? details.action_kind : null;
-  const headline = typeof details?.headline === "string" ? details.headline : null;
+  const screenshotPath =
+    typeof details?.screenshot_path === "string"
+      ? details.screenshot_path
+      : null;
+  const stepGoal =
+    typeof details?.step_goal === "string" ? details.step_goal : null;
+  const actionKind =
+    typeof details?.action_kind === "string" ? details.action_kind : null;
+  const headline =
+    typeof details?.headline === "string" ? details.headline : null;
   if (reason) detailParts.push(`reason=${reason}`);
   if (relayUrl) detailParts.push(`relay_url=${relayUrl}`);
-  if (workflowStack && workflowStack.length > 0) detailParts.push(`workflow_stack=${workflowStack.length}`);
+  if (workflowStack && workflowStack.length > 0)
+    detailParts.push(`workflow_stack=${workflowStack.length}`);
   if (headline) detailParts.push(`headline=${JSON.stringify(headline)}`);
   if (actionKind) detailParts.push(`action=${actionKind}`);
   if (stage) detailParts.push(`stage=${stage}`);
@@ -1200,15 +1414,16 @@ function formatFastBrowserProgressEvent(event: FastBrowserProgressEvent): string
   const primaryText = stepGoal || message;
   const prefix = [scope, state].filter(Boolean).join(" ");
   const suffix = detailParts.length > 0 ? ` (${detailParts.join(", ")})` : "";
-  const core = prefix && primaryText
-    ? `${prefix}: ${primaryText}${suffix}`
-    : primaryText
-      ? `${primaryText}${suffix}`
-      : prefix
-        ? `${prefix}${suffix}`
-        : suffix
-          ? suffix.slice(1, -1)
-          : null;
+  const core =
+    prefix && primaryText
+      ? `${prefix}: ${primaryText}${suffix}`
+      : primaryText
+        ? `${primaryText}${suffix}`
+        : prefix
+          ? `${prefix}${suffix}`
+          : suffix
+            ? suffix.slice(1, -1)
+            : null;
   if (!core) {
     return null;
   }
@@ -1218,16 +1433,24 @@ function formatFastBrowserProgressEvent(event: FastBrowserProgressEvent): string
   return core;
 }
 
-function shouldSuppressFastBrowserProgressEvent(phase: string | null, status: string | null): boolean {
+function shouldSuppressFastBrowserProgressEvent(
+  phase: string | null,
+  status: string | null,
+): boolean {
   const key = [phase || "", status || ""].join(":");
-  return key === "pre:start"
-    || key === "pre:ok"
-    || key === "post:start"
-    || key === "post:ok"
-    || key === "action:start";
+  return (
+    key === "pre:start" ||
+    key === "pre:ok" ||
+    key === "post:start" ||
+    key === "post:ok" ||
+    key === "action:start"
+  );
 }
 
-function formatFastBrowserEventState(phase: string | null, status: string | null): string {
+function formatFastBrowserEventState(
+  phase: string | null,
+  status: string | null,
+): string {
   const key = [phase || "", status || ""].join(":");
   switch (key) {
     case "step:start":
@@ -1268,16 +1491,18 @@ async function runFastBrowserDaemonWorkflow(
   },
 ): Promise<FastBrowserRunResult> {
   ensureFastBrowserPlaywright();
-  const clientModuleUrl = pathToFileURL(resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
-    "lib",
-    "daemon",
-    "client.mjs",
-  )).href;
+  const clientModuleUrl = pathToFileURL(
+    resolve(
+      REPO_ROOT,
+      "..",
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "daemon",
+      "client.mjs",
+    ),
+  ).href;
   const bridgeScript = `
     import { runDaemonWorkflow } from ${JSON.stringify(clientModuleUrl)};
     const response = await runDaemonWorkflow({
@@ -1296,63 +1521,66 @@ async function runFastBrowserDaemonWorkflow(
     });
     console.log(JSON.stringify(response));
   `;
-  const executeBridge = async (): Promise<FastBrowserCommandResult> => await new Promise((resolve, reject) => {
-    const child = spawn("node", ["--input-type=module", "-e", bridgeScript], {
-      cwd: REPO_ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let stderrBuffer = "";
+  const executeBridge = async (): Promise<FastBrowserCommandResult> =>
+    await new Promise((resolve, reject) => {
+      const child = spawn("node", ["--input-type=module", "-e", bridgeScript], {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let stderrBuffer = "";
 
-    const flushStderrLine = (line: string): void => {
-      const progressEvent = parseFastBrowserProgressEventLine(line);
-      if (progressEvent) {
-        emitFastBrowserProgressEvent(progressEvent);
-        return;
-      }
-      stderr += `${line}\n`;
-      process.stderr.write(`${line}\n`);
-    };
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      stderrBuffer += chunk;
-      while (true) {
-        const newlineIndex = stderrBuffer.indexOf("\n");
-        if (newlineIndex === -1) {
-          break;
+      const flushStderrLine = (line: string): void => {
+        const progressEvent = parseFastBrowserProgressEventLine(line);
+        if (progressEvent) {
+          emitFastBrowserProgressEvent(progressEvent);
+          return;
         }
-        const line = stderrBuffer.slice(0, newlineIndex);
-        stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
-        if (line.trim()) {
-          flushStderrLine(line);
-        }
-      }
-    });
+        stderr += `${line}\n`;
+        process.stderr.write(`${line}\n`);
+      };
 
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (stderrBuffer.trim()) {
-        flushStderrLine(stderrBuffer.trimEnd());
-      }
-      resolve({
-        status: code,
-        signal,
-        stdout,
-        stderr,
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderrBuffer += chunk;
+        while (true) {
+          const newlineIndex = stderrBuffer.indexOf("\n");
+          if (newlineIndex === -1) {
+            break;
+          }
+          const line = stderrBuffer.slice(0, newlineIndex);
+          stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
+          if (line.trim()) {
+            flushStderrLine(line);
+          }
+        }
+      });
+
+      child.once("error", reject);
+      child.once("close", (code, signal) => {
+        if (stderrBuffer.trim()) {
+          flushStderrLine(stderrBuffer.trimEnd());
+        }
+        resolve({
+          status: code,
+          signal,
+          stdout,
+          stderr,
+        });
       });
     });
-  });
 
   let result = await executeBridge();
   if (typeof result.status === "number" && result.status !== 0) {
-    const combinedOutput = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    const combinedOutput = [result.stdout, result.stderr]
+      .filter(Boolean)
+      .join("\n");
     if (await resetStuckFastBrowserDaemon(profileName, combinedOutput)) {
       result = await executeBridge();
     }
@@ -1368,14 +1596,21 @@ async function runFastBrowserDaemonWorkflow(
 
   if (response.result.status === "paused") {
     const reason = response.result.pause?.reason ?? "pause";
-    const relay = response.result.pause?.relay_url ? ` Open ${response.result.pause.relay_url} to continue the workflow.` : "";
-    throw new Error(`fast-browser workflow ${workflowRef} paused for ${reason}.${relay}`);
+    const relay = response.result.pause?.relay_url
+      ? ` Open ${response.result.pause.relay_url} to continue the workflow.`
+      : "";
+    throw new Error(
+      `fast-browser workflow ${workflowRef} paused for ${reason}.${relay}`,
+    );
   }
 
   return response.result;
 }
 
-async function resetStuckFastBrowserDaemon(profileName: string, output: string | null | undefined): Promise<boolean> {
+async function resetStuckFastBrowserDaemon(
+  profileName: string,
+  output: string | null | undefined,
+): Promise<boolean> {
   const match = output?.match(FAST_BROWSER_DAEMON_TIMEOUT_PATTERN);
   if (!match) {
     return false;
@@ -1387,12 +1622,16 @@ async function resetStuckFastBrowserDaemon(profileName: string, output: string |
 
 export function inspectManagedProfiles(): ManagedProfilesInspection {
   return parseFastBrowserJson<ManagedProfilesInspection>(
-    runFastBrowserCommandSync(["inspect-profiles"], { requirePlaywright: false }),
+    runFastBrowserCommandSync(["inspect-profiles"], {
+      requirePlaywright: false,
+    }),
     "fast-browser inspect-profiles",
   );
 }
 
-function normalizeWorkflowScalar(rawValue: string | null | undefined): string | null {
+function normalizeWorkflowScalar(
+  rawValue: string | null | undefined,
+): string | null {
   const trimmed = rawValue?.trim();
   if (!trimmed) return null;
 
@@ -1401,14 +1640,16 @@ function normalizeWorkflowScalar(rawValue: string | null | undefined): string | 
 
   const first = withoutComment[0];
   const last = withoutComment[withoutComment.length - 1];
-  if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
     return withoutComment.slice(1, -1).trim() || null;
   }
 
   return withoutComment;
 }
 
-function parseWorkflowYamlDocument(raw: string): Record<string, unknown> | null {
+function parseWorkflowYamlDocument(
+  raw: string,
+): Record<string, unknown> | null {
   const rubyScript = `
 require "json"
 require "yaml"
@@ -1432,28 +1673,46 @@ puts JSON.generate(data)
   try {
     const parsed = JSON.parse(result.stdout);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
+      ? (parsed as Record<string, unknown>)
       : null;
   } catch {
     return null;
   }
 }
 
-export function parseWorkflowFileMetadata(raw: string): Omit<WorkflowFileMetadata, "filePath"> {
+export function parseWorkflowFileMetadata(
+  raw: string,
+): Omit<WorkflowFileMetadata, "filePath"> {
   const parsed = parseWorkflowYamlDocument(raw);
-  const document = parsed?.document && typeof parsed.document === "object" && !Array.isArray(parsed.document)
-    ? parsed.document as Record<string, unknown>
-    : null;
-  const metadata = document?.metadata && typeof document.metadata === "object" && !Array.isArray(document.metadata)
-    ? document.metadata as Record<string, unknown>
-    : null;
+  const document =
+    parsed?.document &&
+    typeof parsed.document === "object" &&
+    !Array.isArray(parsed.document)
+      ? (parsed.document as Record<string, unknown>)
+      : null;
+  const metadata =
+    document?.metadata &&
+    typeof document.metadata === "object" &&
+    !Array.isArray(document.metadata)
+      ? (document.metadata as Record<string, unknown>)
+      : null;
   return {
-    preferredProfileName: normalizeWorkflowScalar(typeof metadata?.preferredProfile === "string" ? metadata.preferredProfile : null),
-    preferredEmail: normalizeWorkflowScalar(typeof metadata?.preferredEmail === "string" ? metadata.preferredEmail : null),
+    preferredProfileName: normalizeWorkflowScalar(
+      typeof metadata?.preferredProfile === "string"
+        ? metadata.preferredProfile
+        : null,
+    ),
+    preferredEmail: normalizeWorkflowScalar(
+      typeof metadata?.preferredEmail === "string"
+        ? metadata.preferredEmail
+        : null,
+    ),
   };
 }
 
-export function readWorkflowFileMetadata(filePath: string): WorkflowFileMetadata {
+export function readWorkflowFileMetadata(
+  filePath: string,
+): WorkflowFileMetadata {
   if (!existsSync(filePath)) {
     throw new Error(`Workflow file was not found at ${filePath}.`);
   }
@@ -1479,7 +1738,9 @@ export function resolveManagedProfileNameFromCandidates(
   const requestedProfile = options?.requestedProfileName?.trim();
   if (requestedProfile) {
     if (!availableProfileNames.has(requestedProfile)) {
-      throw new Error(`Managed fast-browser profile "${requestedProfile}" was not found.`);
+      throw new Error(
+        `Managed fast-browser profile "${requestedProfile}" was not found.`,
+      );
     }
     return requestedProfile;
   }
@@ -1487,8 +1748,12 @@ export function resolveManagedProfileNameFromCandidates(
   const preferredProfile = options?.preferredProfileName?.trim();
   if (preferredProfile) {
     if (!availableProfileNames.has(preferredProfile)) {
-      const source = options?.preferredProfileSource ? ` from ${options.preferredProfileSource}` : "";
-      throw new Error(`Managed fast-browser profile "${preferredProfile}"${source} was not found.`);
+      const source = options?.preferredProfileSource
+        ? ` from ${options.preferredProfileSource}`
+        : "";
+      throw new Error(
+        `Managed fast-browser profile "${preferredProfile}"${source} was not found.`,
+      );
     }
     return preferredProfile;
   }
@@ -1506,13 +1771,11 @@ export function resolveManagedProfileNameFromCandidates(
   throw new Error("No managed fast-browser profiles are configured.");
 }
 
-export function resolveManagedProfileName(
-  options?: {
-    requestedProfileName?: string;
-    preferredProfileName?: string | null;
-    preferredProfileSource?: string | null;
-  },
-): string {
+export function resolveManagedProfileName(options?: {
+  requestedProfileName?: string;
+  preferredProfileName?: string | null;
+  preferredProfileSource?: string | null;
+}): string {
   const inspection = inspectManagedProfiles();
   return resolveManagedProfileNameFromCandidates(
     inspection.managedProfiles.profiles.map((profile) => profile.name),
@@ -1538,7 +1801,9 @@ export function resolveCreateBaseEmail(
   return normalizeBaseEmailFamily("dev.{N}@astronlab.com");
 }
 
-export function shouldUseDefaultCreateFamilyHint(baseEmail: string | null | undefined): boolean {
+export function shouldUseDefaultCreateFamilyHint(
+  baseEmail: string | null | undefined,
+): boolean {
   if (!baseEmail) {
     return false;
   }
@@ -1558,7 +1823,7 @@ async function runCodexBrowserLoginWorkflow(
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
-    },
+  },
 ): Promise<FastBrowserRunResult> {
   const codexBin = ensureCodexLoginManagedBrowserWrapper(
     profileName,
@@ -1569,22 +1834,39 @@ async function runCodexBrowserLoginWorkflow(
     {
       mode: "codex_login",
       codex_bin: codexBin,
-      ...(options?.codexSession?.auth_url ? { auth_url: options.codexSession.auth_url } : {}),
-      ...(options?.codexSession?.callback_url ? { callback_url: options.codexSession.callback_url } : {}),
-      ...(options?.codexSession?.callback_port !== undefined && options.codexSession.callback_port !== null
+      ...(options?.codexSession?.auth_url
+        ? { auth_url: options.codexSession.auth_url }
+        : {}),
+      ...(options?.codexSession?.callback_url
+        ? { callback_url: options.codexSession.callback_url }
+        : {}),
+      ...(options?.codexSession?.callback_port !== undefined &&
+      options.codexSession.callback_port !== null
         ? { callback_port: String(options.codexSession.callback_port) }
         : {}),
-      ...(options?.codexSession?.device_code ? { device_code: options.codexSession.device_code } : {}),
-      ...(options?.codexSession?.session_dir ? { codex_session_dir: options.codexSession.session_dir } : {}),
-      ...(options?.codexSession?.pid !== undefined && options.codexSession.pid !== null
+      ...(options?.codexSession?.device_code
+        ? { device_code: options.codexSession.device_code }
+        : {}),
+      ...(options?.codexSession?.session_dir
+        ? { codex_session_dir: options.codexSession.session_dir }
+        : {}),
+      ...(options?.codexSession?.pid !== undefined &&
+      options.codexSession.pid !== null
         ? { codex_login_pid: String(options.codexSession.pid) }
         : {}),
-      ...(options?.codexSession?.stdout_path ? { codex_login_stdout_path: options.codexSession.stdout_path } : {}),
-      ...(options?.codexSession?.stderr_path ? { codex_login_stderr_path: options.codexSession.stderr_path } : {}),
-      ...(options?.codexSession?.exit_path ? { codex_login_exit_path: options.codexSession.exit_path } : {}),
+      ...(options?.codexSession?.stdout_path
+        ? { codex_login_stdout_path: options.codexSession.stdout_path }
+        : {}),
+      ...(options?.codexSession?.stderr_path
+        ? { codex_login_stderr_path: options.codexSession.stderr_path }
+        : {}),
+      ...(options?.codexSession?.exit_path
+        ? { codex_login_exit_path: options.codexSession.exit_path }
+        : {}),
       email,
       account_secret: accountSecretRef,
-      prefer_signup_recovery: options?.preferSignupRecovery === true ? "true" : "false",
+      prefer_signup_recovery:
+        options?.preferSignupRecovery === true ? "true" : "false",
       birth_month: String(options?.birthMonth ?? 1),
       birth_day: String(options?.birthDay ?? 1),
       birth_year: String(options?.birthYear ?? 1990),
@@ -1616,7 +1898,9 @@ export async function completeCodexLoginViaWorkflow(
     restoreState?: (() => void) | null;
   },
 ): Promise<CodexRotateAuthFlowSummary> {
-  const { ensureDaemonSecretStoreReadyInteractive } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  const { ensureDaemonSecretStoreReadyInteractive } = await import(
+    FAST_BROWSER_DAEMON_CLIENT_MODULE
+  );
   await ensureDaemonSecretStoreReadyInteractive({
     profileName,
     store: "bitwarden-cli",
@@ -1625,17 +1909,20 @@ export async function completeCodexLoginViaWorkflow(
 
   const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 6));
   const maxReplayPasses = Math.max(1, Number(options?.maxReplayPasses ?? 5));
-  const retryDelaysMs = Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
-    ? options.retryDelaysMs
-    : [30_000, 60_000, 120_000, 240_000, 300_000];
+  const retryDelaysMs =
+    Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
+      ? options.retryDelaysMs
+      : [30_000, 60_000, 120_000, 240_000, 300_000];
   const note = typeof options?.onNote === "function" ? options.onNote : null;
-  const restoreState = typeof options?.restoreState === "function" ? options.restoreState : null;
+  const restoreState =
+    typeof options?.restoreState === "function" ? options.restoreState : null;
   let allowSignupRecovery = options?.preferSignupRecovery === true;
   let codexSession: CodexRotateAuthFlowSession | null = null;
 
-  const sleep = async (milliseconds: number) => await new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
+  const sleep = async (milliseconds: number) =>
+    await new Promise((resolve) => {
+      setTimeout(resolve, milliseconds);
+    });
 
   try {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -1646,7 +1933,11 @@ export async function completeCodexLoginViaWorkflow(
             : `Retrying Codex login in managed profile "${profileName}" (attempt ${attempt}/${maxAttempts}).`,
         );
 
-        for (let replayPass = 1; replayPass <= maxReplayPasses; replayPass += 1) {
+        for (
+          let replayPass = 1;
+          replayPass <= maxReplayPasses;
+          replayPass += 1
+        ) {
           const loginWorkflowRunStamp = options?.workflowRunStamp
             ? `${options.workflowRunStamp}-codex-login-${attempt}-${replayPass}`
             : undefined;
@@ -1665,32 +1956,48 @@ export async function completeCodexLoginViaWorkflow(
             },
           );
           const flow = readCodexRotateAuthFlowSummary(loginResult);
-          codexSession = readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
+          codexSession =
+            readCodexRotateAuthFlowSession(loginResult) ?? codexSession;
           const callbackComplete = flow.callback_complete === true;
           const success = flow.success === true;
-          const currentUrl = typeof flow.current_url === "string" ? flow.current_url : null;
-          const nextAction = typeof flow.next_action === "string" ? flow.next_action : null;
-          const replayReason = typeof flow.replay_reason === "string" ? flow.replay_reason : null;
-          const retryReason = typeof flow.retry_reason === "string" ? flow.retry_reason : null;
-          const errorMessage = typeof flow.error_message === "string" && flow.error_message.trim()
-            ? flow.error_message.trim()
-            : null;
+          const currentUrl =
+            typeof flow.current_url === "string" ? flow.current_url : null;
+          const nextAction =
+            typeof flow.next_action === "string" ? flow.next_action : null;
+          const replayReason =
+            typeof flow.replay_reason === "string" ? flow.replay_reason : null;
+          const retryReason =
+            typeof flow.retry_reason === "string" ? flow.retry_reason : null;
+          const errorMessage =
+            typeof flow.error_message === "string" && flow.error_message.trim()
+              ? flow.error_message.trim()
+              : null;
           const sawOauthConsent = flow.saw_oauth_consent === true;
           const existingAccountPrompt = flow.existing_account_prompt === true;
 
-          if (sawOauthConsent || existingAccountPrompt || (replayReason && replayReason !== "auth_prompt")) {
+          if (
+            sawOauthConsent ||
+            existingAccountPrompt ||
+            (replayReason && replayReason !== "auth_prompt")
+          ) {
             allowSignupRecovery = false;
           }
           if (nextAction === "fail_invalid_credentials") {
-            throw new Error(errorMessage ?? `OpenAI rejected the stored password for ${email}.`);
+            throw new Error(
+              errorMessage ??
+                `OpenAI rejected the stored password for ${email}.`,
+            );
           }
-          if (nextAction === "replay_auth_url" && replayPass < maxReplayPasses) {
+          if (
+            nextAction === "replay_auth_url" &&
+            replayPass < maxReplayPasses
+          ) {
             const replayReasonLabel = replayReason
               ? replayReason.replace(/_/g, " ")
               : "the next auth step";
             note?.(
-              `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-              + `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${maxReplayPasses}).`,
+              `OpenAI still needs ${replayReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. ` +
+                `Replaying the workflow-owned Codex auth session in managed profile "${profileName}" (${replayPass + 1}/${maxReplayPasses}).`,
             );
             await sleep(1000);
             continue;
@@ -1698,7 +2005,10 @@ export async function completeCodexLoginViaWorkflow(
           if (nextAction === "retry_attempt") {
             restoreState?.();
             if (attempt < maxAttempts) {
-              const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
+              const delayMs =
+                retryDelaysMs[
+                  Math.min(attempt - 1, retryDelaysMs.length - 1)
+                ] ?? 30_000;
               const retryReasonLabel = retryReason
                 ? retryReason.replace(/_/g, " ")
                 : "needs another retry";
@@ -1706,25 +2016,28 @@ export async function completeCodexLoginViaWorkflow(
                 codexSession = null;
               }
               note?.(
-                `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. `
-                + `${retryReason === "retryable_timeout" ? "Starting a fresh Codex auth session. " : ""}`
-                + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
+                `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. ` +
+                  `${retryReason === "retryable_timeout" ? "Starting a fresh Codex auth session. " : ""}` +
+                  `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
               );
               await sleep(delayMs);
               break;
             }
-            throw new Error(errorMessage ?? `OpenAI could not complete the Codex login for ${email}.`);
+            throw new Error(
+              errorMessage ??
+                `OpenAI could not complete the Codex login for ${email}.`,
+            );
           }
           if (!callbackComplete && !success) {
             throw new Error(
-              errorMessage
-              ?? `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
+              errorMessage ??
+                `Codex browser login did not reach the callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
             );
           }
           if (flow.codex_login_exit_ok === false) {
             throw new Error(
-              `"codex login" did not exit cleanly for ${email}.`
-              + `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
+              `"codex login" did not exit cleanly for ${email}.` +
+                `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
             );
           }
           return flow;
@@ -1733,15 +2046,34 @@ export async function completeCodexLoginViaWorkflow(
         restoreState?.();
         const failedResult = readFastBrowserResultFromError(error);
         if (failedResult) {
-          codexSession = readCodexRotateAuthFlowSession(failedResult) ?? codexSession;
+          codexSession =
+            readCodexRotateAuthFlowSession(failedResult) ?? codexSession;
         }
         const message = error instanceof Error ? error.message : String(error);
-        const deviceAuthRateLimited = /device code request failed with status 429|device auth failed with status 429|codex-login-exited-before-auth-url:.*429 Too Many Requests|429 Too Many Requests/i.test(message);
-        if (deviceAuthRateLimited && attempt < maxAttempts) {
-          const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ?? 30_000;
+        const verificationArtifactPending =
+          isRetryableCodexLoginWorkflowErrorMessage(message);
+        const deviceAuthRateLimited =
+          /device code request failed with status 429|device auth failed with status 429|codex-login-exited-before-auth-url:.*429 Too Many Requests|429 Too Many Requests/i.test(
+            message,
+          );
+        if (verificationArtifactPending && attempt < maxAttempts) {
+          const delayMs =
+            retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ??
+            30_000;
           note?.(
-            `Codex device authorization is rate limited for ${email}. `
-            + `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
+            `OpenAI verification is not ready for ${email}. ` +
+              `Waiting ${Math.round(delayMs / 1000)}s before retrying the same managed-profile flow.`,
+          );
+          await sleep(delayMs);
+          continue;
+        }
+        if (deviceAuthRateLimited && attempt < maxAttempts) {
+          const delayMs =
+            retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ??
+            30_000;
+          note?.(
+            `Codex device authorization is rate limited for ${email}. ` +
+              `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
           );
           await sleep(delayMs);
           continue;
@@ -1751,7 +2083,9 @@ export async function completeCodexLoginViaWorkflow(
     }
 
     restoreState?.();
-    throw new Error(`Codex browser login exhausted all retry attempts for ${email}.`);
+    throw new Error(
+      `Codex browser login exhausted all retry attempts for ${email}.`,
+    );
   } finally {
     if (codexSession) {
       cancelCodexBrowserLoginSession(codexSession);
@@ -1759,16 +2093,20 @@ export async function completeCodexLoginViaWorkflow(
   }
 }
 
-function normalizeCredentialRecordMap(raw: unknown): Record<string, StoredCredential> {
+function normalizeCredentialRecordMap(
+  raw: unknown,
+): Record<string, StoredCredential> {
   if (!isRecord(raw)) {
     return {};
   }
   const entries = Object.entries(raw)
     .map(([email, value]) => {
       const normalized = normalizeCredentialRecord(value);
-      return normalized ? [email, normalized] as const : null;
+      return normalized ? ([email, normalized] as const) : null;
     })
-    .filter((entry): entry is readonly [string, StoredCredential] => Boolean(entry));
+    .filter((entry): entry is readonly [string, StoredCredential] =>
+      Boolean(entry),
+    );
   return Object.fromEntries(entries);
 }
 
@@ -1777,10 +2115,13 @@ function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
     return null;
   }
   const normalized = { ...raw } as Record<string, unknown>;
-  const secretRef = normalizeCodexRotateSecretRef(normalized.account_secret_ref);
-  const legacyPassword = typeof normalized.password === "string" && normalized.password.length > 0
-    ? normalized.password
-    : null;
+  const secretRef = normalizeCodexRotateSecretRef(
+    normalized.account_secret_ref,
+  );
+  const legacyPassword =
+    typeof normalized.password === "string" && normalized.password.length > 0
+      ? normalized.password
+      : null;
   delete normalized.password;
   return {
     ...(normalized as unknown as StoredCredential),
@@ -1789,18 +2130,28 @@ function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
   };
 }
 
-function serializeCredentialRecordMap(raw: Record<string, StoredCredential>): Record<string, StoredCredential> {
+function serializeCredentialRecordMap(
+  raw: Record<string, StoredCredential>,
+): Record<string, StoredCredential> {
   return Object.fromEntries(
-    Object.entries(raw).map(([email, value]) => [email, serializeCredentialRecord(value)]),
+    Object.entries(raw).map(([email, value]) => [
+      email,
+      serializeCredentialRecord(value),
+    ]),
   );
 }
 
-export function serializeCredentialStore(store: CredentialStore): CredentialStore {
+export function serializeCredentialStore(
+  store: CredentialStore,
+): CredentialStore {
   return {
     version: 2,
     families: store.families,
     accounts: serializeCredentialRecordMap(store.accounts),
-    pending: serializeCredentialRecordMap(store.pending) as Record<string, PendingCredential>,
+    pending: serializeCredentialRecordMap(store.pending) as Record<
+      string,
+      PendingCredential
+    >,
   };
 }
 
@@ -1824,28 +2175,40 @@ function serializeCredentialRecord(raw: StoredCredential): StoredCredential {
   if (typeof raw.birth_year === "number") {
     serialized.birth_year = raw.birth_year;
   }
-  if ("started_at" in raw && typeof (raw as PendingCredential).started_at === "string") {
+  if (
+    "started_at" in raw &&
+    typeof (raw as PendingCredential).started_at === "string"
+  ) {
     serialized.started_at = (raw as PendingCredential).started_at;
   }
   const secretRef = normalizeCodexRotateSecretRef(raw.account_secret_ref);
   if (secretRef) {
     serialized.account_secret_ref = secretRef;
-  } else if (typeof raw.legacy_password === "string" && raw.legacy_password.length > 0) {
+  } else if (
+    typeof raw.legacy_password === "string" &&
+    raw.legacy_password.length > 0
+  ) {
     serialized.password = raw.legacy_password;
   }
   return serialized as unknown as StoredCredential;
 }
 
-function normalizeCodexRotateSecretRef(raw: unknown): CodexRotateSecretRef | null {
+function normalizeCodexRotateSecretRef(
+  raw: unknown,
+): CodexRotateSecretRef | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
   }
   const record = raw as Record<string, unknown>;
-  const objectId = typeof record.object_id === "string" ? record.object_id.trim() : "";
+  const objectId =
+    typeof record.object_id === "string" ? record.object_id.trim() : "";
   if (!objectId) {
     return null;
   }
-  const store = typeof record.store === "string" && record.store.trim() ? record.store.trim() : "bitwarden-cli";
+  const store =
+    typeof record.store === "string" && record.store.trim()
+      ? record.store.trim()
+      : "bitwarden-cli";
   if (store !== "bitwarden-cli") {
     return null;
   }
@@ -1857,13 +2220,16 @@ function normalizeCodexRotateSecretRef(raw: unknown): CodexRotateSecretRef | nul
     type: "secret_ref",
     store: "bitwarden-cli",
     object_id: objectId,
-    field_path: typeof record.field_path === "string" ? record.field_path : null,
+    field_path:
+      typeof record.field_path === "string" ? record.field_path : null,
     version: typeof record.version === "string" ? record.version : null,
   };
 }
 
 function buildCodexRotateAccountSecretName(email: string): string {
-  return `codex-rotate/openai/${String(email || "").trim().toLowerCase()}`;
+  return `codex-rotate/openai/${String(email || "")
+    .trim()
+    .toLowerCase()}`;
 }
 
 function readWorkflowActionString(
@@ -1876,9 +2242,7 @@ function readWorkflowActionString(
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-function readWorkflowOutputRecord<T>(
-  result: FastBrowserRunResult,
-): T | null {
+function readWorkflowOutputRecord<T>(result: FastBrowserRunResult): T | null {
   const value = result.output;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1886,46 +2250,90 @@ function readWorkflowOutputRecord<T>(
   return value as T;
 }
 
-function readCodexRotateAuthFlowSummary(result: FastBrowserRunResult): CodexRotateAuthFlowSummary {
+function readCodexRotateAuthFlowSummary(
+  result: FastBrowserRunResult,
+): CodexRotateAuthFlowSummary {
   return readWorkflowOutputRecord<CodexRotateAuthFlowSummary>(result) ?? {};
 }
 
-function normalizeCodexRotateAuthFlowSession(raw: unknown): CodexRotateAuthFlowSession | null {
+function normalizeCodexRotateAuthFlowSession(
+  raw: unknown,
+): CodexRotateAuthFlowSession | null {
   if (!isRecord(raw)) {
     return null;
   }
   const callbackPort = raw.callback_port;
   const pid = raw.pid;
   const session: CodexRotateAuthFlowSession = {
-    auth_url: typeof raw.auth_url === "string" && raw.auth_url.trim() ? raw.auth_url.trim() : null,
-    callback_url: typeof raw.callback_url === "string" && raw.callback_url.trim() ? raw.callback_url.trim() : null,
-    callback_port: typeof callbackPort === "number"
-      ? callbackPort
-      : (typeof callbackPort === "string" && callbackPort.trim() ? Number.parseInt(callbackPort, 10) : null),
-    device_code: typeof raw.device_code === "string" && raw.device_code.trim() ? raw.device_code.trim() : null,
-    session_dir: typeof raw.session_dir === "string" && raw.session_dir.trim() ? raw.session_dir.trim() : null,
-    pid: typeof pid === "number"
-      ? pid
-      : (typeof pid === "string" && pid.trim() ? Number.parseInt(pid, 10) : null),
-    stdout_path: typeof raw.stdout_path === "string" && raw.stdout_path.trim() ? raw.stdout_path.trim() : null,
-    stderr_path: typeof raw.stderr_path === "string" && raw.stderr_path.trim() ? raw.stderr_path.trim() : null,
-    exit_path: typeof raw.exit_path === "string" && raw.exit_path.trim() ? raw.exit_path.trim() : null,
+    auth_url:
+      typeof raw.auth_url === "string" && raw.auth_url.trim()
+        ? raw.auth_url.trim()
+        : null,
+    callback_url:
+      typeof raw.callback_url === "string" && raw.callback_url.trim()
+        ? raw.callback_url.trim()
+        : null,
+    callback_port:
+      typeof callbackPort === "number"
+        ? callbackPort
+        : typeof callbackPort === "string" && callbackPort.trim()
+          ? Number.parseInt(callbackPort, 10)
+          : null,
+    device_code:
+      typeof raw.device_code === "string" && raw.device_code.trim()
+        ? raw.device_code.trim()
+        : null,
+    session_dir:
+      typeof raw.session_dir === "string" && raw.session_dir.trim()
+        ? raw.session_dir.trim()
+        : null,
+    pid:
+      typeof pid === "number"
+        ? pid
+        : typeof pid === "string" && pid.trim()
+          ? Number.parseInt(pid, 10)
+          : null,
+    stdout_path:
+      typeof raw.stdout_path === "string" && raw.stdout_path.trim()
+        ? raw.stdout_path.trim()
+        : null,
+    stderr_path:
+      typeof raw.stderr_path === "string" && raw.stderr_path.trim()
+        ? raw.stderr_path.trim()
+        : null,
+    exit_path:
+      typeof raw.exit_path === "string" && raw.exit_path.trim()
+        ? raw.exit_path.trim()
+        : null,
   };
-  if (!session.auth_url && !session.session_dir && !session.stdout_path && !session.stderr_path && !session.exit_path) {
+  if (
+    !session.auth_url &&
+    !session.session_dir &&
+    !session.stdout_path &&
+    !session.stderr_path &&
+    !session.exit_path
+  ) {
     return null;
   }
   return session;
 }
 
-function readCodexRotateAuthFlowSession(result: FastBrowserRunResult): CodexRotateAuthFlowSession | null {
+function readCodexRotateAuthFlowSession(
+  result: FastBrowserRunResult,
+): CodexRotateAuthFlowSession | null {
   const summary = readCodexRotateAuthFlowSummary(result);
-  const summarySession = normalizeCodexRotateAuthFlowSession(summary.codex_session);
+  const summarySession = normalizeCodexRotateAuthFlowSession(
+    summary.codex_session,
+  );
   if (summarySession) {
     return summarySession;
   }
-  const startStepAction = result.state?.steps?.start_codex_login_session?.action;
+  const startStepAction =
+    result.state?.steps?.start_codex_login_session?.action;
   if (isRecord(startStepAction)) {
-    return normalizeCodexRotateAuthFlowSession(startStepAction.value ?? startStepAction);
+    return normalizeCodexRotateAuthFlowSession(
+      startStepAction.value ?? startStepAction,
+    );
   }
   return null;
 }
@@ -1934,7 +2342,9 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function cancelCodexBrowserLoginSession(session: CodexRotateAuthFlowSession | null | undefined): void {
+function cancelCodexBrowserLoginSession(
+  session: CodexRotateAuthFlowSession | null | undefined,
+): void {
   const pid = Number(session?.pid || 0);
   if (!Number.isInteger(pid) || pid <= 1) {
     return;

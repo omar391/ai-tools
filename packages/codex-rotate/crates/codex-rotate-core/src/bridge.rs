@@ -37,7 +37,7 @@ where
         .current_dir(&paths.repo_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| {
             format!(
@@ -56,31 +56,33 @@ where
     }
 
     let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let response = serde_json::from_slice::<BridgeResponse<TResult>>(&output.stdout).ok();
+    if let Some(response) = response {
+        if response.ok && output.status.success() {
+            return response
+                .result
+                .ok_or_else(|| anyhow!("Automation bridge returned no result for {command}."));
+        }
+
+        return Err(anyhow!(
+            "{}",
+            response
+                .error
+                .and_then(|error| error.message)
+                .unwrap_or_else(|| format!("Automation bridge command {command} failed."))
+        ));
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Err(anyhow!(if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
+        return Err(anyhow!(if !stdout.is_empty() {
             stdout
         } else {
             format!("Automation bridge command {command} failed.")
         }));
     }
 
-    let response: BridgeResponse<TResult> = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("Automation bridge returned invalid JSON for {command}."))?;
-    if response.ok {
-        response
-            .result
-            .ok_or_else(|| anyhow!("Automation bridge returned no result for {command}."))
-    } else {
-        Err(anyhow!(
-            "{}",
-            response
-                .error
-                .and_then(|error| error.message)
-                .unwrap_or_else(|| format!("Automation bridge command {command} failed."))
-        ))
-    }
+    Err(anyhow!(
+        "Automation bridge returned invalid JSON for {command}."
+    ))
 }

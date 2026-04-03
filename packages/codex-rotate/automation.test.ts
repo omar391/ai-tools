@@ -7,6 +7,7 @@ import {
   buildCodexRotateOpenAiTempProfileName,
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
+  isRetryableCodexLoginWorkflowErrorMessage,
   normalizeBaseEmailFamily,
   normalizeCredentialStore,
   normalizeGmailBaseEmail,
@@ -35,7 +36,9 @@ function makeSecretRef(objectId: string) {
 
 describe("gmail alias helpers", () => {
   test("normalizes the Gmail base address before suffixing", () => {
-    expect(normalizeGmailBaseEmail("Dev.User+17@gmail.com")).toBe("dev.user@gmail.com");
+    expect(normalizeGmailBaseEmail("Dev.User+17@gmail.com")).toBe(
+      "dev.user@gmail.com",
+    );
   });
 
   test("picks the next alias suffix from known emails", () => {
@@ -60,11 +63,15 @@ describe("gmail alias helpers", () => {
 
 describe("templated email family helpers", () => {
   test("normalizes a templated family address", () => {
-    expect(normalizeBaseEmailFamily("Dev.{N}@HotspotPrime.com")).toBe("dev.{n}@hotspotprime.com");
+    expect(normalizeBaseEmailFamily("Dev.{N}@HotspotPrime.com")).toBe(
+      "dev.{n}@hotspotprime.com",
+    );
   });
 
   test("builds a concrete email from a templated family", () => {
-    expect(buildAccountFamilyEmail("dev.{N}@hotspotprime.com", 7)).toBe("dev.7@hotspotprime.com");
+    expect(buildAccountFamilyEmail("dev.{N}@hotspotprime.com", 7)).toBe(
+      "dev.7@hotspotprime.com",
+    );
   });
 
   test("picks the next suffix from templated family emails", () => {
@@ -97,13 +104,17 @@ describe("workflow metadata", () => {
 
 describe("temporary profile naming", () => {
   test("derives the same retained OpenAI temp profile for the same workflow run stamp", () => {
-    expect(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"))
-      .toBe(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"));
+    expect(
+      buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"),
+    ).toBe(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"));
   });
 
   test("changes the retained OpenAI temp profile when the workflow run stamp changes", () => {
-    expect(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"))
-      .not.toBe(buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:13.000Z"));
+    expect(
+      buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"),
+    ).not.toBe(
+      buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:13.000Z"),
+    );
   });
 });
 
@@ -118,6 +129,34 @@ describe("codex login managed-browser wrapper", () => {
     expect(buildCodexLoginManagedBrowserWrapperPath("dev-1", "codex")).not.toBe(
       buildCodexLoginManagedBrowserWrapperPath("dev-2", "codex"),
     );
+  });
+});
+
+describe("codex login retry policy", () => {
+  test("retries when verification code collection is not ready yet", () => {
+    expect(
+      isRetryableCodexLoginWorkflowErrorMessage(
+        "signup-verification-code-missing",
+      ),
+    ).toBe(true);
+    expect(
+      isRetryableCodexLoginWorkflowErrorMessage(
+        "login-verification-submit-stuck:email_verification:https://auth.openai.com/email-verification",
+      ),
+    ).toBe(true);
+  });
+
+  test("does not retry unrelated managed-browser failures", () => {
+    expect(
+      isRetryableCodexLoginWorkflowErrorMessage(
+        "OpenAI rejected the stored password",
+      ),
+    ).toBe(false);
+    expect(
+      isRetryableCodexLoginWorkflowErrorMessage(
+        "device auth failed with status 429",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -144,11 +183,15 @@ describe("create resolution helpers", () => {
   });
 
   test("prefers explicit base email over the discovered profile email", () => {
-    expect(resolveCreateBaseEmail("other@gmail.com", "dev.user@gmail.com")).toBe("other@gmail.com");
+    expect(
+      resolveCreateBaseEmail("other@gmail.com", "dev.user@gmail.com"),
+    ).toBe("other@gmail.com");
   });
 
   test("uses the discovered profile email when no explicit base email is provided", () => {
-    expect(resolveCreateBaseEmail(null, "Dev.User+4@gmail.com")).toBe("dev.user@gmail.com");
+    expect(resolveCreateBaseEmail(null, "Dev.User+4@gmail.com")).toBe(
+      "dev.user@gmail.com",
+    );
   });
 
   test("defaults to the Astronlab template when no hint is available", () => {
@@ -157,27 +200,37 @@ describe("create resolution helpers", () => {
 
   test("ignores legacy Gmail hints on the default create path", () => {
     expect(shouldUseDefaultCreateFamilyHint("dev.user@gmail.com")).toBe(false);
-    expect(shouldUseDefaultCreateFamilyHint("dev.user+4@gmail.com")).toBe(false);
+    expect(shouldUseDefaultCreateFamilyHint("dev.user+4@gmail.com")).toBe(
+      false,
+    );
   });
 
   test("keeps templated hints on the default create path", () => {
-    expect(shouldUseDefaultCreateFamilyHint("dev.{N}@astronlab.com")).toBe(true);
+    expect(shouldUseDefaultCreateFamilyHint("dev.{N}@astronlab.com")).toBe(
+      true,
+    );
   });
 
   test("accepts an explicit templated base email family", () => {
-    expect(resolveCreateBaseEmail("dev.{N}@hotspotprime.com", null)).toBe("dev.{n}@hotspotprime.com");
+    expect(resolveCreateBaseEmail("dev.{N}@hotspotprime.com", null)).toBe(
+      "dev.{n}@hotspotprime.com",
+    );
   });
 
   test("matches the most likely Gmail base email for a managed profile name", () => {
-    expect(selectBestEmailForManagedProfile("dev-1", [
-      "arjuda.anjum@gmail.com",
-      "dev.2.astronlab@gmail.com",
-      "1.dev.astronlab@gmail.com",
-    ])).toBe("1.dev.astronlab@gmail.com");
+    expect(
+      selectBestEmailForManagedProfile("dev-1", [
+        "arjuda.anjum@gmail.com",
+        "dev.2.astronlab@gmail.com",
+        "1.dev.astronlab@gmail.com",
+      ]),
+    ).toBe("1.dev.astronlab@gmail.com");
   });
 
   test("scores exact profile-token matches above generic matches", () => {
-    expect(scoreEmailForManagedProfileName("dev-1", "1.dev.astronlab@gmail.com")).toBeGreaterThan(
+    expect(
+      scoreEmailForManagedProfileName("dev-1", "1.dev.astronlab@gmail.com"),
+    ).toBeGreaterThan(
       scoreEmailForManagedProfileName("dev-1", "dev.2.astronlab@gmail.com"),
     );
   });
@@ -249,8 +302,12 @@ describe("credential store normalization", () => {
       },
     });
 
-    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBe("pw-1");
-    expect(store.accounts["dev.user+1@gmail.com"]?.account_secret_ref).toBeNull();
+    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBe(
+      "pw-1",
+    );
+    expect(
+      store.accounts["dev.user+1@gmail.com"]?.account_secret_ref,
+    ).toBeNull();
   });
 
   test("drops legacy passwords from saved records once a Bitwarden ref exists", () => {
@@ -317,7 +374,10 @@ describe("pending credential reuse", () => {
       },
     });
 
-    expect(selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")?.email).toBe("dev.user+1@gmail.com");
+    expect(
+      selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")
+        ?.email,
+    ).toBe("dev.user+1@gmail.com");
   });
 
   test("can restrict reuse to a matching alias when provided", () => {
@@ -350,7 +410,14 @@ describe("pending credential reuse", () => {
       },
     });
 
-    expect(selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com", "team-a")?.email).toBe("dev.user+2@gmail.com");
+    expect(
+      selectPendingCredentialForFamily(
+        store,
+        "dev-1",
+        "dev.user@gmail.com",
+        "team-a",
+      )?.email,
+    ).toBe("dev.user+2@gmail.com");
   });
 
   test("still prefers the lowest suffix even if a newer pending entry was touched later", () => {
@@ -383,7 +450,10 @@ describe("pending credential reuse", () => {
       },
     });
 
-    expect(selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")?.email).toBe("dev.user+1@gmail.com");
+    expect(
+      selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")
+        ?.email,
+    ).toBe("dev.user+1@gmail.com");
   });
 
   test("prefers the oldest pending family for a profile before switching to a newly discovered family", () => {
@@ -416,7 +486,9 @@ describe("pending credential reuse", () => {
       },
     });
 
-    expect(selectPendingBaseEmailHintForProfile(store, "dev-1")).toBe("1.dev.astronlab@gmail.com");
+    expect(selectPendingBaseEmailHintForProfile(store, "dev-1")).toBe(
+      "1.dev.astronlab@gmail.com",
+    );
   });
 });
 
@@ -462,6 +534,8 @@ describe("stored base-email hints", () => {
       },
     });
 
-    expect(selectStoredBaseEmailHint(store, "dev-1")).toBe("1.dev.astronlab@gmail.com");
+    expect(selectStoredBaseEmailHint(store, "dev-1")).toBe(
+      "1.dev.astronlab@gmail.com",
+    );
   });
 });
