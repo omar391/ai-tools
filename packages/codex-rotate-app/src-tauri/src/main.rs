@@ -1,10 +1,12 @@
-use serde::Deserialize;
+use codex_rotate_core::hook::read_live_account;
+use codex_rotate_core::launcher::ensure_debug_codex_instance;
+use codex_rotate_core::pool::{rotate_next_internal, NextResult};
+use codex_rotate_core::quota::CachedQuotaState;
+use codex_rotate_core::watch::{refresh_quota_cache, run_watch_iteration, WatchIterationOptions};
 use std::{
-    path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tauri::{
     image::Image,
@@ -15,7 +17,6 @@ use tauri::{
 
 const DEFAULT_PORT: u16 = 9333;
 const DEFAULT_INTERVAL_SECONDS: u64 = 15;
-const QUOTA_REFRESH_INTERVAL_SECONDS: u64 = 60;
 
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -137,181 +138,16 @@ struct StatusSnapshot {
     current_plan: Option<String>,
     current_quota: Option<String>,
     current_quota_percent: Option<u8>,
-    last_quota_checked_at_ms: Option<u64>,
     last_rotation_email: Option<String>,
     last_rotation_reason: Option<String>,
     last_message: Option<String>,
+    quota_cache: Option<CachedQuotaState>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LiveAccountEnvelope {
-    account: Option<LiveAccount>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LiveAccount {
-    email: Option<String>,
-    #[serde(rename = "planType")]
-    plan_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuotaSummaryEnvelope {
-    summary: String,
-    #[serde(rename = "primaryQuotaLeftPercent")]
-    primary_quota_left_percent: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WatchOnceEnvelope {
-    rotated: bool,
-    rotation: Option<RotationEnvelope>,
-    live: Option<RotationLive>,
-    decision: WatchDecision,
-}
-
-#[derive(Debug, Deserialize)]
-struct RotationEnvelope {
-    summary: RotationSummary,
-}
-
-#[derive(Debug, Deserialize)]
-struct RotationSummary {
-    email: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RotationLive {
-    email: String,
-    #[serde(rename = "planType")]
-    plan_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WatchDecision {
-    reason: Option<String>,
-    #[serde(rename = "assessmentError")]
-    assessment_error: Option<String>,
-    assessment: Option<QuotaSummaryEnvelope>,
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("repo root should resolve")
-}
-
-fn bun_bin() -> String {
-    std::env::var("BUN_BIN").unwrap_or_else(|_| "bun".to_string())
-}
-
-fn run_bun_json(args: &[&str]) -> Result<serde_json::Value, String> {
-    let repo_root = repo_root();
-    let package_entry = repo_root
-        .join("packages")
-        .join("codex-rotate-app")
-        .join("index.ts");
-    let output = Command::new(bun_bin())
-        .arg(package_entry)
-        .args(args)
-        .current_dir(&repo_root)
-        .output()
-        .map_err(|error| format!("failed to run bun command: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(if detail.is_empty() {
-            "bun command failed".to_string()
-        } else {
-            detail
-        });
-    }
-
-    serde_json::from_slice::<serde_json::Value>(&output.stdout)
-        .map_err(|error| format!("failed to parse bun JSON output: {error}"))
-}
-
-fn launch_codex() -> Result<(), String> {
-    run_bun_json(&["launch", "--port", &DEFAULT_PORT.to_string()]).map(|_| ())
-}
-
-fn read_live_account() -> Result<LiveAccountEnvelope, String> {
-    let value = run_bun_json(&["account-read", "--port", &DEFAULT_PORT.to_string()])?;
-    serde_json::from_value(value).map_err(|error| format!("failed to decode live account: {error}"))
-}
-
-fn rotate_next_and_switch() -> Result<WatchOnceEnvelope, String> {
-    let value = run_bun_json(&[
-        "rotate-next-and-switch",
-        "--port",
-        &DEFAULT_PORT.to_string(),
-    ])?;
-    let wrapped = serde_json::json!({
-        "rotated": true,
-        "rotation": value.get("rotation").cloned(),
-        "live": value.get("live").cloned(),
-        "decision": {
-            "reason": "manual rotation",
-            "assessmentError": null
-        }
-    });
-    serde_json::from_value(wrapped)
-        .map_err(|error| format!("failed to decode rotation result: {error}"))
-}
-
-fn watch_once() -> Result<WatchOnceEnvelope, String> {
-    let value = run_bun_json(&["watch-once", "--port", &DEFAULT_PORT.to_string()])?;
-    serde_json::from_value(value).map_err(|error| format!("failed to decode watch result: {error}"))
-}
-
-fn read_quota_summary() -> Result<QuotaSummaryEnvelope, String> {
-    let value = run_bun_json(&["quota-read"])?;
-    serde_json::from_value(value).map_err(|error| format!("failed to decode quota result: {error}"))
-}
-
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn normalize_quota_percent(value: Option<f64>) -> Option<u8> {
-    value.map(|percent| percent.clamp(0.0, 100.0).round() as u8)
-}
-
-fn set_quota_summary(snapshot: &mut StatusSnapshot, assessment: &QuotaSummaryEnvelope) {
-    snapshot.current_quota = Some(assessment.summary.clone());
-    snapshot.current_quota_percent = normalize_quota_percent(assessment.primary_quota_left_percent);
-    snapshot.last_quota_checked_at_ms = Some(current_timestamp_ms());
-}
-
-fn refresh_quota_summary(snapshot: &mut StatusSnapshot) {
-    match read_quota_summary() {
-        Ok(assessment) => set_quota_summary(snapshot, &assessment),
-        Err(_) => {
-            if snapshot.current_quota.is_none() {
-                snapshot.current_quota = Some("unavailable".to_string());
-                snapshot.current_quota_percent = None;
-            }
-            snapshot.last_quota_checked_at_ms = Some(current_timestamp_ms());
-        }
-    }
-}
-
-fn should_refresh_quota(snapshot: &StatusSnapshot) -> bool {
-    match snapshot.last_quota_checked_at_ms {
-        Some(last_checked_at_ms) => {
-            current_timestamp_ms().saturating_sub(last_checked_at_ms)
-                >= QUOTA_REFRESH_INTERVAL_SECONDS.saturating_mul(1000)
-        }
-        None => true,
-    }
+fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
+    snapshot.current_quota = Some(quota.summary.clone());
+    snapshot.current_quota_percent = quota.primary_quota_left_percent;
+    snapshot.quota_cache = Some(quota.clone());
 }
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
@@ -358,17 +194,27 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 }
 
-fn run_check(app: &AppHandle, status: &SharedStatus) {
-    let next = match watch_once() {
+fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) {
+    let next = match run_watch_iteration(WatchIterationOptions {
+        port: Some(DEFAULT_PORT),
+        after_signal_id: None,
+        cooldown_ms: None,
+        force_quota_refresh,
+    }) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             if let Some(live) = result.live.as_ref() {
                 snapshot.current_email = Some(live.email.clone());
                 snapshot.current_plan = Some(live.plan_type.clone());
+            } else if let Some(email) = result.state.last_live_email.as_ref() {
+                snapshot.current_email = Some(email.clone());
+            }
+            if let Some(quota) = result.state.quota.as_ref() {
+                set_quota_summary(&mut snapshot, quota);
             }
             if result.rotated {
                 if let Some(rotation) = result.rotation.as_ref() {
-                    snapshot.last_rotation_email = Some(rotation.summary.email.clone());
+                    snapshot.last_rotation_email = Some(rotation.email.clone());
                 }
                 snapshot.last_rotation_reason = result.decision.reason.clone();
                 snapshot.last_message = Some(format!(
@@ -379,18 +225,10 @@ fn run_check(app: &AppHandle, status: &SharedStatus) {
                         .clone()
                         .unwrap_or_else(|| "quota exhausted".to_string())
                 ));
-                refresh_quota_summary(&mut snapshot);
+            } else if let Some(error) = result.decision.assessment_error.as_deref() {
+                snapshot.last_message = Some(format!("quota probe failed: {}", error));
             } else {
-                if let Some(assessment) = result.decision.assessment.as_ref() {
-                    set_quota_summary(&mut snapshot, assessment);
-                } else if should_refresh_quota(&snapshot) {
-                    refresh_quota_summary(&mut snapshot);
-                }
-                if let Some(error) = result.decision.assessment_error.as_deref() {
-                    snapshot.last_message = Some(format!("quota probe failed: {}", error));
-                } else {
-                    snapshot.last_message = Some("watch healthy".to_string());
-                }
+                snapshot.last_message = Some("watch healthy".to_string());
             }
             snapshot.clone()
         }
@@ -404,19 +242,43 @@ fn run_check(app: &AppHandle, status: &SharedStatus) {
 }
 
 fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
-    let next = match rotate_next_and_switch() {
+    let next = match rotate_next_internal() {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            if let Some(live) = result.live.as_ref() {
-                snapshot.current_email = Some(live.email.clone());
-                snapshot.current_plan = Some(live.plan_type.clone());
+            match &result {
+                NextResult::Rotated { summary, .. }
+                | NextResult::Stayed { summary, .. }
+                | NextResult::LegacyCreate { summary, .. } => {
+                    snapshot.last_rotation_email = Some(summary.email.clone());
+                }
             }
-            if let Some(rotation) = result.rotation.as_ref() {
-                snapshot.last_rotation_email = Some(rotation.summary.email.clone());
+
+            match codex_rotate_core::hook::switch_live_account_to_current_auth(
+                Some(DEFAULT_PORT),
+                false,
+                15_000,
+            ) {
+                Ok(live) => {
+                    snapshot.current_email = Some(live.email.clone());
+                    snapshot.current_plan = Some(live.plan_type.clone());
+                }
+                Err(error) => {
+                    snapshot.last_message = Some(format!("manual rotate failed: {}", error));
+                    return update_snapshot(app, snapshot.clone());
+                }
             }
+
+            match refresh_quota_cache(true, snapshot.quota_cache.as_ref()) {
+                Ok(quota) => set_quota_summary(&mut snapshot, &quota),
+                Err(error) => snapshot.last_message = Some(format!("quota refresh failed: {}", error)),
+            }
+
             snapshot.last_rotation_reason = Some("manual rotation".to_string());
-            snapshot.last_message = Some("manual rotate succeeded".to_string());
-            refresh_quota_summary(&mut snapshot);
+            snapshot.last_message = Some(match result {
+                NextResult::Rotated { .. } => "manual rotate succeeded".to_string(),
+                NextResult::Stayed { .. } => "manual rotate stayed on current account".to_string(),
+                NextResult::LegacyCreate { .. } => "manual rotate created a fresh account".to_string(),
+            });
             snapshot.clone()
         }
         Err(error) => {
@@ -428,16 +290,17 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
     update_snapshot(app, next);
 }
 
-fn refresh_live_account(app: &AppHandle, status: &SharedStatus) {
-    let next = match read_live_account() {
+fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) {
+    let next = match read_live_account(Some(DEFAULT_PORT)) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             if let Some(account) = result.account.as_ref() {
                 snapshot.current_email = account.email.clone();
                 snapshot.current_plan = account.plan_type.clone();
             }
-            if should_refresh_quota(&snapshot) {
-                refresh_quota_summary(&mut snapshot);
+            match refresh_quota_cache(force_quota_refresh, snapshot.quota_cache.as_ref()) {
+                Ok(quota) => set_quota_summary(&mut snapshot, &quota),
+                Err(error) => snapshot.last_message = Some(format!("quota refresh failed: {}", error)),
             }
             if snapshot.last_message.is_none() {
                 snapshot.last_message = Some("launcher ready".to_string());
@@ -455,7 +318,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus) {
 
 fn spawn_watch_loop(app: AppHandle, status: SharedStatus) {
     thread::spawn(move || loop {
-        run_check(&app, &status);
+        run_check(&app, &status, false);
         thread::sleep(Duration::from_secs(DEFAULT_INTERVAL_SECONDS));
     });
 }
@@ -521,22 +384,29 @@ fn main() {
                             let app = app.clone();
                             let status = app.state::<SharedStatus>().inner().clone();
                             thread::spawn(move || {
-                                let next = if let Err(error) = launch_codex() {
-                                    let mut snapshot = status.inner.lock().expect("status mutex");
-                                    snapshot.last_message =
-                                        Some(format!("launch failed: {}", error));
-                                    snapshot.clone()
-                                } else {
-                                    refresh_live_account(&app, &status);
-                                    return;
-                                };
+                                let next =
+                                    if let Err(error) = ensure_debug_codex_instance(
+                                        None,
+                                        Some(DEFAULT_PORT),
+                                        None,
+                                        None,
+                                    ) {
+                                        let mut snapshot =
+                                            status.inner.lock().expect("status mutex");
+                                        snapshot.last_message =
+                                            Some(format!("launch failed: {}", error));
+                                        snapshot.clone()
+                                    } else {
+                                        refresh_live_account(&app, &status, true);
+                                        return;
+                                    };
                                 update_snapshot(&app, next);
                             });
                         }
                         "check" => {
                             let app = app.clone();
                             let status = app.state::<SharedStatus>().inner().clone();
-                            thread::spawn(move || run_check(&app, &status));
+                            thread::spawn(move || run_check(&app, &status, true));
                         }
                         "rotate" => {
                             let app = app.clone();
@@ -549,8 +419,8 @@ fn main() {
                 })
                 .build(app)?;
 
-            launch_codex().ok();
-            refresh_live_account(&app.handle().clone(), &status);
+            ensure_debug_codex_instance(None, Some(DEFAULT_PORT), None, None).ok();
+            refresh_live_account(&app.handle().clone(), &status, true);
             spawn_watch_loop(app.handle().clone(), status);
 
             Ok(())

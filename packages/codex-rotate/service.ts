@@ -43,7 +43,7 @@ const POOL_FILE = join(ROTATE_HOME, "accounts.json");
 
 const DEFAULT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? "https://auth.openai.com/oauth/token";
-const WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const WHAM_USAGE_URL = process.env.CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE ?? "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_MS = 8000;
 const CODEX_BIN = process.env.CODEX_ROTATE_CODEX_BIN ?? "codex";
 
