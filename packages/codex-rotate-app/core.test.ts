@@ -2,16 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import {
   buildDeviceLoginPayload,
   buildLoginStartRequest,
   sanitizeLoginStartRequest,
   summarizeCodexAuth,
 } from "./auth.ts";
+import { LOW_QUOTA_ROTATION_THRESHOLD_PERCENT, planRotation } from "./controller.ts";
 import { readCodexSignals } from "./logs.ts";
 import { describeQuotaBlocker, formatQuotaSummary, hasUsableQuota } from "./quota.ts";
-import { formatRotationSummary, runRotateNext } from "./rotate.ts";
+import { formatRotationSummary, runRotateCommand } from "./rotate.ts";
+import { liveAccountMatchesAuth } from "./watch.ts";
 import type { CodexAuth, UsageResponse } from "./types.ts";
 
 function base64UrlEncode(input: string): string {
@@ -129,41 +131,58 @@ describe("quota helpers", () => {
         limit_reached: true,
         primary_window: {
           used_percent: 100,
-          limit_window_seconds: 18000,
+          limit_window_seconds: 604800,
           reset_after_seconds: 3600,
           reset_at: 1775138000,
         },
         secondary_window: null,
       },
     });
-    expect(describeQuotaBlocker(usage)).toContain("5h quota exhausted");
+    expect(describeQuotaBlocker(usage)).toContain("7d quota exhausted");
   });
 
   test("formatQuotaSummary includes 5h and 7d windows", () => {
     expect(formatQuotaSummary(makeUsage())).toContain("5h 90% left");
   });
+
+  test("formatQuotaSummary uses the actual API window duration", () => {
+    const usage = makeUsage({
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 604800,
+          reset_after_seconds: 604800,
+          reset_at: 1775793711,
+        },
+        secondary_window: null,
+      },
+    });
+    expect(formatQuotaSummary(usage)).toContain("7d 100% left");
+  });
 });
 
 describe("rotation helpers", () => {
-  test("runRotateNext reloads auth after successful rotate command", () => {
+  test("runRotateCommand reloads auth after successful rotate command", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "codex-rotate-app-"));
     try {
       const authPath = join(tempDir, "auth.json");
       writeFileSync(authPath, JSON.stringify(makeAuth(), null, 2), "utf8");
 
-      const result = runRotateNext({
+      const result = runRotateCommand({
         authFilePath: authPath,
         rotateEntrypoint: "/fake/codex-rotate/index.ts",
         runtime: "bun",
         repoRoot: tempDir,
-        run: () => ({
+        run: ((() => ({
           status: 0,
           stdout: "ok",
           stderr: "",
           signal: null,
-          output: [],
+          output: [] as string[],
           pid: 1,
-        }),
+        }) as SpawnSyncReturns<string>) as unknown) as typeof spawnSync,
       });
 
       expect(formatRotationSummary(result.summary)).toContain("dev.22@astronlab.com");
@@ -171,6 +190,64 @@ describe("rotation helpers", () => {
     } finally {
       rmSync(tempDir, { force: true, recursive: true });
     }
+  });
+});
+
+describe("rotation planning", () => {
+  test("plans a create flow when quota is low but still usable", () => {
+    const plan = planRotation({
+      usage: makeUsage(),
+      usable: true,
+      summary: "5h 10% left",
+      blocker: null,
+      primaryQuotaLeftPercent: LOW_QUOTA_ROTATION_THRESHOLD_PERCENT,
+    }, []);
+
+    expect(plan).toEqual({
+      shouldRotate: true,
+      reason: "quota low: 10% left",
+      rotationCommand: "create",
+      rotationArgs: ["--ignore-current"],
+    });
+  });
+
+  test("plans a next rotation when quota is exhausted", () => {
+    const plan = planRotation({
+      usage: makeUsage({
+        rate_limit: {
+          allowed: false,
+          limit_reached: true,
+          primary_window: {
+            used_percent: 100,
+            limit_window_seconds: 18000,
+            reset_after_seconds: 3600,
+            reset_at: 1775138000,
+          },
+          secondary_window: null,
+        },
+      }),
+      usable: false,
+      summary: "5h 0% left",
+      blocker: "5h quota exhausted",
+      primaryQuotaLeftPercent: 0,
+    }, []);
+
+    expect(plan.rotationCommand).toBe("next");
+    expect(plan.shouldRotate).toBe(true);
+  });
+});
+
+describe("live session sync", () => {
+  test("detects when the live account already matches auth", () => {
+    expect(liveAccountMatchesAuth({
+      account: { email: "dev.22@astronlab.com", planType: "free" },
+    }, "dev.22@astronlab.com")).toBe(true);
+  });
+
+  test("detects mismatched live accounts", () => {
+    expect(liveAccountMatchesAuth({
+      account: { email: "other@astronlab.com", planType: "free" },
+    }, "dev.22@astronlab.com")).toBe(false);
   });
 });
 

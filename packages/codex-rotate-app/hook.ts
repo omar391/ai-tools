@@ -131,10 +131,11 @@ export async function switchLiveAccountToCurrentAuth(options?: {
   const deadline = Date.now() + (options?.timeoutMs ?? 15_000);
   while (Date.now() < deadline) {
     const current = await readLiveAccount({ port });
-    if (expectedEmail && current.account?.email === expectedEmail) {
+    const currentAccount = current.account;
+    if (expectedEmail && currentAccount && currentAccount.email === expectedEmail) {
       return {
-        email: current.account.email ?? "unknown",
-        planType: current.account.planType ?? "unknown",
+        email: currentAccount.email ?? "unknown",
+        planType: currentAccount.planType ?? "unknown",
         accountId: expected.request.params.chatgptAccountId,
       };
     }
