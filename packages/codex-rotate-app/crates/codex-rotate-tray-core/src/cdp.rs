@@ -110,7 +110,10 @@ fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .context("Failed to build CDP HTTP client.")?;
-    let response = client.get(url).send().with_context(|| format!("CDP endpoint failed: {url}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("CDP endpoint failed: {url}"))?;
     if !response.status().is_success() {
         return Err(anyhow!(
             "CDP endpoint failed ({}): {}",
@@ -118,5 +121,7 @@ fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
             url
         ));
     }
-    response.json().context("Failed to decode CDP JSON response.")
+    response
+        .json()
+        .context("Failed to decode CDP JSON response.")
 }

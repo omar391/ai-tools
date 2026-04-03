@@ -1,8 +1,10 @@
-use codex_rotate_core::hook::read_live_account;
-use codex_rotate_core::launcher::ensure_debug_codex_instance;
 use codex_rotate_core::pool::{rotate_next_internal, NextResult};
 use codex_rotate_core::quota::CachedQuotaState;
-use codex_rotate_core::watch::{refresh_quota_cache, run_watch_iteration, WatchIterationOptions};
+use codex_rotate_tray_core::hook::{read_live_account, switch_live_account_to_current_auth};
+use codex_rotate_tray_core::launcher::ensure_debug_codex_instance;
+use codex_rotate_tray_core::watch::{
+    refresh_quota_cache, run_watch_iteration, WatchIterationOptions,
+};
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -248,16 +250,12 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
             match &result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
-                | NextResult::LegacyCreate { summary, .. } => {
+                | NextResult::Created { summary, .. } => {
                     snapshot.last_rotation_email = Some(summary.email.clone());
                 }
             }
 
-            match codex_rotate_core::hook::switch_live_account_to_current_auth(
-                Some(DEFAULT_PORT),
-                false,
-                15_000,
-            ) {
+            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
                 Ok(live) => {
                     snapshot.current_email = Some(live.email.clone());
                     snapshot.current_plan = Some(live.plan_type.clone());
@@ -270,14 +268,16 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
 
             match refresh_quota_cache(true, snapshot.quota_cache.as_ref()) {
                 Ok(quota) => set_quota_summary(&mut snapshot, &quota),
-                Err(error) => snapshot.last_message = Some(format!("quota refresh failed: {}", error)),
+                Err(error) => {
+                    snapshot.last_message = Some(format!("quota refresh failed: {}", error))
+                }
             }
 
             snapshot.last_rotation_reason = Some("manual rotation".to_string());
             snapshot.last_message = Some(match result {
                 NextResult::Rotated { .. } => "manual rotate succeeded".to_string(),
                 NextResult::Stayed { .. } => "manual rotate stayed on current account".to_string(),
-                NextResult::LegacyCreate { .. } => "manual rotate created a fresh account".to_string(),
+                NextResult::Created { .. } => "manual rotate created a fresh account".to_string(),
             });
             snapshot.clone()
         }
@@ -300,7 +300,9 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
             }
             match refresh_quota_cache(force_quota_refresh, snapshot.quota_cache.as_ref()) {
                 Ok(quota) => set_quota_summary(&mut snapshot, &quota),
-                Err(error) => snapshot.last_message = Some(format!("quota refresh failed: {}", error)),
+                Err(error) => {
+                    snapshot.last_message = Some(format!("quota refresh failed: {}", error))
+                }
             }
             if snapshot.last_message.is_none() {
                 snapshot.last_message = Some("launcher ready".to_string());
@@ -384,22 +386,20 @@ fn main() {
                             let app = app.clone();
                             let status = app.state::<SharedStatus>().inner().clone();
                             thread::spawn(move || {
-                                let next =
-                                    if let Err(error) = ensure_debug_codex_instance(
-                                        None,
-                                        Some(DEFAULT_PORT),
-                                        None,
-                                        None,
-                                    ) {
-                                        let mut snapshot =
-                                            status.inner.lock().expect("status mutex");
-                                        snapshot.last_message =
-                                            Some(format!("launch failed: {}", error));
-                                        snapshot.clone()
-                                    } else {
-                                        refresh_live_account(&app, &status, true);
-                                        return;
-                                    };
+                                let next = if let Err(error) = ensure_debug_codex_instance(
+                                    None,
+                                    Some(DEFAULT_PORT),
+                                    None,
+                                    None,
+                                ) {
+                                    let mut snapshot = status.inner.lock().expect("status mutex");
+                                    snapshot.last_message =
+                                        Some(format!("launch failed: {}", error));
+                                    snapshot.clone()
+                                } else {
+                                    refresh_live_account(&app, &status, true);
+                                    return;
+                                };
                                 update_snapshot(&app, next);
                             });
                         }

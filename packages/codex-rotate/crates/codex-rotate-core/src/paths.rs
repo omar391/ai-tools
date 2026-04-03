@@ -5,15 +5,10 @@ use anyhow::{Context, Result};
 #[derive(Clone, Debug)]
 pub struct CorePaths {
     pub repo_root: PathBuf,
-    pub codex_home: PathBuf,
     pub codex_auth_file: PathBuf,
-    pub codex_logs_db_file: PathBuf,
-    pub rotate_home: PathBuf,
     pub pool_file: PathBuf,
-    pub rotate_app_home: PathBuf,
-    pub debug_profile_dir: PathBuf,
-    pub session_file: PathBuf,
-    pub legacy_cli_entrypoint: PathBuf,
+    pub credentials_file: PathBuf,
+    pub account_flow_file: PathBuf,
     pub automation_bridge_entrypoint: PathBuf,
     pub bun_bin: String,
 }
@@ -25,18 +20,17 @@ pub fn resolve_paths() -> Result<CorePaths> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
     let rotate_home = home.join(".codex-rotate");
-    let rotate_app_home = home.join(".codex-rotate-app");
     Ok(CorePaths {
         codex_auth_file: codex_home.join("auth.json"),
-        codex_logs_db_file: codex_home.join("logs_1.sqlite"),
         repo_root: repo_root.clone(),
-        codex_home,
-        rotate_home: rotate_home.clone(),
         pool_file: rotate_home.join("accounts.json"),
-        rotate_app_home: rotate_app_home.clone(),
-        debug_profile_dir: rotate_app_home.join("profile"),
-        session_file: rotate_app_home.join("session.json"),
-        legacy_cli_entrypoint: repo_root.join("packages").join("codex-rotate").join("index.ts"),
+        credentials_file: rotate_home.join("credentials.json"),
+        account_flow_file: repo_root
+            .join(".fast-browser")
+            .join("workflows")
+            .join("web")
+            .join("auth.openai.com")
+            .join("codex-rotate-account-flow.yaml"),
         automation_bridge_entrypoint: repo_root
             .join("packages")
             .join("codex-rotate")

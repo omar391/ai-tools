@@ -79,7 +79,10 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
     let response = client
         .get(&usage_url)
         .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", auth.tokens.access_token))
+        .header(
+            "Authorization",
+            format!("Bearer {}", auth.tokens.access_token),
+        )
         .header("ChatGPT-Account-Id", summary.account_id)
         .header("User-Agent", "codex-rotate-rs")
         .send()
@@ -91,7 +94,10 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
             "Usage lookup failed ({}): {}",
             status.as_u16(),
             if body.is_empty() {
-                status.canonical_reason().unwrap_or("unknown error").to_string()
+                status
+                    .canonical_reason()
+                    .unwrap_or("unknown error")
+                    .to_string()
             } else {
                 body
             }
@@ -109,7 +115,8 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
             Some(describe_quota_blocker(&usage))
         },
         primary_quota_left_percent: get_quota_left(
-            usage.rate_limit
+            usage
+                .rate_limit
                 .as_ref()
                 .and_then(|limits| limits.primary_window.as_ref()),
         ),
@@ -125,7 +132,8 @@ pub fn get_quota_left(window: Option<&UsageWindow>) -> Option<f64> {
 
 pub fn has_usable_quota(usage: &UsageResponse) -> bool {
     let primary_left = get_quota_left(
-        usage.rate_limit
+        usage
+            .rate_limit
             .as_ref()
             .and_then(|limits| limits.primary_window.as_ref()),
     );
@@ -139,7 +147,8 @@ pub fn has_usable_quota(usage: &UsageResponse) -> bool {
         return true;
     }
 
-    usage.credits
+    usage
+        .credits
         .as_ref()
         .map(|credits| credits.unlimited || credits.has_credits)
         .unwrap_or(false)
@@ -153,8 +162,7 @@ pub fn describe_quota_blocker(usage: &UsageResponse) -> String {
     let primary_left = get_quota_left(primary);
     if primary_left.map(|value| value <= 0.0).unwrap_or(false) {
         let label = format_window_label(primary, "current");
-        let reset = primary
-            .and_then(|window| format_reset_suffix(window.reset_after_seconds));
+        let reset = primary.and_then(|window| format_reset_suffix(window.reset_after_seconds));
         return format!("{} quota exhausted{}", label, reset.unwrap_or_default());
     }
     if usage
@@ -171,7 +179,8 @@ pub fn describe_quota_blocker(usage: &UsageResponse) -> String {
 pub fn format_quota_summary(usage: &UsageResponse) -> String {
     let mut parts = Vec::new();
     if let Some(text) = format_usage_window(
-        usage.rate_limit
+        usage
+            .rate_limit
             .as_ref()
             .and_then(|limits| limits.primary_window.as_ref()),
         "primary",
@@ -179,7 +188,8 @@ pub fn format_quota_summary(usage: &UsageResponse) -> String {
         parts.push(text);
     }
     if let Some(text) = format_usage_window(
-        usage.rate_limit
+        usage
+            .rate_limit
             .as_ref()
             .and_then(|limits| limits.secondary_window.as_ref()),
         "secondary",
@@ -203,20 +213,14 @@ pub fn format_compact_quota(usage: &UsageResponse) -> String {
         .as_ref()
         .and_then(|limits| limits.primary_window.as_ref())
     {
-        parts.push(format!(
-            "5h {}",
-            format_usage_window_value(window, true)
-        ));
+        parts.push(format!("5h {}", format_usage_window_value(window, true)));
     }
     if let Some(window) = usage
         .rate_limit
         .as_ref()
         .and_then(|limits| limits.secondary_window.as_ref())
     {
-        parts.push(format!(
-            "week {}",
-            format_usage_window_value(window, true)
-        ));
+        parts.push(format!("week {}", format_usage_window_value(window, true)));
     }
     if let Some(text) = format_credits_compact(usage.credits.as_ref()) {
         parts.push(format!("credits {}", text));
@@ -228,7 +232,10 @@ pub fn format_compact_quota(usage: &UsageResponse) -> String {
     }
 }
 
-pub fn quota_cache_ttl(assessment: Option<&QuotaAssessment>, error: Option<&str>) -> chrono::Duration {
+pub fn quota_cache_ttl(
+    assessment: Option<&QuotaAssessment>,
+    error: Option<&str>,
+) -> chrono::Duration {
     if error.is_some() {
         return chrono::Duration::seconds(30);
     }
@@ -263,13 +270,20 @@ pub fn build_cached_quota_state(
         blocker: assessment
             .and_then(|value| value.blocker.clone())
             .or_else(|| error.map(ToOwned::to_owned)),
-        primary_quota_left_percent: assessment
-            .and_then(|value| value.primary_quota_left_percent.map(|percent| percent.round() as u8)),
+        primary_quota_left_percent: assessment.and_then(|value| {
+            value
+                .primary_quota_left_percent
+                .map(|percent| percent.round() as u8)
+        }),
         error: error.map(ToOwned::to_owned),
     }
 }
 
-pub fn quota_cache_is_stale(cache: Option<&CachedQuotaState>, account_id: &str, now: DateTime<Utc>) -> bool {
+pub fn quota_cache_is_stale(
+    cache: Option<&CachedQuotaState>,
+    account_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
     let Some(cache) = cache else {
         return true;
     };
@@ -457,8 +471,16 @@ mod tests {
         if let Some(rate_limit) = usage.rate_limit.as_mut() {
             rate_limit.allowed = false;
             rate_limit.limit_reached = true;
-            rate_limit.primary_window.as_mut().unwrap().limit_window_seconds = 604_800;
-            rate_limit.primary_window.as_mut().unwrap().reset_after_seconds = 3_600;
+            rate_limit
+                .primary_window
+                .as_mut()
+                .unwrap()
+                .limit_window_seconds = 604_800;
+            rate_limit
+                .primary_window
+                .as_mut()
+                .unwrap()
+                .reset_after_seconds = 3_600;
         }
         assert!(describe_quota_blocker(&usage).contains("7d quota exhausted"));
     }
@@ -477,19 +499,28 @@ mod tests {
             blocker: None,
             primary_quota_left_percent: Some(40.0),
         };
-        assert_eq!(quota_cache_ttl(Some(&assessment), None), chrono::Duration::minutes(5));
+        assert_eq!(
+            quota_cache_ttl(Some(&assessment), None),
+            chrono::Duration::minutes(5)
+        );
 
         let assessment = QuotaAssessment {
             primary_quota_left_percent: Some(15.0),
             ..assessment
         };
-        assert_eq!(quota_cache_ttl(Some(&assessment), None), chrono::Duration::seconds(90));
+        assert_eq!(
+            quota_cache_ttl(Some(&assessment), None),
+            chrono::Duration::seconds(90)
+        );
 
         let assessment = QuotaAssessment {
             primary_quota_left_percent: Some(5.0),
             ..assessment
         };
-        assert_eq!(quota_cache_ttl(Some(&assessment), None), chrono::Duration::seconds(30));
+        assert_eq!(
+            quota_cache_ttl(Some(&assessment), None),
+            chrono::Duration::seconds(30)
+        );
     }
 
     #[test]

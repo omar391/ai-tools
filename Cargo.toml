@@ -2,6 +2,7 @@
 members = [
   "packages/codex-rotate/crates/codex-rotate-core",
   "packages/codex-rotate/crates/codex-rotate-cli",
+  "packages/codex-rotate-app/crates/codex-rotate-tray-core",
   "packages/codex-rotate-app/src-tauri",
 ]
 resolver = "2"
@@ -11,10 +12,10 @@ anyhow = "1.0.100"
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 dirs = "6.0.0"
+rand = "0.8.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tempfile = "3.23.0"
 tungstenite = "0.24.0"
-url = "2.5.7"

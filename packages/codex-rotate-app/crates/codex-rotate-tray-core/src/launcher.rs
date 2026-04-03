@@ -28,8 +28,12 @@ pub fn read_launch_session() -> Result<Option<CodexLaunchSession>> {
     }
     let raw = fs::read_to_string(&paths.session_file)
         .with_context(|| format!("Failed to read {}.", paths.session_file.display()))?;
-    let session = serde_json::from_str(&raw)
-        .with_context(|| format!("Invalid launch session at {}.", paths.session_file.display()))?;
+    let session = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Invalid launch session at {}.",
+            paths.session_file.display()
+        )
+    })?;
     Ok(Some(session))
 }
 
@@ -47,8 +51,7 @@ pub fn ensure_debug_codex_instance(
             .unwrap_or(&paths.debug_profile_dir)
             .display()
             .to_string(),
-        launched_at: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        launched_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
 
     if is_cdp_ready(session.port) {

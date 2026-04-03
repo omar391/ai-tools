@@ -4,21 +4,23 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
+use codex_rotate_core::pool::{current_auth_summary, rotate_next_internal, NextResult};
+use codex_rotate_core::quota::{
+    build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
+};
+use codex_rotate_core::workflow::{cmd_create, CreateCommandOptions, CreateCommandSource};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
 use crate::hook::{
     live_account_matches_summary, read_live_account, switch_live_account_to_current_auth,
     AccountReadResult, LiveSwitchResult,
 };
 use crate::launcher::ensure_debug_codex_instance;
-use crate::legacy::run_legacy_create_ignore_current;
-use crate::logs::{read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind};
-use crate::paths::resolve_paths;
-use crate::pool::{current_auth_summary, rotate_next_internal, NextResult};
-use crate::quota::{
-    build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
+use crate::logs::{
+    read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
 };
+use crate::paths::resolve_paths;
 
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 10;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
@@ -121,7 +123,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id = read_latest_codex_signal_id(&paths.codex_logs_db_file)?;
     }
 
-    let live_account = ensure_live_account_matches_current_auth(port, read_live_account(Some(port))?)?;
+    let live_account =
+        ensure_live_account_matches_current_auth(port, read_live_account(Some(port))?)?;
     let current_summary = current_auth_summary()?;
     let (decision, mut quota_cache) = decide_rotation(
         after_signal_id,
@@ -131,33 +134,47 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
 
     let mut rotated = false;
     let mut rotation = None;
-    let mut live = live_account.account.as_ref().map(|account| LiveSwitchResult {
-        email: account.email.clone().unwrap_or_else(|| "unknown".to_string()),
-        plan_type: account
-            .plan_type
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
-        account_id: current_summary.account_id.clone(),
-    });
+    let mut live = live_account
+        .account
+        .as_ref()
+        .map(|account| LiveSwitchResult {
+            email: account
+                .email
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            plan_type: account
+                .plan_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            account_id: current_summary.account_id.clone(),
+        });
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
         match decision.rotation_command {
             Some(RotationCommand::Next) => {
-            let next_result = rotate_next_internal()?;
-            let summary = match next_result {
-                NextResult::Rotated { summary, .. }
-                | NextResult::Stayed { summary, .. }
-                    | NextResult::LegacyCreate { summary, .. } => summary,
+                let next_result = rotate_next_internal()?;
+                let summary = match next_result {
+                    NextResult::Rotated { summary, .. }
+                    | NextResult::Stayed { summary, .. }
+                    | NextResult::Created { summary, .. } => summary,
                 };
                 rotation = Some(summary);
             }
             Some(RotationCommand::Create) => {
-                run_legacy_create_ignore_current()?;
+                cmd_create(CreateCommandOptions {
+                    ignore_current: true,
+                    source: CreateCommandSource::Manual,
+                    ..CreateCommandOptions::default()
+                })?;
                 rotation = Some(current_auth_summary()?);
             }
             None => {}
         }
-        live = Some(switch_live_account_to_current_auth(Some(port), false, 15_000)?);
+        live = Some(switch_live_account_to_current_auth(
+            Some(port),
+            false,
+            15_000,
+        )?);
         rotated = rotation.is_some();
         quota_cache = Some(refresh_quota_cache(true, None)?);
     }
@@ -198,7 +215,10 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     })
 }
 
-pub fn refresh_quota_cache(force_refresh: bool, previous: Option<&CachedQuotaState>) -> Result<CachedQuotaState> {
+pub fn refresh_quota_cache(
+    force_refresh: bool,
+    previous: Option<&CachedQuotaState>,
+) -> Result<CachedQuotaState> {
     let paths = resolve_paths()?;
     let auth = load_codex_auth(&paths.codex_auth_file)?;
     let summary = summarize_codex_auth(&auth);

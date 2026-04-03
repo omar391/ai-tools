@@ -2,10 +2,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use codex_rotate_core::auth::{
+    build_login_start_request, load_codex_auth, summarize_codex_auth, AuthSummary,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::auth::{build_login_start_request, load_codex_auth, summarize_codex_auth, AuthSummary};
 use crate::cdp::connect_to_local_codex_page;
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::resolve_paths;
@@ -142,10 +144,17 @@ await window.electronBridge.sendMessageFromView(request);
     let value: serde_json::Value = connection.evaluate(&expression)?;
     connection.close();
     if value.get("timeout").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Err(anyhow!("Timed out waiting for {method} response from Codex."));
+        return Err(anyhow!(
+            "Timed out waiting for {method} response from Codex."
+        ));
     }
-    serde_json::from_value(value.get("result").cloned().unwrap_or(serde_json::Value::Null))
-        .map_err(|error| anyhow!("Failed to decode {method} response from Codex: {error}"))
+    serde_json::from_value(
+        value
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|error| anyhow!("Failed to decode {method} response from Codex: {error}"))
 }
 
 fn normalize_email(value: &str) -> String {

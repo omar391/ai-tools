@@ -11,15 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::{
-    decode_jwt_payload, extract_account_id_from_auth, extract_account_id_from_token, is_token_expired,
-    load_codex_auth, summarize_codex_auth, write_codex_auth, AuthSummary, CodexAuth,
+    decode_jwt_payload, extract_account_id_from_auth, extract_account_id_from_token,
+    is_token_expired, load_codex_auth, summarize_codex_auth, write_codex_auth, AuthSummary,
+    CodexAuth,
 };
-use crate::legacy::run_legacy_next_auto_create;
 use crate::paths::resolve_paths;
 use crate::quota::{
     describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota, UsageCredits,
     UsageResponse, UsageWindow,
 };
+use crate::workflow::{cmd_create, create_next_fallback_options};
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -74,9 +75,18 @@ pub struct RotationCandidate {
 }
 
 pub enum NextResult {
-    Rotated { message: String, summary: AuthSummary },
-    Stayed { message: String, summary: AuthSummary },
-    LegacyCreate { output: String, summary: AuthSummary },
+    Rotated {
+        message: String,
+        summary: AuthSummary,
+    },
+    Stayed {
+        message: String,
+        summary: AuthSummary,
+    },
+    Created {
+        output: String,
+        summary: AuthSummary,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +127,10 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
     let label = build_account_label(&email, &plan_type);
     let next_alias = normalize_alias(alias);
 
-    let existing_index = pool.accounts.iter().position(|account| account.label == label);
+    let existing_index = pool
+        .accounts
+        .iter()
+        .position(|account| account.label == label);
     let duplicate_index = pool.accounts.iter().position(|account| {
         account.account_id == account_id || account.auth.tokens.account_id == account_id
     });
@@ -186,7 +199,10 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
             pool.accounts[duplicate_index].label,
             pool.accounts[duplicate_index].email,
             if previous_label != pool.accounts[duplicate_index].label {
-                format!("\n{YELLOW}WARN{RESET} Account moved from \"{}\".", previous_label)
+                format!(
+                    "\n{YELLOW}WARN{RESET} Account moved from \"{}\".",
+                    previous_label
+                )
             } else {
                 String::new()
             }
@@ -226,7 +242,9 @@ pub fn cmd_next() -> Result<String> {
     match rotate_next_internal()? {
         NextResult::Rotated { message, .. }
         | NextResult::Stayed { message, .. }
-        | NextResult::LegacyCreate { output: message, .. } => Ok(message),
+        | NextResult::Created {
+            output: message, ..
+        } => Ok(message),
     }
 }
 
@@ -356,9 +374,9 @@ pub fn rotate_next_internal() -> Result<NextResult> {
     if dirty {
         save_pool(&pool)?;
     }
-    let output = run_legacy_next_auto_create()?;
+    let output = cmd_create(create_next_fallback_options())?;
     let auth = load_codex_auth(&paths.codex_auth_file)?;
-    Ok(NextResult::LegacyCreate {
+    Ok(NextResult::Created {
         summary: summarize_codex_auth(&auth),
         output: output.trim_end().to_string(),
     })
@@ -371,7 +389,9 @@ pub fn cmd_prev() -> Result<String> {
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     if pool.accounts.len() == 1 {
-        return Err(anyhow!("Only 1 account in pool. Add more with: codex-rotate add"));
+        return Err(anyhow!(
+            "Only 1 account in pool. Add more with: codex-rotate add"
+        ));
     }
 
     let _ = sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -399,7 +419,9 @@ pub fn cmd_list() -> Result<String> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     if pool.accounts.is_empty() {
-        return Ok(format!("{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"));
+        return Ok(format!(
+            "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"
+        ));
     }
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
 
@@ -424,7 +446,11 @@ pub fn cmd_list() -> Result<String> {
         };
         lines.push(format!(
             "  {} {}  {CYAN}{}{RESET}  {DIM}{}{RESET}  {DIM}{}{RESET}",
-            if is_active { format!("{GREEN}>{RESET}") } else { " ".to_string() },
+            if is_active {
+                format!("{GREEN}>{RESET}")
+            } else {
+                " ".to_string()
+            },
             label,
             entry.email,
             entry.plan_type,
@@ -447,7 +473,9 @@ pub fn cmd_list() -> Result<String> {
             unavailable_count += 1;
             lines.push(format!(
                 "    {DIM}quota{RESET}  unavailable ({})",
-                inspection.error.unwrap_or_else(|| "unknown error".to_string())
+                inspection
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
             ));
         }
     }
@@ -506,7 +534,8 @@ pub fn cmd_status() -> Result<String> {
             .iter()
             .position(|entry| entry.account_id == extract_account_id_from_auth(&auth))
         {
-            let inspection = inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, true)?;
+            let inspection =
+                inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, true)?;
             dirty |= inspection.updated;
             if let Some(usage) = inspection.usage.as_ref() {
                 if let Some(window) = usage
@@ -545,7 +574,9 @@ pub fn cmd_status() -> Result<String> {
             } else {
                 lines.push(format!(
                     "  {BOLD}Quota:{RESET}            unavailable ({})",
-                    inspection.error.unwrap_or_else(|| "unknown error".to_string())
+                    inspection
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
                 ));
             }
         } else {
@@ -669,7 +700,7 @@ pub fn load_pool() -> Result<Pool> {
     Ok(pool)
 }
 
-fn save_pool(pool: &Pool) -> Result<()> {
+pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
     let paths = resolve_paths()?;
     if let Some(parent) = paths.pool_file.parent() {
         fs::create_dir_all(parent)
@@ -798,7 +829,14 @@ fn get_account_summary(entry: &AccountEntry) -> String {
     }
 }
 
-fn sync_pool_active_account_from_codex(pool: &mut Pool, auth_path: &Path) -> Result<bool> {
+pub(crate) fn format_account_summary_for_display(entry: &AccountEntry) -> String {
+    get_account_summary(entry)
+}
+
+pub(crate) fn sync_pool_active_account_from_codex(
+    pool: &mut Pool,
+    auth_path: &Path,
+) -> Result<bool> {
     if !auth_path.exists() {
         return Ok(false);
     }
@@ -819,7 +857,7 @@ fn sync_pool_active_account_from_codex(pool: &mut Pool, auth_path: &Path) -> Res
     Ok(apply_auth_to_account(&mut pool.accounts[current_index], current_auth) || changed)
 }
 
-fn normalize_pool_entries(pool: &mut Pool) -> bool {
+pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
     let mut changed = false;
     for entry in &mut pool.accounts {
         let next_label = build_account_label(&entry.email, &entry.plan_type);
@@ -986,7 +1024,7 @@ fn apply_quota_inspection_to_account(
     changed
 }
 
-fn inspect_account(
+pub(crate) fn inspect_account(
     entry: &mut AccountEntry,
     auth_path: &Path,
     persist_if_current: bool,
@@ -1003,9 +1041,13 @@ fn inspect_account(
             };
             updated |= apply_quota_inspection_to_account(entry, &inspection, &inspected_at);
             if persist_if_current {
-                updated |= write_codex_auth_if_current_account(auth_path, &entry.account_id, &entry.auth)?;
+                updated |=
+                    write_codex_auth_if_current_account(auth_path, &entry.account_id, &entry.auth)?;
             }
-            AccountInspection { updated, ..inspection }
+            AccountInspection {
+                updated,
+                ..inspection
+            }
         }
         Err(error) => {
             let inspection = AccountInspection {
@@ -1014,7 +1056,10 @@ fn inspect_account(
                 updated: false,
             };
             let updated = apply_quota_inspection_to_account(entry, &inspection, &inspected_at);
-            AccountInspection { updated, ..inspection }
+            AccountInspection {
+                updated,
+                ..inspection
+            }
         }
     };
     Ok(inspection)
@@ -1032,7 +1077,12 @@ fn fetch_usage_with_recovery(auth: &CodexAuth) -> Result<(CodexAuth, UsageRespon
     match fetch_usage_once(&working_auth) {
         Ok(usage) => Ok((working_auth, usage, refreshed)),
         Err(error) => {
-            if refreshed || !error.downcast_ref::<HttpError>().map(|value| value.status == 401).unwrap_or(false) {
+            if refreshed
+                || !error
+                    .downcast_ref::<HttpError>()
+                    .map(|value| value.status == 401)
+                    .unwrap_or(false)
+            {
                 return Err(error);
             }
             working_auth = refresh_auth(&working_auth)?;
@@ -1052,7 +1102,10 @@ fn fetch_usage_once(auth: &CodexAuth) -> Result<UsageResponse> {
     let response = client
         .get(&usage_url)
         .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", auth.tokens.access_token))
+        .header(
+            "Authorization",
+            format!("Bearer {}", auth.tokens.access_token),
+        )
         .header("ChatGPT-Account-Id", extract_account_id_from_auth(auth))
         .header("User-Agent", "codex-rotate-cli-rs")
         .send()
@@ -1079,7 +1132,10 @@ fn refresh_auth(auth: &CodexAuth) -> Result<CodexAuth> {
         .build()
         .context("Failed to build token refresh client.")?;
     let response = client
-        .post(std::env::var("CODEX_REFRESH_TOKEN_URL_OVERRIDE").unwrap_or_else(|_| OAUTH_TOKEN_URL.to_string()))
+        .post(
+            std::env::var("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
+                .unwrap_or_else(|_| OAUTH_TOKEN_URL.to_string()),
+        )
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("User-Agent", "codex-rotate-rs")
@@ -1116,7 +1172,11 @@ fn refresh_auth(auth: &CodexAuth) -> Result<CodexAuth> {
                 .refresh_token
                 .or_else(|| auth.tokens.refresh_token.clone()),
             account_id: extract_account_id_from_token(&access_token)
-                .or_else(|| refreshed_id_token.as_deref().and_then(extract_account_id_from_token))
+                .or_else(|| {
+                    refreshed_id_token
+                        .as_deref()
+                        .and_then(extract_account_id_from_token)
+                })
                 .unwrap_or_else(|| auth.tokens.account_id.clone()),
         },
         last_refresh: now_iso(),
@@ -1138,7 +1198,9 @@ fn build_http_error_message(action: &str, status: u16, body: &str) -> String {
             let code = error.get("code").and_then(Value::as_str);
             let message = error.get("message").and_then(Value::as_str);
             if code == Some("refresh_token_reused") {
-                return format!("{action} failed ({status}): refresh token already rotated; sign in again");
+                return format!(
+                    "{action} failed ({status}): refresh token already rotated; sign in again"
+                );
             }
             if let (Some(code), Some(message)) = (code, message) {
                 return format!("{action} failed ({status}): {code}: {message}");
@@ -1216,7 +1278,7 @@ pub fn build_reusable_account_probe_order(
     }
 }
 
-fn find_next_usable_account(
+pub(crate) fn find_next_usable_account(
     pool: &mut Pool,
     auth_path: &Path,
     mode: ReusableAccountProbeMode,
@@ -1225,13 +1287,18 @@ fn find_next_usable_account(
     skip_indices: &HashSet<usize>,
 ) -> Result<(Option<RotationCandidate>, bool)> {
     let mut next_dirty = dirty;
-    let probe_order = build_reusable_account_probe_order(pool.active_index, pool.accounts.len(), mode);
+    let probe_order =
+        build_reusable_account_probe_order(pool.active_index, pool.accounts.len(), mode);
 
     for index in probe_order {
         if skip_indices.contains(&index) {
             continue;
         }
-        let inspection = inspect_account(&mut pool.accounts[index], auth_path, index == pool.active_index)?;
+        let inspection = inspect_account(
+            &mut pool.accounts[index],
+            auth_path,
+            index == pool.active_index,
+        )?;
         next_dirty |= inspection.updated;
         if let Some(usage) = inspection.usage.as_ref() {
             if has_usable_quota(usage) {
@@ -1263,7 +1330,7 @@ fn find_next_usable_account(
     Ok((None, next_dirty))
 }
 
-fn resolve_account_selector(pool: &Pool, selector: &str) -> Result<AccountSelection> {
+pub(crate) fn resolve_account_selector(pool: &Pool, selector: &str) -> Result<AccountSelection> {
     let normalized_selector = selector.trim();
     if normalized_selector.is_empty() {
         return Err(anyhow!("Account selector cannot be empty."));
@@ -1327,12 +1394,12 @@ fn resolve_account_selector(pool: &Pool, selector: &str) -> Result<AccountSelect
 }
 
 #[derive(Clone)]
-struct AccountSelection {
-    index: usize,
-    entry: AccountEntry,
+pub(crate) struct AccountSelection {
+    pub index: usize,
+    pub entry: AccountEntry,
 }
 
-fn format_short_account_id(account_id: &str) -> String {
+pub(crate) fn format_short_account_id(account_id: &str) -> String {
     if account_id.len() > 8 {
         format!("{}...", &account_id[..8])
     } else {

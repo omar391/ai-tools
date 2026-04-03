@@ -348,13 +348,11 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
+ "rand 0.8.5",
  "reqwest 0.12.28",
- "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
- "tungstenite",
- "url",
 ]
 
 [[package]]
@@ -362,10 +360,27 @@ name = "codex-rotate-tray"
 version = "1.0.0"
 dependencies = [
  "codex-rotate-core",
+ "codex-rotate-tray-core",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "codex-rotate-tray-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codex-rotate-core",
+ "dirs",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tungstenite",
 ]
 
 [[package]]

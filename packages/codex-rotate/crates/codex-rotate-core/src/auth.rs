@@ -165,9 +165,7 @@ pub fn build_login_start_request(
         host_id: host_id.unwrap_or("local").to_string(),
         request: JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: request_id
-                .unwrap_or("codex-rotate-app-login")
-                .to_string(),
+            id: request_id.unwrap_or("codex-rotate-app-login").to_string(),
             method: "account/login/start".to_string(),
             params: build_device_login_payload(auth),
         },

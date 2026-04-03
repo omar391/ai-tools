@@ -13,28 +13,34 @@ import {
 } from "./automation.ts";
 
 type BridgeRequest =
-  | { command: "inspect-managed-profiles"; payload?: Record<string, never> | null }
-  | { command: "read-workflow-metadata"; payload: { filePath: string } }
-  | { command: "ensure-account-secret-ref"; payload: { profileName: string; email: string; password: string } }
   | {
-    command: "complete-codex-login";
-    payload: {
-      profileName: string;
-      email: string;
-      accountSecretRef: CodexRotateSecretRef;
-      options?: {
-        codexBin?: string;
-        workflowRunStamp?: string;
-        preferSignupRecovery?: boolean;
-        birthMonth?: number;
-        birthDay?: number;
-        birthYear?: number;
-        maxAttempts?: number;
-        maxReplayPasses?: number;
-        retryDelaysMs?: number[];
+      command: "inspect-managed-profiles";
+      payload?: Record<string, never> | null;
+    }
+  | { command: "read-workflow-metadata"; payload: { filePath: string } }
+  | {
+      command: "ensure-account-secret-ref";
+      payload: { profileName: string; email: string; password: string };
+    }
+  | {
+      command: "complete-codex-login";
+      payload: {
+        profileName: string;
+        email: string;
+        accountSecretRef: CodexRotateSecretRef;
+        options?: {
+          codexBin?: string;
+          workflowRunStamp?: string;
+          preferSignupRecovery?: boolean;
+          birthMonth?: number;
+          birthDay?: number;
+          birthYear?: number;
+          maxAttempts?: number;
+          maxReplayPasses?: number;
+          retryDelaysMs?: number[];
+        };
       };
     };
-  };
 
 type BridgeResponse =
   | { ok: true; result: unknown }
@@ -62,7 +68,7 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.password,
       );
     case "complete-codex-login":
-      return await completeCodexLoginViaWorkflow(
+      return (await completeCodexLoginViaWorkflow(
         request.payload.profileName,
         request.payload.email,
         request.payload.accountSecretRef,
@@ -71,10 +77,12 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
           onNote: null,
           restoreState: null,
         },
-      ) as CodexRotateAuthFlowSummary;
+      )) as CodexRotateAuthFlowSummary;
     default: {
       const exhaustive: never = request;
-      throw new Error(`Unsupported automation bridge command: ${String(exhaustive)}`);
+      throw new Error(
+        `Unsupported automation bridge command: ${String(exhaustive)}`,
+      );
     }
   }
 }
