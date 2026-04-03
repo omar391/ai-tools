@@ -4,7 +4,7 @@
  *
  * Usage:
  *   codex-rotate add [alias]      Snapshot current ~/.codex/auth.json into the pool
- *   codex-rotate create [alias]   Create a new OpenAI account and switch to it
+ *   codex-rotate create [alias]   Reuse a healthy account or create a new one when needed
  *   codex-rotate next             Swap to the next account with usable quota
  *   codex-rotate prev             Swap to the previous account
  *   codex-rotate list             Show all accounts in the pool with live quota
@@ -165,6 +165,8 @@ interface CreateCommandOptions {
   alias?: string;
   profileName?: string;
   baseEmail?: string;
+  force?: boolean;
+  ignoreCurrent?: boolean;
   requireUsableQuota?: boolean;
   source?: "manual" | "next";
 }
@@ -385,13 +387,20 @@ function writeCodexAuth(auth: CodexAuth): void {
 function syncPoolActiveAccountFromCodex(pool: Pool): boolean {
   if (!existsSync(CODEX_AUTH)) return false;
 
-  const active = pool.accounts[pool.active_index];
-  if (!active) return false;
-
   const currentAuth = loadCodexAuth();
-  if (active.auth.tokens.account_id !== currentAuth.tokens.account_id) return false;
+  const currentAccountId = extractAccountIdFromAuth(currentAuth);
+  const currentIndex = pool.accounts.findIndex(
+    (entry) => entry.account_id === currentAccountId || entry.auth.tokens.account_id === currentAuth.tokens.account_id,
+  );
+  if (currentIndex === -1) return false;
 
-  return applyAuthToAccount(active, currentAuth);
+  let changed = false;
+  if (pool.active_index !== currentIndex) {
+    pool.active_index = currentIndex;
+    changed = true;
+  }
+
+  return applyAuthToAccount(pool.accounts[currentIndex]!, currentAuth) || changed;
 }
 
 function findPoolEntryByAccountId(pool: Pool, accountId: string): AccountEntry | undefined {
@@ -1042,9 +1051,37 @@ export function findNextImmediateRoundRobinIndex(
   return null;
 }
 
+export type ReusableAccountProbeMode = "current-first" | "others-first" | "others-only";
+
+export function buildReusableAccountProbeOrder(
+  activeIndex: number,
+  accountCount: number,
+  mode: ReusableAccountProbeMode,
+): number[] {
+  if (accountCount <= 0) {
+    return [];
+  }
+
+  const normalizedActiveIndex = Math.min(Math.max(activeIndex, 0), accountCount - 1);
+  const others: number[] = [];
+  for (let offset = 1; offset < accountCount; offset += 1) {
+    others.push((normalizedActiveIndex + offset) % accountCount);
+  }
+
+  switch (mode) {
+    case "current-first":
+      return [normalizedActiveIndex, ...others];
+    case "others-first":
+      return [...others, normalizedActiveIndex];
+    case "others-only":
+      return others;
+  }
+}
+
 async function findNextUsableAccount(
   pool: Pool,
   options?: {
+    mode?: ReusableAccountProbeMode;
     reasons?: string[];
     dirty?: boolean;
     skipIndices?: ReadonlySet<number>;
@@ -1053,14 +1090,18 @@ async function findNextUsableAccount(
   const reasons = options?.reasons ?? [];
   let nextDirty = options?.dirty ?? false;
   const skipIndices = options?.skipIndices ?? new Set<number>();
+  const probeOrder = buildReusableAccountProbeOrder(
+    pool.active_index,
+    pool.accounts.length,
+    options?.mode ?? "others-first",
+  );
 
-  for (let offset = 1; offset < pool.accounts.length; offset++) {
-    const index = (pool.active_index + offset) % pool.accounts.length;
+  for (const index of probeOrder) {
     if (skipIndices.has(index)) {
       continue;
     }
     const entry = pool.accounts[index]!;
-    const inspection = await inspectAccount(entry);
+    const inspection = await inspectAccount(entry, { persistIfCurrent: index === pool.active_index });
     nextDirty = inspection.updated || nextDirty;
 
     if (!inspection.usage) {
@@ -1078,24 +1119,6 @@ async function findNextUsableAccount(
       reasons,
       dirty: nextDirty,
     };
-  }
-
-  const currentEntry = pool.accounts[pool.active_index];
-  if (currentEntry) {
-    const inspection = await inspectAccount(currentEntry, { persistIfCurrent: true });
-    nextDirty = inspection.updated || nextDirty;
-
-    if (!inspection.usage) {
-      reasons.push(`${currentEntry.label}: ${inspection.error ?? "unknown error"}`);
-    } else if (hasUsableQuota(inspection.usage)) {
-      return {
-        candidate: { index: pool.active_index, entry: currentEntry, inspection },
-        reasons,
-        dirty: nextDirty,
-      };
-    } else {
-      reasons.push(`${currentEntry.label}: ${describeQuotaBlocker(inspection.usage)}`);
-    }
   }
 
   return { candidate: null, reasons, dirty: nextDirty };
@@ -1235,13 +1258,23 @@ function parseCreateOptions(args: string[]): CreateCommandOptions {
   const positionals: string[] = [];
   let profileName: string | undefined;
   let baseEmail: string | undefined;
+  let force = false;
+  let ignoreCurrent = false;
 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
+    if (arg === "--force") {
+      force = true;
+      continue;
+    }
+    if (arg === "--ignore-current") {
+      ignoreCurrent = true;
+      continue;
+    }
     if (arg === "--profile") {
       profileName = args[index + 1];
       if (!profileName) {
-        die("Usage: codex-rotate create [alias] [--profile <managed-name>] [--base-email <email-family>]");
+        die("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]");
       }
       index += 1;
       continue;
@@ -1253,7 +1286,7 @@ function parseCreateOptions(args: string[]): CreateCommandOptions {
     if (arg === "--base-email") {
       baseEmail = args[index + 1];
       if (!baseEmail) {
-        die("Usage: codex-rotate create [alias] [--profile <managed-name>] [--base-email <email-family>]");
+        die("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]");
       }
       index += 1;
       continue;
@@ -1269,13 +1302,15 @@ function parseCreateOptions(args: string[]): CreateCommandOptions {
   }
 
   if (positionals.length > 1) {
-    die("Usage: codex-rotate create [alias] [--profile <managed-name>] [--base-email <email-family>]");
+    die("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]");
   }
 
   return {
     alias: normalizeAlias(positionals[0]),
     profileName,
     baseEmail,
+    force,
+    ignoreCurrent,
     source: "manual",
   };
 }
@@ -1531,7 +1566,54 @@ function cmdAdd(alias?: string): void {
   );
 }
 
-async function cmdCreate(options: CreateCommandOptions): Promise<CreateCommandResult> {
+async function cmdCreate(options: CreateCommandOptions): Promise<void> {
+  const pool = loadPool();
+  let dirty = normalizePoolEntries(pool);
+  dirty = syncPoolActiveAccountFromCodex(pool) || dirty;
+
+  if (!options.force && pool.accounts.length > 0) {
+    const previousIndex = pool.active_index;
+    const previous = pool.accounts[previousIndex]!;
+    const { candidate, dirty: candidateDirty } = await findNextUsableAccount(pool, {
+      mode: options.ignoreCurrent ? "others-only" : "current-first",
+      reasons: [],
+      dirty,
+    });
+    dirty = candidateDirty || dirty;
+
+    if (candidate) {
+      const switched = candidate.index !== previousIndex;
+      if (switched) {
+        pool.active_index = candidate.index;
+        writeCodexAuth(candidate.entry.auth);
+      }
+      if (dirty || switched) {
+        savePool(pool);
+      }
+
+      const quotaSummary = candidate.inspection.usage ? formatCompactQuota(candidate.inspection.usage) : "quota unavailable";
+      if (switched) {
+        info(
+          `Reused ${candidate.entry.label} instead of creating a new account. `
+          + `Previous active was ${previous.label}.`,
+        );
+      } else {
+        info(`Current account ${candidate.entry.label} still has healthy quota. Not creating a new account.`);
+      }
+      note(`Quota: ${quotaSummary}`);
+      note(`Use "codex-rotate create --force" to create a new account anyway.`);
+      return;
+    }
+
+    if (dirty) {
+      savePool(pool);
+    }
+  }
+
+  if (dirty) {
+    savePool(pool);
+  }
+
   const result = await executeCreateFlow(options);
   const quotaSummary = summarizeQuotaForCreate(result);
   info(
@@ -1539,7 +1621,6 @@ async function cmdCreate(options: CreateCommandOptions): Promise<CreateCommandRe
     + `from ${result.baseEmail}.`,
   );
   note(`Quota: ${quotaSummary}`);
-  return result;
 }
 
 async function cmdNext(): Promise<void> {
@@ -1580,6 +1661,7 @@ async function cmdNext(): Promise<void> {
   }
 
   const { candidate, reasons, dirty: candidateDirty } = await findNextUsableAccount(pool, {
+    mode: "others-first",
     reasons: [],
     dirty,
     skipIndices: inspectedLaterIndices,
@@ -1710,7 +1792,7 @@ async function cmdStatus(): Promise<void> {
   if (auth) {
     const email = extractEmailFromAuth(auth);
     const plan = extractPlanFromAuth(auth);
-    console.log(`  ${BOLD}Active in Codex:${RESET}  ${CYAN}${email}${RESET}  (${plan})`);
+    console.log(`  ${BOLD}Auth file target:${RESET} ${CYAN}${email}${RESET}  (${plan})`);
     console.log(`  ${BOLD}Account ID:${RESET}       ${extractAccountIdFromAuth(auth)}`);
     console.log(`  ${BOLD}Last refresh:${RESET}     ${auth.last_refresh}`);
 
@@ -1884,7 +1966,7 @@ ${BOLD}USAGE${RESET}
 
 ${BOLD}COMMANDS${RESET}
   ${CYAN}add${RESET} [alias]      Snapshot current ~/.codex/auth.json into the pool
-  ${CYAN}create${RESET} [alias]   Resume the oldest unfinished account or create a new one
+  ${CYAN}create${RESET} [alias]   Reuse a healthy account, or create a new one when needed
   ${CYAN}next${RESET}             Swap to the next account with usable quota
   ${CYAN}prev${RESET}             Swap to the previous account
   ${CYAN}list${RESET}             Show all accounts with live quota info
@@ -1911,6 +1993,8 @@ ${BOLD}RELOGIN FLAGS${RESET}
   ${DIM}--allow-email-change${RESET} Replace the selected account even if the signed-in email changed
 
 ${BOLD}CREATE FLAGS${RESET}
+  ${DIM}--force${RESET}                  Create a new account even if a healthy pool account exists
+  ${DIM}--ignore-current${RESET}         Ignore the current slot when probing reusable healthy accounts
   ${DIM}--profile <managed-name>${RESET} Choose the fast-browser managed profile
   ${DIM}--base-email <email-family>${RESET} Override the create email family for this run
   ${DIM}(omitted values default to workflow preferred_profile "dev-1" and discover email from that profile)${RESET}

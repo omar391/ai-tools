@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { decideRotation, rotateNow } from "./controller.ts";
-import { sanitizeDeviceLoginPayload } from "./auth.ts";
-import { readLiveAccount, switchLiveAccountToCurrentAuth } from "./hook.ts";
+import { loadCodexAuth, sanitizeDeviceLoginPayload, summarizeCodexAuth } from "./auth.ts";
+import {
+  readLiveAccount,
+  switchLiveAccountToCurrentAuth,
+  type AccountReadResult,
+} from "./hook.ts";
 import { ensureDebugCodexInstance } from "./launcher.ts";
 import { readLatestCodexSignalId } from "./logs.ts";
 import { resolveCodexRotateAppPaths } from "./paths.ts";
@@ -97,10 +101,51 @@ export function writeWatchState(state: WatchState): void {
 }
 
 function shouldRotate(decision: RotationDecision): { rotate: boolean; reason: string | null } {
-  if (decision.shouldRotate) {
-    return { rotate: true, reason: decision.reason };
+  if (!decision.shouldRotate) {
+    return { rotate: false, reason: null };
   }
-  return { rotate: false, reason: null };
+  return { rotate: true, reason: decision.reason };
+}
+
+function normalizeEmail(email: string | null | undefined): string | null {
+  if (typeof email !== "string") {
+    return null;
+  }
+  const normalized = email.trim().toLowerCase();
+  return normalized || null;
+}
+
+export function liveAccountMatchesAuth(liveAccount: AccountReadResult, expectedEmail: string): boolean {
+  const liveEmail = normalizeEmail(liveAccount.account?.email);
+  const normalizedExpectedEmail = normalizeEmail(expectedEmail);
+  if (!liveEmail || !normalizedExpectedEmail) {
+    return false;
+  }
+  return liveEmail === normalizedExpectedEmail;
+}
+
+async function ensureLiveAccountMatchesCurrentAuth(
+  port: number,
+  liveAccount: AccountReadResult,
+  onEvent?: (message: string) => void,
+): Promise<AccountReadResult> {
+  const paths = resolveCodexRotateAppPaths();
+  const expected = summarizeCodexAuth(loadCodexAuth(paths.codexAuthFile));
+  if (liveAccountMatchesAuth(liveAccount, expected.email)) {
+    return liveAccount;
+  }
+
+  onEvent?.(
+    `live account drift detected: ${liveAccount.account?.email ?? "unknown"} -> ${expected.email}`,
+  );
+  const switched = await switchLiveAccountToCurrentAuth({ port, ensureLaunched: false });
+  return {
+    account: {
+      email: switched.email,
+      planType: switched.planType,
+    },
+    requiresOpenaiAuth: false,
+  };
 }
 
 function cooldownActive(state: WatchState, cooldownMs: number): boolean {
@@ -130,7 +175,11 @@ export async function runWatchIteration(options?: {
     afterSignalId = readLatestCodexSignalId(resolveCodexRotateAppPaths().codexLogsDbFile);
   }
 
-  const liveAccount = await readLiveAccount({ port });
+  const liveAccount = await ensureLiveAccountMatchesCurrentAuth(
+    port,
+    await readLiveAccount({ port }),
+    options?.onEvent,
+  );
   const decision = await decideRotation({ afterSignalId });
   const rotationCheck = shouldRotate(decision);
 
@@ -140,7 +189,10 @@ export async function runWatchIteration(options?: {
 
   if (rotationCheck.rotate && !cooldownActive(previousState, cooldownMs)) {
     options?.onEvent?.(`rotation triggered: ${rotationCheck.reason ?? "unknown"}`);
-    rotation = rotateNow();
+    rotation = rotateNow({
+      command: decision.rotationCommand ?? "next",
+      args: decision.rotationArgs,
+    });
     live = await switchLiveAccountToCurrentAuth({ port, ensureLaunched: false });
     rotated = true;
   } else if (rotationCheck.rotate) {

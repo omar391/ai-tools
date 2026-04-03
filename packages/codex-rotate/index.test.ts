@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { PendingCredential, StoredCredential } from "./automation.ts";
 import {
+  buildReusableAccountProbeOrder,
   findNextImmediateRoundRobinIndex,
   findNextCachedUsableAccountIndex,
   generateRandomAdultBirthDate,
@@ -181,5 +182,19 @@ describe("immediate next rotation", () => {
       { last_quota_usable: false, last_quota_checked_at: "2026-04-02T00:00:00.000Z" },
       { last_quota_usable: false, last_quota_checked_at: "2026-04-02T00:00:00.000Z" },
     ])).toBeNull();
+  });
+});
+
+describe("reusable account probe order", () => {
+  test("prefers the current account first for manual create", () => {
+    expect(buildReusableAccountProbeOrder(1, 4, "current-first")).toEqual([1, 2, 3, 0]);
+  });
+
+  test("prefers later accounts first for next rotation", () => {
+    expect(buildReusableAccountProbeOrder(1, 4, "others-first")).toEqual([2, 3, 0, 1]);
+  });
+
+  test("can exclude the current account entirely", () => {
+    expect(buildReusableAccountProbeOrder(1, 4, "others-only")).toEqual([2, 3, 0]);
   });
 });

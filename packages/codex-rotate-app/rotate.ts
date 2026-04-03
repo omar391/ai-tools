@@ -2,20 +2,22 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import type { AuthSummary, RotationResult } from "./types.ts";
 import { buildDeviceLoginPayload, loadCodexAuth, summarizeCodexAuth } from "./auth.ts";
 
-export interface RotateNextOptions {
+export interface RotateCommandOptions {
   authFilePath: string;
   rotateEntrypoint: string;
   runtime: string;
   repoRoot: string;
+  command?: "next" | "create";
   args?: string[];
   run?: typeof spawnSync;
 }
 
-export function runRotateNext(options: RotateNextOptions): RotationResult {
+export function runRotateCommand(options: RotateCommandOptions): RotationResult {
   const run = options.run ?? spawnSync;
+  const command = options.command ?? "next";
   const result = run(
     options.runtime,
-    [options.rotateEntrypoint, "next", ...(options.args ?? [])],
+    [options.rotateEntrypoint, command, ...(options.args ?? [])],
     {
       cwd: options.repoRoot,
       encoding: "utf8",
@@ -24,7 +26,7 @@ export function runRotateNext(options: RotateNextOptions): RotationResult {
   ) as SpawnSyncReturns<string>;
 
   if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout || "codex-rotate next failed").trim();
+    const detail = (result.stderr || result.stdout || `codex-rotate ${command} failed`).trim();
     throw new Error(detail);
   }
 
