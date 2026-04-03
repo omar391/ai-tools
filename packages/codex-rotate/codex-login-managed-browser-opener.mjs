@@ -12,20 +12,32 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(MODULE_DIR, "..", "..");
-const FAST_BROWSER_CLIENT_MODULE = pathToFileURL(path.resolve(
-  REPO_ROOT,
-  "..",
-  "ai-rules",
-  "skills",
-  "fast-browser",
-  "lib",
-  "daemon",
-  "client.mjs",
-)).href;
-const PROFILE_NAME = String(process.env.FAST_BROWSER_PROFILE || "dev-1").trim() || "dev-1";
-const LOG_PATH = process.env.CODEX_ROTATE_BROWSER_SHIM_LOG
-  || path.join(os.tmpdir(), "codex-rotate-managed-browser-opener.log");
-const USER_DATA_DIR = path.join(os.homedir(), ".fast-browser", "profiles", PROFILE_NAME);
+const FAST_BROWSER_CLIENT_MODULE = pathToFileURL(
+  path.resolve(
+    REPO_ROOT,
+    "..",
+    "ai-rules",
+    "skills",
+    "fast-browser",
+    "lib",
+    "daemon",
+    "client.mjs",
+  ),
+).href;
+const PROFILE_NAME =
+  String(process.env.FAST_BROWSER_PROFILE || "dev-1").trim() || "dev-1";
+const LOG_PATH =
+  process.env.CODEX_ROTATE_BROWSER_SHIM_LOG ||
+  path.join(os.tmpdir(), "codex-rotate-managed-browser-opener.log");
+const USER_DATA_DIR = path.join(
+  os.homedir(),
+  ".fast-browser",
+  "profiles",
+  PROFILE_NAME,
+);
+const REAL_OPEN =
+  String(process.env.CODEX_ROTATE_REAL_OPEN || "/usr/bin/open").trim() ||
+  "/usr/bin/open";
 
 function pickUrl(argv) {
   for (const value of argv) {
@@ -35,6 +47,21 @@ function pickUrl(argv) {
     }
   }
   return null;
+}
+
+async function fallbackToSystemOpen(argv) {
+  if (!argv.length || !REAL_OPEN) {
+    return false;
+  }
+  await appendLog("browser_shim_fallback_open", {
+    command: REAL_OPEN,
+    argv,
+  });
+  await execFileAsync(REAL_OPEN, argv, {
+    env: process.env,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return true;
 }
 
 async function appendLog(message, details = null) {
@@ -60,7 +87,9 @@ async function findManagedChromeDebugPort() {
       return Number.parseInt(portMatch[1], 10);
     }
   }
-  throw new Error(`Could not find a remote debugging port for managed profile '${PROFILE_NAME}'.`);
+  throw new Error(
+    `Could not find a remote debugging port for managed profile '${PROFILE_NAME}'.`,
+  );
 }
 
 async function main() {
@@ -68,7 +97,18 @@ async function main() {
 
   const url = pickUrl(process.argv.slice(2));
   if (!url) {
-    await appendLog("no_url_arg", { argv: process.argv.slice(2) });
+    const argv = process.argv.slice(2);
+    const opened = await fallbackToSystemOpen(argv).catch(async (error) => {
+      await appendLog("browser_shim_fallback_open_failed", {
+        argv,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    });
+    if (opened) {
+      process.exit(0);
+    }
+    await appendLog("no_url_arg", { argv });
     process.exit(1);
   }
 
@@ -82,12 +122,16 @@ async function main() {
   await client.ensureProfileReady({ profileName: PROFILE_NAME, headed: false });
 
   const port = await findManagedChromeDebugPort();
-  const requireFromWorkspace = createRequire(path.join(REPO_ROOT, "package.json"));
+  const requireFromWorkspace = createRequire(
+    path.join(REPO_ROOT, "package.json"),
+  );
   const { chromium } = requireFromWorkspace("playwright");
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
   const context = browser.contexts()[0];
   if (!context) {
-    throw new Error(`Managed profile '${PROFILE_NAME}' did not expose a default browser context.`);
+    throw new Error(
+      `Managed profile '${PROFILE_NAME}' did not expose a default browser context.`,
+    );
   }
 
   const page = await context.newPage();

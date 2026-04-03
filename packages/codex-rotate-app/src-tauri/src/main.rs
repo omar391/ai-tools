@@ -19,6 +19,8 @@ use tauri::{
 
 const DEFAULT_PORT: u16 = 9333;
 const DEFAULT_INTERVAL_SECONDS: u64 = 15;
+const LOW_QUOTA_INTERVAL_SECONDS: u64 = 5;
+const CRITICAL_QUOTA_INTERVAL_SECONDS: u64 = 2;
 
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -243,6 +245,16 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
     update_snapshot(app, next);
 }
 
+fn next_watch_interval(status: &SharedStatus) -> Duration {
+    let snapshot = status.inner.lock().expect("status mutex");
+    let seconds = match snapshot.current_quota_percent {
+        Some(percent) if percent <= 2 => CRITICAL_QUOTA_INTERVAL_SECONDS,
+        Some(percent) if percent <= 10 => LOW_QUOTA_INTERVAL_SECONDS,
+        _ => DEFAULT_INTERVAL_SECONDS,
+    };
+    Duration::from_secs(seconds)
+}
+
 fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
     let next = match rotate_next_internal() {
         Ok(result) => {
@@ -321,7 +333,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
 fn spawn_watch_loop(app: AppHandle, status: SharedStatus) {
     thread::spawn(move || loop {
         run_check(&app, &status, false);
-        thread::sleep(Duration::from_secs(DEFAULT_INTERVAL_SECONDS));
+        thread::sleep(next_watch_interval(&status));
     });
 }
 

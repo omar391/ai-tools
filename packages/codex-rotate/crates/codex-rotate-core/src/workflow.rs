@@ -68,7 +68,6 @@ impl Default for CreateCommandOptions {
 #[derive(Clone, Debug)]
 pub struct ReloginOptions {
     pub allow_email_change: bool,
-    pub device_auth: bool,
     pub logout_first: bool,
     pub manual_login: bool,
 }
@@ -77,7 +76,6 @@ impl Default for ReloginOptions {
     fn default() -> Self {
         Self {
             allow_email_change: false,
-            device_auth: false,
             logout_first: true,
             manual_login: false,
         }
@@ -213,6 +211,13 @@ struct BridgeEnsureSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BridgeFindSecretPayload<'a> {
+    profile_name: &'a str,
+    email: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
@@ -337,20 +342,27 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
     let stored_credential = store
         .accounts
         .get(&normalize_email_key(&expected_email))
-        .cloned();
+        .cloned()
+        .or_else(|| {
+            store
+                .pending
+                .get(&normalize_email_key(&expected_email))
+                .map(|entry| entry.stored.clone())
+        });
 
     if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
         let stored_credential = stored_credential.ok_or_else(|| {
             anyhow!("Stored credential lookup unexpectedly failed for {expected_email}.")
         })?;
-        let account_secret_ref = ensure_credential_account_secret_ref(
+        let account_secret_ref = resolve_credential_account_secret_ref(
             stored_credential.account_secret_ref.as_ref(),
             stored_credential.legacy_password.as_deref(),
             &stored_credential.email,
             &stored_credential.profile_name,
+            false,
         )?;
         let mut updated_stored = stored_credential.clone();
-        updated_stored.account_secret_ref = Some(account_secret_ref.clone());
+        updated_stored.account_secret_ref = None;
         updated_stored.legacy_password = None;
         updated_stored.updated_at = now_iso();
         store.accounts.insert(
@@ -396,6 +408,7 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
                 .get(&normalize_email_key(&updated_stored.email))
                 .cloned()
                 .unwrap_or(updated_stored);
+            store.pending.remove(&normalize_email_key(&entry.email));
             store.accounts.insert(
                 normalize_email_key(&entry.email),
                 StoredCredential {
@@ -418,7 +431,7 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
         ));
     }
 
-    if stored_credential.is_none() && !options.manual_login && !options.device_auth {
+    if stored_credential.is_none() && !options.manual_login {
         eprintln!(
             "{YELLOW}WARN{RESET} No stored credentials were found for {}. Falling back to manual login.",
             expected_email
@@ -432,11 +445,7 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
         }
     }
 
-    if options.device_auth {
-        run_codex_command(["login", "--device-auth"])?;
-    } else {
-        run_codex_command(["login"])?;
-    }
+    run_codex_command(["login"])?;
 
     let auth = load_current_auth()?;
     let logged_in_email = summarize_codex_auth(&auth).email;
@@ -458,18 +467,7 @@ pub fn should_use_stored_credential_relogin(
     stored_credential: Option<&StoredCredential>,
     options: &ReloginOptions,
 ) -> bool {
-    stored_credential.is_some()
-        && !options.manual_login
-        && !options.device_auth
-        && stored_credential
-            .and_then(|value| {
-                value
-                    .account_secret_ref
-                    .as_ref()
-                    .map(|_| ())
-                    .or_else(|| value.legacy_password.as_ref().map(|_| ()))
-            })
-            .is_some()
+    stored_credential.is_some() && !options.manual_login
 }
 
 pub fn create_next_fallback_options() -> CreateCommandOptions {
@@ -553,17 +551,18 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         started_at: Some(started_at.clone()),
     });
 
-    let account_secret_ref = ensure_credential_account_secret_ref(
+    let account_secret_ref = resolve_credential_account_secret_ref(
         existing_pending.stored.account_secret_ref.as_ref(),
         existing_pending.stored.legacy_password.as_deref(),
         &created_email,
         &profile_name,
+        true,
     )?;
     let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
     let pending = PendingCredential {
         stored: StoredCredential {
             email: created_email.clone(),
-            account_secret_ref: Some(account_secret_ref.clone()),
+            account_secret_ref: None,
             legacy_password: None,
             profile_name: profile_name.clone(),
             base_email: base_email.clone(),
@@ -647,7 +646,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         normalize_email_key(&created_email),
         StoredCredential {
             email: created_email.clone(),
-            account_secret_ref: Some(account_secret_ref.clone()),
+            account_secret_ref: None,
             legacy_password: None,
             profile_name: profile_name.clone(),
             base_email: base_email.clone(),
@@ -946,15 +945,18 @@ fn normalize_pending_credential_map(raw: Option<&Value>) -> HashMap<String, Pend
 fn normalize_stored_credential(raw: &Value) -> Option<StoredCredential> {
     let object = raw.as_object()?;
     let mut normalized = serde_json::from_value::<StoredCredential>(raw.clone()).ok()?;
-    let secret_ref = normalize_secret_ref(object.get("account_secret_ref"));
+    let had_persisted_secret_ref = object
+        .get("account_secret_ref")
+        .and_then(Value::as_object)
+        .is_some();
     let legacy_password = object
         .get("password")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    normalized.account_secret_ref = secret_ref.clone();
-    normalized.legacy_password = if secret_ref.is_some() {
+    normalized.account_secret_ref = None;
+    normalized.legacy_password = if had_persisted_secret_ref {
         None
     } else {
         legacy_password
@@ -1057,80 +1059,52 @@ fn serialize_stored_credential(record: &StoredCredential) -> Value {
             Value::Number(u64::from(value).into()),
         );
     }
-    if let Some(secret_ref) = normalize_secret_ref(
-        record
-            .account_secret_ref
-            .as_ref()
-            .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
-            .as_ref(),
-    ) {
-        object.insert(
-            "account_secret_ref".to_string(),
-            serde_json::to_value(secret_ref).unwrap_or(Value::Null),
-        );
-    } else if let Some(password) = record.legacy_password.as_ref() {
+    if let Some(password) = record.legacy_password.as_ref() {
         object.insert("password".to_string(), Value::String(password.clone()));
     }
     Value::Object(object)
 }
 
-fn normalize_secret_ref(raw: Option<&Value>) -> Option<CodexRotateSecretRef> {
-    let object = raw?.as_object()?;
-    let object_id = object
-        .get("object_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let store = object
-        .get("store")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("bitwarden-cli");
-    if store != "bitwarden-cli" {
-        return None;
-    }
-    let ref_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("secret_ref");
-    if ref_type != "secret_ref" {
-        return None;
-    }
-    Some(CodexRotateSecretRef {
-        ref_type: "secret_ref".to_string(),
-        store: "bitwarden-cli".to_string(),
-        object_id,
-        field_path: object
-            .get("field_path")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        version: object
-            .get("version")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-    })
-}
-
-fn ensure_credential_account_secret_ref(
+fn resolve_credential_account_secret_ref(
     account_secret_ref: Option<&CodexRotateSecretRef>,
     legacy_password: Option<&str>,
     email: &str,
     profile_name: &str,
+    create_if_missing: bool,
 ) -> Result<CodexRotateSecretRef> {
     if let Some(account_secret_ref) = account_secret_ref {
         return Ok(account_secret_ref.clone());
     }
-    let password = legacy_password
+    if let Some(found) = find_credential_account_secret_ref(email, profile_name)? {
+        return Ok(found);
+    }
+    let Some(password) = legacy_password
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| generate_password(18));
+        .or_else(|| create_if_missing.then(|| generate_password(18)))
+    else {
+        return Err(anyhow!(
+            "No managed OpenAI secret was found for {email}. Re-run with --manual-login to repair it interactively."
+        ));
+    };
     run_automation_bridge(
         "ensure-account-secret-ref",
         BridgeEnsureSecretPayload {
             profile_name,
             email,
             password: &password,
+        },
+    )
+}
+
+fn find_credential_account_secret_ref(
+    email: &str,
+    profile_name: &str,
+) -> Result<Option<CodexRotateSecretRef>> {
+    run_automation_bridge(
+        "find-account-secret-ref",
+        BridgeFindSecretPayload {
+            profile_name,
+            email,
         },
     )
 }
@@ -1797,5 +1771,31 @@ mod tests {
                 .and_then(|value| value.legacy_password.as_deref()),
             Some("pw-1")
         );
+    }
+
+    #[test]
+    fn ignores_persisted_secret_refs_from_old_store_files() {
+        let store = normalize_credential_store(json!({
+            "accounts": {
+                "dev.user+1@gmail.com": {
+                    "email": "dev.user+1@gmail.com",
+                    "account_secret_ref": {
+                        "type": "secret_ref",
+                        "store": "bitwarden-cli",
+                        "object_id": "bw-1"
+                    },
+                    "profile_name": "dev-1",
+                    "base_email": "dev.user@gmail.com",
+                    "suffix": 1,
+                    "selector": "dev.user+1@gmail.com_free",
+                    "alias": null,
+                    "created_at": "2026-03-20T00:00:00.000Z",
+                    "updated_at": "2026-03-20T00:00:00.000Z"
+                }
+            }
+        }));
+        let record = store.accounts.get("dev.user+1@gmail.com").unwrap();
+        assert!(record.account_secret_ref.is_none());
+        assert!(record.legacy_password.is_none());
     }
 }

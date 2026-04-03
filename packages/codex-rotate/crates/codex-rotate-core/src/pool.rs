@@ -117,6 +117,43 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+struct LineEmitter<'a> {
+    writer: Option<&'a mut dyn Write>,
+    lines: Vec<String>,
+}
+
+impl<'a> LineEmitter<'a> {
+    fn buffered() -> Self {
+        Self {
+            writer: None,
+            lines: Vec::new(),
+        }
+    }
+
+    fn streaming(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer: Some(writer),
+            lines: Vec::new(),
+        }
+    }
+
+    fn push_line(&mut self, line: impl Into<String>) -> Result<()> {
+        let line = line.into();
+        if let Some(writer) = self.writer.as_deref_mut() {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        } else {
+            self.lines.push(line);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> String {
+        self.lines.join("\n")
+    }
+}
+
 pub fn cmd_add(alias: Option<&str>) -> Result<String> {
     let paths = resolve_paths()?;
     let auth = load_codex_auth(&paths.codex_auth_file)?;
@@ -415,36 +452,50 @@ pub fn cmd_prev() -> Result<String> {
 }
 
 pub fn cmd_list() -> Result<String> {
+    let mut emitter = LineEmitter::buffered();
+    cmd_list_impl(&mut emitter)?;
+    Ok(emitter.finish())
+}
+
+pub fn cmd_list_stream(writer: &mut dyn Write) -> Result<()> {
+    let mut emitter = LineEmitter::streaming(writer);
+    cmd_list_impl(&mut emitter)
+}
+
+fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     if pool.accounts.is_empty() {
-        return Ok(format!(
+        output.push_line(format!(
             "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"
-        ));
+        ))?;
+        return Ok(());
     }
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
 
     let mut usable_count = 0;
     let mut exhausted_count = 0;
     let mut unavailable_count = 0;
-    let mut lines = vec![format!(
-        "\n{BOLD}Codex OAuth Account Pool{RESET} ({} account(s))\n",
+    output.push_line(String::new())?;
+    output.push_line(format!(
+        "{BOLD}Codex OAuth Account Pool{RESET} ({} account(s))",
         pool.accounts.len()
-    )];
+    ))?;
+    output.push_line(String::new())?;
 
     for index in 0..pool.accounts.len() {
         let is_active = index == pool.active_index;
-        let inspection =
-            inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
-        dirty |= inspection.updated;
-        let entry = &pool.accounts[index];
         let label = if is_active {
-            format!("{BOLD}{}{RESET}", entry.label)
+            format!("{BOLD}{}{RESET}", pool.accounts[index].label)
         } else {
-            entry.label.clone()
+            pool.accounts[index].label.clone()
         };
-        lines.push(format!(
+        let email = pool.accounts[index].email.clone();
+        let plan_type = pool.accounts[index].plan_type.clone();
+        let account_id = pool.accounts[index].account_id.clone();
+        let alias = pool.accounts[index].alias.clone();
+        output.push_line(format!(
             "  {} {}  {CYAN}{}{RESET}  {DIM}{}{RESET}  {DIM}{}{RESET}",
             if is_active {
                 format!("{GREEN}>{RESET}")
@@ -452,31 +503,34 @@ pub fn cmd_list() -> Result<String> {
                 " ".to_string()
             },
             label,
-            entry.email,
-            entry.plan_type,
-            format_short_account_id(&entry.account_id)
-        ));
-        if let Some(alias) = &entry.alias {
-            lines.push(format!("    {DIM}alias{RESET}  {}", alias));
+            email,
+            plan_type,
+            format_short_account_id(&account_id)
+        ))?;
+        if let Some(alias) = alias {
+            output.push_line(format!("    {DIM}alias{RESET}  {}", alias))?;
         }
+        let inspection =
+            inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
+        dirty |= inspection.updated;
         if let Some(usage) = inspection.usage.as_ref() {
             if has_usable_quota(usage) {
                 usable_count += 1;
             } else {
                 exhausted_count += 1;
             }
-            lines.push(format!(
+            output.push_line(format!(
                 "    {DIM}quota{RESET}  {}",
                 format_compact_quota(usage)
-            ));
+            ))?;
         } else {
             unavailable_count += 1;
-            lines.push(format!(
+            output.push_line(format!(
                 "    {DIM}quota{RESET}  unavailable ({})",
                 inspection
                     .error
                     .unwrap_or_else(|| "unknown error".to_string())
-            ));
+            ))?;
         }
     }
 
@@ -491,43 +545,56 @@ pub fn cmd_list() -> Result<String> {
         if unavailable_count > 0 {
             details.push(format!("{unavailable_count} unavailable"));
         }
-        lines.push(format!(
+        output.push_line(format!(
             "{YELLOW}WARN{RESET} All accounts are exhausted or unavailable{}.",
             if details.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", details.join(", "))
             }
-        ));
+        ))?;
     }
-    lines.push(String::new());
-    Ok(lines.join("\n"))
+    output.push_line(String::new())?;
+    Ok(())
 }
 
 pub fn cmd_status() -> Result<String> {
+    let mut emitter = LineEmitter::buffered();
+    cmd_status_impl(&mut emitter)?;
+    Ok(emitter.finish())
+}
+
+pub fn cmd_status_stream(writer: &mut dyn Write) -> Result<()> {
+    let mut emitter = LineEmitter::streaming(writer);
+    cmd_status_impl(&mut emitter)
+}
+
+fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
 
-    let mut lines = vec![format!("\n{BOLD}Codex Rotate Status{RESET}\n")];
+    output.push_line(String::new())?;
+    output.push_line(format!("{BOLD}Codex Rotate Status{RESET}"))?;
+    output.push_line(String::new())?;
 
     if paths.codex_auth_file.exists() {
         let auth = load_codex_auth(&paths.codex_auth_file)?;
         let email = extract_email_from_auth(&auth);
         let plan = extract_plan_from_auth(&auth);
-        lines.push(format!(
+        output.push_line(format!(
             "  {BOLD}Auth file target:{RESET} {CYAN}{}{RESET}  ({})",
             email, plan
-        ));
-        lines.push(format!(
+        ))?;
+        output.push_line(format!(
             "  {BOLD}Account ID:{RESET}       {}",
             extract_account_id_from_auth(&auth)
-        ));
-        lines.push(format!(
+        ))?;
+        output.push_line(format!(
             "  {BOLD}Last refresh:{RESET}     {}",
             auth.last_refresh
-        ));
+        ))?;
 
         if let Some(index) = pool
             .accounts
@@ -543,41 +610,41 @@ pub fn cmd_status() -> Result<String> {
                     .as_ref()
                     .and_then(|limits| limits.primary_window.as_ref())
                 {
-                    lines.push(format!(
+                    output.push_line(format!(
                         "  {BOLD}Quota (5h):{RESET}       {}",
                         format_usage_window(window)
-                    ));
+                    ))?;
                 }
                 if let Some(window) = usage
                     .rate_limit
                     .as_ref()
                     .and_then(|limits| limits.secondary_window.as_ref())
                 {
-                    lines.push(format!(
+                    output.push_line(format!(
                         "  {BOLD}Quota (week):{RESET}     {}",
                         format_usage_window(window)
-                    ));
+                    ))?;
                 }
                 if let Some(window) = usage
                     .code_review_rate_limit
                     .as_ref()
                     .and_then(|limits| limits.primary_window.as_ref())
                 {
-                    lines.push(format!(
+                    output.push_line(format!(
                         "  {BOLD}Code review:{RESET}      {}",
                         format_usage_window(window)
-                    ));
+                    ))?;
                 }
                 if let Some(credits) = format_credits_full(usage.credits.as_ref()) {
-                    lines.push(format!("  {BOLD}Credits:{RESET}          {}", credits));
+                    output.push_line(format!("  {BOLD}Credits:{RESET}          {}", credits))?;
                 }
             } else {
-                lines.push(format!(
+                output.push_line(format!(
                     "  {BOLD}Quota:{RESET}            unavailable ({})",
                     inspection
                         .error
                         .unwrap_or_else(|| "unknown error".to_string())
-                ));
+                ))?;
             }
         } else {
             match fetch_usage_with_recovery(&auth) {
@@ -590,73 +657,74 @@ pub fn cmd_status() -> Result<String> {
                         .as_ref()
                         .and_then(|limits| limits.primary_window.as_ref())
                     {
-                        lines.push(format!(
+                        output.push_line(format!(
                             "  {BOLD}Quota (5h):{RESET}       {}",
                             format_usage_window(window)
-                        ));
+                        ))?;
                     }
                     if let Some(window) = usage
                         .rate_limit
                         .as_ref()
                         .and_then(|limits| limits.secondary_window.as_ref())
                     {
-                        lines.push(format!(
+                        output.push_line(format!(
                             "  {BOLD}Quota (week):{RESET}     {}",
                             format_usage_window(window)
-                        ));
+                        ))?;
                     }
                     if let Some(window) = usage
                         .code_review_rate_limit
                         .as_ref()
                         .and_then(|limits| limits.primary_window.as_ref())
                     {
-                        lines.push(format!(
+                        output.push_line(format!(
                             "  {BOLD}Code review:{RESET}      {}",
                             format_usage_window(window)
-                        ));
+                        ))?;
                     }
                     if let Some(credits) = format_credits_full(usage.credits.as_ref()) {
-                        lines.push(format!("  {BOLD}Credits:{RESET}          {}", credits));
+                        output
+                            .push_line(format!("  {BOLD}Credits:{RESET}          {}", credits))?;
                     }
                 }
                 Err(error) => {
-                    lines.push(format!(
+                    output.push_line(format!(
                         "  {BOLD}Quota:{RESET}            unavailable ({})",
                         error
-                    ));
+                    ))?;
                 }
             }
         }
     } else {
-        lines.push(format!("{YELLOW}WARN{RESET} No Codex auth file found."));
+        output.push_line(format!("{YELLOW}WARN{RESET} No Codex auth file found."))?;
     }
 
-    lines.push(format!(
+    output.push_line(format!(
         "\n  {BOLD}Pool file:{RESET}        {}",
         paths.pool_file.display()
-    ));
-    lines.push(format!(
+    ))?;
+    output.push_line(format!(
         "  {BOLD}Pool size:{RESET}        {} account(s)",
         pool.accounts.len()
-    ));
+    ))?;
 
     if let Some(active) = pool.accounts.get(pool.active_index) {
-        lines.push(format!(
+        output.push_line(format!(
             "  {BOLD}Active slot:{RESET}      {} [{}/{}]",
             active.label,
             pool.active_index + 1,
             pool.accounts.len()
-        ));
+        ))?;
         if let Some(alias) = &active.alias {
-            lines.push(format!("  {BOLD}Active alias:{RESET}     {}", alias));
+            output.push_line(format!("  {BOLD}Active alias:{RESET}     {}", alias))?;
         }
     }
 
     if dirty {
         save_pool(&pool)?;
     }
-    lines.push(String::new());
-    Ok(lines.join("\n"))
+    output.push_line(String::new())?;
+    Ok(())
 }
 
 pub fn cmd_remove(selector: &str) -> Result<String> {

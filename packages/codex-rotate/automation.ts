@@ -51,7 +51,7 @@ const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
     "client.mjs",
   ),
 ).href;
-const CODEX_LOGIN_MANAGED_BROWSER_OPENER = resolve(
+const CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT = resolve(
   MODULE_DIR,
   "codex-login-managed-browser-opener.mjs",
 );
@@ -67,6 +67,10 @@ export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
   "codex-rotate-account-flow.yaml",
 );
 export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
+const OPENAI_ACCOUNT_SECRET_URIS = [
+  "https://auth.openai.com",
+  "https://chatgpt.com",
+];
 
 export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 
@@ -370,7 +374,7 @@ export async function ensureBitwardenCliAccountSecretRef(
     username: normalizedEmail,
     password: normalizedPassword,
     notes: `Managed by codex-rotate for ${normalizedEmail}.`,
-    uris: ["https://auth.openai.com", "https://chatgpt.com"],
+    uris: OPENAI_ACCOUNT_SECRET_URIS,
   });
   if (!response?.ok) {
     throw new Error(
@@ -385,6 +389,47 @@ export async function ensureBitwardenCliAccountSecretRef(
     );
   }
   return ref;
+}
+
+export async function findBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+): Promise<CodexRotateSecretRef | null> {
+  const normalizedProfileName = String(profileName || "").trim();
+  const normalizedEmail = String(email || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedProfileName) {
+    throw new Error(
+      "Bitwarden account secret lookup requires a managed profile name.",
+    );
+  }
+  if (!normalizedEmail) {
+    throw new Error(
+      "Bitwarden account secret lookup requires a non-empty email.",
+    );
+  }
+
+  const { ensureDaemonSecretStoreReadyInteractive, findDaemonLoginSecretRef } =
+    await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  await ensureDaemonSecretStoreReadyInteractive({
+    profileName: normalizedProfileName,
+    store: "bitwarden-cli",
+    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
+  });
+  const response = await findDaemonLoginSecretRef({
+    profileName: normalizedProfileName,
+    store: "bitwarden-cli",
+    username: normalizedEmail,
+    uris: OPENAI_ACCOUNT_SECRET_URIS,
+  });
+  if (!response?.ok) {
+    throw new Error(
+      response?.error?.message ||
+        `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalizedEmail}.`,
+    );
+  }
+  return normalizeCodexRotateSecretRef(response?.ref);
 }
 
 export function loadCredentialStore(): CredentialStore {
@@ -1173,10 +1218,19 @@ function ensureFastBrowserPlaywright(): void {
   }
 }
 
+function resolveCodexLoginManagedBrowserOpenerPath(): string {
+  const override = process.env.CODEX_ROTATE_BROWSER_OPENER_BIN?.trim();
+  if (override) {
+    return override;
+  }
+  return CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT;
+}
+
 function ensureCodexLoginManagedBrowserOpener(): void {
-  if (!existsSync(CODEX_LOGIN_MANAGED_BROWSER_OPENER)) {
+  const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
+  if (!existsSync(openerPath)) {
     throw new Error(
-      `Managed Codex browser opener script not found at ${CODEX_LOGIN_MANAGED_BROWSER_OPENER}.`,
+      `Managed Codex browser opener script not found at ${openerPath}.`,
     );
   }
 }
@@ -1188,20 +1242,47 @@ function shellSingleQuote(value: string): string {
 function renderCodexLoginManagedBrowserWrapper(
   realCodexBin: string,
   profileName: string,
+  shimDir: string,
+  openerPath: string,
 ): string {
   return [
     "#!/bin/sh",
     `export FAST_BROWSER_PROFILE=${shellSingleQuote(profileName)}`,
-    `export BROWSER=${shellSingleQuote(CODEX_LOGIN_MANAGED_BROWSER_OPENER)}`,
+    `export BROWSER=${shellSingleQuote(openerPath)}`,
+    `export CODEX_ROTATE_REAL_OPEN=${shellSingleQuote("/usr/bin/open")}`,
+    `export PATH=${shellSingleQuote(shimDir)}:"$PATH"`,
     `exec ${shellSingleQuote(realCodexBin)} \"$@\"`,
     "",
   ].join("\n");
+}
+
+function ensureCodexLoginManagedBrowserShims(
+  shimDir: string,
+  openerPath: string,
+): void {
+  mkdirSync(shimDir, { recursive: true });
+  const shimContent = [
+    "#!/bin/sh",
+    `exec ${shellSingleQuote(openerPath)} \"$@\"`,
+    "",
+  ].join("\n");
+  for (const shimName of ["open", "xdg-open"]) {
+    const shimPath = join(shimDir, shimName);
+    const current = existsSync(shimPath)
+      ? readFileSync(shimPath, "utf8")
+      : null;
+    if (current !== shimContent) {
+      writeFileSync(shimPath, shimContent, { mode: 0o700 });
+    }
+    chmodSync(shimPath, 0o700);
+  }
 }
 
 export function buildCodexLoginManagedBrowserWrapperPath(
   profileName: string,
   codexBin: string,
 ): string {
+  const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
   const profileToken =
     String(profileName || "default")
       .toLowerCase()
@@ -1209,9 +1290,7 @@ export function buildCodexLoginManagedBrowserWrapperPath(
       .replace(/^-|-$/g, "")
       .slice(0, 32) || "default";
   const hash = createHash("sha256")
-    .update(
-      `${profileName}\n${codexBin}\n${CODEX_LOGIN_MANAGED_BROWSER_OPENER}`,
-    )
+    .update(`${profileName}\n${codexBin}\n${openerPath}`)
     .digest("hex")
     .slice(0, 12);
   return join(ROTATE_HOME, "bin", `codex-login-${profileToken}-${hash}`);
@@ -1223,11 +1302,19 @@ export function ensureCodexLoginManagedBrowserWrapper(
 ): string {
   ensureCodexLoginManagedBrowserOpener();
   mkdirSync(join(ROTATE_HOME, "bin"), { recursive: true });
+  const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
+  const shimDir = join(ROTATE_HOME, "bin", "codex-login-shims");
+  ensureCodexLoginManagedBrowserShims(shimDir, openerPath);
   const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(
     profileName,
     codexBin,
   );
-  const content = renderCodexLoginManagedBrowserWrapper(codexBin, profileName);
+  const content = renderCodexLoginManagedBrowserWrapper(
+    codexBin,
+    profileName,
+    shimDir,
+    openerPath,
+  );
   const current = existsSync(wrapperPath)
     ? readFileSync(wrapperPath, "utf8")
     : null;
@@ -2115,18 +2202,18 @@ function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
     return null;
   }
   const normalized = { ...raw } as Record<string, unknown>;
-  const secretRef = normalizeCodexRotateSecretRef(
-    normalized.account_secret_ref,
-  );
+  const hadPersistedSecretRef =
+    normalizeCodexRotateSecretRef(normalized.account_secret_ref) !== null;
   const legacyPassword =
     typeof normalized.password === "string" && normalized.password.length > 0
       ? normalized.password
       : null;
   delete normalized.password;
+  delete normalized.account_secret_ref;
   return {
     ...(normalized as unknown as StoredCredential),
-    account_secret_ref: secretRef,
-    legacy_password: secretRef ? null : legacyPassword,
+    account_secret_ref: null,
+    legacy_password: hadPersistedSecretRef ? null : legacyPassword,
   };
 }
 
@@ -2181,10 +2268,7 @@ function serializeCredentialRecord(raw: StoredCredential): StoredCredential {
   ) {
     serialized.started_at = (raw as PendingCredential).started_at;
   }
-  const secretRef = normalizeCodexRotateSecretRef(raw.account_secret_ref);
-  if (secretRef) {
-    serialized.account_secret_ref = secretRef;
-  } else if (
+  if (
     typeof raw.legacy_password === "string" &&
     raw.legacy_password.length > 0
   ) {

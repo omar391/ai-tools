@@ -8,6 +8,7 @@ import type {
 import {
   completeCodexLoginViaWorkflow,
   ensureBitwardenCliAccountSecretRef,
+  findBitwardenCliAccountSecretRef,
   inspectManagedProfiles,
   readWorkflowFileMetadata,
 } from "./automation.ts";
@@ -21,6 +22,10 @@ type BridgeRequest =
   | {
       command: "ensure-account-secret-ref";
       payload: { profileName: string; email: string; password: string };
+    }
+  | {
+      command: "find-account-secret-ref";
+      payload: { profileName: string; email: string };
     }
   | {
       command: "complete-codex-login";
@@ -66,6 +71,11 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.profileName,
         request.payload.email,
         request.payload.password,
+      );
+    case "find-account-secret-ref":
+      return await findBitwardenCliAccountSecretRef(
+        request.payload.profileName,
+        request.payload.email,
       );
     case "complete-codex-login":
       return (await completeCodexLoginViaWorkflow(

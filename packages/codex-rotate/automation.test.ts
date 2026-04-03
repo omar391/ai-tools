@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   buildCodexLoginManagedBrowserWrapperPath,
@@ -7,6 +11,7 @@ import {
   buildCodexRotateOpenAiTempProfileName,
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
+  ensureCodexLoginManagedBrowserWrapper,
   isRetryableCodexLoginWorkflowErrorMessage,
   normalizeBaseEmailFamily,
   normalizeCredentialStore,
@@ -129,6 +134,78 @@ describe("codex login managed-browser wrapper", () => {
     expect(buildCodexLoginManagedBrowserWrapperPath("dev-1", "codex")).not.toBe(
       buildCodexLoginManagedBrowserWrapperPath("dev-2", "codex"),
     );
+  });
+
+  test("routes macOS open-based login launches through the managed-profile opener", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
+    const openerLogPath = join(fixtureRoot, "opener-log.json");
+    const openerPath = join(fixtureRoot, "fake-opener.mjs");
+    const codexPath = join(fixtureRoot, "fake-codex.sh");
+
+    writeFileSync(
+      openerPath,
+      [
+        "#!/usr/bin/env node",
+        'import { writeFileSync } from "node:fs";',
+        "const logPath = process.env.CODEX_ROTATE_TEST_OPENER_LOG;",
+        "writeFileSync(logPath, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "  profile: process.env.FAST_BROWSER_PROFILE || null,",
+        "  browser: process.env.BROWSER || null,",
+        "}));",
+      ].join("\n"),
+      { encoding: "utf8", mode: 0o700 },
+    );
+    writeFileSync(
+      codexPath,
+      [
+        "#!/bin/sh",
+        'open "https://auth.openai.com/oauth/authorize?state=test-wrapper"',
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+
+    const previousOpener = process.env.CODEX_ROTATE_BROWSER_OPENER_BIN;
+    const previousLog = process.env.CODEX_ROTATE_TEST_OPENER_LOG;
+
+    try {
+      process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = openerPath;
+      process.env.CODEX_ROTATE_TEST_OPENER_LOG = openerLogPath;
+
+      const wrapperPath = ensureCodexLoginManagedBrowserWrapper(
+        "managed-dev-1",
+        codexPath,
+      );
+      const result = spawnSync(wrapperPath, ["login"], {
+        encoding: "utf8",
+        env: process.env,
+      });
+
+      expect(result.status).toBe(0);
+      const logged = JSON.parse(readFileSync(openerLogPath, "utf8")) as {
+        argv: string[];
+        profile: string | null;
+        browser: string | null;
+      };
+      expect(logged.profile).toBe("managed-dev-1");
+      expect(logged.argv).toContain(
+        "https://auth.openai.com/oauth/authorize?state=test-wrapper",
+      );
+      expect(logged.browser).toBe(openerPath);
+    } finally {
+      if (previousOpener === undefined) {
+        delete process.env.CODEX_ROTATE_BROWSER_OPENER_BIN;
+      } else {
+        process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = previousOpener;
+      }
+      if (previousLog === undefined) {
+        delete process.env.CODEX_ROTATE_TEST_OPENER_LOG;
+      } else {
+        process.env.CODEX_ROTATE_TEST_OPENER_LOG = previousLog;
+      }
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -310,7 +387,7 @@ describe("credential store normalization", () => {
     ).toBeNull();
   });
 
-  test("drops legacy passwords from saved records once a Bitwarden ref exists", () => {
+  test("drops Bitwarden refs and legacy passwords from saved records once a vault entry exists", () => {
     const store = normalizeCredentialStore({
       accounts: {
         "dev.user+1@gmail.com": {
@@ -331,7 +408,6 @@ describe("credential store normalization", () => {
     const serialized = serializeCredentialStore(store);
     expect(serialized.accounts["dev.user+1@gmail.com"]).toEqual({
       email: "dev.user+1@gmail.com",
-      account_secret_ref: makeSecretRef("bw-dev-user-1"),
       profile_name: "dev-1",
       base_email: "dev.user@gmail.com",
       suffix: 1,
@@ -340,6 +416,29 @@ describe("credential store normalization", () => {
       created_at: "2026-03-20T00:00:00.000Z",
       updated_at: "2026-03-20T00:00:00.000Z",
     });
+  });
+
+  test("ignores persisted Bitwarden refs from old files and relies on runtime lookup instead", () => {
+    const store = normalizeCredentialStore({
+      accounts: {
+        "dev.user+1@gmail.com": {
+          email: "dev.user+1@gmail.com",
+          account_secret_ref: makeSecretRef("bw-dev-user-1"),
+          profile_name: "dev-1",
+          base_email: "dev.user@gmail.com",
+          suffix: 1,
+          selector: "dev.user+1@gmail.com_free",
+          alias: null,
+          created_at: "2026-03-20T00:00:00.000Z",
+          updated_at: "2026-03-20T00:00:00.000Z",
+        },
+      },
+    });
+
+    expect(
+      store.accounts["dev.user+1@gmail.com"]?.account_secret_ref,
+    ).toBeNull();
+    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBeNull();
   });
 });
 

@@ -1,5 +1,9 @@
+use std::io::{self, Write};
+
 use anyhow::{anyhow, Result};
-use codex_rotate_core::pool::{cmd_add, cmd_list, cmd_next, cmd_prev, cmd_remove, cmd_status};
+use codex_rotate_core::pool::{
+    cmd_add, cmd_list_stream, cmd_next, cmd_prev, cmd_remove, cmd_status_stream,
+};
 use codex_rotate_core::workflow::{
     cmd_create, cmd_relogin, CreateCommandOptions, CreateCommandSource, ReloginOptions,
 };
@@ -18,31 +22,47 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str);
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
 
-    let output = match command {
-        None | Some("help") | Some("--help") | Some("-h") => help_text(),
-        Some("add") => cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
-        Some("create") | Some("new") => cmd_create(parse_create_options(&args[1..])?)?,
-        Some("next") | Some("n") => cmd_next()?,
-        Some("prev") | Some("p") => cmd_prev()?,
-        Some("list") | Some("ls") => cmd_list()?,
-        Some("status") | Some("s") => cmd_status()?,
+    match command {
+        None | Some("help") | Some("--help") | Some("-h") => {
+            write_output(&mut stdout, &help_text())?
+        }
+        Some("add") => write_output(
+            &mut stdout,
+            &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
+        )?,
+        Some("create") | Some("new") => {
+            write_output(&mut stdout, &cmd_create(parse_create_options(&args[1..])?)?)?
+        }
+        Some("next") | Some("n") => write_output(&mut stdout, &cmd_next()?)?,
+        Some("prev") | Some("p") => write_output(&mut stdout, &cmd_prev()?)?,
+        Some("list") | Some("ls") => cmd_list_stream(&mut stdout)?,
+        Some("status") | Some("s") => cmd_status_stream(&mut stdout)?,
         Some("relogin") | Some("reauth") => {
             let (selector, options) = parse_relogin_options(&args[1..])?;
-            cmd_relogin(&selector, options)?
+            write_output(&mut stdout, &cmd_relogin(&selector, options)?)?
         }
-        Some("remove") | Some("rm") => cmd_remove(parse_remove_selector(&args[1..])?)?,
+        Some("remove") | Some("rm") => write_output(
+            &mut stdout,
+            &cmd_remove(parse_remove_selector(&args[1..])?)?,
+        )?,
         Some(other) => {
             return Err(anyhow!(
                 "Unknown command: \"{other}\". Run \"codex-rotate help\" for usage."
             ))
         }
-    };
-
-    print!("{output}");
-    if !output.ends_with('\n') {
-        println!();
     }
+    Ok(())
+}
+
+fn write_output(writer: &mut dyn Write, output: &str) -> Result<()> {
+    writer.write_all(output.as_bytes())?;
+    if !output.ends_with('\n') {
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -144,12 +164,12 @@ fn parse_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
         match arg.as_str() {
             "--allow-email-change" => options.allow_email_change = true,
             "--device-auth" => {
-                options.device_auth = true;
-                options.manual_login = true;
+                return Err(anyhow!(
+                    "--device-auth is no longer supported. Use the managed-browser default flow or pass --manual-login if you need to repair it interactively."
+                ));
             }
             "--manual-login" | "--browser-login" | "--no-device-auth" => {
                 options.manual_login = true;
-                options.device_auth = false;
             }
             "--logout-first" => options.logout_first = true,
             "--keep-session" | "--no-logout-first" => options.logout_first = false,
@@ -160,7 +180,7 @@ fn parse_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
 
     if positionals.len() != 1 {
         return Err(anyhow!(
-            "Usage: codex-rotate relogin <selector> [--allow-email-change] [--manual-login] [--device-auth] [--keep-session]"
+            "Usage: codex-rotate relogin <selector> [--allow-email-change] [--manual-login] [--keep-session]"
         ));
     }
 
