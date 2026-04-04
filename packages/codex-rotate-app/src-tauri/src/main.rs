@@ -298,7 +298,8 @@ struct StatusSnapshot {
     current_plan: Option<String>,
     current_quota: Option<String>,
     current_quota_percent: Option<u8>,
-    last_rotation_email: Option<String>,
+    last_rotation_from_email: Option<String>,
+    last_rotation_to_email: Option<String>,
     last_rotation_reason: Option<String>,
     last_message: Option<String>,
     quota_cache: Option<CachedQuotaState>,
@@ -381,6 +382,15 @@ fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
 }
 
 fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
+    let rotation_text = match (
+        snapshot.last_rotation_from_email.as_deref(),
+        snapshot.last_rotation_to_email.as_deref(),
+    ) {
+        (Some(from), Some(to)) if from != to => format!("Last rotation: {from} -> {to}"),
+        (_, Some(to)) => format!("Last rotation: {to}"),
+        _ => "Last rotation: none".to_string(),
+    };
+
     RenderedSnapshot {
         account_text: format!(
             "Account: {}",
@@ -402,10 +412,7 @@ fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
             "Status: {}",
             snapshot.last_message.as_deref().unwrap_or("starting")
         ),
-        rotation_text: format!(
-            "Last rotation: {}",
-            snapshot.last_rotation_email.as_deref().unwrap_or("none")
-        ),
+        rotation_text,
         tooltip_text: match snapshot.current_quota_percent {
             Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
             None => "Codex Rotate\nClick for status".to_string(),
@@ -451,6 +458,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
     }) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            let previous_displayed_email = snapshot.current_email.clone();
             refresh_inventory_count(app, &mut snapshot);
             if let Some(live) = result.live.as_ref() {
                 snapshot.current_email = Some(live.email.clone());
@@ -463,7 +471,8 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
             }
             if result.rotated {
                 if let Some(rotation) = result.rotation.as_ref() {
-                    snapshot.last_rotation_email = Some(rotation.email.clone());
+                    snapshot.last_rotation_from_email = previous_displayed_email;
+                    snapshot.last_rotation_to_email = Some(rotation.email.clone());
                 }
                 snapshot.last_rotation_reason = result.decision.reason.clone();
                 snapshot.last_message = Some(format!(
@@ -505,16 +514,18 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
     let next = match rotate_next_internal() {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            let previous_displayed_email = snapshot.current_email.clone();
             refresh_inventory_count(app, &mut snapshot);
             match &result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
                 | NextResult::Created { summary, .. } => {
-                    snapshot.last_rotation_email = Some(summary.email.clone());
+                    snapshot.last_rotation_from_email = previous_displayed_email.clone();
+                    snapshot.last_rotation_to_email = Some(summary.email.clone());
                 }
             }
 
-            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000, false) {
+            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
                 Ok(live) => {
                     snapshot.current_email = Some(live.email.clone());
                     snapshot.current_plan = Some(live.plan_type.clone());
@@ -708,7 +719,8 @@ mod tests {
             plan_text: "Plan: free".to_string(),
             quota_text: "Quota: 5h 80% left".to_string(),
             status_text: "Status: watch healthy".to_string(),
-            rotation_text: "Last rotation: none".to_string(),
+            rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com"
+                .to_string(),
             tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
             quota_percent: Some(80),
         }

@@ -185,13 +185,10 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             None => {}
         }
         if rotation.is_some() || refreshed_current {
-            let reload_after_switch = rotation.is_some()
-                && matches!(decision.rotation_command, Some(RotationCommand::Next));
             live = Some(switch_live_account_to_current_auth(
                 Some(port),
                 false,
                 15_000,
-                reload_after_switch,
             )?);
             let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
             let refreshed_summary = summarize_codex_auth(&refreshed_auth);
@@ -292,7 +289,7 @@ fn ensure_live_account_matches_current_auth(
     if live_account_matches_summary(&live_account, &summary) {
         return Ok(live_account);
     }
-    let switched = switch_live_account_to_current_auth(Some(port), false, 15_000, false)?;
+    let switched = switch_live_account_to_current_auth(Some(port), false, 15_000)?;
     Ok(AccountReadResult {
         account: Some(crate::hook::LiveAccount {
             account_type: None,
