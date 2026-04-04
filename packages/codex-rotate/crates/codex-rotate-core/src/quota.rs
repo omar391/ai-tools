@@ -237,18 +237,18 @@ pub fn quota_cache_ttl(
     error: Option<&str>,
 ) -> chrono::Duration {
     if error.is_some() {
-        return chrono::Duration::seconds(30);
+        return chrono::Duration::seconds(15);
     }
     let Some(assessment) = assessment else {
-        return chrono::Duration::seconds(30);
+        return chrono::Duration::seconds(15);
     };
     if !assessment.usable {
-        return chrono::Duration::seconds(30);
+        return chrono::Duration::seconds(15);
     }
     match assessment.primary_quota_left_percent.unwrap_or(0.0) {
-        value if value > 20.0 => chrono::Duration::minutes(5),
-        value if value > 10.0 => chrono::Duration::seconds(90),
-        _ => chrono::Duration::seconds(30),
+        value if value > 20.0 => chrono::Duration::seconds(60),
+        value if value > 10.0 => chrono::Duration::seconds(30),
+        _ => chrono::Duration::seconds(15),
     }
 }
 
@@ -501,7 +501,7 @@ mod tests {
         };
         assert_eq!(
             quota_cache_ttl(Some(&assessment), None),
-            chrono::Duration::minutes(5)
+            chrono::Duration::seconds(60)
         );
 
         let assessment = QuotaAssessment {
@@ -510,7 +510,7 @@ mod tests {
         };
         assert_eq!(
             quota_cache_ttl(Some(&assessment), None),
-            chrono::Duration::seconds(90)
+            chrono::Duration::seconds(30)
         );
 
         let assessment = QuotaAssessment {
@@ -519,7 +519,7 @@ mod tests {
         };
         assert_eq!(
             quota_cache_ttl(Some(&assessment), None),
-            chrono::Duration::seconds(30)
+            chrono::Duration::seconds(15)
         );
     }
 

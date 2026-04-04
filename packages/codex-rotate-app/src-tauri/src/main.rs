@@ -1,4 +1,4 @@
-use codex_rotate_core::pool::{rotate_next_internal, NextResult};
+use codex_rotate_core::pool::{load_pool, rotate_next_internal, NextResult};
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_tray_core::hook::{read_live_account, switch_live_account_to_current_auth};
 use codex_rotate_tray_core::launcher::ensure_debug_codex_instance;
@@ -38,6 +38,28 @@ fn paint_alpha(rgba: &mut [u8], width: u32, x: u32, y: u32, alpha: u8) {
     rgba[offset + 3] = rgba[offset + 3].max(alpha);
 }
 
+fn paint_rect(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    alpha: u8,
+) {
+    for row in 0..rect_height {
+        for col in 0..rect_width {
+            let px = x + col as i32;
+            let py = y + row as i32;
+            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                continue;
+            }
+            paint_alpha(rgba, width, px as u32, py as u32, alpha);
+        }
+    }
+}
+
 fn ring_coverage(distance: f32, inner_radius: f32, outer_radius: f32) -> f32 {
     let outer_alpha = clamp_unit(outer_radius + 0.75 - distance);
     let inner_alpha = clamp_unit(distance - inner_radius + 0.75);
@@ -67,13 +89,136 @@ fn paint_dot(rgba: &mut [u8], width: u32, height: u32, center_x: f32, center_y: 
     }
 }
 
+fn seven_segment_mask(digit: char) -> Option<u8> {
+    match digit {
+        '0' => Some(0b0111111),
+        '1' => Some(0b0000110),
+        '2' => Some(0b1011011),
+        '3' => Some(0b1001111),
+        '4' => Some(0b1100110),
+        '5' => Some(0b1101101),
+        '6' => Some(0b1111101),
+        '7' => Some(0b0000111),
+        '8' => Some(0b1111111),
+        '9' => Some(0b1101111),
+        _ => None,
+    }
+}
+
+fn paint_segment_digit(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    digit_width: u32,
+    digit_height: u32,
+    digit: char,
+) {
+    let Some(mask) = seven_segment_mask(digit) else {
+        return;
+    };
+    let thickness = (digit_width / 5).max(4);
+    let half_height = digit_height / 2;
+    let vertical_height = half_height.saturating_sub(thickness);
+    let mid_y = y + half_height as i32 - (thickness as i32 / 2);
+    let right_x = x + digit_width as i32 - thickness as i32;
+
+    let segments = [
+        (
+            0b0000001,
+            x + thickness as i32,
+            y,
+            digit_width.saturating_sub(thickness * 2),
+            thickness,
+        ),
+        (
+            0b0000010,
+            right_x,
+            y + thickness as i32,
+            thickness,
+            vertical_height,
+        ),
+        (
+            0b0000100,
+            right_x,
+            y + half_height as i32,
+            thickness,
+            vertical_height,
+        ),
+        (
+            0b0001000,
+            x + thickness as i32,
+            y + digit_height as i32 - thickness as i32,
+            digit_width.saturating_sub(thickness * 2),
+            thickness,
+        ),
+        (
+            0b0010000,
+            x,
+            y + half_height as i32,
+            thickness,
+            vertical_height,
+        ),
+        (
+            0b0100000,
+            x,
+            y + thickness as i32,
+            thickness,
+            vertical_height,
+        ),
+        (
+            0b1000000,
+            x + thickness as i32,
+            mid_y,
+            digit_width.saturating_sub(thickness * 2),
+            thickness,
+        ),
+    ];
+
+    for (segment_mask, seg_x, seg_y, seg_width, seg_height) in segments {
+        if mask & segment_mask != 0 {
+            paint_rect(
+                rgba, width, height, seg_x, seg_y, seg_width, seg_height, 255,
+            );
+        }
+    }
+}
+
+fn paint_percent_digits(rgba: &mut [u8], width: u32, height: u32, center: f32, percent: u8) {
+    let text = percent.to_string();
+    let (digit_width, digit_height, spacing) = match text.len() {
+        1 => (28u32, 48u32, 0u32),
+        2 => (22u32, 38u32, 4u32),
+        _ => (18u32, 30u32, 3u32),
+    };
+    let total_width =
+        text.len() as u32 * digit_width + (text.len().saturating_sub(1) as u32 * spacing);
+    let start_x = center.round() as i32 - (total_width as i32 / 2);
+    let start_y = center.round() as i32 - (digit_height as i32 / 2);
+
+    for (index, digit) in text.chars().enumerate() {
+        let digit_x = start_x + index as i32 * (digit_width + spacing) as i32;
+        paint_segment_digit(
+            rgba,
+            width,
+            height,
+            digit_x,
+            start_y,
+            digit_width,
+            digit_height,
+            digit,
+        );
+    }
+}
+
 fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
-    let width = 32u32;
-    let height = 32u32;
+    let width = 96u32;
+    let height = 96u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
-    let center = 16.0f32;
-    let outer_radius = 12.4f32;
-    let inner_radius = 8.6f32;
+    let center = 48.0f32;
+    let outer_radius = 46.0f32;
+    let inner_radius = 37.0f32;
     let start_degrees = 135.0f32;
     let gauge_sweep = 270.0f32;
     let progress_sweep = quota_percent
@@ -116,7 +261,8 @@ fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
     if let Some(percent) = quota_percent {
         let end_angle = start_degrees + gauge_sweep * (percent as f32 / 100.0);
         let (dot_x, dot_y) = point_on_circle(center, active_radius, end_angle);
-        paint_dot(&mut rgba, width, height, dot_x, dot_y, 2.2);
+        paint_dot(&mut rgba, width, height, dot_x, dot_y, 5.0);
+        paint_percent_digits(&mut rgba, width, height, center, percent);
     }
 
     Image::new_owned(rgba, width, height)
@@ -130,6 +276,7 @@ struct SharedStatus {
 #[derive(Clone)]
 struct MenuHandles {
     account_item: MenuItem<tauri::Wry>,
+    inventory_item: MenuItem<tauri::Wry>,
     plan_item: MenuItem<tauri::Wry>,
     quota_item: MenuItem<tauri::Wry>,
     status_item: MenuItem<tauri::Wry>,
@@ -139,6 +286,7 @@ struct MenuHandles {
 #[derive(Clone, Default)]
 struct StatusSnapshot {
     current_email: Option<String>,
+    inventory_count: Option<usize>,
     current_plan: Option<String>,
     current_quota: Option<String>,
     current_quota_percent: Option<u8>,
@@ -154,12 +302,20 @@ fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
     snapshot.quota_cache = Some(quota.clone());
 }
 
+fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
+    snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
+}
+
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     if let Some(menu) = app.try_state::<MenuHandles>() {
         let account_text = format!(
             "Account: {}",
             snapshot.current_email.as_deref().unwrap_or("unknown")
         );
+        let inventory_text = match snapshot.inventory_count {
+            Some(count) => format!("Inventory: {count} account(s)"),
+            None => "Inventory: unknown".to_string(),
+        };
         let plan_text = format!(
             "Plan: {}",
             snapshot.current_plan.as_deref().unwrap_or("unknown")
@@ -177,6 +333,7 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
             snapshot.last_rotation_email.as_deref().unwrap_or("none")
         );
         let _ = menu.account_item.set_text(account_text);
+        let _ = menu.inventory_item.set_text(inventory_text);
         let _ = menu.plan_item.set_text(plan_text);
         let _ = menu.quota_item.set_text(quota_text);
         let _ = menu.status_item.set_text(status_text);
@@ -184,16 +341,13 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 
     if let Some(tray) = app.tray_by_id("main") {
-        let tray_title = snapshot
-            .current_quota_percent
-            .map(|percent| format!("{percent}%"));
         let tooltip = match snapshot.current_quota_percent {
             Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
             None => "Codex Rotate\nClick for status".to_string(),
         };
         let _ = tray.set_icon(Some(build_tray_icon(snapshot.current_quota_percent)));
         let _ = tray.set_icon_as_template(true);
-        let _ = tray.set_title(tray_title);
+        let _ = tray.set_title(Option::<String>::None);
         let _ = tray.set_tooltip(Some(tooltip));
     }
 }
@@ -207,6 +361,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
     }) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             if let Some(live) = result.live.as_ref() {
                 snapshot.current_email = Some(live.email.clone());
                 snapshot.current_plan = Some(live.plan_type.clone());
@@ -238,6 +393,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             snapshot.last_message = Some(format!("watch failed: {}", error));
             snapshot.clone()
         }
@@ -259,6 +415,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
     let next = match rotate_next_internal() {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             match &result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -267,7 +424,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
                 }
             }
 
-            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
+            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000, false) {
                 Ok(live) => {
                     snapshot.current_email = Some(live.email.clone());
                     snapshot.current_plan = Some(live.plan_type.clone());
@@ -295,6 +452,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             snapshot.last_message = Some(format!("manual rotate failed: {}", error));
             snapshot.clone()
         }
@@ -306,6 +464,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
     let next = match read_live_account(Some(DEFAULT_PORT)) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             if let Some(account) = result.account.as_ref() {
                 snapshot.current_email = account.email.clone();
                 snapshot.current_plan = account.plan_type.clone();
@@ -323,6 +482,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
+            refresh_inventory_count(&mut snapshot);
             snapshot.last_message = Some(format!("account read failed: {}", error));
             snapshot.clone()
         }
@@ -347,6 +507,8 @@ fn main() {
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
+            let inventory_item =
+                MenuItem::with_id(app, "inventory", "Inventory: unknown", false, None::<&str>)?;
             let plan_item = MenuItem::with_id(app, "plan", "Plan: unknown", false, None::<&str>)?;
             let quota_item =
                 MenuItem::with_id(app, "quota", "Quota: unknown", false, None::<&str>)?;
@@ -360,12 +522,13 @@ fn main() {
                 None::<&str>,
             )?;
             let launch_item =
-                MenuItem::with_id(app, "launch", "Open Wrapper Codex", true, None::<&str>)?;
+                MenuItem::with_id(app, "launch", "Open Managed Codex", true, None::<&str>)?;
             let check_item = MenuItem::with_id(app, "check", "Check Now", true, None::<&str>)?;
             let rotate_item = MenuItem::with_id(app, "rotate", "Rotate Now", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             app.manage(MenuHandles {
                 account_item: account_item.clone(),
+                inventory_item: inventory_item.clone(),
                 plan_item: plan_item.clone(),
                 quota_item: quota_item.clone(),
                 status_item: status_item.clone(),
@@ -375,6 +538,7 @@ fn main() {
                 app,
                 &[
                     &account_item,
+                    &inventory_item,
                     &plan_item,
                     &quota_item,
                     &status_item,

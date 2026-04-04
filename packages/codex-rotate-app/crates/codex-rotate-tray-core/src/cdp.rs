@@ -62,6 +62,16 @@ impl CdpConnection {
         serde_json::from_value(value).context("Failed to decode CDP evaluation result.")
     }
 
+    pub fn reload_page(&mut self, ignore_cache: bool) -> Result<()> {
+        let _: Value = self.send_command(
+            "Page.reload",
+            json!({
+                "ignoreCache": ignore_cache,
+            }),
+        )?;
+        Ok(())
+    }
+
     pub fn close(&mut self) {
         let _ = self.socket.close(None);
     }

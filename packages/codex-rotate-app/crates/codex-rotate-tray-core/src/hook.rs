@@ -45,6 +45,7 @@ pub fn switch_live_account_to_current_auth(
     port: Option<u16>,
     ensure_launched: bool,
     timeout_ms: u64,
+    reload_after_switch: bool,
 ) -> Result<LiveSwitchResult> {
     let paths = resolve_paths()?;
     let auth = load_codex_auth(&paths.codex_auth_file)?;
@@ -76,6 +77,9 @@ pub fn switch_live_account_to_current_auth(
             .unwrap_or(false)
         {
             let current_account = current.account.clone();
+            if reload_after_switch {
+                reload_live_codex_page(port, timeout_ms)?;
+            }
             return Ok(LiveSwitchResult {
                 email: current_account
                     .as_ref()
@@ -94,6 +98,26 @@ pub fn switch_live_account_to_current_auth(
     Err(anyhow!(
         "Codex did not switch to {} in time.",
         summary.email
+    ))
+}
+
+fn reload_live_codex_page(port: u16, timeout_ms: u64) -> Result<()> {
+    {
+        let mut connection = connect_to_local_codex_page(port)?;
+        connection.reload_page(true)?;
+        connection.close();
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(8_000));
+    while Instant::now() < deadline {
+        if connect_to_local_codex_page(port).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    Err(anyhow!(
+        "Codex did not reconnect after reloading the active page."
     ))
 }
 
