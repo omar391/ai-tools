@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -137,10 +143,83 @@ describe("codex login managed-browser wrapper", () => {
     );
   });
 
-  test("routes macOS open-based login launches through the managed-profile opener", () => {
+  test("intercepts login through the dedicated managed-login helper", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
+    const helperLogPath = join(fixtureRoot, "helper-log.json");
+    const helperPath = join(fixtureRoot, "fake-helper.mjs");
+    const codexMarkerPath = join(fixtureRoot, "codex-invoked.txt");
+    const codexPath = join(fixtureRoot, "fake-codex.sh");
+
+    writeFileSync(
+      helperPath,
+      [
+        "#!/usr/bin/env node",
+        'import { writeFileSync } from "node:fs";',
+        "const logPath = process.env.CODEX_ROTATE_TEST_HELPER_LOG;",
+        "writeFileSync(logPath, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "  profile: process.env.FAST_BROWSER_PROFILE || null,",
+        "  realCodex: process.env.CODEX_ROTATE_REAL_CODEX || null,",
+        "}));",
+      ].join("\n"),
+      { encoding: "utf8", mode: 0o700 },
+    );
+    writeFileSync(
+      codexPath,
+      [
+        "#!/bin/sh",
+        `printf 'invoked' > ${JSON.stringify(codexMarkerPath)}`,
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+
+    const previousHelper = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+    const previousLog = process.env.CODEX_ROTATE_TEST_HELPER_LOG;
+
+    try {
+      process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
+      process.env.CODEX_ROTATE_TEST_HELPER_LOG = helperLogPath;
+
+      const wrapperPath = ensureCodexLoginManagedBrowserWrapper(
+        "managed-dev-1",
+        codexPath,
+      );
+      const result = spawnSync(wrapperPath, ["login"], {
+        encoding: "utf8",
+        env: process.env,
+      });
+
+      expect(result.status).toBe(0);
+      const logged = JSON.parse(readFileSync(helperLogPath, "utf8")) as {
+        argv: string[];
+        profile: string | null;
+        realCodex: string | null;
+      };
+      expect(logged.profile).toBe("managed-dev-1");
+      expect(logged.argv).toEqual([]);
+      expect(logged.realCodex).toBe(codexPath);
+      expect(existsSync(codexMarkerPath)).toBe(false);
+    } finally {
+      if (previousHelper === undefined) {
+        delete process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+      } else {
+        process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = previousHelper;
+      }
+      if (previousLog === undefined) {
+        delete process.env.CODEX_ROTATE_TEST_HELPER_LOG;
+      } else {
+        process.env.CODEX_ROTATE_TEST_HELPER_LOG = previousLog;
+      }
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("routes macOS open-based launches through the managed-profile opener", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
     const openerLogPath = join(fixtureRoot, "opener-log.json");
     const openerPath = join(fixtureRoot, "fake-opener.mjs");
+    const helperPath = join(fixtureRoot, "fake-helper.mjs");
     const codexPath = join(fixtureRoot, "fake-codex.sh");
 
     writeFileSync(
@@ -157,6 +236,9 @@ describe("codex login managed-browser wrapper", () => {
       ].join("\n"),
       { encoding: "utf8", mode: 0o700 },
     );
+    writeFileSync(helperPath, ["#!/bin/sh", "exit 0"].join("\n"), {
+      mode: 0o700,
+    });
     writeFileSync(
       codexPath,
       [
@@ -168,17 +250,19 @@ describe("codex login managed-browser wrapper", () => {
     );
 
     const previousOpener = process.env.CODEX_ROTATE_BROWSER_OPENER_BIN;
+    const previousHelper = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
     const previousLog = process.env.CODEX_ROTATE_TEST_OPENER_LOG;
 
     try {
       process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = openerPath;
+      process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
       process.env.CODEX_ROTATE_TEST_OPENER_LOG = openerLogPath;
 
       const wrapperPath = ensureCodexLoginManagedBrowserWrapper(
         "managed-dev-1",
         codexPath,
       );
-      const result = spawnSync(wrapperPath, ["login"], {
+      const result = spawnSync(wrapperPath, ["status"], {
         encoding: "utf8",
         env: process.env,
       });
@@ -200,11 +284,98 @@ describe("codex login managed-browser wrapper", () => {
       } else {
         process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = previousOpener;
       }
+      if (previousHelper === undefined) {
+        delete process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+      } else {
+        process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = previousHelper;
+      }
       if (previousLog === undefined) {
         delete process.env.CODEX_ROTATE_TEST_OPENER_LOG;
       } else {
         process.env.CODEX_ROTATE_TEST_OPENER_LOG = previousLog;
       }
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks non-URL browser launches instead of falling back to the system browser", () => {
+    const openerPath = join(
+      import.meta.dir,
+      "codex-login-managed-browser-opener.mjs",
+    );
+    const result = spawnSync(process.execPath, [openerPath, "/tmp/not-a-url"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FAST_BROWSER_PROFILE: "managed-dev-1",
+      },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "Managed Codex browser opener refused a non-URL browser launch request.",
+    );
+  });
+});
+
+describe("managed login helper", () => {
+  test("starts login through codex app-server and exits on completion", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-app-server-"));
+    const helperPath = join(
+      import.meta.dir,
+      "codex-login-app-server-helper.mjs",
+    );
+    const fakeCodexPath = join(fixtureRoot, "fake-codex.mjs");
+
+    writeFileSync(
+      fakeCodexPath,
+      [
+        "#!/usr/bin/env node",
+        "import process from 'node:process';",
+        "let buffer = '';",
+        "function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', (chunk) => {",
+        "  buffer += chunk;",
+        "  while (true) {",
+        "    const newlineIndex = buffer.indexOf('\\n');",
+        "    if (newlineIndex === -1) break;",
+        "    const line = buffer.slice(0, newlineIndex).trim();",
+        "    buffer = buffer.slice(newlineIndex + 1);",
+        "    if (!line) continue;",
+        "    const message = JSON.parse(line);",
+        "    if (message.method === 'initialize') {",
+        "      send({ id: message.id, result: { userAgent: 'fake', codexHome: '/tmp', platformFamily: 'unix', platformOs: 'macos' } });",
+        "    } else if (message.method === 'account/login/start') {",
+        "      send({ id: message.id, result: { type: 'chatgpt', loginId: 'login-123', authUrl: 'https://auth.openai.com/oauth/authorize?redirect_uri=' + encodeURIComponent('http://localhost:1455/auth/callback') } });",
+        "      setTimeout(() => send({ jsonrpc: '2.0', method: 'account/login/completed', params: { success: true, loginId: 'login-123', error: null } }), 25);",
+        "    } else if (message.method === 'account/login/cancel') {",
+        "      send({ id: message.id, result: { status: 'canceled' } });",
+        "    }",
+        "  }",
+        "});",
+      ].join("\n"),
+      { encoding: "utf8", mode: 0o700 },
+    );
+
+    try {
+      const result = spawnSync(process.execPath, [helperPath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_ROTATE_REAL_CODEX: fakeCodexPath,
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain(
+        "Starting local login server on http://localhost:1455.",
+      );
+      expect(result.stderr).toContain(
+        "https://auth.openai.com/oauth/authorize?",
+      );
+      expect(result.stderr).toContain("Successfully logged in");
+    } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });

@@ -55,6 +55,10 @@ const CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT = resolve(
   MODULE_DIR,
   "codex-login-managed-browser-opener.mjs",
 );
+const CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT = resolve(
+  MODULE_DIR,
+  "codex-login-app-server-helper.mjs",
+);
 
 const CODEX_ROTATE_ACCOUNT_FLOW_ID =
   "workspace.web.auth-openai-com.codex-rotate-account-flow";
@@ -1365,6 +1369,14 @@ function resolveCodexLoginManagedBrowserOpenerPath(): string {
   return CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT;
 }
 
+function resolveCodexLoginManagedLoginHelperPath(): string {
+  const override = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN?.trim();
+  if (override) {
+    return override;
+  }
+  return CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT;
+}
+
 function ensureCodexLoginManagedBrowserOpener(): void {
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
   if (!existsSync(openerPath)) {
@@ -1372,6 +1384,17 @@ function ensureCodexLoginManagedBrowserOpener(): void {
       `Managed Codex browser opener script not found at ${openerPath}.`,
     );
   }
+  chmodSync(openerPath, 0o700);
+}
+
+function ensureCodexLoginManagedLoginHelper(): void {
+  const helperPath = resolveCodexLoginManagedLoginHelperPath();
+  if (!existsSync(helperPath)) {
+    throw new Error(
+      `Managed Codex login helper script not found at ${helperPath}.`,
+    );
+  }
+  chmodSync(helperPath, 0o700);
 }
 
 function shellSingleQuote(value: string): string {
@@ -1383,13 +1406,18 @@ function renderCodexLoginManagedBrowserWrapper(
   profileName: string,
   shimDir: string,
   openerPath: string,
+  loginHelperPath: string,
 ): string {
   return [
     "#!/bin/sh",
     `export FAST_BROWSER_PROFILE=${shellSingleQuote(profileName)}`,
     `export BROWSER=${shellSingleQuote(openerPath)}`,
-    `export CODEX_ROTATE_REAL_OPEN=${shellSingleQuote("/usr/bin/open")}`,
     `export PATH=${shellSingleQuote(shimDir)}:"$PATH"`,
+    `export CODEX_ROTATE_REAL_CODEX=${shellSingleQuote(realCodexBin)}`,
+    'if [ "$1" = "login" ]; then',
+    "  shift",
+    `  exec ${shellSingleQuote(loginHelperPath)} "$@"`,
+    "fi",
     `exec ${shellSingleQuote(realCodexBin)} \"$@\"`,
     "",
   ].join("\n");
@@ -1422,6 +1450,7 @@ export function buildCodexLoginManagedBrowserWrapperPath(
   codexBin: string,
 ): string {
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
+  const loginHelperPath = resolveCodexLoginManagedLoginHelperPath();
   const profileToken =
     String(profileName || "default")
       .toLowerCase()
@@ -1429,7 +1458,7 @@ export function buildCodexLoginManagedBrowserWrapperPath(
       .replace(/^-|-$/g, "")
       .slice(0, 32) || "default";
   const hash = createHash("sha256")
-    .update(`${profileName}\n${codexBin}\n${openerPath}`)
+    .update(`${profileName}\n${codexBin}\n${openerPath}\n${loginHelperPath}`)
     .digest("hex")
     .slice(0, 12);
   return join(ROTATE_HOME, "bin", `codex-login-${profileToken}-${hash}`);
@@ -1440,8 +1469,10 @@ export function ensureCodexLoginManagedBrowserWrapper(
   codexBin: string,
 ): string {
   ensureCodexLoginManagedBrowserOpener();
+  ensureCodexLoginManagedLoginHelper();
   mkdirSync(join(ROTATE_HOME, "bin"), { recursive: true });
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
+  const loginHelperPath = resolveCodexLoginManagedLoginHelperPath();
   const shimDir = join(ROTATE_HOME, "bin", "codex-login-shims");
   ensureCodexLoginManagedBrowserShims(shimDir, openerPath);
   const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(
@@ -1453,6 +1484,7 @@ export function ensureCodexLoginManagedBrowserWrapper(
     profileName,
     shimDir,
     openerPath,
+    loginHelperPath,
   );
   const current = existsSync(wrapperPath)
     ? readFileSync(wrapperPath, "utf8")

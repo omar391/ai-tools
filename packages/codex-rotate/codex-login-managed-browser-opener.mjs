@@ -35,9 +35,6 @@ const USER_DATA_DIR = path.join(
   "profiles",
   PROFILE_NAME,
 );
-const REAL_OPEN =
-  String(process.env.CODEX_ROTATE_REAL_OPEN || "/usr/bin/open").trim() ||
-  "/usr/bin/open";
 
 function pickUrl(argv) {
   for (const value of argv) {
@@ -47,21 +44,6 @@ function pickUrl(argv) {
     }
   }
   return null;
-}
-
-async function fallbackToSystemOpen(argv) {
-  if (!argv.length || !REAL_OPEN) {
-    return false;
-  }
-  await appendLog("browser_shim_fallback_open", {
-    command: REAL_OPEN,
-    argv,
-  });
-  await execFileAsync(REAL_OPEN, argv, {
-    env: process.env,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  return true;
 }
 
 async function appendLog(message, details = null) {
@@ -98,17 +80,10 @@ async function main() {
   const url = pickUrl(process.argv.slice(2));
   if (!url) {
     const argv = process.argv.slice(2);
-    const opened = await fallbackToSystemOpen(argv).catch(async (error) => {
-      await appendLog("browser_shim_fallback_open_failed", {
-        argv,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      return false;
-    });
-    if (opened) {
-      process.exit(0);
-    }
-    await appendLog("no_url_arg", { argv });
+    await appendLog("browser_shim_blocked_non_url_open", { argv });
+    process.stderr.write(
+      "Managed Codex browser opener refused a non-URL browser launch request.\n",
+    );
     process.exit(1);
   }
 

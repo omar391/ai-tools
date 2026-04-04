@@ -1404,8 +1404,7 @@ do:
             const stderrPath = path.join(sessionDir, "stderr.log");
             const exitPath = path.join(sessionDir, "exit.code");
             const quote = (value) => "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
-            const command = "BROWSER=/usr/bin/false "
-              + quote(codexBin)
+            const command = quote(codexBin)
               + " login >"
               + quote(stdoutPath)
               + " 2>"
