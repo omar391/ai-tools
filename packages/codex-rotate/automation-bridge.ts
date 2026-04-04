@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import type {
   CodexRotateAuthFlowSummary,
+  CodexRotateSecretLocator,
   CodexRotateSecretRef,
 } from "./automation.ts";
 import {
@@ -32,7 +33,7 @@ type BridgeRequest =
       payload: {
         profileName: string;
         email: string;
-        accountSecretRef: CodexRotateSecretRef;
+        accountLoginLocator?: CodexRotateSecretLocator | null;
         options?: {
           codexBin?: string;
           workflowRunStamp?: string;
@@ -54,6 +55,20 @@ type BridgeResponse =
 
 function readStdin(): string {
   return readFileSync(process.stdin.fd, "utf8");
+}
+
+function readRequestRaw(): string {
+  const requestFileFlagIndex = process.argv.indexOf("--request-file");
+  if (requestFileFlagIndex !== -1) {
+    const requestFilePath = process.argv[requestFileFlagIndex + 1];
+    if (!requestFilePath) {
+      throw new Error(
+        "Automation bridge expected a path after --request-file.",
+      );
+    }
+    return readFileSync(requestFilePath, "utf8");
+  }
+  return readStdin();
 }
 
 function respond(response: BridgeResponse): never {
@@ -82,7 +97,7 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
       return (await completeCodexLoginViaWorkflow(
         request.payload.profileName,
         request.payload.email,
-        request.payload.accountSecretRef,
+        request.payload.accountLoginLocator ?? null,
         {
           ...request.payload.options,
           onNote: (message) => {
@@ -102,9 +117,11 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
 
 async function main(): Promise<void> {
   try {
-    const raw = readStdin().trim();
+    const raw = readRequestRaw().trim();
     if (!raw) {
-      throw new Error("Automation bridge expected a JSON request on stdin.");
+      throw new Error(
+        "Automation bridge expected a JSON request on stdin or --request-file.",
+      );
     }
     const request = JSON.parse(raw) as BridgeRequest;
     const result = await handleRequest(request);

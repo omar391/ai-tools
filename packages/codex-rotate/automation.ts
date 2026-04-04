@@ -76,6 +76,13 @@ const DEFAULT_OPENAI_BIRTH_MONTH = 1;
 const DEFAULT_OPENAI_BIRTH_DAY = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR = 1990;
 
+export function shouldPromptForCodexRotateSecretUnlock(): boolean {
+  return (
+    process.env.CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK === "1" ||
+    (process.stdin.isTTY && process.stderr.isTTY)
+  );
+}
+
 export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 
 export interface CredentialFamily {
@@ -89,8 +96,6 @@ export interface CredentialFamily {
 
 export interface StoredCredential {
   email: string;
-  account_secret_ref?: CodexRotateSecretRef | null;
-  legacy_password?: string | null;
   profile_name: string;
   base_email: string;
   suffix: number;
@@ -111,14 +116,38 @@ export interface CodexRotateSecretRef {
   version?: string | null;
 }
 
+export interface CodexRotateLoginLookupSecretLocator {
+  kind: "login_lookup";
+  store?: "bitwarden-cli";
+  username: string;
+  uris: string[];
+  field_path?: string | null;
+}
+
+export interface CodexRotateNamedSecretLocator {
+  kind: "named_secret";
+  store?: "bitwarden-cli";
+  name: string;
+  field_path?: string | null;
+}
+
+export interface CodexRotateEnvVarSecretLocator {
+  kind: "env_var";
+  name: string;
+}
+
+export type CodexRotateSecretLocator =
+  | CodexRotateLoginLookupSecretLocator
+  | CodexRotateNamedSecretLocator
+  | CodexRotateEnvVarSecretLocator;
+
 export interface PendingCredential extends StoredCredential {
   started_at: string;
 }
 
 export interface CredentialStore {
-  version: 2;
+  version: 3;
   families: Record<string, CredentialFamily>;
-  accounts: Record<string, StoredCredential>;
   pending: Record<string, PendingCredential>;
 }
 
@@ -325,17 +354,129 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function normalizeCredentialStore(
   raw: LegacyCredentialStore | null | undefined,
 ): CredentialStore {
+  const families = isRecord(raw?.families)
+    ? ({ ...(raw.families as Record<string, CredentialFamily>) } as Record<
+        string,
+        CredentialFamily
+      >)
+    : {};
+  const legacyAccounts = normalizeCredentialRecordMap(raw?.accounts);
+  for (const account of Object.values(legacyAccounts)) {
+    const familyKey = `${account.profile_name}::${normalizeBaseEmailFamily(account.base_email)}`;
+    const existing = families[familyKey];
+    const updatedAtValues = [
+      parseSortableTimestamp(existing?.updated_at),
+      parseSortableTimestamp(account.updated_at),
+    ];
+    const createdAtValues = [
+      parseSortableTimestamp(existing?.created_at),
+      parseSortableTimestamp(account.created_at),
+    ];
+    families[familyKey] = {
+      profile_name: account.profile_name,
+      base_email: normalizeBaseEmailFamily(account.base_email),
+      next_suffix: Math.max(
+        existing?.next_suffix ?? 1,
+        (account.suffix || 0) + 1,
+      ),
+      created_at:
+        createdAtValues[0] !== 0 &&
+        createdAtValues[0] <= (createdAtValues[1] || Number.MAX_SAFE_INTEGER)
+          ? (existing?.created_at ?? account.created_at)
+          : account.created_at,
+      updated_at:
+        updatedAtValues[0] >= updatedAtValues[1]
+          ? (existing?.updated_at ?? account.updated_at)
+          : account.updated_at,
+      last_created_email:
+        updatedAtValues[0] >= updatedAtValues[1]
+          ? (existing?.last_created_email ?? account.email)
+          : account.email,
+    };
+  }
   return {
-    version: 2,
-    families: isRecord(raw?.families)
-      ? (raw.families as Record<string, CredentialFamily>)
-      : {},
-    accounts: normalizeCredentialRecordMap(raw?.accounts),
+    version: 3,
+    families,
     pending: normalizeCredentialRecordMap(raw?.pending) as Record<
       string,
       PendingCredential
     >,
   };
+}
+
+export function buildOpenAiAccountLoginLocator(
+  email: string,
+): CodexRotateSecretLocator {
+  return {
+    kind: "login_lookup",
+    store: "bitwarden-cli",
+    username: String(email || "")
+      .trim()
+      .toLowerCase(),
+    uris: [...OPENAI_ACCOUNT_SECRET_URIS],
+    field_path: "/password",
+  };
+}
+
+function isStoreBackedSecretLocator(
+  locator: CodexRotateSecretLocator | null | undefined,
+): locator is Exclude<
+  CodexRotateSecretLocator,
+  CodexRotateEnvVarSecretLocator
+> {
+  return Boolean(locator && locator.kind !== "env_var");
+}
+
+function isMissingOptionalSecretLocatorError(
+  locator: CodexRotateSecretLocator,
+  error: unknown,
+): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (locator.kind === "env_var") {
+    return false;
+  }
+  return (
+    /No Bitwarden login item matched/i.test(message) ||
+    /No Bitwarden item matched the exact name/i.test(message)
+  );
+}
+
+async function resolveOptionalCodexRotateSecretLocator(
+  profileName: string,
+  locator: CodexRotateSecretLocator | null | undefined,
+): Promise<CodexRotateSecretLocator | null> {
+  if (!locator) {
+    return null;
+  }
+  const {
+    ensureDaemonSecretStoreReadyInteractive,
+    resolveDaemonSecretLocator,
+  } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+  if (isStoreBackedSecretLocator(locator)) {
+    await ensureDaemonSecretStoreReadyInteractive({
+      profileName,
+      store: locator.store ?? "bitwarden-cli",
+      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+    });
+  }
+  try {
+    const response = await resolveDaemonSecretLocator({
+      profileName,
+      locator,
+    });
+    if (!response?.ok) {
+      throw new Error(
+        response?.error?.message ||
+          "fast-browser failed to resolve the requested secret locator.",
+      );
+    }
+    return locator;
+  } catch (error) {
+    if (isMissingOptionalSecretLocatorError(locator, error)) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export async function ensureBitwardenCliAccountSecretRef(
@@ -369,7 +510,7 @@ export async function ensureBitwardenCliAccountSecretRef(
   await ensureDaemonSecretStoreReadyInteractive({
     profileName: normalizedProfileName,
     store: "bitwarden-cli",
-    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
+    promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
   });
   const response = await ensureDaemonLoginSecretRef({
     profileName: normalizedProfileName,
@@ -419,7 +560,7 @@ export async function findBitwardenCliAccountSecretRef(
   await ensureDaemonSecretStoreReadyInteractive({
     profileName: normalizedProfileName,
     store: "bitwarden-cli",
-    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
+    promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
   });
   const response = await findDaemonLoginSecretRef({
     profileName: normalizedProfileName,
@@ -451,9 +592,8 @@ export function loadCredentialStore(): CredentialStore {
 
 export function saveCredentialStore(store: CredentialStore): void {
   writePrivateJson(CREDENTIALS_FILE, {
-    version: 2,
+    version: 3,
     families: store.families,
-    accounts: serializeCredentialRecordMap(store.accounts),
     pending: serializeCredentialRecordMap(store.pending),
   });
 }
@@ -931,11 +1071,6 @@ export function selectStoredBaseEmailHint(
   for (const family of Object.values(store.families)) {
     if (family.profile_name === profileName) {
       remember(family.base_email, family.updated_at);
-    }
-  }
-  for (const account of Object.values(store.accounts)) {
-    if (account.profile_name === profileName) {
-      remember(account.base_email || account.email, account.updated_at);
     }
   }
   for (const pending of Object.values(store.pending)) {
@@ -1904,7 +2039,7 @@ export function shouldUseDefaultCreateFamilyHint(
 async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
-  accountSecretRef: CodexRotateSecretRef,
+  accountLoginLocator: CodexRotateSecretLocator | null,
   workflowRunStamp?: string,
   options?: {
     artifactMode?: "minimal" | "full";
@@ -1956,7 +2091,9 @@ async function runCodexBrowserLoginWorkflow(
         ? { codex_login_exit_path: options.codexSession.exit_path }
         : {}),
       email,
-      account_secret: accountSecretRef,
+      ...(accountLoginLocator
+        ? { account_login_locator: accountLoginLocator }
+        : {}),
       full_name: String(options?.fullName ?? DEFAULT_OPENAI_FULL_NAME).trim(),
       prefer_signup_recovery:
         options?.preferSignupRecovery === true ? "true" : "false",
@@ -1976,7 +2113,7 @@ async function runCodexBrowserLoginWorkflow(
 export async function completeCodexLoginViaWorkflow(
   profileName: string,
   email: string,
-  accountSecretRef: CodexRotateSecretRef,
+  accountLoginLocator: CodexRotateSecretLocator | null,
   options?: {
     codexBin?: string;
     workflowRunStamp?: string;
@@ -1992,14 +2129,11 @@ export async function completeCodexLoginViaWorkflow(
     restoreState?: (() => void) | null;
   },
 ): Promise<CodexRotateAuthFlowSummary> {
-  const { ensureDaemonSecretStoreReadyInteractive } = await import(
-    FAST_BROWSER_DAEMON_CLIENT_MODULE
-  );
-  await ensureDaemonSecretStoreReadyInteractive({
-    profileName,
-    store: "bitwarden-cli",
-    promptIfLocked: process.stdin.isTTY && process.stderr.isTTY,
-  });
+  const workflowAccountLoginLocator =
+    await resolveOptionalCodexRotateSecretLocator(
+      profileName,
+      accountLoginLocator,
+    );
 
   const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 6));
   const maxReplayPasses = Math.max(1, Number(options?.maxReplayPasses ?? 5));
@@ -2019,6 +2153,16 @@ export async function completeCodexLoginViaWorkflow(
     });
 
   try {
+    if (workflowAccountLoginLocator) {
+      note?.(
+        `Found a stored OpenAI login secret for ${email}; attempting password login first.`,
+      );
+    } else {
+      note?.(
+        `No stored OpenAI login secret was found for ${email}; using one-time-code recovery.`,
+      );
+    }
+
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         note?.(
@@ -2038,7 +2182,7 @@ export async function completeCodexLoginViaWorkflow(
           const loginResult = await runCodexBrowserLoginWorkflow(
             profileName,
             email,
-            accountSecretRef,
+            workflowAccountLoginLocator,
             loginWorkflowRunStamp,
             {
               codexBin: options?.codexBin,
@@ -2210,19 +2354,9 @@ function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
     return null;
   }
   const normalized = { ...raw } as Record<string, unknown>;
-  const hadPersistedSecretRef =
-    normalizeCodexRotateSecretRef(normalized.account_secret_ref) !== null;
-  const legacyPassword =
-    typeof normalized.password === "string" && normalized.password.length > 0
-      ? normalized.password
-      : null;
   delete normalized.password;
   delete normalized.account_secret_ref;
-  return {
-    ...(normalized as unknown as StoredCredential),
-    account_secret_ref: null,
-    legacy_password: hadPersistedSecretRef ? null : legacyPassword,
-  };
+  return normalized as unknown as StoredCredential;
 }
 
 function serializeCredentialRecordMap(
@@ -2240,9 +2374,8 @@ export function serializeCredentialStore(
   store: CredentialStore,
 ): CredentialStore {
   return {
-    version: 2,
+    version: 3,
     families: store.families,
-    accounts: serializeCredentialRecordMap(store.accounts),
     pending: serializeCredentialRecordMap(store.pending) as Record<
       string,
       PendingCredential
@@ -2275,12 +2408,6 @@ function serializeCredentialRecord(raw: StoredCredential): StoredCredential {
     typeof (raw as PendingCredential).started_at === "string"
   ) {
     serialized.started_at = (raw as PendingCredential).started_at;
-  }
-  if (
-    typeof raw.legacy_password === "string" &&
-    raw.legacy_password.length > 0
-  ) {
-    serialized.password = raw.legacy_password;
   }
   return serialized as unknown as StoredCredential;
 }

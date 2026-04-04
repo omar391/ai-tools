@@ -119,10 +119,6 @@ pub struct CodexRotateSecretRef {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredCredential {
     pub email: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account_secret_ref: Option<CodexRotateSecretRef>,
-    #[serde(skip)]
-    pub legacy_password: Option<String>,
     pub profile_name: String,
     pub base_email: String,
     pub suffix: u32,
@@ -148,20 +144,29 @@ pub struct PendingCredential {
     pub started_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CodexRotateSecretLocator {
+    LoginLookup {
+        store: String,
+        username: String,
+        uris: Vec<String>,
+        field_path: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CredentialStore {
     pub version: u8,
     pub families: HashMap<String, CredentialFamily>,
-    pub accounts: HashMap<String, StoredCredential>,
     pub pending: HashMap<String, PendingCredential>,
 }
 
 impl Default for CredentialStore {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             families: HashMap::new(),
-            accounts: HashMap::new(),
             pending: HashMap::new(),
         }
     }
@@ -215,13 +220,6 @@ struct BridgeEnsureSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BridgeFindSecretPayload<'a> {
-    profile_name: &'a str,
-    email: &'a str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
@@ -244,7 +242,8 @@ struct BridgeLoginOptions<'a> {
 struct BridgeCompleteLoginPayload<'a> {
     profile_name: &'a str,
     email: &'a str,
-    account_secret_ref: &'a CodexRotateSecretRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_login_locator: Option<&'a CodexRotateSecretLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<BridgeLoginOptions<'a>>,
 }
@@ -345,43 +344,21 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
     let existing = selection.entry.clone();
     let expected_email = existing.email.clone();
     let mut store = load_credential_store()?;
-    let stored_credential = store
-        .accounts
-        .get(&normalize_email_key(&expected_email))
-        .cloned()
-        .or_else(|| {
-            store
-                .pending
-                .get(&normalize_email_key(&expected_email))
-                .map(|entry| entry.stored.clone())
-        });
+    let stored_credential = resolve_relogin_credential(&store, &existing);
 
     if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
         let stored_credential = stored_credential.ok_or_else(|| {
             anyhow!("Stored credential lookup unexpectedly failed for {expected_email}.")
         })?;
-        let account_secret_ref = resolve_credential_account_secret_ref(
-            stored_credential.account_secret_ref.as_ref(),
-            stored_credential.legacy_password.as_deref(),
-            &stored_credential.email,
-            &stored_credential.profile_name,
-            false,
-        )?;
         let mut updated_stored = stored_credential.clone();
-        updated_stored.account_secret_ref = None;
-        updated_stored.legacy_password = None;
         updated_stored.updated_at = now_iso();
-        store.accounts.insert(
-            normalize_email_key(&updated_stored.email),
-            updated_stored.clone(),
-        );
-        save_credential_store(&store)?;
+        let account_login_locator = build_openai_account_login_locator(&updated_stored.email);
 
         let previous_auth = load_codex_auth_if_exists()?;
         let login_result = run_complete_codex_login(
             &updated_stored.profile_name,
             &updated_stored.email,
-            &account_secret_ref,
+            Some(&account_login_locator),
             None,
             None,
             None,
@@ -409,15 +386,17 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
         if let Some(inspected) =
             inspect_pool_entry_by_account_id(&extract_account_id_from_auth(&auth))?
         {
-            let entry = store
-                .accounts
-                .get(&normalize_email_key(&updated_stored.email))
-                .cloned()
-                .unwrap_or(updated_stored);
-            store.pending.remove(&normalize_email_key(&entry.email));
-            store.accounts.insert(
-                normalize_email_key(&entry.email),
-                StoredCredential {
+            let mut dirty = false;
+            if store
+                .pending
+                .remove(&normalize_email_key(&updated_stored.email))
+                .is_some()
+            {
+                dirty = true;
+            }
+            dirty |= upsert_family_for_account(
+                &mut store,
+                &StoredCredential {
                     selector: Some(inspected.entry.label.clone()),
                     alias: inspected
                         .entry
@@ -425,10 +404,12 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
                         .clone()
                         .or_else(|| existing.alias.clone()),
                     updated_at: now_iso(),
-                    ..entry
+                    ..updated_stored
                 },
             );
-            save_credential_store(&store)?;
+            if dirty {
+                save_credential_store(&store)?;
+            }
         }
 
         return Ok(format!(
@@ -526,6 +507,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         &base_email,
         options.alias.as_deref(),
     );
+    let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
         Some(entry) => entry.stored.suffix,
         None => compute_next_account_family_suffix(
@@ -541,8 +523,6 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let existing_pending = existing_pending.unwrap_or_else(|| PendingCredential {
         stored: StoredCredential {
             email: created_email.clone(),
-            account_secret_ref: None,
-            legacy_password: None,
             profile_name: profile_name.clone(),
             base_email: base_email.clone(),
             suffix,
@@ -556,20 +536,22 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         },
         started_at: Some(started_at.clone()),
     });
-
-    let account_secret_ref = resolve_credential_account_secret_ref(
-        existing_pending.stored.account_secret_ref.as_ref(),
-        existing_pending.stored.legacy_password.as_deref(),
-        &created_email,
-        &profile_name,
-        true,
-    )?;
+    if !reusing_pending {
+        let generated_password = generate_password(18);
+        let _: CodexRotateSecretRef = run_automation_bridge(
+            "ensure-account-secret-ref",
+            BridgeEnsureSecretPayload {
+                profile_name: &profile_name,
+                email: &created_email,
+                password: &generated_password,
+            },
+        )?;
+    }
+    let account_login_locator = build_openai_account_login_locator(&created_email);
     let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
     let pending = PendingCredential {
         stored: StoredCredential {
             email: created_email.clone(),
-            account_secret_ref: None,
-            legacy_password: None,
             profile_name: profile_name.clone(),
             base_email: base_email.clone(),
             suffix,
@@ -598,7 +580,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let login_result = run_complete_codex_login(
         &profile_name,
         &created_email,
-        &account_secret_ref,
+        Some(&account_login_locator),
         Some(codex_bin().as_str()),
         Some(started_at.as_str()),
         Some(true),
@@ -633,12 +615,10 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
 
     let updated_at = now_iso();
     store.pending.remove(&normalize_email_key(&created_email));
-    store.accounts.insert(
-        normalize_email_key(&created_email),
-        StoredCredential {
+    upsert_family_for_account(
+        &mut store,
+        &StoredCredential {
             email: created_email.clone(),
-            account_secret_ref: None,
-            legacy_password: None,
             profile_name: profile_name.clone(),
             base_email: base_email.clone(),
             suffix,
@@ -797,7 +777,7 @@ fn restore_active_auth(previous_auth: Option<&CodexAuth>) -> Result<()> {
 fn run_complete_codex_login(
     profile_name: &str,
     email: &str,
-    account_secret_ref: &CodexRotateSecretRef,
+    account_login_locator: Option<&CodexRotateSecretLocator>,
     codex_bin: Option<&str>,
     workflow_run_stamp: Option<&str>,
     prefer_signup_recovery: Option<bool>,
@@ -825,11 +805,23 @@ fn run_complete_codex_login(
         BridgeCompleteLoginPayload {
             profile_name,
             email,
-            account_secret_ref,
+            account_login_locator,
             options: Some(options),
         },
     )?;
     Ok(())
+}
+
+fn build_openai_account_login_locator(email: &str) -> CodexRotateSecretLocator {
+    CodexRotateSecretLocator::LoginLookup {
+        store: "bitwarden-cli".to_string(),
+        username: email.trim().to_lowercase(),
+        uris: vec![
+            "https://auth.openai.com".to_string(),
+            "https://chatgpt.com".to_string(),
+        ],
+        field_path: "/password".to_string(),
+    }
 }
 
 fn run_codex_command<const N: usize>(args: [&str; N]) -> Result<()> {
@@ -894,7 +886,7 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
 }
 
 fn normalize_credential_store(raw: Value) -> CredentialStore {
-    let families = raw
+    let mut families = raw
         .get("families")
         .and_then(Value::as_object)
         .map(|map| {
@@ -907,11 +899,14 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
+    let legacy_accounts = normalize_stored_credential_map(raw.get("accounts"));
+    for account in legacy_accounts.values() {
+        merge_legacy_account_into_families(&mut families, account);
+    }
 
     CredentialStore {
-        version: 2,
+        version: 3,
         families,
-        accounts: normalize_stored_credential_map(raw.get("accounts")),
         pending: normalize_pending_credential_map(raw.get("pending")),
     }
 }
@@ -943,25 +938,7 @@ fn normalize_pending_credential_map(raw: Option<&Value>) -> HashMap<String, Pend
 }
 
 fn normalize_stored_credential(raw: &Value) -> Option<StoredCredential> {
-    let object = raw.as_object()?;
-    let mut normalized = serde_json::from_value::<StoredCredential>(raw.clone()).ok()?;
-    let had_persisted_secret_ref = object
-        .get("account_secret_ref")
-        .and_then(Value::as_object)
-        .is_some();
-    let legacy_password = object
-        .get("password")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    normalized.account_secret_ref = None;
-    normalized.legacy_password = if had_persisted_secret_ref {
-        None
-    } else {
-        legacy_password
-    };
-    Some(normalized)
+    serde_json::from_value::<StoredCredential>(raw.clone()).ok()
 }
 
 fn normalize_pending_credential(raw: &Value) -> Option<PendingCredential> {
@@ -976,20 +953,14 @@ fn normalize_pending_credential(raw: &Value) -> Option<PendingCredential> {
 }
 
 fn serialize_credential_store(store: &CredentialStore) -> Value {
-    let accounts = store
-        .accounts
-        .iter()
-        .map(|(email, record)| (email.clone(), serialize_stored_credential(record)))
-        .collect::<Map<String, Value>>();
     let pending = store
         .pending
         .iter()
         .map(|(email, record)| (email.clone(), serialize_pending_credential(record)))
         .collect::<Map<String, Value>>();
     json!({
-        "version": 2,
+        "version": 3,
         "families": store.families,
-        "accounts": accounts,
         "pending": pending,
     })
 }
@@ -1059,54 +1030,7 @@ fn serialize_stored_credential(record: &StoredCredential) -> Value {
             Value::Number(u64::from(value).into()),
         );
     }
-    if let Some(password) = record.legacy_password.as_ref() {
-        object.insert("password".to_string(), Value::String(password.clone()));
-    }
     Value::Object(object)
-}
-
-fn resolve_credential_account_secret_ref(
-    account_secret_ref: Option<&CodexRotateSecretRef>,
-    legacy_password: Option<&str>,
-    email: &str,
-    profile_name: &str,
-    create_if_missing: bool,
-) -> Result<CodexRotateSecretRef> {
-    if let Some(account_secret_ref) = account_secret_ref {
-        return Ok(account_secret_ref.clone());
-    }
-    if let Some(found) = find_credential_account_secret_ref(email, profile_name)? {
-        return Ok(found);
-    }
-    let Some(password) = legacy_password
-        .map(ToOwned::to_owned)
-        .or_else(|| create_if_missing.then(|| generate_password(18)))
-    else {
-        return Err(anyhow!(
-            "No managed OpenAI secret was found for {email}. Re-run with --manual-login to repair it interactively."
-        ));
-    };
-    run_automation_bridge(
-        "ensure-account-secret-ref",
-        BridgeEnsureSecretPayload {
-            profile_name,
-            email,
-            password: &password,
-        },
-    )
-}
-
-fn find_credential_account_secret_ref(
-    email: &str,
-    profile_name: &str,
-) -> Result<Option<CodexRotateSecretRef>> {
-    run_automation_bridge(
-        "find-account-secret-ref",
-        BridgeFindSecretPayload {
-            profile_name,
-            email,
-        },
-    )
 }
 
 fn read_workflow_file_metadata(file_path: &std::path::Path) -> Result<WorkflowFileMetadata> {
@@ -1375,7 +1299,6 @@ fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<Str
         .iter()
         .map(|entry| entry.email.clone())
         .collect::<Vec<_>>();
-    emails.extend(store.accounts.keys().cloned());
     emails.extend(store.pending.keys().cloned());
     emails
 }
@@ -1495,13 +1418,6 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
     {
         remember(Some(&family.base_email), Some(&family.updated_at));
     }
-    for account in store
-        .accounts
-        .values()
-        .filter(|entry| entry.profile_name == profile_name)
-    {
-        remember(Some(&account.base_email), Some(&account.updated_at));
-    }
     for pending in store
         .pending
         .values()
@@ -1526,6 +1442,181 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
                 .then_with(|| right.0.cmp(&left.0))
         })
         .map(|entry| entry.0)
+}
+
+fn resolve_relogin_credential(
+    store: &CredentialStore,
+    entry: &AccountEntry,
+) -> Option<StoredCredential> {
+    if let Some(pending) = store
+        .pending
+        .get(&normalize_email_key(&entry.email))
+        .map(|value| value.stored.clone())
+    {
+        return Some(pending);
+    }
+    let family_match = select_family_for_account_email(store, &entry.email)?;
+    Some(StoredCredential {
+        email: entry.email.clone(),
+        profile_name: family_match.family.profile_name.clone(),
+        base_email: family_match.family.base_email.clone(),
+        suffix: family_match.suffix,
+        selector: Some(entry.label.clone()),
+        alias: entry.alias.clone(),
+        birth_month: None,
+        birth_day: None,
+        birth_year: None,
+        created_at: family_match.family.created_at.clone(),
+        updated_at: family_match.family.updated_at.clone(),
+    })
+}
+
+#[derive(Clone)]
+struct FamilyAccountMatch {
+    key: String,
+    family: CredentialFamily,
+    suffix: u32,
+}
+
+fn select_family_for_account_email(
+    store: &CredentialStore,
+    email: &str,
+) -> Option<FamilyAccountMatch> {
+    let normalized_email = normalize_email_key(email);
+    let mut matches = store
+        .families
+        .iter()
+        .filter_map(|(key, family)| {
+            extract_account_family_suffix(&normalized_email, &family.base_email)
+                .ok()
+                .flatten()
+                .map(|suffix| FamilyAccountMatch {
+                    key: key.clone(),
+                    family: family.clone(),
+                    suffix,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    matches.sort_by(|left, right| {
+        let left_exact =
+            left.family.last_created_email.as_deref() == Some(normalized_email.as_str());
+        let right_exact =
+            right.family.last_created_email.as_deref() == Some(normalized_email.as_str());
+        left_exact
+            .cmp(&right_exact)
+            .then_with(|| {
+                parse_sortable_timestamp(Some(left.family.updated_at.as_str())).cmp(
+                    &parse_sortable_timestamp(Some(right.family.updated_at.as_str())),
+                )
+            })
+            .then_with(|| right.key.cmp(&left.key))
+    });
+
+    let top = matches.pop()?;
+    let top_exact = top.family.last_created_email.as_deref() == Some(normalized_email.as_str());
+    if top_exact {
+        let other_exact_exists = matches.iter().any(|entry| {
+            entry.family.last_created_email.as_deref() == Some(normalized_email.as_str())
+        });
+        if other_exact_exists {
+            return None;
+        }
+        return Some(top);
+    }
+
+    if matches.is_empty() {
+        return Some(top);
+    }
+
+    None
+}
+
+fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCredential) -> bool {
+    let Ok(family_key) = make_credential_family_key(&account.profile_name, &account.base_email)
+    else {
+        return false;
+    };
+    let next_updated_at = account.updated_at.clone();
+    let next_created_at = account.created_at.clone();
+    let next_last_created_email = Some(account.email.clone());
+    let next_suffix = account.suffix.saturating_add(1);
+    match store.families.get_mut(&family_key) {
+        Some(existing) => {
+            let previous = existing.clone();
+            existing.next_suffix = existing.next_suffix.max(next_suffix);
+            if parse_sortable_timestamp(Some(next_created_at.as_str()))
+                < parse_sortable_timestamp(Some(existing.created_at.as_str()))
+                || existing.created_at.trim().is_empty()
+            {
+                existing.created_at = next_created_at.clone();
+            }
+            if parse_sortable_timestamp(Some(next_updated_at.as_str()))
+                >= parse_sortable_timestamp(Some(existing.updated_at.as_str()))
+            {
+                existing.updated_at = next_updated_at.clone();
+                existing.last_created_email = next_last_created_email.clone();
+            }
+            previous != *existing
+        }
+        None => {
+            store.families.insert(
+                family_key,
+                CredentialFamily {
+                    profile_name: account.profile_name.clone(),
+                    base_email: account.base_email.clone(),
+                    next_suffix,
+                    created_at: next_created_at,
+                    updated_at: next_updated_at,
+                    last_created_email: next_last_created_email,
+                },
+            );
+            true
+        }
+    }
+}
+
+fn merge_legacy_account_into_families(
+    families: &mut HashMap<String, CredentialFamily>,
+    account: &StoredCredential,
+) {
+    let Ok(family_key) = make_credential_family_key(&account.profile_name, &account.base_email)
+    else {
+        return;
+    };
+    let updated_at = parse_sortable_timestamp(Some(account.updated_at.as_str()));
+    let created_at = parse_sortable_timestamp(Some(account.created_at.as_str()));
+    match families.get_mut(&family_key) {
+        Some(existing) => {
+            existing.next_suffix = existing.next_suffix.max(account.suffix.saturating_add(1));
+            if created_at < parse_sortable_timestamp(Some(existing.created_at.as_str()))
+                || existing.created_at.trim().is_empty()
+            {
+                existing.created_at = account.created_at.clone();
+            }
+            if updated_at >= parse_sortable_timestamp(Some(existing.updated_at.as_str())) {
+                existing.updated_at = account.updated_at.clone();
+                existing.last_created_email = Some(account.email.clone());
+            }
+        }
+        None => {
+            families.insert(
+                family_key,
+                CredentialFamily {
+                    profile_name: account.profile_name.clone(),
+                    base_email: account.base_email.clone(),
+                    next_suffix: account.suffix.saturating_add(1),
+                    created_at: account.created_at.clone(),
+                    updated_at: account.updated_at.clone(),
+                    last_created_email: Some(account.email.clone()),
+                },
+            );
+        }
+    }
 }
 
 fn parse_sortable_timestamp(value: Option<&str>) -> i64 {
@@ -1609,14 +1700,6 @@ mod tests {
     fn stored_credentials_used_only_for_non_manual_relogin() {
         let stored = StoredCredential {
             email: "dev.user+1@gmail.com".to_string(),
-            account_secret_ref: Some(CodexRotateSecretRef {
-                ref_type: "secret_ref".to_string(),
-                store: "bitwarden-cli".to_string(),
-                object_id: "bw-1".to_string(),
-                field_path: None,
-                version: None,
-            }),
-            legacy_password: None,
             profile_name: "dev-1".to_string(),
             base_email: "dev.user@gmail.com".to_string(),
             suffix: 1,
@@ -1658,8 +1741,6 @@ mod tests {
         let value = resolve_credential_birth_date(
             Some(&StoredCredential {
                 email: "dev.user+1@gmail.com".to_string(),
-                account_secret_ref: None,
-                legacy_password: None,
                 profile_name: "dev-1".to_string(),
                 base_email: "dev.user@gmail.com".to_string(),
                 suffix: 1,
@@ -1679,37 +1760,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_legacy_password_records() {
+    fn drops_legacy_secret_fields_from_loaded_records() {
         let store = normalize_credential_store(json!({
             "accounts": {
                 "dev.user+1@gmail.com": {
                     "email": "dev.user+1@gmail.com",
                     "password": "pw-1",
-                    "profile_name": "dev-1",
-                    "base_email": "dev.user@gmail.com",
-                    "suffix": 1,
-                    "selector": "dev.user+1@gmail.com_free",
-                    "alias": null,
-                    "created_at": "2026-03-20T00:00:00.000Z",
-                    "updated_at": "2026-03-20T00:00:00.000Z"
-                }
-            }
-        }));
-        assert_eq!(
-            store
-                .accounts
-                .get("dev.user+1@gmail.com")
-                .and_then(|value| value.legacy_password.as_deref()),
-            Some("pw-1")
-        );
-    }
-
-    #[test]
-    fn ignores_persisted_secret_refs_from_old_store_files() {
-        let store = normalize_credential_store(json!({
-            "accounts": {
-                "dev.user+1@gmail.com": {
-                    "email": "dev.user+1@gmail.com",
                     "account_secret_ref": {
                         "type": "secret_ref",
                         "store": "bitwarden-cli",
@@ -1725,8 +1781,98 @@ mod tests {
                 }
             }
         }));
-        let record = store.accounts.get("dev.user+1@gmail.com").unwrap();
-        assert!(record.account_secret_ref.is_none());
-        assert!(record.legacy_password.is_none());
+        let family = store.families.get("dev-1::dev.user@gmail.com").unwrap();
+        assert_eq!(family.profile_name, "dev-1");
+        assert_eq!(family.base_email, "dev.user@gmail.com");
+        assert_eq!(family.next_suffix, 2);
+        assert_eq!(
+            family.last_created_email.as_deref(),
+            Some("dev.user+1@gmail.com")
+        );
+    }
+
+    #[test]
+    fn builds_openai_login_locator_from_email() {
+        let locator = build_openai_account_login_locator("Dev.User+1@gmail.com");
+        match locator {
+            CodexRotateSecretLocator::LoginLookup {
+                store,
+                username,
+                uris,
+                field_path,
+            } => {
+                assert_eq!(store, "bitwarden-cli");
+                assert_eq!(username, "dev.user+1@gmail.com");
+                assert_eq!(field_path, "/password");
+                assert_eq!(
+                    uris,
+                    vec![
+                        "https://auth.openai.com".to_string(),
+                        "https://chatgpt.com".to_string()
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relogin_family_match_prefers_exact_last_created_email() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::dev.user@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.user@gmail.com".to_string(),
+                next_suffix: 4,
+                created_at: "2026-03-20T00:00:00.000Z".to_string(),
+                updated_at: "2026-03-20T01:00:00.000Z".to_string(),
+                last_created_email: Some("dev.user+3@gmail.com".to_string()),
+            },
+        );
+        store.families.insert(
+            "dev-2::dev.user@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-2".to_string(),
+                base_email: "dev.user@gmail.com".to_string(),
+                next_suffix: 5,
+                created_at: "2026-03-20T00:00:00.000Z".to_string(),
+                updated_at: "2026-03-20T02:00:00.000Z".to_string(),
+                last_created_email: Some("dev.user+2@gmail.com".to_string()),
+            },
+        );
+
+        let match_result = select_family_for_account_email(&store, "dev.user+2@gmail.com")
+            .expect("expected exact family match");
+        assert_eq!(match_result.family.profile_name, "dev-2");
+        assert_eq!(match_result.suffix, 2);
+    }
+
+    #[test]
+    fn relogin_family_match_refuses_ambiguous_non_exact_matches() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::dev.user@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.user@gmail.com".to_string(),
+                next_suffix: 4,
+                created_at: "2026-03-20T00:00:00.000Z".to_string(),
+                updated_at: "2026-03-20T01:00:00.000Z".to_string(),
+                last_created_email: Some("dev.user+3@gmail.com".to_string()),
+            },
+        );
+        store.families.insert(
+            "dev-2::dev.user@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-2".to_string(),
+                base_email: "dev.user@gmail.com".to_string(),
+                next_suffix: 5,
+                created_at: "2026-03-20T00:00:00.000Z".to_string(),
+                updated_at: "2026-03-20T02:00:00.000Z".to_string(),
+                last_created_email: Some("dev.user+4@gmail.com".to_string()),
+            },
+        );
+
+        assert!(select_family_for_account_email(&store, "dev.user+2@gmail.com").is_none());
     }
 }

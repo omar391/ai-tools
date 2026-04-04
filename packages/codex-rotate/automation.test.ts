@@ -26,6 +26,7 @@ import {
   selectBestSystemChromeProfileMatch,
   selectPendingBaseEmailHintForProfile,
   selectPendingCredentialForFamily,
+  shouldPromptForCodexRotateSecretUnlock,
   selectStoredBaseEmailHint,
 } from "./automation.ts";
 
@@ -209,6 +210,65 @@ describe("codex login managed-browser wrapper", () => {
   });
 });
 
+describe("automation bridge transport", () => {
+  test("accepts request payloads through --request-file", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-bridge-"));
+    const requestPath = join(fixtureRoot, "request.json");
+
+    writeFileSync(
+      requestPath,
+      JSON.stringify({
+        command: "read-workflow-metadata",
+        payload: {
+          filePath: CODEX_ROTATE_ACCOUNT_FLOW_FILE,
+        },
+      }),
+      "utf8",
+    );
+
+    try {
+      const result = spawnSync(
+        "bun",
+        [
+          "packages/codex-rotate/automation-bridge.ts",
+          "--request-file",
+          requestPath,
+        ],
+        {
+          cwd: join(import.meta.dir, "..", ".."),
+          encoding: "utf8",
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const response = JSON.parse(result.stdout) as {
+        ok: boolean;
+        result?: { preferredProfileName?: string | null };
+      };
+      expect(response.ok).toBe(true);
+      expect(response.result?.preferredProfileName).toBe("dev-1");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("secret unlock prompt policy", () => {
+  test("allows the bridge to force interactive secret unlock prompts", () => {
+    const previous = process.env.CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK;
+    try {
+      process.env.CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK = "1";
+      expect(shouldPromptForCodexRotateSecretUnlock()).toBe(true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK;
+      } else {
+        process.env.CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK = previous;
+      }
+    }
+  });
+});
+
 describe("codex login retry policy", () => {
   test("retries when verification code collection is not ready yet", () => {
     expect(
@@ -336,7 +396,7 @@ describe("create resolution helpers", () => {
 });
 
 describe("credential store normalization", () => {
-  test("ignores legacy defaults while keeping account and family data", () => {
+  test("ignores legacy defaults while keeping family data", () => {
     const store = normalizeCredentialStore({
       version: 1,
       defaults: {
@@ -354,7 +414,6 @@ describe("credential store normalization", () => {
           last_created_email: "dev.user+2@gmail.com",
         },
       },
-      accounts: {},
       pending: {},
     });
 
@@ -362,7 +421,7 @@ describe("credential store normalization", () => {
     expect(Object.keys(store.families)).toEqual(["dev-1::dev.user@gmail.com"]);
   });
 
-  test("keeps legacy passwords in memory until the record is migrated", () => {
+  test("migrates legacy accounts into families during normalization", () => {
     const store = normalizeCredentialStore({
       accounts: {
         "dev.user+1@gmail.com": {
@@ -379,15 +438,18 @@ describe("credential store normalization", () => {
       },
     });
 
-    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBe(
-      "pw-1",
-    );
-    expect(
-      store.accounts["dev.user+1@gmail.com"]?.account_secret_ref,
-    ).toBeNull();
+    expect("accounts" in (store as Record<string, unknown>)).toBe(false);
+    expect(store.families["dev-1::dev.user@gmail.com"]).toEqual({
+      profile_name: "dev-1",
+      base_email: "dev.user@gmail.com",
+      next_suffix: 2,
+      created_at: "2026-03-20T00:00:00.000Z",
+      updated_at: "2026-03-20T00:00:00.000Z",
+      last_created_email: "dev.user+1@gmail.com",
+    });
   });
 
-  test("drops Bitwarden refs and legacy passwords from saved records once a vault entry exists", () => {
+  test("writes only families and pending after normalizing old account records", () => {
     const store = normalizeCredentialStore({
       accounts: {
         "dev.user+1@gmail.com": {
@@ -405,16 +467,20 @@ describe("credential store normalization", () => {
       },
     });
 
-    const serialized = serializeCredentialStore(store);
-    expect(serialized.accounts["dev.user+1@gmail.com"]).toEqual({
-      email: "dev.user+1@gmail.com",
-      profile_name: "dev-1",
-      base_email: "dev.user@gmail.com",
-      suffix: 1,
-      selector: "dev.user+1@gmail.com_free",
-      alias: null,
-      created_at: "2026-03-20T00:00:00.000Z",
-      updated_at: "2026-03-20T00:00:00.000Z",
+    const serialized = serializeCredentialStore(store) as Record<
+      string,
+      unknown
+    >;
+    expect("accounts" in serialized).toBe(false);
+    expect(serialized.families).toEqual({
+      "dev-1::dev.user@gmail.com": {
+        profile_name: "dev-1",
+        base_email: "dev.user@gmail.com",
+        next_suffix: 2,
+        created_at: "2026-03-20T00:00:00.000Z",
+        updated_at: "2026-03-20T00:00:00.000Z",
+        last_created_email: "dev.user+1@gmail.com",
+      },
     });
   });
 
@@ -435,10 +501,14 @@ describe("credential store normalization", () => {
       },
     });
 
-    expect(
-      store.accounts["dev.user+1@gmail.com"]?.account_secret_ref,
-    ).toBeNull();
-    expect(store.accounts["dev.user+1@gmail.com"]?.legacy_password).toBeNull();
+    expect(store.families["dev-1::dev.user@gmail.com"]).toEqual({
+      profile_name: "dev-1",
+      base_email: "dev.user@gmail.com",
+      next_suffix: 2,
+      created_at: "2026-03-20T00:00:00.000Z",
+      updated_at: "2026-03-20T00:00:00.000Z",
+      last_created_email: "dev.user+1@gmail.com",
+    });
   });
 });
 

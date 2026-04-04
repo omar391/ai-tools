@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tempfile::NamedTempFile;
 
 use crate::paths::resolve_paths;
 
@@ -32,10 +33,17 @@ where
 {
     let paths = resolve_paths()?;
     let request = serde_json::to_vec(&BridgeRequest { command, payload })?;
-    let mut child = Command::new(&paths.bun_bin)
+    let mut request_file =
+        NamedTempFile::new().context("Failed to create automation bridge request file.")?;
+    request_file.write_all(&request)?;
+    request_file.flush()?;
+    let child = Command::new(&paths.bun_bin)
         .arg(&paths.automation_bridge_entrypoint)
+        .arg("--request-file")
+        .arg(request_file.path())
         .current_dir(&paths.repo_root)
-        .stdin(Stdio::piped())
+        .env("CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK", "1")
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -46,14 +54,6 @@ where
                 paths.automation_bridge_entrypoint.display()
             )
         })?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("Automation bridge stdin was unavailable."))?;
-        stdin.write_all(&request)?;
-    }
 
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
