@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
@@ -116,10 +117,7 @@ impl CdpConnection {
 }
 
 fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .context("Failed to build CDP HTTP client.")?;
+    let client = cdp_http_client();
     let response = client
         .get(url)
         .send()
@@ -134,4 +132,14 @@ fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
     response
         .json()
         .context("Failed to decode CDP JSON response.")
+}
+
+fn cdp_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("failed to build CDP HTTP client")
+    })
 }

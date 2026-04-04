@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use crate::auth::{summarize_codex_auth, CodexAuth};
 
@@ -72,11 +73,7 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
     let summary = summarize_codex_auth(auth);
     let usage_url = std::env::var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE")
         .unwrap_or_else(|_| WHAM_USAGE_URL.to_string());
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .context("Failed to build quota probe client.")?;
-    let response = client
+    let response = quota_http_client()
         .get(&usage_url)
         .header("Accept", "application/json")
         .header(
@@ -122,6 +119,16 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
         ),
         usage,
         usable,
+    })
+}
+
+fn quota_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+            .build()
+            .expect("failed to build quota probe client")
     })
 }
 

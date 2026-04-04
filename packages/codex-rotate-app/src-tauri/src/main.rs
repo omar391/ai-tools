@@ -1,3 +1,4 @@
+use codex_rotate_core::paths::resolve_paths as resolve_core_paths;
 use codex_rotate_core::pool::{load_pool, rotate_next_internal, NextResult};
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_tray_core::hook::{read_live_account, switch_live_account_to_current_auth};
@@ -6,9 +7,11 @@ use codex_rotate_tray_core::watch::{
     refresh_quota_cache, run_watch_iteration, WatchIterationOptions,
 };
 use std::{
+    fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tauri::{
     image::Image,
@@ -274,6 +277,11 @@ struct SharedStatus {
 }
 
 #[derive(Clone)]
+struct SharedRuntimeCaches {
+    inner: Arc<Mutex<RuntimeCaches>>,
+}
+
+#[derive(Clone)]
 struct MenuHandles {
     account_item: MenuItem<tauri::Wry>,
     inventory_item: MenuItem<tauri::Wry>,
@@ -296,59 +304,131 @@ struct StatusSnapshot {
     quota_cache: Option<CachedQuotaState>,
 }
 
+#[derive(Clone, Default)]
+struct RuntimeCaches {
+    pool_file: PathBuf,
+    inventory_count: Option<usize>,
+    inventory_modified_at: Option<SystemTime>,
+    inventory_exists: bool,
+    last_rendered: Option<RenderedSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedSnapshot {
+    account_text: String,
+    inventory_text: String,
+    plan_text: String,
+    quota_text: String,
+    status_text: String,
+    rotation_text: String,
+    tooltip_text: String,
+    quota_percent: Option<u8>,
+}
+
 fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
     snapshot.current_quota = Some(quota.summary.clone());
     snapshot.current_quota_percent = quota.primary_quota_left_percent;
     snapshot.quota_cache = Some(quota.clone());
 }
 
-fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
-    snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
+impl SharedRuntimeCaches {
+    fn new(pool_file: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeCaches {
+                pool_file,
+                ..RuntimeCaches::default()
+            })),
+        }
+    }
+}
+
+fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
+    let Some(runtime) = app.try_state::<SharedRuntimeCaches>() else {
+        snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
+        return;
+    };
+
+    let mut runtime = runtime.inner.lock().expect("runtime caches mutex");
+    let metadata = fs::metadata(&runtime.pool_file).ok();
+    let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
+    let exists = metadata.is_some();
+    let cache_valid = runtime.inventory_count.is_some()
+        && runtime.inventory_exists == exists
+        && runtime.inventory_modified_at == modified_at;
+
+    if cache_valid {
+        snapshot.inventory_count = runtime.inventory_count;
+        return;
+    }
+
+    let count = load_pool().ok().map(|pool| pool.accounts.len());
+    runtime.inventory_count = count;
+    runtime.inventory_modified_at = modified_at;
+    runtime.inventory_exists = exists;
+    snapshot.inventory_count = count;
+}
+
+fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
+    RenderedSnapshot {
+        account_text: format!(
+            "Account: {}",
+            snapshot.current_email.as_deref().unwrap_or("unknown")
+        ),
+        inventory_text: match snapshot.inventory_count {
+            Some(count) => format!("Inventory: {count} account(s)"),
+            None => "Inventory: unknown".to_string(),
+        },
+        plan_text: format!(
+            "Plan: {}",
+            snapshot.current_plan.as_deref().unwrap_or("unknown")
+        ),
+        quota_text: format!(
+            "Quota: {}",
+            snapshot.current_quota.as_deref().unwrap_or("unknown")
+        ),
+        status_text: format!(
+            "Status: {}",
+            snapshot.last_message.as_deref().unwrap_or("starting")
+        ),
+        rotation_text: format!(
+            "Last rotation: {}",
+            snapshot.last_rotation_email.as_deref().unwrap_or("none")
+        ),
+        tooltip_text: match snapshot.current_quota_percent {
+            Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
+            None => "Codex Rotate\nClick for status".to_string(),
+        },
+        quota_percent: snapshot.current_quota_percent,
+    }
 }
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
+    let rendered = rendered_snapshot(&snapshot);
+    if let Some(runtime) = app.try_state::<SharedRuntimeCaches>() {
+        let mut runtime = runtime.inner.lock().expect("runtime caches mutex");
+        if runtime.last_rendered.as_ref() == Some(&rendered) {
+            return;
+        }
+        runtime.last_rendered = Some(rendered.clone());
+    }
+
     if let Some(menu) = app.try_state::<MenuHandles>() {
-        let account_text = format!(
-            "Account: {}",
-            snapshot.current_email.as_deref().unwrap_or("unknown")
-        );
-        let inventory_text = match snapshot.inventory_count {
-            Some(count) => format!("Inventory: {count} account(s)"),
-            None => "Inventory: unknown".to_string(),
-        };
-        let plan_text = format!(
-            "Plan: {}",
-            snapshot.current_plan.as_deref().unwrap_or("unknown")
-        );
-        let quota_text = format!(
-            "Quota: {}",
-            snapshot.current_quota.as_deref().unwrap_or("unknown")
-        );
-        let status_text = format!(
-            "Status: {}",
-            snapshot.last_message.as_deref().unwrap_or("starting")
-        );
-        let rotation_text = format!(
-            "Last rotation: {}",
-            snapshot.last_rotation_email.as_deref().unwrap_or("none")
-        );
-        let _ = menu.account_item.set_text(account_text);
-        let _ = menu.inventory_item.set_text(inventory_text);
-        let _ = menu.plan_item.set_text(plan_text);
-        let _ = menu.quota_item.set_text(quota_text);
-        let _ = menu.status_item.set_text(status_text);
-        let _ = menu.last_rotation_item.set_text(rotation_text);
+        let _ = menu.account_item.set_text(rendered.account_text.clone());
+        let _ = menu
+            .inventory_item
+            .set_text(rendered.inventory_text.clone());
+        let _ = menu.plan_item.set_text(rendered.plan_text.clone());
+        let _ = menu.quota_item.set_text(rendered.quota_text.clone());
+        let _ = menu.status_item.set_text(rendered.status_text.clone());
+        let _ = menu
+            .last_rotation_item
+            .set_text(rendered.rotation_text.clone());
     }
 
     if let Some(tray) = app.tray_by_id("main") {
-        let tooltip = match snapshot.current_quota_percent {
-            Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
-            None => "Codex Rotate\nClick for status".to_string(),
-        };
-        let _ = tray.set_icon(Some(build_tray_icon(snapshot.current_quota_percent)));
-        let _ = tray.set_icon_as_template(true);
+        let _ = tray.set_icon(Some(build_tray_icon(rendered.quota_percent)));
         let _ = tray.set_title(Option::<String>::None);
-        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_tooltip(Some(rendered.tooltip_text));
     }
 }
 
@@ -361,7 +441,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
     }) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             if let Some(live) = result.live.as_ref() {
                 snapshot.current_email = Some(live.email.clone());
                 snapshot.current_plan = Some(live.plan_type.clone());
@@ -393,7 +473,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             snapshot.last_message = Some(format!("watch failed: {}", error));
             snapshot.clone()
         }
@@ -415,7 +495,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
     let next = match rotate_next_internal() {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             match &result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -452,7 +532,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             snapshot.last_message = Some(format!("manual rotate failed: {}", error));
             snapshot.clone()
         }
@@ -464,7 +544,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
     let next = match read_live_account(Some(DEFAULT_PORT)) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             if let Some(account) = result.account.as_ref() {
                 snapshot.current_email = account.email.clone();
                 snapshot.current_plan = account.plan_type.clone();
@@ -482,7 +562,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
         }
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(&mut snapshot);
+            refresh_inventory_count(app, &mut snapshot);
             snapshot.last_message = Some(format!("account read failed: {}", error));
             snapshot.clone()
         }
@@ -503,7 +583,9 @@ fn main() {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
             let status = SharedStatus::default();
+            let pool_file = resolve_core_paths()?.pool_file;
             app.manage(status.clone());
+            app.manage(SharedRuntimeCaches::new(pool_file));
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
@@ -538,11 +620,11 @@ fn main() {
                 app,
                 &[
                     &account_item,
-                    &inventory_item,
                     &plan_item,
                     &quota_item,
                     &status_item,
                     &last_rotation_item,
+                    &inventory_item,
                     &launch_item,
                     &check_item,
                     &rotate_item,

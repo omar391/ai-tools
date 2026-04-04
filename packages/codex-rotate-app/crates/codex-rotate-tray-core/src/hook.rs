@@ -57,7 +57,7 @@ pub fn switch_live_account_to_current_auth(
     }
 
     {
-        let mut connection = connect_to_local_codex_page(port)?;
+        let mut connection = connect_to_live_codex_page(port, false)?;
         let request = serde_json::to_string(&expected)?;
         let expression = format!(
             "new Promise(async (resolve) => {{ const request = {request}; await window.electronBridge.sendMessageFromView(request); resolve({{ sent: true }}); }})"
@@ -103,7 +103,7 @@ pub fn switch_live_account_to_current_auth(
 
 fn reload_live_codex_page(port: u16, timeout_ms: u64) -> Result<()> {
     {
-        let mut connection = connect_to_local_codex_page(port)?;
+        let mut connection = connect_to_live_codex_page(port, false)?;
         connection.reload_page(true)?;
         connection.close();
     }
@@ -134,6 +134,23 @@ fn send_mcp_request<T>(port: u16, method: &str, params: serde_json::Value) -> Re
 where
     T: for<'de> Deserialize<'de>,
 {
+    match send_mcp_request_once(port, method, &params) {
+        Ok(value) => Ok(value),
+        Err(first_error) => {
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            send_mcp_request_once(port, method, &params).map_err(|retry_error| {
+                anyhow!(
+                    "{retry_error} (initial {method} request failed before relaunch: {first_error})"
+                )
+            })
+        }
+    }
+}
+
+fn send_mcp_request_once<T>(port: u16, method: &str, params: &serde_json::Value) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let request = json!({
         "type": "mcp-request",
         "hostId": "local",
@@ -144,7 +161,7 @@ where
             "params": params,
         }
     });
-    let mut connection = connect_to_local_codex_page(port)?;
+    let mut connection = connect_to_live_codex_page(port, false)?;
     let request_json = serde_json::to_string(&request)?;
     let expression = format!(
         r#"new Promise(async (resolve) => {{
@@ -179,6 +196,26 @@ await window.electronBridge.sendMessageFromView(request);
             .unwrap_or(serde_json::Value::Null),
     )
     .map_err(|error| anyhow!("Failed to decode {method} response from Codex: {error}"))
+}
+
+fn connect_to_live_codex_page(
+    port: u16,
+    ensure_launched: bool,
+) -> Result<crate::cdp::CdpConnection> {
+    if ensure_launched {
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+    }
+    match connect_to_local_codex_page(port) {
+        Ok(connection) => Ok(connection),
+        Err(first_error) => {
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            connect_to_local_codex_page(port).map_err(|retry_error| {
+                anyhow!(
+                    "{retry_error} (initial CDP connection failed before relaunch: {first_error})"
+                )
+            })
+        }
+    }
 }
 
 fn normalize_email(value: &str) -> String {

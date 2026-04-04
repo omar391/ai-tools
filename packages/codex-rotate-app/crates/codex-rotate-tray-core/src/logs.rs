@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,8 +25,7 @@ pub fn read_codex_signals(
     after_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<CodexLogSignal>> {
-    let connection = Connection::open(logs_db_path)
-        .with_context(|| format!("Failed to open {}.", logs_db_path.display()))?;
+    let connection = open_logs_connection(logs_db_path)?;
     let mut statement = connection.prepare(
         r#"
 select id, ts, target, feedback_log_body
@@ -74,8 +73,7 @@ limit ?2
 }
 
 pub fn read_latest_codex_signal_id(logs_db_path: &Path) -> Result<Option<i64>> {
-    let connection = Connection::open(logs_db_path)
-        .with_context(|| format!("Failed to open {}.", logs_db_path.display()))?;
+    let connection = open_logs_connection(logs_db_path)?;
     let mut statement = connection.prepare(
         r#"
 select id
@@ -120,6 +118,14 @@ pub fn classify_signal(target: &str, body: &str) -> Option<CodexSignalKind> {
     }
 
     None
+}
+
+fn open_logs_connection(logs_db_path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        logs_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open {}.", logs_db_path.display()))
 }
 
 #[cfg(test)]

@@ -4,10 +4,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
-use codex_rotate_core::pool::{
-    current_auth_summary, other_usable_account_exists, rotate_next_internal, NextResult,
-};
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
+use codex_rotate_core::pool::{other_usable_account_exists, rotate_next_internal, NextResult};
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
@@ -18,7 +16,6 @@ use crate::hook::{
     live_account_matches_summary, read_live_account, switch_live_account_to_current_auth,
     AccountReadResult, LiveSwitchResult,
 };
-use crate::launcher::ensure_debug_codex_instance;
 use crate::logs::{
     read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
 };
@@ -27,7 +24,7 @@ use crate::paths::resolve_paths;
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 10;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WatchState {
     pub last_signal_id: Option<i64>,
@@ -117,7 +114,6 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let port = options.port.unwrap_or(9333);
     let cooldown_ms = options.cooldown_ms.unwrap_or(DEFAULT_COOLDOWN_MS);
     let paths = resolve_paths()?;
-    ensure_debug_codex_instance(None, Some(port), None, None)?;
 
     let previous_state = read_watch_state()?;
     let mut after_signal_id = options.after_signal_id.or(previous_state.last_signal_id);
@@ -125,31 +121,44 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id = read_latest_codex_signal_id(&paths.codex_logs_db_file)?;
     }
 
-    let live_account =
-        ensure_live_account_matches_current_auth(port, read_live_account(Some(port))?)?;
-    let current_summary = current_auth_summary()?;
+    let current_auth = load_codex_auth(&paths.codex_auth_file)?;
+    let current_summary = summarize_codex_auth(&current_auth);
     let (decision, mut quota_cache) = decide_rotation(
+        &current_auth,
+        &current_summary,
         after_signal_id,
         previous_state.quota.as_ref(),
         options.force_quota_refresh,
     )?;
+    let live_account = ensure_live_account_matches_current_auth(
+        port,
+        &current_summary,
+        read_live_account(Some(port))?,
+    )?;
 
     let mut rotated = false;
     let mut rotation = None;
-    let mut live = live_account
-        .account
-        .as_ref()
-        .map(|account| LiveSwitchResult {
-            email: account
-                .email
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            plan_type: account
-                .plan_type
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            account_id: current_summary.account_id.clone(),
-        });
+    let mut live = Some(
+        live_account
+            .account
+            .as_ref()
+            .map(|account| LiveSwitchResult {
+                email: account
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| current_summary.email.clone()),
+                plan_type: account
+                    .plan_type
+                    .clone()
+                    .unwrap_or_else(|| current_summary.plan_type.clone()),
+                account_id: current_summary.account_id.clone(),
+            })
+            .unwrap_or_else(|| LiveSwitchResult {
+                email: current_summary.email.clone(),
+                plan_type: current_summary.plan_type.clone(),
+                account_id: current_summary.account_id.clone(),
+            }),
+    );
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
         let mut refreshed_current = false;
@@ -184,7 +193,14 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 15_000,
                 reload_after_switch,
             )?);
-            quota_cache = Some(refresh_quota_cache(true, None)?);
+            let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
+            let refreshed_summary = summarize_codex_auth(&refreshed_auth);
+            quota_cache = Some(refresh_quota_cache_for_auth(
+                &refreshed_auth,
+                &refreshed_summary,
+                true,
+                None,
+            )?);
         }
         rotated = rotation.is_some();
     }
@@ -195,26 +211,31 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         last_live_email: live
             .as_ref()
             .map(|value| value.email.clone())
-            .or_else(|| live_account.account.and_then(|account| account.email))
-            .or(previous_state.last_live_email),
+            .or_else(|| {
+                live_account
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.email.clone())
+            })
+            .or_else(|| previous_state.last_live_email.clone()),
         last_rotation_at: if rotated {
             Some(now_iso())
         } else {
-            previous_state.last_rotation_at
+            previous_state.last_rotation_at.clone()
         },
         last_rotation_reason: if rotated {
             decision.reason.clone()
         } else {
-            previous_state.last_rotation_reason
+            previous_state.last_rotation_reason.clone()
         },
         last_rotated_email: if rotated {
             rotation.as_ref().map(|summary| summary.email.clone())
         } else {
-            previous_state.last_rotated_email
+            previous_state.last_rotated_email.clone()
         },
         quota: quota_cache,
     };
-    write_watch_state(&next_state)?;
+    write_watch_state_if_needed(&previous_state, &next_state)?;
 
     Ok(WatchIterationResult {
         state: next_state,
@@ -232,13 +253,22 @@ pub fn refresh_quota_cache(
     let paths = resolve_paths()?;
     let auth = load_codex_auth(&paths.codex_auth_file)?;
     let summary = summarize_codex_auth(&auth);
+    refresh_quota_cache_for_auth(&auth, &summary, force_refresh, previous)
+}
+
+fn refresh_quota_cache_for_auth(
+    auth: &CodexAuth,
+    summary: &AuthSummary,
+    force_refresh: bool,
+    previous: Option<&CachedQuotaState>,
+) -> Result<CachedQuotaState> {
     let now = Utc::now();
     if !force_refresh && !quota_cache_is_stale(previous, &summary.account_id, now) {
         if let Some(previous) = previous {
             return Ok(previous.clone());
         }
     }
-    match inspect_quota(&auth) {
+    match inspect_quota(auth) {
         Ok(assessment) => Ok(build_cached_quota_state(
             &summary.account_id,
             Some(&assessment),
@@ -256,11 +286,9 @@ pub fn refresh_quota_cache(
 
 fn ensure_live_account_matches_current_auth(
     port: u16,
+    summary: &AuthSummary,
     live_account: AccountReadResult,
 ) -> Result<AccountReadResult> {
-    let paths = resolve_paths()?;
-    let auth = load_codex_auth(&paths.codex_auth_file)?;
-    let summary = summarize_codex_auth(&auth);
     if live_account_matches_summary(&live_account, &summary) {
         return Ok(live_account);
     }
@@ -276,21 +304,31 @@ fn ensure_live_account_matches_current_auth(
 }
 
 fn decide_rotation(
+    auth: &CodexAuth,
+    summary: &AuthSummary,
     after_signal_id: Option<i64>,
     previous_cache: Option<&CachedQuotaState>,
     force_quota_refresh: bool,
 ) -> Result<(RotationDecision, Option<CachedQuotaState>)> {
     let paths = resolve_paths()?;
-    let auth = load_codex_auth(&paths.codex_auth_file)?;
-    let summary = summarize_codex_auth(&auth);
     let signals = read_codex_signals(&paths.codex_logs_db_file, after_signal_id, 50)?;
     let last_signal_id = signals.last().map(|signal| signal.id).or(after_signal_id);
     let cache_invalidated = quota_cache_invalidated(previous_cache, &summary.account_id, &signals)?;
 
     let quota_cache = if force_quota_refresh || cache_invalidated {
-        Some(refresh_quota_cache(true, previous_cache)?)
+        Some(refresh_quota_cache_for_auth(
+            auth,
+            summary,
+            true,
+            previous_cache,
+        )?)
     } else {
-        Some(refresh_quota_cache(false, previous_cache)?)
+        Some(refresh_quota_cache_for_auth(
+            auth,
+            summary,
+            false,
+            previous_cache,
+        )?)
     };
 
     let assessment = quota_cache
@@ -421,6 +459,24 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn write_watch_state_if_needed(previous: &WatchState, next: &WatchState) -> Result<()> {
+    if should_persist_watch_state(previous, next) {
+        write_watch_state(next)?;
+    }
+    Ok(())
+}
+
+fn should_persist_watch_state(previous: &WatchState, next: &WatchState) -> bool {
+    if previous == next {
+        return false;
+    }
+    let mut previous_normalized = previous.clone();
+    let mut next_normalized = next.clone();
+    previous_normalized.last_checked_at = None;
+    next_normalized.last_checked_at = None;
+    previous_normalized != next_normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +572,33 @@ mod tests {
             ..older_signal[0].clone()
         }];
         assert!(quota_cache_invalidated(Some(&cache), "acct-123", &newer_signal).unwrap());
+    }
+
+    #[test]
+    fn watch_state_write_skips_heartbeat_only_changes() {
+        let previous = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+            ..WatchState::default()
+        };
+        let next = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+            ..previous.clone()
+        };
+        assert!(!should_persist_watch_state(&previous, &next));
+    }
+
+    #[test]
+    fn watch_state_write_keeps_signal_progress() {
+        let previous = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+            last_signal_id: Some(10),
+            ..WatchState::default()
+        };
+        let next = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+            last_signal_id: Some(11),
+            ..previous.clone()
+        };
+        assert!(should_persist_watch_state(&previous, &next));
     }
 }

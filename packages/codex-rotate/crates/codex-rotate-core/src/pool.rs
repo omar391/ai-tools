@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -1192,11 +1193,7 @@ fn fetch_usage_with_recovery(auth: &CodexAuth) -> Result<(CodexAuth, UsageRespon
 fn fetch_usage_once(auth: &CodexAuth) -> Result<UsageResponse> {
     let usage_url = std::env::var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE")
         .unwrap_or_else(|_| WHAM_USAGE_URL.to_string());
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .context("Failed to build codex-rotate usage client.")?;
-    let response = client
+    let response = core_http_client()
         .get(&usage_url)
         .header("Accept", "application/json")
         .header(
@@ -1224,11 +1221,7 @@ fn refresh_auth(auth: &CodexAuth) -> Result<CodexAuth> {
         .refresh_token
         .as_ref()
         .ok_or_else(|| anyhow!("No refresh token is available for this account."))?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
-        .build()
-        .context("Failed to build token refresh client.")?;
-    let response = client
+    let response = core_http_client()
         .post(
             std::env::var("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
                 .unwrap_or_else(|_| OAUTH_TOKEN_URL.to_string()),
@@ -1311,6 +1304,16 @@ fn build_http_error_message(action: &str, status: u16, body: &str) -> String {
         }
     }
     format!("{action} failed ({status})")
+}
+
+fn core_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+            .build()
+            .expect("failed to build codex-rotate core HTTP client")
+    })
 }
 
 pub fn find_next_cached_usable_account_index(
