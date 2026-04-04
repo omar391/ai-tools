@@ -8,7 +8,7 @@ use codex_rotate_core::auth::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::cdp::connect_to_local_codex_page;
+use crate::cdp::{invalidate_local_codex_connection, with_local_codex_connection};
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::resolve_paths;
 
@@ -57,14 +57,15 @@ pub fn switch_live_account_to_current_auth(
     }
 
     {
-        let mut connection = connect_to_live_codex_page(port, false)?;
         let request = serde_json::to_string(&expected)?;
         let expression = format!(
             "new Promise(async (resolve) => {{ const request = {request}; await window.electronBridge.sendMessageFromView(request); resolve({{ sent: true }}); }})"
         );
-        let _: serde_json::Value = connection.evaluate(&expression)?;
-        connection.close();
-    }
+        with_live_codex_connection(port, ensure_launched, |connection| {
+            let _: serde_json::Value = connection.evaluate(&expression)?;
+            Ok(())
+        })?;
+    };
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
@@ -102,15 +103,15 @@ pub fn switch_live_account_to_current_auth(
 }
 
 fn reload_live_codex_page(port: u16, timeout_ms: u64) -> Result<()> {
-    {
-        let mut connection = connect_to_live_codex_page(port, false)?;
+    with_live_codex_connection(port, false, |connection| {
         connection.reload_page(true)?;
-        connection.close();
-    }
+        Ok(())
+    })?;
+    invalidate_local_codex_connection(port, false);
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(8_000));
     while Instant::now() < deadline {
-        if connect_to_local_codex_page(port).is_ok() {
+        if with_local_codex_connection(port, |_connection| Ok(())).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(500));
@@ -161,7 +162,6 @@ where
             "params": params,
         }
     });
-    let mut connection = connect_to_live_codex_page(port, false)?;
     let request_json = serde_json::to_string(&request)?;
     let expression = format!(
         r#"new Promise(async (resolve) => {{
@@ -182,8 +182,8 @@ window.addEventListener("message", handler);
 await window.electronBridge.sendMessageFromView(request);
 }})"#
     );
-    let value: serde_json::Value = connection.evaluate(&expression)?;
-    connection.close();
+    let value: serde_json::Value =
+        with_local_codex_connection(port, |connection| connection.evaluate(&expression))?;
     if value.get("timeout").and_then(serde_json::Value::as_bool) == Some(true) {
         return Err(anyhow!(
             "Timed out waiting for {method} response from Codex."
@@ -198,22 +198,25 @@ await window.electronBridge.sendMessageFromView(request);
     .map_err(|error| anyhow!("Failed to decode {method} response from Codex: {error}"))
 }
 
-fn connect_to_live_codex_page(
-    port: u16,
-    ensure_launched: bool,
-) -> Result<crate::cdp::CdpConnection> {
+fn with_live_codex_connection<T, F>(port: u16, ensure_launched: bool, mut operation: F) -> Result<T>
+where
+    F: FnMut(&mut crate::cdp::CdpConnection) -> Result<T>,
+{
     if ensure_launched {
         ensure_debug_codex_instance(None, Some(port), None, None)?;
     }
-    match connect_to_local_codex_page(port) {
-        Ok(connection) => Ok(connection),
+    match with_local_codex_connection(port, |connection| operation(connection)) {
+        Ok(value) => Ok(value),
         Err(first_error) => {
+            invalidate_local_codex_connection(port, true);
             ensure_debug_codex_instance(None, Some(port), None, None)?;
-            connect_to_local_codex_page(port).map_err(|retry_error| {
-                anyhow!(
-                    "{retry_error} (initial CDP connection failed before relaunch: {first_error})"
-                )
-            })
+            with_local_codex_connection(port, |connection| operation(connection)).map_err(
+                |retry_error| {
+                    anyhow!(
+                        "{retry_error} (initial live Codex connection failed before relaunch: {first_error})"
+                    )
+                },
+            )
         }
     }
 }

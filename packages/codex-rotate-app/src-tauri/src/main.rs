@@ -277,8 +277,8 @@ struct SharedStatus {
 }
 
 #[derive(Clone)]
-struct SharedRuntimeCaches {
-    inner: Arc<Mutex<RuntimeCaches>>,
+struct SharedTrayRuntime {
+    inner: Arc<Mutex<TrayRuntime>>,
 }
 
 #[derive(Clone)]
@@ -305,7 +305,7 @@ struct StatusSnapshot {
 }
 
 #[derive(Clone, Default)]
-struct RuntimeCaches {
+struct TrayRuntime {
     pool_file: PathBuf,
     inventory_count: Option<usize>,
     inventory_modified_at: Option<SystemTime>,
@@ -331,41 +331,53 @@ fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
     snapshot.quota_cache = Some(quota.clone());
 }
 
-impl SharedRuntimeCaches {
+impl SharedTrayRuntime {
     fn new(pool_file: PathBuf) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RuntimeCaches {
+            inner: Arc::new(Mutex::new(TrayRuntime {
                 pool_file,
-                ..RuntimeCaches::default()
+                ..TrayRuntime::default()
             })),
         }
+    }
+
+    fn refresh_inventory_count(&self, snapshot: &mut StatusSnapshot) {
+        let mut runtime = self.inner.lock().expect("tray runtime mutex");
+        let metadata = fs::metadata(&runtime.pool_file).ok();
+        let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
+        let exists = metadata.is_some();
+        let cache_valid = runtime.inventory_count.is_some()
+            && runtime.inventory_exists == exists
+            && runtime.inventory_modified_at == modified_at;
+
+        if cache_valid {
+            snapshot.inventory_count = runtime.inventory_count;
+            return;
+        }
+
+        let count = load_pool().ok().map(|pool| pool.accounts.len());
+        runtime.inventory_count = count;
+        runtime.inventory_modified_at = modified_at;
+        runtime.inventory_exists = exists;
+        snapshot.inventory_count = count;
+    }
+
+    fn begin_render(&self, rendered: &RenderedSnapshot) -> bool {
+        let mut runtime = self.inner.lock().expect("tray runtime mutex");
+        if runtime.last_rendered.as_ref() == Some(rendered) {
+            return false;
+        }
+        runtime.last_rendered = Some(rendered.clone());
+        true
     }
 }
 
 fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
-    let Some(runtime) = app.try_state::<SharedRuntimeCaches>() else {
+    let Some(runtime) = app.try_state::<SharedTrayRuntime>() else {
         snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
         return;
     };
-
-    let mut runtime = runtime.inner.lock().expect("runtime caches mutex");
-    let metadata = fs::metadata(&runtime.pool_file).ok();
-    let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
-    let exists = metadata.is_some();
-    let cache_valid = runtime.inventory_count.is_some()
-        && runtime.inventory_exists == exists
-        && runtime.inventory_modified_at == modified_at;
-
-    if cache_valid {
-        snapshot.inventory_count = runtime.inventory_count;
-        return;
-    }
-
-    let count = load_pool().ok().map(|pool| pool.accounts.len());
-    runtime.inventory_count = count;
-    runtime.inventory_modified_at = modified_at;
-    runtime.inventory_exists = exists;
-    snapshot.inventory_count = count;
+    runtime.refresh_inventory_count(snapshot);
 }
 
 fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
@@ -404,12 +416,10 @@ fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     let rendered = rendered_snapshot(&snapshot);
-    if let Some(runtime) = app.try_state::<SharedRuntimeCaches>() {
-        let mut runtime = runtime.inner.lock().expect("runtime caches mutex");
-        if runtime.last_rendered.as_ref() == Some(&rendered) {
+    if let Some(runtime) = app.try_state::<SharedTrayRuntime>() {
+        if !runtime.begin_render(&rendered) {
             return;
         }
-        runtime.last_rendered = Some(rendered.clone());
     }
 
     if let Some(menu) = app.try_state::<MenuHandles>() {
@@ -585,7 +595,7 @@ fn main() {
             let status = SharedStatus::default();
             let pool_file = resolve_core_paths()?.pool_file;
             app.manage(status.clone());
-            app.manage(SharedRuntimeCaches::new(pool_file));
+            app.manage(SharedTrayRuntime::new(pool_file));
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
@@ -685,4 +695,40 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run codex rotate tray");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_rendered_snapshot() -> RenderedSnapshot {
+        RenderedSnapshot {
+            account_text: "Account: dev.1@astronlab.com".to_string(),
+            inventory_text: "Inventory: 3 account(s)".to_string(),
+            plan_text: "Plan: free".to_string(),
+            quota_text: "Quota: 5h 80% left".to_string(),
+            status_text: "Status: watch healthy".to_string(),
+            rotation_text: "Last rotation: none".to_string(),
+            tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
+            quota_percent: Some(80),
+        }
+    }
+
+    #[test]
+    fn tray_runtime_dedups_identical_rendered_snapshots() {
+        let runtime = SharedTrayRuntime::new(PathBuf::from("/tmp/accounts.json"));
+        let rendered = sample_rendered_snapshot();
+        assert!(runtime.begin_render(&rendered));
+        assert!(!runtime.begin_render(&rendered));
+    }
+
+    #[test]
+    fn tray_runtime_allows_changed_rendered_snapshots() {
+        let runtime = SharedTrayRuntime::new(PathBuf::from("/tmp/accounts.json"));
+        let rendered = sample_rendered_snapshot();
+        let mut changed = rendered.clone();
+        changed.status_text = "Status: rotated".to_string();
+        assert!(runtime.begin_render(&rendered));
+        assert!(runtime.begin_render(&changed));
+    }
 }

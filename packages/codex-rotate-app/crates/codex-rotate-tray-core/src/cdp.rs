@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
@@ -23,6 +23,13 @@ pub struct CdpConnection {
     next_id: u64,
 }
 
+#[derive(Default)]
+struct SharedCdpSession {
+    port: Option<u16>,
+    websocket_debugger_url: Option<String>,
+    connection: Option<CdpConnection>,
+}
+
 pub fn list_cdp_targets(port: u16) -> Result<Vec<CdpTargetInfo>> {
     fetch_json(&format!("http://127.0.0.1:{port}/json/list"))
 }
@@ -32,17 +39,89 @@ pub fn is_cdp_ready(port: u16) -> bool {
 }
 
 pub fn connect_to_local_codex_page(port: u16) -> Result<CdpConnection> {
-    let page = list_cdp_targets(port)?
-        .into_iter()
-        .find(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
-        .ok_or_else(|| anyhow!("No Codex page target is available on port {port}."))?;
+    let websocket_debugger_url = local_codex_page_websocket_url(port)?;
+    connect_to_debugger_url(&websocket_debugger_url)
+}
 
-    let (socket, _) = connect(page.websocket_debugger_url.as_str())
-        .with_context(|| format!("Failed to connect to Codex renderer on port {port}."))?;
+pub fn with_local_codex_connection<T, F>(port: u16, mut operation: F) -> Result<T>
+where
+    F: FnMut(&mut CdpConnection) -> Result<T>,
+{
+    let mut session = shared_cdp_session()
+        .lock()
+        .expect("shared cdp session mutex");
+    let connection = ensure_shared_connection(&mut session, port)?;
+    match operation(connection) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            session.connection = None;
+            Err(error)
+        }
+    }
+}
+
+pub fn invalidate_local_codex_connection(port: u16, clear_target_url: bool) {
+    let mut session = shared_cdp_session()
+        .lock()
+        .expect("shared cdp session mutex");
+    if session.port != Some(port) {
+        return;
+    }
+    session.connection = None;
+    if clear_target_url {
+        session.websocket_debugger_url = None;
+    }
+}
+
+fn connect_to_debugger_url(websocket_debugger_url: &str) -> Result<CdpConnection> {
+    let (socket, _) = connect(websocket_debugger_url).with_context(|| {
+        format!("Failed to connect to Codex renderer at {websocket_debugger_url}.")
+    })?;
 
     let mut connection = CdpConnection { socket, next_id: 0 };
     let _: Value = connection.send_command("Runtime.enable", json!({}))?;
     Ok(connection)
+}
+
+fn local_codex_page_websocket_url(port: u16) -> Result<String> {
+    let page = list_cdp_targets(port)?
+        .into_iter()
+        .find(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
+        .ok_or_else(|| anyhow!("No Codex page target is available on port {port}."))?;
+    Ok(page.websocket_debugger_url)
+}
+
+fn ensure_shared_connection<'a>(
+    session: &'a mut SharedCdpSession,
+    port: u16,
+) -> Result<&'a mut CdpConnection> {
+    if session.port != Some(port) {
+        *session = SharedCdpSession {
+            port: Some(port),
+            ..SharedCdpSession::default()
+        };
+    }
+    if session.connection.is_none() {
+        let websocket_debugger_url = match session.websocket_debugger_url.as_deref() {
+            Some(url) => match connect_to_debugger_url(url) {
+                Ok(connection) => {
+                    session.connection = Some(connection);
+                    return Ok(session.connection.as_mut().expect("shared cdp connection"));
+                }
+                Err(_) => local_codex_page_websocket_url(port)?,
+            },
+            None => local_codex_page_websocket_url(port)?,
+        };
+        let connection = connect_to_debugger_url(&websocket_debugger_url)?;
+        session.websocket_debugger_url = Some(websocket_debugger_url);
+        session.connection = Some(connection);
+    }
+    Ok(session.connection.as_mut().expect("shared cdp connection"))
+}
+
+fn shared_cdp_session() -> &'static Mutex<SharedCdpSession> {
+    static SESSION: OnceLock<Mutex<SharedCdpSession>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(SharedCdpSession::default()))
 }
 
 impl CdpConnection {

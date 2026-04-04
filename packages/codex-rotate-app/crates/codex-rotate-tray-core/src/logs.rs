@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
@@ -20,12 +21,31 @@ pub struct CodexLogSignal {
     pub body: String,
 }
 
+#[derive(Default)]
+struct SharedLogReader {
+    path: Option<PathBuf>,
+    connection: Option<Connection>,
+}
+
 pub fn read_codex_signals(
     logs_db_path: &Path,
     after_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<CodexLogSignal>> {
-    let connection = open_logs_connection(logs_db_path)?;
+    with_log_connection(logs_db_path, |connection| {
+        query_codex_signals(connection, after_id, limit)
+    })
+}
+
+pub fn read_latest_codex_signal_id(logs_db_path: &Path) -> Result<Option<i64>> {
+    with_log_connection(logs_db_path, query_latest_codex_signal_id)
+}
+
+fn query_codex_signals(
+    connection: &Connection,
+    after_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<CodexLogSignal>> {
     let mut statement = connection.prepare(
         r#"
 select id, ts, target, feedback_log_body
@@ -72,8 +92,7 @@ limit ?2
     Ok(signals)
 }
 
-pub fn read_latest_codex_signal_id(logs_db_path: &Path) -> Result<Option<i64>> {
-    let connection = open_logs_connection(logs_db_path)?;
+fn query_latest_codex_signal_id(connection: &Connection) -> Result<Option<i64>> {
     let mut statement = connection.prepare(
         r#"
 select id
@@ -128,6 +147,45 @@ fn open_logs_connection(logs_db_path: &Path) -> Result<Connection> {
     .with_context(|| format!("Failed to open {}.", logs_db_path.display()))
 }
 
+fn with_log_connection<T, F>(logs_db_path: &Path, mut operation: F) -> Result<T>
+where
+    F: FnMut(&Connection) -> Result<T>,
+{
+    let mut reader = shared_log_reader().lock().expect("shared log reader mutex");
+    let connection = ensure_log_connection(&mut reader, logs_db_path)?;
+    match operation(connection) {
+        Ok(value) => Ok(value),
+        Err(first_error) => {
+            reader.connection = None;
+            let retry_connection = ensure_log_connection(&mut reader, logs_db_path)?;
+            operation(retry_connection).map_err(|retry_error| {
+                anyhow::anyhow!(
+                    "{retry_error} (initial log query failed before reconnect: {first_error})"
+                )
+            })
+        }
+    }
+}
+
+fn ensure_log_connection<'a>(
+    reader: &'a mut SharedLogReader,
+    logs_db_path: &Path,
+) -> Result<&'a Connection> {
+    if reader.path.as_deref() != Some(logs_db_path) {
+        reader.path = Some(logs_db_path.to_path_buf());
+        reader.connection = None;
+    }
+    if reader.connection.is_none() {
+        reader.connection = Some(open_logs_connection(logs_db_path)?);
+    }
+    Ok(reader.connection.as_ref().expect("shared log connection"))
+}
+
+fn shared_log_reader() -> &'static Mutex<SharedLogReader> {
+    static READER: OnceLock<Mutex<SharedLogReader>> = OnceLock::new();
+    READER.get_or_init(|| Mutex::new(SharedLogReader::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +216,44 @@ insert into logs (id, ts, target, feedback_log_body) values
         assert_eq!(signals.len(), 2);
         assert_eq!(signals[0].kind, CodexSignalKind::UsageLimitReached);
         assert_eq!(signals[1].kind, CodexSignalKind::RateLimitsUpdated);
+    }
+
+    #[test]
+    fn shared_reader_still_observes_new_rows() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text
+);
+insert into logs (id, ts, target, feedback_log_body) values
+  (1, 1000, 'codex_app_server::outgoing_message', 'app-server event: account/rateLimits/updated targeted_connections=1');
+                "#,
+            )
+            .unwrap();
+
+        let first = read_codex_signals(file.path(), None, 50).unwrap();
+        assert_eq!(first.len(), 1);
+
+        connection
+            .execute(
+                "insert into logs (id, ts, target, feedback_log_body) values (?1, ?2, ?3, ?4)",
+                params![
+                    2i64,
+                    1001i64,
+                    "log",
+                    "Received message {\"type\":\"error\",\"error\":{\"type\":\"usage_limit_reached\"},\"status_code\":429}"
+                ],
+            )
+            .unwrap();
+
+        let next = read_codex_signals(file.path(), Some(1), 50).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].kind, CodexSignalKind::UsageLimitReached);
     }
 }
