@@ -37,6 +37,7 @@ type BridgeRequest =
           codexBin?: string;
           workflowRunStamp?: string;
           preferSignupRecovery?: boolean;
+          fullName?: string;
           birthMonth?: number;
           birthDay?: number;
           birthYear?: number;

@@ -71,6 +71,10 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
+const DEFAULT_OPENAI_FULL_NAME = "M Omar Faruque";
+const DEFAULT_OPENAI_BIRTH_MONTH = 1;
+const DEFAULT_OPENAI_BIRTH_DAY = 24;
+const DEFAULT_OPENAI_BIRTH_YEAR = 1990;
 
 export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 
@@ -1907,6 +1911,7 @@ async function runCodexBrowserLoginWorkflow(
     codexBin?: string;
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
+    fullName?: string;
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
@@ -1952,11 +1957,12 @@ async function runCodexBrowserLoginWorkflow(
         : {}),
       email,
       account_secret: accountSecretRef,
+      full_name: String(options?.fullName ?? DEFAULT_OPENAI_FULL_NAME).trim(),
       prefer_signup_recovery:
         options?.preferSignupRecovery === true ? "true" : "false",
-      birth_month: String(options?.birthMonth ?? 1),
-      birth_day: String(options?.birthDay ?? 1),
-      birth_year: String(options?.birthYear ?? 1990),
+      birth_month: String(options?.birthMonth ?? DEFAULT_OPENAI_BIRTH_MONTH),
+      birth_day: String(options?.birthDay ?? DEFAULT_OPENAI_BIRTH_DAY),
+      birth_year: String(options?.birthYear ?? DEFAULT_OPENAI_BIRTH_YEAR),
     },
     profileName,
     {
@@ -1975,6 +1981,7 @@ export async function completeCodexLoginViaWorkflow(
     codexBin?: string;
     workflowRunStamp?: string;
     preferSignupRecovery?: boolean;
+    fullName?: string;
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
@@ -2037,6 +2044,7 @@ export async function completeCodexLoginViaWorkflow(
               codexBin: options?.codexBin,
               codexSession,
               preferSignupRecovery: allowSignupRecovery,
+              fullName: options?.fullName,
               birthMonth: options?.birthMonth,
               birthDay: options?.birthDay,
               birthYear: options?.birthYear,

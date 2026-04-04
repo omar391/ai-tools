@@ -5,7 +5,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Datelike, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,10 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
+const DEFAULT_OPENAI_FULL_NAME: &str = "M Omar Faruque";
+const DEFAULT_OPENAI_BIRTH_MONTH: u8 = 1;
+const DEFAULT_OPENAI_BIRTH_DAY: u8 = 24;
+const DEFAULT_OPENAI_BIRTH_YEAR: u16 = 1990;
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 
@@ -225,6 +229,8 @@ struct BridgeLoginOptions<'a> {
     workflow_run_stamp: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_signup_recovery: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     birth_month: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,24 +579,9 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
                 .alias
                 .clone()
                 .or_else(|| normalize_alias(options.alias.as_deref())),
-            birth_month: Some(
-                existing_pending
-                    .stored
-                    .birth_month
-                    .unwrap_or(birth_date.birth_month),
-            ),
-            birth_day: Some(
-                existing_pending
-                    .stored
-                    .birth_day
-                    .unwrap_or(birth_date.birth_day),
-            ),
-            birth_year: Some(
-                existing_pending
-                    .stored
-                    .birth_year
-                    .unwrap_or(birth_date.birth_year),
-            ),
+            birth_month: Some(birth_date.birth_month),
+            birth_day: Some(birth_date.birth_day),
+            birth_year: Some(birth_date.birth_year),
             created_at: existing_pending.stored.created_at.clone(),
             updated_at: started_at.clone(),
         },
@@ -812,13 +803,22 @@ fn run_complete_codex_login(
     prefer_signup_recovery: Option<bool>,
     birth_date: Option<&AdultBirthDate>,
 ) -> Result<()> {
+    let fallback_birth_date;
+    let birth_date = match birth_date {
+        Some(value) => value,
+        None => {
+            fallback_birth_date = default_openai_birth_date();
+            &fallback_birth_date
+        }
+    };
     let options = BridgeLoginOptions {
         codex_bin,
         workflow_run_stamp,
         prefer_signup_recovery,
-        birth_month: birth_date.map(|value| value.birth_month),
-        birth_day: birth_date.map(|value| value.birth_day),
-        birth_year: birth_date.map(|value| value.birth_year),
+        full_name: Some(DEFAULT_OPENAI_FULL_NAME),
+        birth_month: Some(birth_date.birth_month),
+        birth_day: Some(birth_date.birth_day),
+        birth_year: Some(birth_date.birth_year),
     };
     let _: Value = run_automation_bridge(
         "complete-codex-login",
@@ -1583,83 +1583,17 @@ fn fisher_yates_shuffle(chars: &mut [char]) {
 }
 
 fn resolve_credential_birth_date(
-    credential: Option<&StoredCredential>,
-    now: DateTime<Utc>,
+    _credential: Option<&StoredCredential>,
+    _now: DateTime<Utc>,
 ) -> AdultBirthDate {
-    if let Some(credential) = credential {
-        if let (Some(birth_month), Some(birth_day), Some(birth_year)) = (
-            credential.birth_month,
-            credential.birth_day,
-            credential.birth_year,
-        ) {
-            if (1..=12).contains(&birth_month)
-                && (1..=31).contains(&birth_day)
-                && birth_year >= 1900
-            {
-                return AdultBirthDate {
-                    birth_month,
-                    birth_day,
-                    birth_year,
-                };
-            }
-        }
-    }
-    generate_random_adult_birth_date(now, 20, 45, None)
+    default_openai_birth_date()
 }
 
-fn generate_random_adult_birth_date(
-    now: DateTime<Utc>,
-    min_age_years: i32,
-    max_age_years: i32,
-    pick_offset_ms: Option<fn(u64) -> u64>,
-) -> AdultBirthDate {
-    assert!(min_age_years >= 0);
-    assert!(max_age_years >= min_age_years);
-
-    let latest_birth =
-        chrono::NaiveDate::from_ymd_opt(now.year() - min_age_years, now.month(), now.day())
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc();
-    let earliest_birth =
-        chrono::NaiveDate::from_ymd_opt(now.year() - max_age_years, now.month(), now.day())
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc();
-    let span_ms = (latest_birth - earliest_birth).num_milliseconds().max(0) as u64;
-    let offset_ms = if let Some(picker) = pick_offset_ms {
-        if span_ms == 0 {
-            0
-        } else {
-            picker(span_ms + 1)
-        }
-    } else if span_ms == 0 {
-        0
-    } else {
-        random_below(span_ms + 1)
-    };
-    let chosen = earliest_birth + chrono::Duration::milliseconds(offset_ms as i64);
+fn default_openai_birth_date() -> AdultBirthDate {
     AdultBirthDate {
-        birth_month: chosen.month() as u8,
-        birth_day: chosen.day() as u8,
-        birth_year: chosen.year() as u16,
-    }
-}
-
-fn random_below(max_exclusive: u64) -> u64 {
-    if max_exclusive <= 1 {
-        return 0;
-    }
-    let zone = u64::MAX - (u64::MAX % max_exclusive);
-    loop {
-        let mut bytes = [0u8; 8];
-        OsRng.fill_bytes(&mut bytes);
-        let candidate = u64::from_le_bytes(bytes);
-        if candidate < zone {
-            return candidate % max_exclusive;
-        }
+        birth_month: DEFAULT_OPENAI_BIRTH_MONTH,
+        birth_day: DEFAULT_OPENAI_BIRTH_DAY,
+        birth_year: DEFAULT_OPENAI_BIRTH_YEAR,
     }
 }
 
@@ -1709,14 +1643,11 @@ mod tests {
     }
 
     #[test]
-    fn generates_expected_oldest_adult_date() {
-        let now = DateTime::parse_from_rfc3339("2026-04-02T00:00:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let value = generate_random_adult_birth_date(now, 20, 45, Some(|_| 0));
-        assert_eq!(value.birth_month, 4);
-        assert_eq!(value.birth_day, 2);
-        assert_eq!(value.birth_year, 1981);
+    fn uses_fixed_default_birth_date() {
+        let value = default_openai_birth_date();
+        assert_eq!(value.birth_month, 1);
+        assert_eq!(value.birth_day, 24);
+        assert_eq!(value.birth_year, 1990);
     }
 
     #[test]
@@ -1742,9 +1673,9 @@ mod tests {
             }),
             now,
         );
-        assert_eq!(value.birth_month, 7);
-        assert_eq!(value.birth_day, 14);
-        assert_eq!(value.birth_year, 1994);
+        assert_eq!(value.birth_month, 1);
+        assert_eq!(value.birth_day, 24);
+        assert_eq!(value.birth_year, 1990);
     }
 
     #[test]

@@ -39,11 +39,11 @@ input:
           type: object
           format: secret-ref
         full_name:
-          default: "Dev Astronlab"
+          default: "M Omar Faruque"
         birth_month:
           default: 1
         birth_day:
-          default: 1
+          default: 24
         birth_year:
           default: 1990
         prefer_signup_recovery:
@@ -657,7 +657,7 @@ use:
       call: afn.driver.browser.type
       with:
         body:
-          selector: "input[type=\"password\"], input[name=\"password\"], input[name=\"new-password\"], input[autocomplete=\"current-password\"], input[autocomplete=\"new-password\"]"
+          selector: 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]'
           dispatch_events_after_fill: true
           blur_after_fill: true
           click_away_after_fill: true
@@ -675,9 +675,9 @@ use:
       with:
         body:
           script: |
-            const fullName = String(args.full_name || "Dev Astronlab").trim();
+            const fullName = String(args.full_name || "M Omar Faruque").trim();
             const month = String(args.birth_month || "1").trim();
-            const day = String(args.birth_day || "1").trim();
+            const day = String(args.birth_day || "24").trim();
             const year = String(args.birth_year || "1990").trim();
             const monthNames = {
               "1": ["1", "01", "jan", "january"],
@@ -1586,7 +1586,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]"
+              selector: 'input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]'
             post:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]'));\nconst values = fields.map((field) => field.value || '');\nreturn {\n  ok: values.some((value) => value === String(args.email || '')),\n  values,\n};\n"
@@ -1631,7 +1631,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]"
+              selector: 'input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]'
             post:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]'));\nconst values = fields.map((field) => field.value || '');\nreturn {\n  ok: values.some((value) => value === String(args.email || '')),\n  values,\n};\n"
@@ -1670,7 +1670,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[type=\"password\"], input[name=\"new-password\"], input[autocomplete=\"new-password\"]"
+              selector: 'input[type="password"], input[name="new-password"], input[autocomplete="new-password"]'
             post:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"password\"], input[name=\"new-password\"], input[autocomplete=\"new-password\"]'));\nconst values = fields.map((field) => String(field.value || ''));\nconst submit = Array.from(document.querySelectorAll('button[type=\"submit\"], input[type=\"submit\"], button, [role=\"button\"]')).find((node) => {\n  if (!(node instanceof Element)) {\n    return false;\n  }\n  const style = window.getComputedStyle(node);\n  if (!style || style.display === 'none' || style.visibility === 'hidden') {\n    return false;\n  }\n  const rect = node.getBoundingClientRect();\n  if (!(rect.width > 0 && rect.height > 0)) {\n    return false;\n  }\n  const label = String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || '')).replace(/\\s+/g, ' ').trim();\n  return /continue|next|create account|sign up|submit|verify/i.test(label);\n});\nconst submitDisabled = submit instanceof Element ? (submit.hasAttribute('disabled') || submit.getAttribute('aria-disabled') === 'true') : null;\nconst hasValue = values.some((value) => value.length > 0);\nreturn {\n  ok: hasValue && submitDisabled === false,\n  has_value: hasValue,\n  value_lengths: values.map((value) => value.length),\n  submit_disabled: submitDisabled,\n};\n"
@@ -1774,7 +1774,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[name*=\"name\" i], input[autocomplete=\"name\"], input[placeholder*=\"name\" i]"
+              selector: 'input[name*="name" i], input[autocomplete="name"], input[placeholder*="name" i]'
   - submit_signup_about_you:
       if: "${state.steps.classify_after_signup_password_gate?.action?.existing_account_prompt !== true && state.steps.classify_after_signup_verification_gate?.action?.follow_up_step === true && state.steps.fill_signup_about_you?.action?.ok === true}"
       metadata:
@@ -1841,7 +1841,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]"
+              selector: 'input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]'
             post:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]'));\nconst values = fields.map((field) => field.value || '');\nreturn {\n  ok: values.some((value) => value === String(args.email || '')),\n  values,\n};\n"
@@ -1881,7 +1881,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]"
+              selector: 'input[type="password"], input[name="password"], input[autocomplete="current-password"]'
             post:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]'));\nconst values = fields.map((field) => String(field.value || ''));\nconst submit = Array.from(document.querySelectorAll('button[type=\"submit\"], input[type=\"submit\"], button, [role=\"button\"]')).find((node) => {\n  if (!(node instanceof Element)) {\n    return false;\n  }\n  const style = window.getComputedStyle(node);\n  if (!style || style.display === 'none' || style.visibility === 'hidden') {\n    return false;\n  }\n  const rect = node.getBoundingClientRect();\n  if (!(rect.width > 0 && rect.height > 0)) {\n    return false;\n  }\n  const label = String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || '')).replace(/\\s+/g, ' ').trim();\n  return /continue|next|log in|sign in|submit|verify/i.test(label);\n});\nconst submitDisabled = submit instanceof Element ? (submit.hasAttribute('disabled') || submit.getAttribute('aria-disabled') === 'true') : null;\nconst hasValue = values.some((value) => value.length > 0);\nreturn {\n  ok: hasValue && submitDisabled === false,\n  has_value: hasValue,\n  value_lengths: values.map((value) => value.length),\n  submit_disabled: submitDisabled,\n};\n"
@@ -2286,7 +2286,7 @@ do:
             pre:
               kind: playwright
               op: exists
-              selector: "input[name*=\"name\" i], input[autocomplete=\"name\"], input[placeholder*=\"name\" i]"
+              selector: 'input[name*="name" i], input[autocomplete="name"], input[placeholder*="name" i]'
   - submit_login_about_you:
       if: "${state.steps.classify_after_login_verification_gate?.action?.follow_up_step === true && state.steps.fill_login_about_you?.action?.ok === true}"
       metadata:
