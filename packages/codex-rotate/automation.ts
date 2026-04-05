@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -27,6 +28,8 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
 const DEFAULT_ROTATE_HOME = join(homedir(), ".codex-rotate");
 let ROTATE_HOME = resolve(process.env.CODEX_ROTATE_HOME || DEFAULT_ROTATE_HOME);
+const CODEX_HOME = resolve(process.env.CODEX_HOME || join(homedir(), ".codex"));
+const CODEX_AUTH_FILE = join(CODEX_HOME, "auth.json");
 const FAST_BROWSER_HOME = join(homedir(), ".fast-browser");
 const FAST_BROWSER_PROFILES_HOME = join(FAST_BROWSER_HOME, "profiles");
 const FAST_BROWSER_DAEMON_DIR = join(FAST_BROWSER_HOME, "daemon");
@@ -358,6 +361,8 @@ export interface CodexRotateAuthFlowSession {
   callback_port?: number | null;
   device_code?: string | null;
   session_dir?: string | null;
+  codex_home_path?: string | null;
+  auth_file_path?: string | null;
   pid?: number | null;
   stdout_path?: string | null;
   stderr_path?: string | null;
@@ -1852,6 +1857,32 @@ export function shouldResetCodexLoginSessionForRetry(
   );
 }
 
+export function shouldResetDeviceAuthSessionForRateLimit(
+  message: string,
+  session: CodexRotateAuthFlowSession | null | undefined,
+): boolean {
+  const normalized = String(message || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  const hasReusableDeviceChallenge =
+    typeof session?.auth_url === "string" &&
+    session.auth_url.trim().length > 0 &&
+    typeof session?.device_code === "string" &&
+    session.device_code.trim().length > 0;
+  if (
+    /device auth failed with status 429|device auth failed:.*429 too many requests/i.test(
+      normalized,
+    ) &&
+    hasReusableDeviceChallenge
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function parseFastBrowserProgressEventLine(
   line: string,
 ): FastBrowserProgressEvent | null {
@@ -2398,6 +2429,7 @@ async function runCodexBrowserLoginWorkflow(
   options?: {
     artifactMode?: "minimal" | "full";
     codexBin?: string;
+    workflowFile?: string;
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
     fullName?: string;
@@ -2410,8 +2442,13 @@ async function runCodexBrowserLoginWorkflow(
     profileName,
     String(options?.codexBin || "codex").trim() || "codex",
   );
+  const workflowFile =
+    typeof options?.workflowFile === "string" &&
+    options.workflowFile.trim().length > 0
+      ? resolve(options.workflowFile)
+      : CODEX_ROTATE_ACCOUNT_FLOW_FILE;
   const workflowRef =
-    deriveWorkflowRefFromFilePath(CODEX_ROTATE_ACCOUNT_FLOW_FILE) ??
+    deriveWorkflowRefFromFilePath(workflowFile) ??
     DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID;
   return await runFastBrowserDaemonWorkflow(
     workflowRef,
@@ -2474,6 +2511,7 @@ export async function completeCodexLoginViaWorkflow(
   accountLoginLocator: CodexRotateSecretLocator | null,
   options?: {
     codexBin?: string;
+    workflowFile?: string;
     workflowRunStamp?: string;
     preferSignupRecovery?: boolean;
     fullName?: string;
@@ -2544,6 +2582,7 @@ export async function completeCodexLoginViaWorkflow(
             loginWorkflowRunStamp,
             {
               codexBin: options?.codexBin,
+              workflowFile: options?.workflowFile,
               codexSession,
               preferSignupRecovery: allowSignupRecovery,
               fullName: options?.fullName,
@@ -2677,6 +2716,9 @@ export async function completeCodexLoginViaWorkflow(
                 `${flow.codex_login_stderr_tail ? `\n${flow.codex_login_stderr_tail}` : ""}`,
             );
           }
+          promoteCodexAuthFromSession(
+            readCodexRotateAuthFlowSession(loginResult),
+          );
           return flow;
         }
       } catch (error) {
@@ -2712,8 +2754,14 @@ export async function completeCodexLoginViaWorkflow(
             attempt,
             retryDelaysMs,
           );
+          const resetDeviceAuthSession =
+            shouldResetDeviceAuthSessionForRateLimit(message, codexSession);
+          if (resetDeviceAuthSession) {
+            codexSession = null;
+          }
           note?.(
             `Codex device authorization is rate limited for ${email}. ` +
+              `${resetDeviceAuthSession ? "" : "Reusing the existing device code session when retrying. "}` +
               `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
           );
           await sleep(delayMs);
@@ -2918,6 +2966,14 @@ function normalizeCodexRotateAuthFlowSession(
       typeof raw.session_dir === "string" && raw.session_dir.trim()
         ? raw.session_dir.trim()
         : null,
+    codex_home_path:
+      typeof raw.codex_home_path === "string" && raw.codex_home_path.trim()
+        ? raw.codex_home_path.trim()
+        : null,
+    auth_file_path:
+      typeof raw.auth_file_path === "string" && raw.auth_file_path.trim()
+        ? raw.auth_file_path.trim()
+        : null,
     pid:
       typeof pid === "number"
         ? pid
@@ -2940,6 +2996,8 @@ function normalizeCodexRotateAuthFlowSession(
   if (
     !session.auth_url &&
     !session.session_dir &&
+    !session.codex_home_path &&
+    !session.auth_file_path &&
     !session.stdout_path &&
     !session.stderr_path &&
     !session.exit_path
@@ -2988,4 +3046,24 @@ function cancelCodexBrowserLoginSession(
   try {
     process.kill(pid, "SIGTERM");
   } catch {}
+}
+
+function promoteCodexAuthFromSession(
+  session: CodexRotateAuthFlowSession | null | undefined,
+): void {
+  const authFilePath =
+    typeof session?.auth_file_path === "string" &&
+    session.auth_file_path.trim().length > 0
+      ? resolve(session.auth_file_path)
+      : null;
+  if (!authFilePath) {
+    return;
+  }
+  if (!existsSync(authFilePath)) {
+    throw new Error(
+      `Codex device authorization completed without producing ${authFilePath}.`,
+    );
+  }
+  mkdirSync(dirname(CODEX_AUTH_FILE), { recursive: true });
+  copyFileSync(authFilePath, CODEX_AUTH_FILE);
 }

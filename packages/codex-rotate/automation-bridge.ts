@@ -36,6 +36,7 @@ type BridgeRequest =
         accountLoginLocator?: CodexRotateSecretLocator | null;
         options?: {
           codexBin?: string;
+          workflowFile?: string;
           workflowRunStamp?: string;
           preferSignupRecovery?: boolean;
           fullName?: string;

@@ -38,6 +38,7 @@ import {
   saveCredentialStore,
   serializeCredentialStore,
   setCodexRotateHomeForTesting,
+  shouldResetDeviceAuthSessionForRateLimit,
   shouldResetCodexLoginSessionForRetry,
   shouldUseDefaultCreateFamilyHint,
   selectBestEmailForManagedProfile,
@@ -578,6 +579,30 @@ describe("codex login retry policy", () => {
   test("keeps device-auth rate-limit retries conservative", () => {
     expect(getCodexLoginRetryDelayMs("device_auth_rate_limit", 1)).toBe(30_000);
     expect(getCodexLoginRetryDelayMs("device_auth_rate_limit", 2)).toBe(60_000);
+  });
+
+  test("keeps a reusable device-auth session after a post-issuance 429", () => {
+    expect(
+      shouldResetDeviceAuthSessionForRateLimit(
+        "Error logging in with device code: device auth failed with status 429 Too Many Requests",
+        {
+          auth_url: "https://auth.openai.com/codex/device",
+          device_code: "ABCD-12345",
+        } as never,
+      ),
+    ).toBe(false);
+  });
+
+  test("drops the device-auth session when rate limiting happens before a code is issued", () => {
+    expect(
+      shouldResetDeviceAuthSessionForRateLimit(
+        "Error logging in with device code: device code request failed with status 429 Too Many Requests",
+        {
+          auth_url: null,
+          device_code: null,
+        } as never,
+      ),
+    ).toBe(true);
   });
 
   test("does not recycle the codex auth session on the first timeout retry", () => {

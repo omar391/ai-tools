@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
@@ -230,6 +231,8 @@ struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_file: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workflow_run_stamp: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_signup_recovery: Option<bool>,
@@ -371,6 +374,7 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
             &updated_stored.profile_name,
             &updated_stored.email,
             Some(&account_login_locator),
+            None,
             None,
             None,
             None,
@@ -534,11 +538,13 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let paths = resolve_paths()?;
     let previous_auth = load_codex_auth_if_exists()?;
     let mut store = load_credential_store()?;
-    let workflow_metadata = read_workflow_file_metadata(&paths.account_flow_file)?;
+    let workflow_file = resolve_account_flow_file_for_create(&paths, options);
+    let workflow_file_display = workflow_file.display().to_string();
+    let workflow_metadata = read_workflow_file_metadata(&workflow_file)?;
     let profile_name = resolve_managed_profile_name(
         options.profile_name.as_deref(),
         workflow_metadata.preferred_profile_name.as_deref(),
-        Some(paths.account_flow_file.display().to_string().as_str()),
+        Some(workflow_file_display.as_str()),
     )?;
     let pending_base_hint_raw = if options.base_email.is_some() {
         None
@@ -708,6 +714,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         &profile_name,
         &created_email,
         Some(&account_login_locator),
+        Some(workflow_file.as_path()),
         Some(codex_bin().as_str()),
         Some(started_at.as_str()),
         Some(true),
@@ -938,6 +945,7 @@ fn run_complete_codex_login(
     profile_name: &str,
     email: &str,
     account_login_locator: Option<&CodexRotateSecretLocator>,
+    workflow_file: Option<&Path>,
     codex_bin: Option<&str>,
     workflow_run_stamp: Option<&str>,
     prefer_signup_recovery: Option<bool>,
@@ -953,6 +961,7 @@ fn run_complete_codex_login(
     };
     let options = BridgeLoginOptions {
         codex_bin,
+        workflow_file: workflow_file.and_then(|path| path.to_str()),
         workflow_run_stamp,
         prefer_signup_recovery,
         full_name: Some(DEFAULT_OPENAI_FULL_NAME),
@@ -982,6 +991,13 @@ fn build_openai_account_login_locator(email: &str) -> CodexRotateSecretLocator {
         ],
         field_path: "/password".to_string(),
     }
+}
+
+fn resolve_account_flow_file_for_create(
+    paths: &crate::paths::CorePaths,
+    _options: &CreateCommandOptions,
+) -> std::path::PathBuf {
+    paths.account_flow_file.clone()
 }
 
 fn run_codex_command<const N: usize>(args: [&str; N]) -> Result<()> {

@@ -37,3 +37,10 @@ tmp/debug.md
 .fast-browser/cache
 packages/codex-rotate-app/src-tauri/target
 packages/codex-rotate-app/src-tauri/gen/
+packages/codex-rotate/benchmarks/results/
+
+# git-land trunk
+.trunk/*
+!.trunk/trunk.yaml
+!.trunk/configs/
+!.trunk/configs/**

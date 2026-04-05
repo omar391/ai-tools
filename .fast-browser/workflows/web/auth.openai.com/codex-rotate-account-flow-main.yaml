@@ -2,8 +2,8 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
-  version: 1.0.0
-  summary: "Benchmark-selected codex-rotate OpenAI account flow that runs the best non-device workflow first and falls back to device authorization when needed."
+  version: 1.0.5
+  summary: "Benchmark-selected codex-rotate OpenAI account flow that runs the fastest proven non-device workflow first and falls back to device authorization when needed."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -55,9 +55,9 @@ do:
   - run_primary_non_device_flow:
       metadata:
         description: "Run the benchmark-selected primary OpenAI account flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal
       with:
-        version: 1.0.6
+        version: 1.0.1
         input:
           enabled: "${inputs.enabled}"
           mode: "codex_login"
@@ -83,7 +83,7 @@ do:
         description: "Fallback to the experimental device-auth workflow when the primary flow does not complete."
       call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth
       with:
-        version: 1.0.0
+        version: 1.3.0
         input:
           enabled: "${inputs.enabled}"
           mode: "device_auth"
@@ -123,10 +123,10 @@ do:
               ...(selected && typeof selected === "object" ? selected : {}),
               selected_flow:
                 primaryComplete || !fallback
-                  ? "workspace.web.auth-openai-com.codex-rotate-account-flow"
+                  ? "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal"
                   : "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
               primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
               fallback_flow:
                 "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
               primary_completed: primaryComplete,
