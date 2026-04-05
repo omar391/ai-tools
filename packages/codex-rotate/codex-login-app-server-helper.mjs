@@ -9,6 +9,36 @@ const CLIENT_INFO = {
   name: "codex-rotate-managed-login",
   version: "1.0.0",
 };
+const helperArgs = process.argv.slice(2);
+
+async function runDeviceAuthLogin() {
+  const child = spawn(CODEX_BIN, ["login", "--device-auth"], {
+    stdio: "inherit",
+    env: process.env,
+  });
+
+  const exit = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
+
+  if (exit && typeof exit === "object") {
+    const { code, signal } = exit;
+    if (typeof code === "number") {
+      process.exit(code);
+    }
+    if (signal === "SIGINT") {
+      process.exit(130);
+    }
+    if (signal === "SIGTERM") {
+      process.exit(143);
+    }
+  }
+
+  process.exit(1);
+}
 
 function writeLine(stream, line = "") {
   stream.write(`${line}\n`);
@@ -172,6 +202,11 @@ class JsonRpcStdioClient {
 }
 
 async function main() {
+  if (helperArgs.includes("--device-auth")) {
+    await runDeviceAuthLogin();
+    return;
+  }
+
   const client = new JsonRpcStdioClient(CODEX_BIN, [
     "app-server",
     "--listen",
