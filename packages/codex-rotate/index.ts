@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,7 +32,64 @@ const TRAY_MANIFEST = join(
   "Cargo.toml",
 );
 const CARGO_BIN = process.env.CARGO_BIN ?? "cargo";
-const directBinaryExists = existsSync(RUST_BIN);
+const CLI_BUILD_INPUTS = [
+  join(REPO_ROOT, "Cargo.toml"),
+  join(REPO_ROOT, "Cargo.lock"),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate",
+    "crates",
+    "codex-rotate-cli",
+    "Cargo.toml",
+  ),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate",
+    "crates",
+    "codex-rotate-cli",
+    "src",
+  ),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate",
+    "crates",
+    "codex-rotate-core",
+    "Cargo.toml",
+  ),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate",
+    "crates",
+    "codex-rotate-core",
+    "src",
+  ),
+];
+const TRAY_BUILD_INPUTS = [
+  join(REPO_ROOT, "Cargo.toml"),
+  join(REPO_ROOT, "Cargo.lock"),
+  TRAY_MANIFEST,
+  join(REPO_ROOT, "packages", "codex-rotate-app", "src-tauri", "src"),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate-app",
+    "crates",
+    "codex-rotate-tray-core",
+    "src",
+  ),
+  join(
+    REPO_ROOT,
+    "packages",
+    "codex-rotate",
+    "crates",
+    "codex-rotate-core",
+    "src",
+  ),
+];
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -50,8 +107,15 @@ if (
   process.exit(printHelp());
 }
 
-const runner = directBinaryExists ? RUST_BIN : CARGO_BIN;
-const runnerArgs = directBinaryExists
+const directBinaryReady = ensureRustBinary({
+  binaryPath: RUST_BIN,
+  buildArgs: ["build", "--quiet", "--package", "codex-rotate-cli"],
+  watchPaths: CLI_BUILD_INPUTS,
+  label: "codex-rotate-cli",
+});
+
+const runner = directBinaryReady ? RUST_BIN : CARGO_BIN;
+const runnerArgs = directBinaryReady
   ? args
   : ["run", "--quiet", "--package", "codex-rotate-cli", "--", ...args];
 
@@ -74,9 +138,15 @@ if (result.signal) {
 process.exit(typeof result.status === "number" ? result.status : 1);
 
 function printHelp(): number {
+  const directBinaryReady = ensureRustBinary({
+    binaryPath: RUST_BIN,
+    buildArgs: ["build", "--quiet", "--package", "codex-rotate-cli"],
+    watchPaths: CLI_BUILD_INPUTS,
+    label: "codex-rotate-cli",
+  });
   const helpResult = spawnSync(
-    directBinaryExists ? RUST_BIN : CARGO_BIN,
-    directBinaryExists
+    directBinaryReady ? RUST_BIN : CARGO_BIN,
+    directBinaryReady
       ? ["help"]
       : ["run", "--quiet", "--package", "codex-rotate-cli", "--", "help"],
     {
@@ -208,7 +278,21 @@ function isTrayRunning(): boolean {
 }
 
 function ensureTrayBinary(): boolean {
-  if (existsSync(TRAY_BIN)) {
+  if (
+    ensureRustBinary({
+      binaryPath: TRAY_BIN,
+      buildArgs: [
+        "build",
+        "--quiet",
+        "--manifest-path",
+        TRAY_MANIFEST,
+        "--bin",
+        "codex-rotate-tray",
+      ],
+      watchPaths: TRAY_BUILD_INPUTS,
+      label: "codex-rotate-tray",
+    })
+  ) {
     return true;
   }
   const result = spawnSync(
@@ -235,4 +319,72 @@ function ensureTrayBinary(): boolean {
     return false;
   }
   return existsSync(TRAY_BIN);
+}
+
+function ensureRustBinary(options: {
+  binaryPath: string;
+  buildArgs: string[];
+  watchPaths: string[];
+  label: string;
+}): boolean {
+  if (isBinaryFresh(options.binaryPath, options.watchPaths)) {
+    return true;
+  }
+
+  const result = spawnSync(CARGO_BIN, options.buildArgs, {
+    cwd: REPO_ROOT,
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error) {
+    console.error(result.error.message || `Failed to build ${options.label}.`);
+    return false;
+  }
+  return (result.status ?? 1) === 0 && existsSync(options.binaryPath);
+}
+
+function isBinaryFresh(binaryPath: string, watchPaths: string[]): boolean {
+  if (!existsSync(binaryPath)) {
+    return false;
+  }
+  const binaryMtimeMs = safeMtimeMs(binaryPath);
+  if (binaryMtimeMs === null) {
+    return false;
+  }
+  return newestMtimeMs(watchPaths) <= binaryMtimeMs;
+}
+
+function newestMtimeMs(paths: string[]): number {
+  let newest = 0;
+  for (const candidate of paths) {
+    newest = Math.max(newest, newestPathMtimeMs(candidate));
+  }
+  return newest;
+}
+
+function newestPathMtimeMs(candidatePath: string): number {
+  if (!existsSync(candidatePath)) {
+    return 0;
+  }
+  const stats = lstatSync(candidatePath);
+  if (!stats.isDirectory()) {
+    return stats.mtimeMs;
+  }
+
+  let newest = stats.mtimeMs;
+  for (const entry of readdirSync(candidatePath, { withFileTypes: true })) {
+    newest = Math.max(
+      newest,
+      newestPathMtimeMs(join(candidatePath, entry.name)),
+    );
+  }
+  return newest;
+}
+
+function safeMtimeMs(filePath: string): number | null {
+  try {
+    return lstatSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
 }

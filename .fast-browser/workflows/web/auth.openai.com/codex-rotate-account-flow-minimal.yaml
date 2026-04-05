@@ -1,0 +1,994 @@
+document:
+  dsl: 1.0.0
+  namespace: web-auth-openai-com
+  name: codex-rotate-account-flow-minimal
+  version: 1.0.0
+  summary: "Thin managed-profile OpenAI account flow for codex-rotate that keeps local JS to Codex session plumbing and small auth helpers."
+  metadata:
+    preferredProfile: dev-1
+    primaryTarget: primary
+    targets:
+      - id: primary
+        kind: web
+        match:
+          kind: host_pattern
+          value: "*"
+        target: auth.openai.com
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      properties:
+        enabled:
+          default: true
+        mode:
+          default: codex_login
+        codex_bin:
+          default: codex
+        auth_url: {}
+        callback_url: {}
+        callback_port: {}
+        codex_session_dir: {}
+        codex_login_pid: {}
+        codex_login_stdout_path: {}
+        codex_login_stderr_path: {}
+        codex_login_exit_path: {}
+        email: {}
+        account_login_locator:
+          type: object
+          format: secret-locator
+        full_name:
+          default: "M Omar Faruque"
+        birth_month:
+          default: 1
+        birth_day:
+          default: 24
+        birth_year:
+          default: 1990
+        prefer_signup_recovery:
+          default: "true"
+      required:
+        - mode
+        - email
+use:
+  functions:
+    replay_captured_auth_url:
+      metadata:
+        description: "Replay the captured Codex auth URL and tolerate redirect-driven navigation aborts when the browser lands on a real auth or callback page."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const targetUrl = String(
+              args.auth_url
+              || state.vars?.codex_login?.auth_url
+              || state.steps.capture_codex_login_url?.action?.value?.auth_url
+              || ""
+            ).trim();
+            if (!targetUrl) {
+              throw new Error("captured-auth-url-missing");
+            }
+            const priorUrl = page.url();
+            const isSuccessfulLanding = (href) => {
+              if (!href) {
+                return false;
+              }
+              return /auth\.openai\.com|localhost|127\.0\.0\.1/i.test(href);
+            };
+            const captureState = async () => ({
+              current_url: page.url(),
+              title: await page.title().catch(() => null),
+            });
+            const settleAfterAbort = async (reason) => {
+              await page.waitForTimeout(1200).catch(() => {});
+              const nextState = await captureState();
+              if (
+                isSuccessfulLanding(nextState.current_url)
+                && nextState.current_url !== priorUrl
+              ) {
+                return {
+                  ok: true,
+                  strategy: reason,
+                  prior_url: priorUrl,
+                  ...nextState,
+                };
+              }
+              return null;
+            };
+            if (priorUrl && priorUrl !== "about:blank") {
+              await page.goto("about:blank", {
+                waitUntil: "domcontentloaded",
+                timeout: 5000,
+              }).catch(() => {});
+              await page.waitForTimeout(250).catch(() => {});
+            }
+            try {
+              await page.goto(targetUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+              return {
+                ok: true,
+                strategy: "goto",
+                prior_url: priorUrl,
+                ...(await captureState()),
+              };
+            } catch (error) {
+              const message = String(error?.message || error || "");
+              if (/ERR_ABORTED/i.test(message)) {
+                const abortedLanding = await settleAfterAbort("goto-err-aborted");
+                if (abortedLanding) {
+                  return abortedLanding;
+                }
+              }
+              await page.evaluate((url) => {
+                window.location.assign(url);
+              }, targetUrl).catch(() => {});
+              const assignedLanding = await settleAfterAbort("location-assign");
+              if (assignedLanding) {
+                return assignedLanding;
+              }
+              throw error;
+            }
+    submit_current_auth_form:
+      metadata:
+        description: "Submit the currently active OpenAI auth form after a focused Playwright fill."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const result = await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const activeField =
+                document.activeElement instanceof Element
+                  ? document.activeElement
+                  : document.querySelector(
+                      'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]',
+                    );
+              const form = activeField instanceof Element ? activeField.closest("form") : null;
+              if (form instanceof HTMLFormElement) {
+                if (typeof form.requestSubmit === "function") {
+                  form.requestSubmit();
+                } else {
+                  form.submit();
+                }
+                return {
+                  ok: true,
+                  strategy: "request-submit",
+                };
+              }
+              const candidates = Array.from(
+                document.querySelectorAll("button, input[type='submit'], [role='button']"),
+              ).filter((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                if (!isVisible(node)) {
+                  return false;
+                }
+                if (node.getAttribute("aria-disabled") === "true" || node.hasAttribute("disabled")) {
+                  return false;
+                }
+                const label =
+                  node instanceof HTMLInputElement
+                    ? normalize(node.value || node.getAttribute("aria-label") || "")
+                    : normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                return /continue|next|verify|submit|log in|sign in|create account|sign up|allow|accept|authorize/i.test(
+                  label,
+                );
+              });
+              const target = candidates[0];
+              if (target instanceof HTMLElement) {
+                target.click();
+                return {
+                  ok: true,
+                  strategy: "dom-click",
+                };
+              }
+              return {
+                ok: false,
+                error: "submit-control-not-found",
+              };
+            });
+            if (result.ok) {
+              await page.waitForTimeout(800).catch(() => {});
+            }
+            return {
+              ...result,
+              current_url: page.url(),
+            };
+do:
+  - start_codex_login_session:
+      if: "${String(inputs.mode || 'codex_login') === 'codex_login' && !String(inputs.auth_url || '').trim()}"
+      metadata:
+        description: "Start a detached codex login session on the host and capture its stdout/stderr paths."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const path = await import("node:path");
+            const { spawn } = await import("node:child_process");
+
+            const shell = process.env.SHELL || "/bin/sh";
+            const codexBin = String(args.codex_bin || "codex").trim() || "codex";
+            const sessionRoot = path.join(env.projectArtifactsRoot, "codex-login-sessions");
+            fs.mkdirSync(sessionRoot, { recursive: true });
+            const sessionDir = fs.mkdtempSync(
+              path.join(sessionRoot, String(env.workflowRunStamp || "run") + "-"),
+            );
+            const stdoutPath = path.join(sessionDir, "stdout.log");
+            const stderrPath = path.join(sessionDir, "stderr.log");
+            const exitPath = path.join(sessionDir, "exit.code");
+            const quote = (value) => "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+            const command =
+              quote(codexBin)
+              + " login >"
+              + quote(stdoutPath)
+              + " 2>"
+              + quote(stderrPath)
+              + "; printf '%s' \"$?\" >"
+              + quote(exitPath);
+
+            const child = spawn(shell, ["-lc", command], {
+              cwd: env.workspaceRoot,
+              env: process.env,
+              detached: true,
+              stdio: "ignore",
+            });
+            child.unref();
+
+            return {
+              ok: true,
+              started: true,
+              codex_bin: codexBin,
+              session_dir: sessionDir,
+              pid: child.pid ?? null,
+              stdout_path: stdoutPath,
+              stderr_path: stderrPath,
+              exit_path: exitPath,
+            };
+  - capture_codex_login_url:
+      if: "${String(inputs.mode || 'codex_login') === 'codex_login'}"
+      metadata:
+        description: "Capture or normalize the Codex auth URL and callback session details for this workflow run."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const { setTimeout: delay } = await import("node:timers/promises");
+
+            const explicitAuthUrl = String(args.auth_url || "").trim();
+            const stdoutPath = String(
+              args.codex_login_stdout_path
+              || state.steps.start_codex_login_session?.action?.value?.stdout_path
+              || "",
+            ).trim();
+            const stderrPath = String(
+              args.codex_login_stderr_path
+              || state.steps.start_codex_login_session?.action?.value?.stderr_path
+              || "",
+            ).trim();
+            const exitPath = String(
+              args.codex_login_exit_path
+              || state.steps.start_codex_login_session?.action?.value?.exit_path
+              || "",
+            ).trim();
+            const sessionDir = String(
+              args.codex_session_dir
+              || state.steps.start_codex_login_session?.action?.value?.session_dir
+              || "",
+            ).trim() || null;
+            const pidValue = Number(
+              args.codex_login_pid
+              || state.steps.start_codex_login_session?.action?.value?.pid
+              || 0,
+            );
+
+            const extractAuthUrl = (raw) => {
+              const match = String(raw || "").match(
+                /https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s"'<>]+/,
+              );
+              return match ? match[0] : null;
+            };
+            const parseCapture = (authUrl) => {
+              const parsedAuthUrl = new URL(authUrl);
+              const callbackUrl = parsedAuthUrl.searchParams.get("redirect_uri") || "";
+              if (!callbackUrl) {
+                throw new Error("captured-auth-url-missing-redirect-uri");
+              }
+              const callbackPort = Number.parseInt(new URL(callbackUrl).port, 10);
+              if (!Number.isInteger(callbackPort)) {
+                throw new Error("captured-auth-url-invalid-callback-port:" + callbackUrl);
+              }
+              return {
+                auth_url: authUrl,
+                callback_url: callbackUrl,
+                callback_port: callbackPort,
+              };
+            };
+            const readText = (filePath) => {
+              if (!filePath || !fs.existsSync(filePath)) {
+                return "";
+              }
+              return fs.readFileSync(filePath, "utf8");
+            };
+            const tail = (filePath, maxChars = 1200) => {
+              const text = readText(filePath);
+              return text.length > maxChars ? text.slice(-maxChars) : text;
+            };
+
+            if (explicitAuthUrl) {
+              return {
+                ok: true,
+                reused: true,
+                ...parseCapture(explicitAuthUrl),
+                session_dir: sessionDir,
+                pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
+                stdout_path: stdoutPath || null,
+                stderr_path: stderrPath || null,
+                exit_path: exitPath || null,
+              };
+            }
+
+            const timeoutMs = 45000;
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+              const combined = readText(stdoutPath) + "\n" + readText(stderrPath);
+              const authUrl = extractAuthUrl(combined);
+              if (authUrl) {
+                return {
+                  ok: true,
+                  reused: false,
+                  ...parseCapture(authUrl),
+                  session_dir: sessionDir,
+                  pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
+                  stdout_path: stdoutPath || null,
+                  stderr_path: stderrPath || null,
+                  exit_path: exitPath || null,
+                };
+              }
+              if (exitPath && fs.existsSync(exitPath)) {
+                const exitCodeRaw = readText(exitPath).trim();
+                throw new Error(
+                  "codex-login-exited-before-auth-url:"
+                    + (exitCodeRaw || "unknown")
+                    + ":"
+                    + (tail(stderrPath) || tail(stdoutPath) || "no-output"),
+                );
+              }
+              await delay(250);
+            }
+
+            throw new Error(
+              "codex-login-auth-url-timeout:"
+                + (tail(stderrPath) || tail(stdoutPath) || "no-output"),
+            );
+  - cache_codex_login_session:
+      if: "${state.steps.capture_codex_login_url?.action?.ok === true}"
+      metadata:
+        description: "Cache the current Codex login session metadata for later replay and exit handling."
+      set:
+        codex_login: "${state.steps.capture_codex_login_url?.action?.value || {}}"
+  - open_codex_login_entry:
+      metadata:
+        templateRef: replay_captured_auth_url
+        description: "Open the captured Codex auth URL on the managed browser profile."
+  - advance_initial_openai_auth:
+      metadata:
+        description: "Let the shared OpenAI helper drive the initial auth surface until it reaches a stable next state."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+  - cache_auth_state_after_initial:
+      metadata:
+        description: "Cache the latest normalized OpenAI auth state."
+      set:
+        auth_state: "${state.steps.advance_initial_openai_auth?.action?.result?.output || {}}"
+  - fill_password_cycle_1:
+      if: "${state.vars.auth_state?.password_input === true && inputs.account_login_locator != null}"
+      metadata:
+        description: "Fill the current OpenAI password field from the late-bound secret locator."
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]'
+          value_from:
+            secret_locator_input:
+              name: account_login_locator
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - submit_password_cycle_1:
+      if: "${state.steps.fill_password_cycle_1?.action?.ok === true}"
+      metadata:
+        templateRef: submit_current_auth_form
+        description: "Submit the current OpenAI password form after the first password fill."
+  - advance_after_password_cycle_1:
+      if: "${state.steps.fill_password_cycle_1?.action?.ok === true}"
+      metadata:
+        description: "Resume the shared OpenAI helper after the first local password fill."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+  - cache_auth_state_after_password_cycle_1:
+      if: "${state.steps.advance_after_password_cycle_1?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the first local password submit."
+      set:
+        auth_state: "${state.steps.advance_after_password_cycle_1?.action?.result?.output || state.vars.auth_state || {}}"
+  - collect_verification_cycle_1:
+      if: "${state.vars.auth_state?.needs_email_verification === true}"
+      metadata:
+        description: "Collect the first available OpenAI OTP from Gmail."
+        ref:
+          digest: sha256:d4af4ee7550d5edb2e0092f640e9b39c12d6e6d3222ce4cd5aa183d721361ffa
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
+  - advance_after_verification_cycle_1:
+      if: "${state.steps.collect_verification_cycle_1?.action?.result?.output?.code}"
+      metadata:
+        description: "Resume the shared OpenAI helper with the first Gmail OTP."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+          verification_url: "${state.vars.auth_state?.current_url || ''}"
+          verification_code: "${state.steps.collect_verification_cycle_1?.action?.result?.output?.code || ''}"
+  - cache_auth_state_after_verification_cycle_1:
+      if: "${state.steps.advance_after_verification_cycle_1?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the first Gmail OTP submit."
+      set:
+        auth_state: "${state.steps.advance_after_verification_cycle_1?.action?.result?.output || state.vars.auth_state || {}}"
+  - fill_password_cycle_2:
+      if: "${state.vars.auth_state?.password_input === true && inputs.account_login_locator != null}"
+      metadata:
+        description: "Fill the current OpenAI password field from the late-bound secret locator again if the flow re-enters password auth."
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]'
+          value_from:
+            secret_locator_input:
+              name: account_login_locator
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - submit_password_cycle_2:
+      if: "${state.steps.fill_password_cycle_2?.action?.ok === true}"
+      metadata:
+        templateRef: submit_current_auth_form
+        description: "Submit the current OpenAI password form after the second password fill."
+  - advance_after_password_cycle_2:
+      if: "${state.steps.fill_password_cycle_2?.action?.ok === true}"
+      metadata:
+        description: "Resume the shared OpenAI helper after the second local password fill."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+  - cache_auth_state_after_password_cycle_2:
+      if: "${state.steps.advance_after_password_cycle_2?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the second local password submit."
+      set:
+        auth_state: "${state.steps.advance_after_password_cycle_2?.action?.result?.output || state.vars.auth_state || {}}"
+  - collect_verification_cycle_2:
+      if: "${state.vars.auth_state?.needs_email_verification === true}"
+      metadata:
+        description: "Collect the second available OpenAI OTP from Gmail."
+        ref:
+          digest: sha256:d4af4ee7550d5edb2e0092f640e9b39c12d6e6d3222ce4cd5aa183d721361ffa
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
+  - advance_after_verification_cycle_2:
+      if: "${state.steps.collect_verification_cycle_2?.action?.result?.output?.code}"
+      metadata:
+        description: "Resume the shared OpenAI helper with the second Gmail OTP."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+          verification_url: "${state.vars.auth_state?.current_url || ''}"
+          verification_code: "${state.steps.collect_verification_cycle_2?.action?.result?.output?.code || ''}"
+  - cache_auth_state_after_verification_cycle_2:
+      if: "${state.steps.advance_after_verification_cycle_2?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the second Gmail OTP submit."
+      set:
+        auth_state: "${state.steps.advance_after_verification_cycle_2?.action?.result?.output || state.vars.auth_state || {}}"
+  - fill_password_cycle_3:
+      if: "${state.vars.auth_state?.password_input === true && inputs.account_login_locator != null}"
+      metadata:
+        description: "Fill the current OpenAI password field one last time if the flow re-enters password auth again."
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]'
+          value_from:
+            secret_locator_input:
+              name: account_login_locator
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - submit_password_cycle_3:
+      if: "${state.steps.fill_password_cycle_3?.action?.ok === true}"
+      metadata:
+        templateRef: submit_current_auth_form
+        description: "Submit the current OpenAI password form after the third password fill."
+  - advance_after_password_cycle_3:
+      if: "${state.steps.fill_password_cycle_3?.action?.ok === true}"
+      metadata:
+        description: "Resume the shared OpenAI helper after the third local password fill."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+  - cache_auth_state_after_password_cycle_3:
+      if: "${state.steps.advance_after_password_cycle_3?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the third local password submit."
+      set:
+        auth_state: "${state.steps.advance_after_password_cycle_3?.action?.result?.output || state.vars.auth_state || {}}"
+  - collect_verification_cycle_3:
+      if: "${state.vars.auth_state?.needs_email_verification === true}"
+      metadata:
+        description: "Collect another available OpenAI OTP from Gmail if the flow still requires verification."
+        ref:
+          digest: sha256:d4af4ee7550d5edb2e0092f640e9b39c12d6e6d3222ce4cd5aa183d721361ffa
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
+  - advance_after_verification_cycle_3:
+      if: "${state.steps.collect_verification_cycle_3?.action?.result?.output?.code}"
+      metadata:
+        description: "Resume the shared OpenAI helper with a final Gmail OTP if one is still required."
+        ref:
+          digest: sha256:a105e373dd3feabe7eab6eebf7042788db5b8022de74ba5a064a50a13060433d
+      call: workflow.sys.web.auth-openai-com.advance-auth-page
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          email: "${inputs.email}"
+          prefer_one_time_code: "${inputs.account_login_locator == null ? 'true' : 'false'}"
+          allow_one_time_code: true
+          allow_password_reset: true
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          fallback_url: "${state.vars.codex_login?.auth_url || state.steps.capture_codex_login_url?.action?.value?.auth_url || inputs.auth_url || ''}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+          encountered_existing_account: "${state.vars.auth_state?.encountered_existing_account === true ? 'true' : 'false'}"
+          verification_url: "${state.vars.auth_state?.current_url || ''}"
+          verification_code: "${state.steps.collect_verification_cycle_3?.action?.result?.output?.code || ''}"
+  - cache_auth_state_after_verification_cycle_3:
+      if: "${state.steps.advance_after_verification_cycle_3?.action?.result?.output != null}"
+      metadata:
+        description: "Refresh the cached OpenAI auth state after the final Gmail OTP submit."
+      set:
+        auth_state: "${state.steps.advance_after_verification_cycle_3?.action?.result?.output || state.vars.auth_state || {}}"
+  - inspect_final_openai_surface:
+      metadata:
+        description: "Inspect the final visible surface for consent and state-mismatch signals without reimplementing the full auth state machine locally."
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          screenshot: true
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const title = await page.title().catch(() => "");
+            const bodyText = await page.locator("body").innerText().catch(() => "");
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const firstLine = String(bodyText || "")
+              .split("\n")
+              .map((value) => value.trim())
+              .filter(Boolean)[0] || null;
+            const normalizedText = normalize(bodyText);
+            const stateMismatch =
+              /state mismatch/i.test(title)
+              || /state mismatch/i.test(normalizedText);
+            const sawOauthConsent =
+              /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(
+                normalizedText,
+              )
+              || /sign in to codex/i.test(title);
+            return {
+              ok: true,
+              current_url: page.url(),
+              headline: firstLine || title || null,
+              state_mismatch: stateMismatch,
+              saw_oauth_consent: sawOauthConsent,
+            };
+  - build_auth_outcome:
+      metadata:
+        description: "Build the final codex-rotate auth outcome from the latest cached OpenAI state."
+      run:
+        script:
+          language: javascript
+          code: |
+            const authState =
+              state.vars?.auth_state
+              && typeof state.vars.auth_state === "object"
+              && !Array.isArray(state.vars.auth_state)
+                ? state.vars.auth_state
+                : {};
+            const inspect = state.steps.inspect_final_openai_surface?.action?.value || {};
+
+            const currentUrl =
+              authState.current_url
+              || inspect.current_url
+              || null;
+            const callbackComplete = authState.callback_complete === true;
+            const success = authState.success === true;
+            const accountReady = authState.account_ready === true;
+            const needsEmailVerification =
+              authState.needs_email_verification === true;
+            const followUpStep = authState.follow_up_step === true;
+            const addPhonePrompt = authState.add_phone_prompt === true;
+            const retryableTimeout = authState.retryable_timeout === true;
+            const sessionEnded = authState.session_ended === true;
+            const existingAccountPrompt =
+              authState.existing_account_prompt === true;
+            const encounteredExistingAccount =
+              authState.encountered_existing_account === true;
+            const usernameNotFound = authState.username_not_found === true;
+            const invalidCredentials = authState.invalid_credentials === true;
+            const rateLimitExceeded = authState.rate_limit_exceeded === true;
+            const antiBotGate = authState.anti_bot_gate === true;
+            const authPrompt = authState.auth_prompt === true;
+            const blankAuthShell = authState.blank_auth_shell === true;
+            const stateMismatch = inspect.state_mismatch === true;
+            const sawOauthConsent = inspect.saw_oauth_consent === true;
+            const headline =
+              typeof inspect.headline === "string" && inspect.headline.trim()
+                ? inspect.headline.trim()
+                : null;
+
+            let stage = "unknown";
+            if (callbackComplete) {
+              stage = "callback_complete";
+            } else if (rateLimitExceeded) {
+              stage = "rate_limit";
+            } else if (retryableTimeout) {
+              stage = "retryable_timeout";
+            } else if (sessionEnded) {
+              stage = "session_ended";
+            } else if (addPhonePrompt) {
+              stage = "add_phone";
+            } else if (needsEmailVerification) {
+              stage = "email_verification";
+            } else if (followUpStep) {
+              stage = "about_you";
+            } else if (invalidCredentials) {
+              stage = "invalid_credentials";
+            } else if (existingAccountPrompt || encounteredExistingAccount) {
+              stage = "existing_account_prompt";
+            } else if (authPrompt || blankAuthShell) {
+              stage = "auth_prompt";
+            } else if (stateMismatch) {
+              stage = "state_mismatch";
+            } else if (success) {
+              stage = "success";
+            }
+
+            let nextAction = "fail_terminal";
+            let replayReason = null;
+            let retryReason = null;
+            let errorMessage = null;
+
+            if (callbackComplete || success) {
+              nextAction = "complete";
+            } else if (stateMismatch) {
+              nextAction = "fail_terminal";
+              errorMessage =
+                "OpenAI returned a state mismatch on the final Codex consent callback.";
+            } else if (invalidCredentials) {
+              nextAction = "fail_invalid_credentials";
+              errorMessage =
+                "OpenAI rejected the stored password for "
+                + String(args.email || "the account")
+                + ".";
+            } else if (rateLimitExceeded || retryableTimeout) {
+              nextAction = "retry_attempt";
+              retryReason = rateLimitExceeded ? "rate_limit" : "retryable_timeout";
+              errorMessage = rateLimitExceeded
+                ? "OpenAI rate-limited the Codex login."
+                : "OpenAI timed out before completing the Codex login.";
+            } else if (sessionEnded) {
+              nextAction = "retry_attempt";
+              retryReason = "session_ended";
+              errorMessage =
+                "OpenAI ended the auth session before the Codex callback completed.";
+            } else if (antiBotGate) {
+              nextAction = "retry_attempt";
+              retryReason = "anti_bot_gate";
+              errorMessage =
+                "OpenAI remained behind a security gate before the Codex callback completed.";
+            } else if (existingAccountPrompt || encounteredExistingAccount) {
+              nextAction = "replay_auth_url";
+              replayReason = "existing_account_prompt";
+              errorMessage =
+                "OpenAI redirected signup into an existing-account prompt instead of completing the Codex callback.";
+            } else if (usernameNotFound) {
+              nextAction = "fail_terminal";
+              errorMessage =
+                "OpenAI reported that the username was not found during recovery.";
+            } else if (
+              needsEmailVerification
+              || followUpStep
+              || addPhonePrompt
+              || authPrompt
+              || blankAuthShell
+            ) {
+              nextAction = "replay_auth_url";
+              replayReason = addPhonePrompt
+                ? "add_phone"
+                : (
+                    needsEmailVerification
+                      ? "email_verification"
+                      : (followUpStep ? "about_you" : "auth_prompt")
+                  );
+              errorMessage = addPhonePrompt
+                ? "OpenAI still requires phone setup before the Codex callback can complete."
+                : (
+                    needsEmailVerification
+                      ? "OpenAI still requires email verification before the Codex callback can complete."
+                      : (
+                          followUpStep
+                            ? "OpenAI still requires account setup before the Codex callback can complete."
+                            : "OpenAI remained on an auth prompt instead of reaching the Codex callback."
+                        )
+                  );
+            } else {
+              errorMessage = "Codex browser login did not reach the callback.";
+            }
+
+            return {
+              stage,
+              current_url: currentUrl,
+              headline,
+              callback_complete: callbackComplete,
+              success,
+              account_ready: accountReady,
+              needs_email_verification: needsEmailVerification,
+              follow_up_step: followUpStep,
+              add_phone_prompt: addPhonePrompt,
+              retryable_timeout: retryableTimeout,
+              session_ended: sessionEnded,
+              existing_account_prompt: existingAccountPrompt,
+              encountered_existing_account: encounteredExistingAccount,
+              username_not_found: usernameNotFound,
+              invalid_credentials: invalidCredentials,
+              rate_limit_exceeded: rateLimitExceeded,
+              anti_bot_gate: antiBotGate,
+              auth_prompt: authPrompt,
+              blank_auth_shell: blankAuthShell,
+              saw_oauth_consent: sawOauthConsent,
+              state_mismatch: stateMismatch,
+              next_action: nextAction,
+              replay_reason: replayReason,
+              retry_reason: retryReason,
+              error_message: errorMessage,
+            };
+  - wait_for_codex_login_exit:
+      if: "${(state.steps.build_auth_outcome?.action?.value?.callback_complete === true || state.steps.build_auth_outcome?.action?.value?.success === true) && (state.vars.codex_login?.exit_path || inputs.codex_login_exit_path)}"
+      metadata:
+        description: "Wait for the detached codex login process to exit after the callback completes."
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const { setTimeout: delay } = await import("node:timers/promises");
+
+            const exitPath = String(
+              state.vars?.codex_login?.exit_path || args.codex_login_exit_path || "",
+            ).trim();
+            const stdoutPath = String(
+              state.vars?.codex_login?.stdout_path || args.codex_login_stdout_path || "",
+            ).trim();
+            const stderrPath = String(
+              state.vars?.codex_login?.stderr_path || args.codex_login_stderr_path || "",
+            ).trim();
+
+            if (!exitPath) {
+              return {
+                ok: true,
+                skipped: true,
+              };
+            }
+
+            const readText = (filePath) => {
+              if (!filePath || !fs.existsSync(filePath)) {
+                return "";
+              }
+              return fs.readFileSync(filePath, "utf8");
+            };
+            const tail = (filePath, maxChars = 1200) => {
+              const text = readText(filePath);
+              return text.length > maxChars ? text.slice(-maxChars) : text;
+            };
+
+            const timeoutMs = 15000;
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+              if (fs.existsSync(exitPath)) {
+                const raw = readText(exitPath).trim();
+                const parsed = raw === "" ? null : Number.parseInt(raw, 10);
+                const exitCode = Number.isInteger(parsed) ? parsed : null;
+                return {
+                  ok: exitCode === 0,
+                  exit_code: exitCode,
+                  stdout_tail: tail(stdoutPath) || null,
+                  stderr_tail: tail(stderrPath) || null,
+                };
+              }
+              await delay(250);
+            }
+
+            return {
+              ok: false,
+              timeout: true,
+              exit_code: null,
+              stdout_tail: tail(stdoutPath) || null,
+              stderr_tail: tail(stderrPath) || null,
+            };
+  - finalize_flow_summary:
+      metadata:
+        description: "Attach detached-session exit metadata to the normalized auth outcome."
+      run:
+        script:
+          language: javascript
+          code: |
+            const authOutcome = state.steps.build_auth_outcome?.action?.value || {};
+            const exitResult = state.steps.wait_for_codex_login_exit?.action?.value || {};
+            const session =
+              state.vars?.codex_login
+              && typeof state.vars.codex_login === "object"
+              && !Array.isArray(state.vars.codex_login)
+                ? state.vars.codex_login
+                : {};
+
+            return {
+              ...authOutcome,
+              codex_session: {
+                auth_url: session.auth_url || null,
+                callback_url: session.callback_url || null,
+                callback_port: session.callback_port ?? null,
+                session_dir: session.session_dir || null,
+                pid: session.pid ?? null,
+                stdout_path: session.stdout_path || null,
+                stderr_path: session.stderr_path || null,
+                exit_path: session.exit_path || null,
+              },
+              codex_login_exit_ok: exitResult.ok === true,
+              codex_login_exit_code: exitResult.exit_code ?? null,
+              codex_login_stdout_tail: exitResult.stdout_tail || null,
+              codex_login_stderr_tail: exitResult.stderr_tail || null,
+            };
+output:
+  as: "${state.steps.finalize_flow_summary?.action?.value || {}}"

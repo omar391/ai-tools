@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,6 +22,7 @@ use crate::pool::{
     ReusableAccountProbeMode,
 };
 use crate::quota::{describe_quota_blocker, format_compact_quota, has_usable_quota};
+use crate::state::{load_rotate_state_json, write_rotate_state_json};
 
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
@@ -465,6 +464,59 @@ pub fn create_next_fallback_options() -> CreateCommandOptions {
     }
 }
 
+pub fn reconcile_added_account_credential_state(entry: &AccountEntry) -> Result<bool> {
+    let raw_state = load_rotate_state_json()?;
+    let raw_pending = normalize_pending_credential_map(raw_state.get("pending"));
+    let mut store = normalize_credential_store(raw_state);
+    let mut dirty = false;
+    let updated_at = now_iso();
+    let normalized_email = normalize_email_key(&entry.email);
+
+    if let Some(pending) = raw_pending.get(&normalized_email).cloned() {
+        dirty = true;
+        store.pending.remove(&normalized_email);
+        dirty |= upsert_family_for_account(
+            &mut store,
+            &StoredCredential {
+                email: entry.email.clone(),
+                profile_name: pending.stored.profile_name,
+                base_email: pending.stored.base_email,
+                suffix: pending.stored.suffix,
+                selector: Some(entry.label.clone()),
+                alias: entry.alias.clone(),
+                birth_month: pending.stored.birth_month,
+                birth_day: pending.stored.birth_day,
+                birth_year: pending.stored.birth_year,
+                created_at: pending.stored.created_at,
+                updated_at: updated_at.clone(),
+            },
+        );
+    } else if let Some(family_match) = select_family_for_account_email(&store, &entry.email) {
+        dirty |= upsert_family_for_account(
+            &mut store,
+            &StoredCredential {
+                email: entry.email.clone(),
+                profile_name: family_match.family.profile_name,
+                base_email: family_match.family.base_email,
+                suffix: family_match.suffix,
+                selector: Some(entry.label.clone()),
+                alias: entry.alias.clone(),
+                birth_month: None,
+                birth_day: None,
+                birth_year: None,
+                created_at: family_match.family.created_at,
+                updated_at,
+            },
+        );
+    }
+
+    if dirty {
+        save_credential_store(&store)?;
+    }
+
+    Ok(dirty)
+}
+
 fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandResult> {
     let paths = resolve_paths()?;
     let previous_auth = load_codex_auth_if_exists()?;
@@ -501,6 +553,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let family_key = make_credential_family_key(&profile_name, &base_email)?;
     let family = store.families.get(&family_key).cloned();
     let started_at = now_iso();
+    let known_emails = collect_known_account_emails(&pool, &store);
     let existing_pending = select_pending_credential_for_family(
         &store,
         &profile_name,
@@ -512,8 +565,11 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         Some(entry) => entry.stored.suffix,
         None => compute_next_account_family_suffix(
             &base_email,
-            family.as_ref().map(|entry| entry.next_suffix).unwrap_or(1),
-            collect_known_account_emails(&pool, &store),
+            family
+                .as_ref()
+                .map(|entry| entry.next_suffix)
+                .unwrap_or_else(|| derive_family_frontier_suffix(&base_email, &known_emails)),
+            known_emails,
         )?,
     };
     let created_email = existing_pending
@@ -536,6 +592,56 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         },
         started_at: Some(started_at.clone()),
     });
+    let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
+    if previous_auth
+        .as_ref()
+        .map(|auth| auth_matches_target_email(auth, &created_email))
+        .unwrap_or(false)
+    {
+        let auth = previous_auth
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("Current Codex auth disappeared before create could finish."))?;
+        let result = finalize_created_account(
+            &mut store,
+            family.as_ref(),
+            &family_key,
+            &profile_name,
+            &base_email,
+            suffix,
+            &PendingCredential {
+                stored: StoredCredential {
+                    email: created_email.clone(),
+                    profile_name: profile_name.clone(),
+                    base_email: base_email.clone(),
+                    suffix,
+                    selector: existing_pending.stored.selector.clone(),
+                    alias: existing_pending
+                        .stored
+                        .alias
+                        .clone()
+                        .or_else(|| normalize_alias(options.alias.as_deref())),
+                    birth_month: Some(birth_date.birth_month),
+                    birth_day: Some(birth_date.birth_day),
+                    birth_year: Some(birth_date.birth_year),
+                    created_at: existing_pending.stored.created_at.clone(),
+                    updated_at: started_at.clone(),
+                },
+                started_at: existing_pending
+                    .started_at
+                    .clone()
+                    .or_else(|| Some(started_at.clone())),
+            },
+            options,
+            &auth,
+            started_at.as_str(),
+            previous_auth.as_ref(),
+        )?;
+        if options.restore_previous_auth_after_create {
+            restore_active_auth(previous_auth.as_ref())?;
+        }
+        return Ok(result);
+    }
     if !reusing_pending {
         let generated_password = generate_password(18);
         let _: CodexRotateSecretRef = run_automation_bridge(
@@ -548,7 +654,6 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         )?;
     }
     let account_login_locator = build_openai_account_login_locator(&created_email);
-    let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
     let pending = PendingCredential {
         stored: StoredCredential {
             email: created_email.clone(),
@@ -604,8 +709,47 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         ));
     }
 
+    let result = finalize_created_account(
+        &mut store,
+        family.as_ref(),
+        &family_key,
+        &profile_name,
+        &base_email,
+        suffix,
+        &pending,
+        options,
+        &auth,
+        started_at.as_str(),
+        previous_auth.as_ref(),
+    )?;
+
+    if options.restore_previous_auth_after_create {
+        restore_active_auth(previous_auth.as_ref())?;
+    }
+
+    Ok(result)
+}
+
+fn auth_matches_target_email(auth: &CodexAuth, target_email: &str) -> bool {
+    normalize_email_key(&summarize_codex_auth(auth).email) == normalize_email_key(target_email)
+}
+
+fn finalize_created_account(
+    store: &mut CredentialStore,
+    family: Option<&CredentialFamily>,
+    family_key: &str,
+    profile_name: &str,
+    base_email: &str,
+    suffix: u32,
+    pending: &PendingCredential,
+    options: &CreateCommandOptions,
+    auth: &CodexAuth,
+    started_at: &str,
+    previous_auth: Option<&CodexAuth>,
+) -> Result<CreateCommandResult> {
+    let created_email = pending.stored.email.clone();
     let _ = cmd_add(options.alias.as_deref())?;
-    let inspected = inspect_pool_entry_by_account_id(&extract_account_id_from_auth(&auth))?
+    let inspected = inspect_pool_entry_by_account_id(&extract_account_id_from_auth(auth))?
         .ok_or_else(|| {
             anyhow!(
                 "Created {}, but could not find the new account in the pool after login.",
@@ -616,11 +760,11 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let updated_at = now_iso();
     store.pending.remove(&normalize_email_key(&created_email));
     upsert_family_for_account(
-        &mut store,
+        store,
         &StoredCredential {
             email: created_email.clone(),
-            profile_name: profile_name.clone(),
-            base_email: base_email.clone(),
+            profile_name: profile_name.to_string(),
+            base_email: base_email.to_string(),
             suffix,
             selector: Some(inspected.entry.label.clone()),
             alias: inspected
@@ -636,29 +780,27 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         },
     );
     store.families.insert(
-        family_key,
+        family_key.to_string(),
         CredentialFamily {
-            profile_name: profile_name.clone(),
-            base_email: base_email.clone(),
+            profile_name: profile_name.to_string(),
+            base_email: base_email.to_string(),
             next_suffix: family
-                .as_ref()
                 .map(|entry| entry.next_suffix.max(suffix + 1))
                 .unwrap_or(suffix + 1),
             created_at: family
-                .as_ref()
                 .map(|entry| entry.created_at.clone())
-                .unwrap_or_else(|| started_at.clone()),
+                .unwrap_or_else(|| started_at.to_string()),
             updated_at,
             last_created_email: Some(created_email.clone()),
         },
     );
-    save_credential_store(&store)?;
+    save_credential_store(store)?;
 
     if options.require_usable_quota {
         match inspected.inspection.usage.as_ref() {
             Some(usage) if has_usable_quota(usage) => {}
             Some(usage) => {
-                restore_active_auth(previous_auth.as_ref())?;
+                restore_active_auth(previous_auth)?;
                 return Err(anyhow!(
                     "Created {}, but it does not have usable quota ({}).",
                     inspected.entry.label,
@@ -666,7 +808,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
                 ));
             }
             None => {
-                restore_active_auth(previous_auth.as_ref())?;
+                restore_active_auth(previous_auth)?;
                 return Err(anyhow!(
                     "Created {}, but quota inspection was unavailable ({}).",
                     inspected.entry.label,
@@ -680,15 +822,11 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         }
     }
 
-    if options.restore_previous_auth_after_create {
-        restore_active_auth(previous_auth.as_ref())?;
-    }
-
     Ok(CreateCommandResult {
         entry: inspected.entry,
         inspection: Some(inspected.inspection),
-        profile_name,
-        base_email,
+        profile_name: profile_name.to_string(),
+        base_email: base_email.to_string(),
     })
 }
 
@@ -853,39 +991,51 @@ fn codex_bin() -> String {
 
 fn load_credential_store() -> Result<CredentialStore> {
     let paths = resolve_paths()?;
-    if !paths.credentials_file.exists() {
-        return Ok(CredentialStore::default());
+    let state = load_rotate_state_json()?;
+    let mut store = normalize_credential_store(state);
+    if paths.credentials_file.exists() {
+        let raw = fs::read_to_string(&paths.credentials_file)
+            .with_context(|| format!("Failed to read {}.", paths.credentials_file.display()))?;
+        let parsed: Value = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "Invalid credential store at {}.",
+                paths.credentials_file.display()
+            )
+        })?;
+        store = normalize_credential_store(parsed);
     }
-    let raw = fs::read_to_string(&paths.credentials_file)
-        .with_context(|| format!("Failed to read {}.", paths.credentials_file.display()))?;
-    let parsed: Value = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "Invalid credential store at {}.",
-            paths.credentials_file.display()
-        )
-    })?;
-    Ok(normalize_credential_store(parsed))
+    Ok(store)
 }
 
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
-    let paths = resolve_paths()?;
-    if let Some(parent) = paths.credentials_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    let mut state = load_rotate_state_json()?;
+    if !state.is_object() {
+        state = Value::Object(Map::new());
     }
-    let raw = serde_json::to_string_pretty(&serialize_credential_store(store))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&paths.credentials_file)
-        .with_context(|| format!("Failed to open {}.", paths.credentials_file.display()))?;
-    file.write_all(raw.as_bytes())?;
-    Ok(())
+    let object = state
+        .as_object_mut()
+        .expect("rotate state must be a JSON object");
+    if store.families.is_empty() && store.pending.is_empty() {
+        object.remove("version");
+        object.remove("families");
+        object.remove("pending");
+    } else {
+        let credential_state = serialize_credential_store(store);
+        if let Some(version) = credential_state.get("version").cloned() {
+            object.insert("version".to_string(), version);
+        }
+        if let Some(families) = credential_state.get("families").cloned() {
+            object.insert("families".to_string(), families);
+        }
+        if let Some(pending) = credential_state.get("pending").cloned() {
+            object.insert("pending".to_string(), pending);
+        }
+    }
+    write_rotate_state_json(&state, true)
 }
 
 fn normalize_credential_store(raw: Value) -> CredentialStore {
+    let inventory_emails = collect_inventory_emails_from_state(&raw);
     let mut families = raw
         .get("families")
         .and_then(Value::as_object)
@@ -907,8 +1057,44 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
     CredentialStore {
         version: 3,
         families,
-        pending: normalize_pending_credential_map(raw.get("pending")),
+        pending: normalize_pending_credential_map(raw.get("pending"))
+            .into_iter()
+            .filter(|(email, record)| {
+                !inventory_emails.contains(email)
+                    && !pending_is_superseded_by_inventory(record, &inventory_emails)
+            })
+            .collect(),
     }
+}
+
+fn collect_inventory_emails_from_state(raw: &Value) -> HashSet<String> {
+    raw.get("accounts")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("email")
+                        .and_then(Value::as_str)
+                        .map(normalize_email_key)
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn pending_is_superseded_by_inventory(
+    pending: &PendingCredential,
+    inventory_emails: &HashSet<String>,
+) -> bool {
+    inventory_emails
+        .iter()
+        .filter_map(|email| extract_account_family_suffix(email, &pending.stored.base_email).ok())
+        .flatten()
+        .max()
+        .map(|suffix| suffix > pending.stored.suffix)
+        .unwrap_or(false)
 }
 
 fn normalize_stored_credential_map(raw: Option<&Value>) -> HashMap<String, StoredCredential> {
@@ -1291,6 +1477,16 @@ fn compute_next_account_family_suffix(
         candidate += 1;
     }
     Ok(candidate)
+}
+
+fn derive_family_frontier_suffix(base_email: &str, known_emails: &[String]) -> u32 {
+    known_emails
+        .iter()
+        .filter_map(|email| extract_account_family_suffix(email, base_email).ok())
+        .flatten()
+        .max()
+        .map(|suffix| suffix.saturating_add(1))
+        .unwrap_or(1)
 }
 
 fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<String> {
@@ -1792,6 +1988,54 @@ mod tests {
     }
 
     #[test]
+    fn drops_pending_entries_that_already_exist_in_inventory() {
+        let store = normalize_credential_store(json!({
+            "accounts": [
+                {
+                    "email": "dev.1@astronlab.com"
+                }
+            ],
+            "pending": {
+                "dev.1@astronlab.com": {
+                    "email": "dev.1@astronlab.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "suffix": 1,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-05T04:50:10.406Z",
+                    "updated_at": "2026-04-05T05:39:48.882Z"
+                }
+            }
+        }));
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn drops_pending_entries_superseded_by_newer_inventory_suffixes() {
+        let store = normalize_credential_store(json!({
+            "accounts": [
+                {
+                    "email": "dev.23@astronlab.com"
+                }
+            ],
+            "pending": {
+                "dev.1@astronlab.com": {
+                    "email": "dev.1@astronlab.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "suffix": 1,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-05T04:50:10.406Z",
+                    "updated_at": "2026-04-05T05:39:48.882Z"
+                }
+            }
+        }));
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
     fn builds_openai_login_locator_from_email() {
         let locator = build_openai_account_login_locator("Dev.User+1@gmail.com");
         match locator {
@@ -1874,5 +2118,84 @@ mod tests {
         );
 
         assert!(select_family_for_account_email(&store, "dev.user+2@gmail.com").is_none());
+    }
+
+    #[test]
+    fn derive_family_frontier_suffix_uses_highest_observed_suffix() {
+        let known = vec![
+            "dev.20@astronlab.com".to_string(),
+            "dev.22@astronlab.com".to_string(),
+            "dev.23@astronlab.com".to_string(),
+        ];
+        assert_eq!(derive_family_frontier_suffix("dev.{n}@astronlab.com", &known), 24);
+    }
+
+    #[test]
+    fn add_reconciliation_moves_matching_pending_into_family_state() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "dev.24@astronlab.com".to_string(),
+            PendingCredential {
+                stored: StoredCredential {
+                    email: "dev.24@astronlab.com".to_string(),
+                    profile_name: "dev-1".to_string(),
+                    base_email: "dev.{n}@astronlab.com".to_string(),
+                    suffix: 24,
+                    selector: None,
+                    alias: None,
+                    birth_month: Some(1),
+                    birth_day: Some(24),
+                    birth_year: Some(1990),
+                    created_at: "2026-04-05T05:51:09.049Z".to_string(),
+                    updated_at: "2026-04-05T05:51:09.049Z".to_string(),
+                },
+                started_at: Some("2026-04-05T05:51:09.049Z".to_string()),
+            },
+        );
+        let entry = AccountEntry {
+            label: "dev.24@astronlab.com_free".to_string(),
+            alias: None,
+            email: "dev.24@astronlab.com".to_string(),
+            account_id: "acct-24".to_string(),
+            plan_type: "free".to_string(),
+            auth: CodexAuth {
+                auth_mode: "chatgpt".to_string(),
+                openai_api_key: None,
+                tokens: crate::auth::AuthTokens {
+                    id_token: "id".to_string(),
+                    access_token: "access".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    account_id: "acct-24".to_string(),
+                },
+                last_refresh: "2026-04-05T05:51:09.049Z".to_string(),
+            },
+            added_at: "2026-04-05T05:51:09.049Z".to_string(),
+            last_quota_usable: None,
+            last_quota_summary: None,
+            last_quota_blocker: None,
+            last_quota_checked_at: None,
+        };
+
+        let pending = store.pending.remove("dev.24@astronlab.com").unwrap();
+        assert!(upsert_family_for_account(
+            &mut store,
+            &StoredCredential {
+                email: entry.email.clone(),
+                profile_name: pending.stored.profile_name,
+                base_email: pending.stored.base_email,
+                suffix: pending.stored.suffix,
+                selector: Some(entry.label.clone()),
+                alias: entry.alias.clone(),
+                birth_month: pending.stored.birth_month,
+                birth_day: pending.stored.birth_day,
+                birth_year: pending.stored.birth_year,
+                created_at: pending.stored.created_at,
+                updated_at: "2026-04-05T05:52:00.000Z".to_string(),
+            },
+        ));
+        let family = store.families.get("dev-1::dev.{n}@astronlab.com").unwrap();
+        assert_eq!(family.next_suffix, 25);
+        assert_eq!(family.last_created_email.as_deref(), Some("dev.24@astronlab.com"));
+        assert!(store.pending.is_empty());
     }
 }

@@ -2,23 +2,32 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   buildCodexLoginManagedBrowserWrapperPath,
   buildAccountFamilyEmail,
   CODEX_ROTATE_ACCOUNT_FLOW_FILE,
+  LEGACY_CREDENTIALS_FILE,
+  ROTATE_STATE_FILE,
   buildCodexRotateOpenAiTempProfileName,
+  cleanupLegacyCodexRotateArtifacts,
   computeNextAccountFamilySuffix,
   computeNextGmailAliasSuffix,
+  deriveFamilyFrontierSuffix,
+  deriveWorkflowRefFromFilePath,
   ensureCodexLoginManagedBrowserWrapper,
+  getCodexRotateHome,
+  getCodexLoginRetryDelayMs,
   isRetryableCodexLoginWorkflowErrorMessage,
+  loadCredentialStore,
   normalizeBaseEmailFamily,
   normalizeCredentialStore,
   normalizeGmailBaseEmail,
@@ -26,7 +35,10 @@ import {
   resolveCreateBaseEmail,
   resolveManagedProfileNameFromCandidates,
   scoreEmailForManagedProfileName,
+  saveCredentialStore,
   serializeCredentialStore,
+  setCodexRotateHomeForTesting,
+  shouldResetCodexLoginSessionForRetry,
   shouldUseDefaultCreateFamilyHint,
   selectBestEmailForManagedProfile,
   selectBestSystemChromeProfileMatch,
@@ -103,14 +115,91 @@ describe("templated email family helpers", () => {
       ]),
     ).toBe(3);
   });
+
+  test("can derive the next frontier suffix when no family cursor was persisted", () => {
+    expect(
+      deriveFamilyFrontierSuffix("dev.{N}@astronlab.com", [
+        "dev.20@astronlab.com",
+        "dev.22@astronlab.com",
+        "dev.23@astronlab.com",
+      ]),
+    ).toBe(24);
+  });
 });
 
 describe("workflow metadata", () => {
   test("reads preferred_profile from the unified local codex-rotate workflow", () => {
     const metadata = readWorkflowFileMetadata(CODEX_ROTATE_ACCOUNT_FLOW_FILE);
 
+    expect(metadata.workflowRef).toBe(
+      "workspace.web.auth-openai-com.codex-rotate-account-flow",
+    );
     expect(metadata.preferredProfileName).toBe("dev-1");
     expect(metadata.preferredEmail).toBeNull();
+  });
+
+  test("derives the minimal workflow ref from an alternate local workflow file", () => {
+    const minimalWorkflowFile = join(
+      dirname(CODEX_ROTATE_ACCOUNT_FLOW_FILE),
+      "codex-rotate-account-flow-minimal.yaml",
+    );
+
+    expect(deriveWorkflowRefFromFilePath(minimalWorkflowFile)).toBe(
+      "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+    );
+    expect(readWorkflowFileMetadata(minimalWorkflowFile).workflowRef).toBe(
+      "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+    );
+  });
+});
+
+describe("credential store normalization", () => {
+  test("drops pending entries that already exist in the account inventory", () => {
+    const store = normalizeCredentialStore({
+      accounts: [
+        {
+          email: "dev.1@astronlab.com",
+        },
+      ],
+      pending: {
+        "dev.1@astronlab.com": {
+          email: "dev.1@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          suffix: 1,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-05T04:50:10.406Z",
+          updated_at: "2026-04-05T05:39:48.882Z",
+        },
+      },
+    } as never);
+
+    expect(store.pending).toEqual({});
+  });
+
+  test("drops stale pending entries that are behind the family frontier", () => {
+    const store = normalizeCredentialStore({
+      accounts: [
+        {
+          email: "dev.23@astronlab.com",
+        },
+      ],
+      pending: {
+        "dev.1@astronlab.com": {
+          email: "dev.1@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          suffix: 1,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-05T04:50:10.406Z",
+          updated_at: "2026-04-05T05:39:48.882Z",
+        },
+      },
+    } as never);
+
+    expect(store.pending).toEqual({});
   });
 });
 
@@ -145,10 +234,12 @@ describe("codex login managed-browser wrapper", () => {
 
   test("intercepts login through the dedicated managed-login helper", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
+    const rotateHome = join(fixtureRoot, "rotate-home");
     const helperLogPath = join(fixtureRoot, "helper-log.json");
     const helperPath = join(fixtureRoot, "fake-helper.mjs");
     const codexMarkerPath = join(fixtureRoot, "codex-invoked.txt");
     const codexPath = join(fixtureRoot, "fake-codex.sh");
+    const previousRotateHome = getCodexRotateHome();
 
     writeFileSync(
       helperPath,
@@ -178,6 +269,8 @@ describe("codex login managed-browser wrapper", () => {
     const previousLog = process.env.CODEX_ROTATE_TEST_HELPER_LOG;
 
     try {
+      mkdirSync(rotateHome, { recursive: true });
+      setCodexRotateHomeForTesting(rotateHome);
       process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
       process.env.CODEX_ROTATE_TEST_HELPER_LOG = helperLogPath;
 
@@ -201,6 +294,7 @@ describe("codex login managed-browser wrapper", () => {
       expect(logged.realCodex).toBe(codexPath);
       expect(existsSync(codexMarkerPath)).toBe(false);
     } finally {
+      setCodexRotateHomeForTesting(previousRotateHome);
       if (previousHelper === undefined) {
         delete process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
       } else {
@@ -217,10 +311,12 @@ describe("codex login managed-browser wrapper", () => {
 
   test("routes macOS open-based launches through the managed-profile opener", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
+    const rotateHome = join(fixtureRoot, "rotate-home");
     const openerLogPath = join(fixtureRoot, "opener-log.json");
     const openerPath = join(fixtureRoot, "fake-opener.mjs");
     const helperPath = join(fixtureRoot, "fake-helper.mjs");
     const codexPath = join(fixtureRoot, "fake-codex.sh");
+    const previousRotateHome = getCodexRotateHome();
 
     writeFileSync(
       openerPath,
@@ -254,6 +350,8 @@ describe("codex login managed-browser wrapper", () => {
     const previousLog = process.env.CODEX_ROTATE_TEST_OPENER_LOG;
 
     try {
+      mkdirSync(rotateHome, { recursive: true });
+      setCodexRotateHomeForTesting(rotateHome);
       process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = openerPath;
       process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
       process.env.CODEX_ROTATE_TEST_OPENER_LOG = openerLogPath;
@@ -279,6 +377,7 @@ describe("codex login managed-browser wrapper", () => {
       );
       expect(logged.browser).toBe(openerPath);
     } finally {
+      setCodexRotateHomeForTesting(previousRotateHome);
       if (previousOpener === undefined) {
         delete process.env.CODEX_ROTATE_BROWSER_OPENER_BIN;
       } else {
@@ -465,6 +564,80 @@ describe("codex login retry policy", () => {
         "device auth failed with status 429",
       ),
     ).toBe(false);
+  });
+
+  test("uses shorter early retries for verification propagation waits", () => {
+    expect(getCodexLoginRetryDelayMs("verification_artifact_pending", 1)).toBe(
+      5_000,
+    );
+    expect(getCodexLoginRetryDelayMs("verification_artifact_pending", 2)).toBe(
+      10_000,
+    );
+  });
+
+  test("keeps device-auth rate-limit retries conservative", () => {
+    expect(getCodexLoginRetryDelayMs("device_auth_rate_limit", 1)).toBe(30_000);
+    expect(getCodexLoginRetryDelayMs("device_auth_rate_limit", 2)).toBe(60_000);
+  });
+
+  test("does not recycle the codex auth session on the first timeout retry", () => {
+    expect(shouldResetCodexLoginSessionForRetry("retryable_timeout", 1)).toBe(
+      false,
+    );
+    expect(shouldResetCodexLoginSessionForRetry("retryable_timeout", 2)).toBe(
+      true,
+    );
+  });
+});
+
+describe("legacy rotate-home cleanup", () => {
+  test("removes obsolete root and bin artifacts but keeps current files", () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-rotate-home-"));
+    const binDir = join(root, "bin");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(root, "accounts.json"), "{}");
+    writeFileSync(
+      join(root, "codex-login-browser-capture-1.js"),
+      "console.log('legacy');",
+    );
+    writeFileSync(join(root, "fast-browser-1.json"), "");
+    mkdirSync(join(root, "codex-login-browser-shim-123"), { recursive: true });
+    writeFileSync(
+      join(binDir, "codex-login-managed-dev-1-deadbeef"),
+      "#!/bin/sh",
+    );
+    writeFileSync(
+      join(binDir, "codex-login-dev-1-deadbeefcafe"),
+      "#!/bin/sh\nexec 'codex' \"$@\"\n",
+    );
+    writeFileSync(
+      join(binDir, "codex-login-dev-1-123456789abc"),
+      "#!/bin/sh\nexec '/tmp/codex-login-app-server-helper.mjs' \"$@\"\n",
+    );
+
+    try {
+      cleanupLegacyCodexRotateArtifacts(root);
+
+      expect(existsSync(join(root, "accounts.json"))).toBe(true);
+      expect(existsSync(join(binDir, "codex-login-dev-1-123456789abc"))).toBe(
+        true,
+      );
+      expect(existsSync(join(root, "codex-login-browser-capture-1.js"))).toBe(
+        false,
+      );
+      expect(existsSync(join(root, "fast-browser-1.json"))).toBe(false);
+      expect(existsSync(join(root, "codex-login-browser-shim-123"))).toBe(
+        false,
+      );
+      expect(
+        existsSync(join(binDir, "codex-login-managed-dev-1-deadbeef")),
+      ).toBe(false);
+      expect(existsSync(join(binDir, "codex-login-dev-1-deadbeefcafe"))).toBe(
+        false,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -680,6 +853,147 @@ describe("credential store normalization", () => {
       updated_at: "2026-03-20T00:00:00.000Z",
       last_created_email: "dev.user+1@gmail.com",
     });
+  });
+
+  test("ignores merged pool accounts when normalizing credential families", () => {
+    const store = normalizeCredentialStore({
+      active_index: 0,
+      accounts: [
+        {
+          label: "dev.23@astronlab.com_free",
+          email: "dev.23@astronlab.com",
+          account_id: "acct-123",
+        },
+      ],
+      version: 3,
+      families: {
+        "dev-1::dev.{n}@astronlab.com": {
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          next_suffix: 24,
+          created_at: "2026-04-05T00:00:00.000Z",
+          updated_at: "2026-04-05T00:00:00.000Z",
+          last_created_email: "dev.23@astronlab.com",
+        },
+      },
+      pending: {},
+    });
+
+    expect(store.families["dev-1::dev.{n}@astronlab.com"]?.next_suffix).toBe(
+      24,
+    );
+  });
+});
+
+describe("credential store state-file merge", () => {
+  test("writes credential state into accounts.json and removes legacy credentials.json", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-state-"));
+    const previousRotateHome = getCodexRotateHome();
+
+    try {
+      setCodexRotateHomeForTesting(fixtureRoot);
+      writeFileSync(
+        ROTATE_STATE_FILE,
+        JSON.stringify({
+          active_index: 2,
+          accounts: [{ email: "dev.22@astronlab.com" }],
+        }),
+      );
+      writeFileSync(
+        LEGACY_CREDENTIALS_FILE,
+        JSON.stringify({
+          version: 3,
+          families: {
+            "dev-1::dev.{n}@astronlab.com": {
+              profile_name: "dev-1",
+              base_email: "dev.{n}@astronlab.com",
+              next_suffix: 23,
+              created_at: "2026-04-05T00:00:00.000Z",
+              updated_at: "2026-04-05T00:00:00.000Z",
+              last_created_email: "dev.22@astronlab.com",
+            },
+          },
+          pending: {
+            "dev.23@astronlab.com": {
+              email: "dev.23@astronlab.com",
+              profile_name: "dev-1",
+              base_email: "dev.{n}@astronlab.com",
+              suffix: 23,
+              selector: null,
+              alias: null,
+              created_at: "2026-04-05T00:00:00.000Z",
+              updated_at: "2026-04-05T00:00:00.000Z",
+              started_at: "2026-04-05T00:00:00.000Z",
+            },
+          },
+        }),
+      );
+
+      const store = loadCredentialStore();
+      expect(store.families["dev-1::dev.{n}@astronlab.com"]?.next_suffix).toBe(
+        23,
+      );
+
+      saveCredentialStore(store);
+
+      const merged = JSON.parse(readFileSync(ROTATE_STATE_FILE, "utf8")) as {
+        active_index?: number;
+        accounts?: Array<{ email?: string }>;
+        families?: Record<string, { next_suffix?: number }>;
+      };
+      expect(merged.active_index).toBe(2);
+      expect(merged.accounts?.[0]?.email).toBe("dev.22@astronlab.com");
+      expect(
+        merged.families?.["dev-1::dev.{n}@astronlab.com"]?.next_suffix,
+      ).toBe(23);
+      expect(existsSync(LEGACY_CREDENTIALS_FILE)).toBe(false);
+    } finally {
+      setCodexRotateHomeForTesting(previousRotateHome);
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("drops empty credential metadata from accounts.json after merge", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-state-"));
+    const previousRotateHome = getCodexRotateHome();
+
+    try {
+      setCodexRotateHomeForTesting(fixtureRoot);
+      writeFileSync(
+        ROTATE_STATE_FILE,
+        JSON.stringify({
+          active_index: 0,
+          accounts: [{ email: "dev.23@astronlab.com" }],
+          version: 3,
+          families: {},
+          pending: {},
+        }),
+      );
+
+      saveCredentialStore(
+        normalizeCredentialStore({
+          version: 3,
+          families: {},
+          pending: {},
+        }),
+      );
+
+      const merged = JSON.parse(readFileSync(ROTATE_STATE_FILE, "utf8")) as {
+        active_index?: number;
+        accounts?: Array<{ email?: string }>;
+        version?: number;
+        families?: Record<string, unknown>;
+        pending?: Record<string, unknown>;
+      };
+      expect(merged.active_index).toBe(0);
+      expect(merged.accounts?.[0]?.email).toBe("dev.23@astronlab.com");
+      expect("version" in merged).toBe(false);
+      expect("families" in merged).toBe(false);
+      expect("pending" in merged).toBe(false);
+    } finally {
+      setCodexRotateHomeForTesting(previousRotateHome);
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });
 

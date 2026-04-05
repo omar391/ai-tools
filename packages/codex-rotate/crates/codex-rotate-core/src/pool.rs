@@ -1,7 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -9,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use crate::auth::{
     decode_jwt_payload, extract_account_id_from_auth, extract_account_id_from_token,
@@ -21,7 +19,10 @@ use crate::quota::{
     describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota, UsageCredits,
     UsageResponse, UsageWindow,
 };
-use crate::workflow::{cmd_create, create_next_fallback_options};
+use crate::state::{load_rotate_state_json, write_rotate_state_json};
+use crate::workflow::{
+    cmd_create, create_next_fallback_options, reconcile_added_account_credential_state,
+};
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -205,6 +206,7 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
             .position(|account| account.label == label)
             .unwrap_or(existing_index);
         save_pool(&pool)?;
+        let _ = reconcile_added_account_credential_state(&pool.accounts[pool.active_index])?;
         return Ok(format!(
             "{GREEN}OK{RESET} Updated account \"{}\" ({}{})",
             label,
@@ -232,6 +234,7 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
 
         pool.active_index = duplicate_index;
         save_pool(&pool)?;
+        let _ = reconcile_added_account_credential_state(&pool.accounts[duplicate_index])?;
         return Ok(format!(
             "{GREEN}OK{RESET} Updated account \"{}\" ({}){}",
             pool.accounts[duplicate_index].label,
@@ -262,6 +265,7 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
     });
     pool.active_index = pool.accounts.len() - 1;
     save_pool(&pool)?;
+    let _ = reconcile_added_account_credential_state(&pool.accounts[pool.active_index])?;
     Ok(format!(
         "{GREEN}OK{RESET} Added account \"{}\" ({}, {}{}) - pool now has {} account(s)",
         label,
@@ -783,37 +787,31 @@ pub fn other_usable_account_exists() -> Result<bool> {
 }
 
 pub fn load_pool() -> Result<Pool> {
-    let paths = resolve_paths()?;
-    if !paths.pool_file.exists() {
-        return Ok(Pool {
-            active_index: 0,
-            accounts: Vec::new(),
-        });
-    }
-    let raw = fs::read_to_string(&paths.pool_file)
-        .with_context(|| format!("Failed to read {}.", paths.pool_file.display()))?;
-    let mut pool: Pool = serde_json::from_str(&raw)
-        .with_context(|| format!("Invalid pool file at {}.", paths.pool_file.display()))?;
+    let state = load_rotate_state_json()?;
+    let object = state.as_object().cloned().unwrap_or_default();
+    let mut pool: Pool = serde_json::from_value(json!({
+        "active_index": object.get("active_index").cloned().unwrap_or_else(|| Value::Number(0usize.into())),
+        "accounts": object.get("accounts").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+    }))
+    .context("Invalid pool data in rotate state.")?;
     normalize_pool_entries(&mut pool);
     Ok(pool)
 }
 
 pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
-    let paths = resolve_paths()?;
-    if let Some(parent) = paths.pool_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    let mut state = load_rotate_state_json()?;
+    if !state.is_object() {
+        state = Value::Object(Map::new());
     }
-    let raw = serde_json::to_string_pretty(pool)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&paths.pool_file)
-        .with_context(|| format!("Failed to open {}.", paths.pool_file.display()))?;
-    file.write_all(raw.as_bytes())?;
-    Ok(())
+    let object = state
+        .as_object_mut()
+        .expect("rotate state must be a JSON object");
+    object.insert(
+        "active_index".to_string(),
+        Value::Number(pool.active_index.into()),
+    );
+    object.insert("accounts".to_string(), serde_json::to_value(&pool.accounts)?);
+    write_rotate_state_json(&state, false)
 }
 
 fn extract_email_from_auth(auth: &CodexAuth) -> String {

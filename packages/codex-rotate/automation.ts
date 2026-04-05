@@ -4,18 +4,29 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
-const ROTATE_HOME = join(homedir(), ".codex-rotate");
+const DEFAULT_ROTATE_HOME = join(homedir(), ".codex-rotate");
+let ROTATE_HOME = resolve(process.env.CODEX_ROTATE_HOME || DEFAULT_ROTATE_HOME);
 const FAST_BROWSER_HOME = join(homedir(), ".fast-browser");
 const FAST_BROWSER_PROFILES_HOME = join(FAST_BROWSER_HOME, "profiles");
 const FAST_BROWSER_DAEMON_DIR = join(FAST_BROWSER_HOME, "daemon");
@@ -60,17 +71,33 @@ const CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT = resolve(
   "codex-login-app-server-helper.mjs",
 );
 
-const CODEX_ROTATE_ACCOUNT_FLOW_ID =
+const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID =
   "workspace.web.auth-openai-com.codex-rotate-account-flow";
-export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = join(
+export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = resolve(
+  process.env.CODEX_ROTATE_ACCOUNT_FLOW_FILE ||
+    join(
+      REPO_ROOT,
+      ".fast-browser",
+      "workflows",
+      "web",
+      "auth.openai.com",
+      "codex-rotate-account-flow.yaml",
+    ),
+);
+export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
+const FAST_BROWSER_WORKFLOWS_ROOT = resolve(
   REPO_ROOT,
   ".fast-browser",
   "workflows",
-  "web",
-  "auth.openai.com",
-  "codex-rotate-account-flow.yaml",
 );
-export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
+const FAST_BROWSER_GLOBAL_WORKFLOWS_ROOT = resolve(
+  REPO_ROOT,
+  "..",
+  "ai-rules",
+  "skills",
+  "fast-browser",
+  "workflows",
+);
 const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
@@ -79,6 +106,26 @@ const DEFAULT_OPENAI_FULL_NAME = "M Omar Faruque";
 const DEFAULT_OPENAI_BIRTH_MONTH = 1;
 const DEFAULT_OPENAI_BIRTH_DAY = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR = 1990;
+const DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS = [
+  15_000, 30_000, 60_000, 120_000, 240_000,
+] as const;
+const DEFAULT_CODEX_LOGIN_VERIFICATION_RETRY_DELAYS_MS = [
+  5_000, 10_000, 20_000, 30_000, 60_000,
+] as const;
+const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS = [
+  8_000, 15_000, 30_000, 60_000, 120_000,
+] as const;
+const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS = [
+  30_000, 60_000, 120_000, 240_000, 300_000,
+] as const;
+const LEGACY_ROTATE_HOME_FILE_PATTERNS = [
+  /^codex-login-browser-capture-.*\.js$/,
+  /^fast-browser-.*\.json$/,
+];
+const LEGACY_ROTATE_HOME_DIR_PATTERNS = [/^codex-login-browser-shim-.+$/];
+const LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS = [/^codex-login-managed-.+$/];
+const CURRENT_CODEX_LOGIN_WRAPPER_PATTERN =
+  /^codex-login-[a-z0-9._-]+-[0-9a-f]{12}$/;
 
 export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   return (
@@ -87,7 +134,18 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   );
 }
 
-export const CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
+export let ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
+export let LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
+
+export function getCodexRotateHome(): string {
+  return ROTATE_HOME;
+}
+
+export function setCodexRotateHomeForTesting(rootDir: string | null): void {
+  ROTATE_HOME = resolve(rootDir || DEFAULT_ROTATE_HOME);
+  ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
+  LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
+}
 
 export interface CredentialFamily {
   profile_name: string;
@@ -165,6 +223,7 @@ interface LegacyCredentialStore {
 
 export interface WorkflowFileMetadata {
   filePath: string;
+  workflowRef: string;
   preferredProfileName: string | null;
   preferredEmail: string | null;
 }
@@ -343,12 +402,101 @@ function ensureRotateDir(): void {
   if (!existsSync(ROTATE_HOME)) {
     mkdirSync(ROTATE_HOME, { recursive: true });
   }
+  cleanupLegacyCodexRotateArtifacts(ROTATE_HOME);
+}
+
+function matchesAnyPattern(
+  value: string,
+  patterns: readonly RegExp[],
+): boolean {
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+export function cleanupLegacyCodexRotateArtifacts(rootDir = ROTATE_HOME): void {
+  if (!existsSync(rootDir)) {
+    return;
+  }
+
+  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
+    const entryPath = join(rootDir, entry.name);
+    if (
+      entry.isFile() &&
+      matchesAnyPattern(entry.name, LEGACY_ROTATE_HOME_FILE_PATTERNS)
+    ) {
+      rmSync(entryPath, { force: true });
+      continue;
+    }
+    if (
+      entry.isDirectory() &&
+      matchesAnyPattern(entry.name, LEGACY_ROTATE_HOME_DIR_PATTERNS)
+    ) {
+      rmSync(entryPath, { recursive: true, force: true });
+      continue;
+    }
+    if (!entry.isDirectory() || entry.name !== "bin") {
+      continue;
+    }
+    for (const binEntry of readdirSync(entryPath, { withFileTypes: true })) {
+      const binEntryPath = join(entryPath, binEntry.name);
+      const binEntryContents =
+        binEntry.isFile() &&
+        CURRENT_CODEX_LOGIN_WRAPPER_PATTERN.test(binEntry.name)
+          ? readFileSync(binEntryPath, "utf8")
+          : null;
+      if (
+        binEntry.isFile() &&
+        (matchesAnyPattern(
+          binEntry.name,
+          LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS,
+        ) ||
+          (typeof binEntryContents === "string" &&
+            !binEntryContents.includes("codex-login-app-server-helper.mjs")))
+      ) {
+        rmSync(binEntryPath, { force: true });
+      }
+    }
+  }
 }
 
 function writePrivateJson(filePath: string, value: unknown): void {
   ensureRotateDir();
   writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
   chmodSync(filePath, 0o600);
+}
+
+function readPrivateJsonRecord(
+  filePath: string,
+  fallbackLabel: string,
+): Record<string, unknown> {
+  const raw = readFileSync(filePath, "utf8");
+  const parsed = parseJson<unknown>(raw, fallbackLabel);
+  if (!isRecord(parsed)) {
+    throw new Error(fallbackLabel);
+  }
+  return { ...parsed };
+}
+
+function loadRotateStateDocument(): Record<string, unknown> {
+  const state = existsSync(ROTATE_STATE_FILE)
+    ? readPrivateJsonRecord(
+        ROTATE_STATE_FILE,
+        `Invalid rotate state at ${ROTATE_STATE_FILE}`,
+      )
+    : {};
+
+  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
+    const legacyStore = normalizeCredentialStore(
+      parseJson<LegacyCredentialStore>(
+        readFileSync(LEGACY_CREDENTIALS_FILE, "utf8"),
+        `Invalid credential store at ${LEGACY_CREDENTIALS_FILE}`,
+      ),
+    );
+    state.version = legacyStore.version;
+    state.families = legacyStore.families;
+    state.pending = serializeCredentialRecordMap(legacyStore.pending);
+  }
+
+  return state;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -358,6 +506,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function normalizeCredentialStore(
   raw: LegacyCredentialStore | null | undefined,
 ): CredentialStore {
+  const inventoryEmails = collectInventoryEmailsFromState(raw);
   const families = isRecord(raw?.families)
     ? ({ ...(raw.families as Record<string, CredentialFamily>) } as Record<
         string,
@@ -401,11 +550,54 @@ export function normalizeCredentialStore(
   return {
     version: 3,
     families,
-    pending: normalizeCredentialRecordMap(raw?.pending) as Record<
-      string,
-      PendingCredential
-    >,
+    pending: Object.fromEntries(
+      Object.entries(
+        normalizeCredentialRecordMap(raw?.pending) as Record<
+          string,
+          PendingCredential
+        >,
+      ).filter(
+        ([email, record]) =>
+          !inventoryEmails.has(normalizePendingEmailKey(email)) &&
+          !pendingIsSupersededByInventory(record, inventoryEmails),
+      ),
+    ),
   };
+}
+
+function collectInventoryEmailsFromState(
+  raw: LegacyCredentialStore | null | undefined,
+): Set<string> {
+  const entries = Array.isArray(raw?.accounts) ? raw.accounts : [];
+  return new Set(
+    entries
+      .map((entry) =>
+        isRecord(entry) && typeof entry.email === "string"
+          ? normalizePendingEmailKey(entry.email)
+          : null,
+      )
+      .filter((value): value is string => Boolean(value)),
+  );
+}
+
+function normalizePendingEmailKey(value: string): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function pendingIsSupersededByInventory(
+  pending: PendingCredential,
+  inventoryEmails: Set<string>,
+): boolean {
+  let maxObservedSuffix = 0;
+  for (const email of inventoryEmails) {
+    const suffix = extractAccountFamilySuffix(email, pending.base_email);
+    if (suffix && suffix > maxObservedSuffix) {
+      maxObservedSuffix = suffix;
+    }
+  }
+  return maxObservedSuffix > pending.suffix;
 }
 
 export function buildOpenAiAccountLoginLocator(
@@ -582,24 +774,35 @@ export async function findBitwardenCliAccountSecretRef(
 }
 
 export function loadCredentialStore(): CredentialStore {
-  if (!existsSync(CREDENTIALS_FILE)) {
+  if (!existsSync(ROTATE_STATE_FILE) && !existsSync(LEGACY_CREDENTIALS_FILE)) {
     return normalizeCredentialStore(null);
   }
 
-  const raw = readFileSync(CREDENTIALS_FILE, "utf8");
-  const parsed = parseJson<LegacyCredentialStore>(
-    raw,
-    `Invalid credential store at ${CREDENTIALS_FILE}`,
+  return normalizeCredentialStore(
+    loadRotateStateDocument() as LegacyCredentialStore,
   );
-  return normalizeCredentialStore(parsed);
 }
 
 export function saveCredentialStore(store: CredentialStore): void {
-  writePrivateJson(CREDENTIALS_FILE, {
-    version: 3,
-    families: store.families,
-    pending: serializeCredentialRecordMap(store.pending),
-  });
+  const nextState = loadRotateStateDocument();
+  const serializedFamilies = store.families;
+  const serializedPending = serializeCredentialRecordMap(store.pending);
+  const hasCredentialState =
+    Object.keys(serializedFamilies).length > 0 ||
+    Object.keys(serializedPending).length > 0;
+  if (hasCredentialState) {
+    nextState.version = 3;
+    nextState.families = serializedFamilies;
+    nextState.pending = serializedPending;
+  } else {
+    delete nextState.version;
+    delete nextState.families;
+    delete nextState.pending;
+  }
+  writePrivateJson(ROTATE_STATE_FILE, nextState);
+  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
+    unlinkSync(LEGACY_CREDENTIALS_FILE);
+  }
 }
 
 const EMAIL_FAMILY_PLACEHOLDER = "{n}";
@@ -743,6 +946,20 @@ export function computeNextAccountFamilySuffix(
     candidate += 1;
   }
   return candidate;
+}
+
+export function deriveFamilyFrontierSuffix(
+  baseEmail: string,
+  knownEmails: Iterable<string>,
+): number {
+  let maxObservedSuffix = 0;
+  for (const email of knownEmails) {
+    const suffix = extractAccountFamilySuffix(email, baseEmail);
+    if (suffix && suffix > maxObservedSuffix) {
+      maxObservedSuffix = suffix;
+    }
+  }
+  return Math.max(1, maxObservedSuffix + 1);
 }
 
 export function normalizeGmailBaseEmail(email: string): string {
@@ -1590,6 +1807,43 @@ export function isRetryableCodexLoginWorkflowErrorMessage(
   );
 }
 
+export function getCodexLoginRetryDelaysMs(
+  reason: string | null,
+  overrideDelaysMs?: readonly number[] | null,
+): readonly number[] {
+  if (Array.isArray(overrideDelaysMs) && overrideDelaysMs.length > 0) {
+    return overrideDelaysMs;
+  }
+  switch (reason) {
+    case "verification_artifact_pending":
+      return DEFAULT_CODEX_LOGIN_VERIFICATION_RETRY_DELAYS_MS;
+    case "retryable_timeout":
+      return DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS;
+    case "device_auth_rate_limit":
+    case "rate_limit":
+      return DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS;
+    default:
+      return DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS;
+  }
+}
+
+export function getCodexLoginRetryDelayMs(
+  reason: string | null,
+  attempt: number,
+  overrideDelaysMs?: readonly number[] | null,
+): number {
+  const delays = getCodexLoginRetryDelaysMs(reason, overrideDelaysMs);
+  const index = Math.max(0, Math.min(attempt - 1, delays.length - 1));
+  return delays[index] ?? DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS[0];
+}
+
+export function shouldResetCodexLoginSessionForRetry(
+  retryReason: string | null,
+  attempt: number,
+): boolean {
+  return retryReason === "retryable_timeout" && attempt >= 2;
+}
+
 function parseFastBrowserProgressEventLine(
   line: string,
 ): FastBrowserProgressEvent | null {
@@ -1938,6 +2192,62 @@ puts JSON.generate(data)
   }
 }
 
+function slugifyWorkflowPathSegment(value: string): string | null {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-");
+  return slug.replace(/^-+|-+$/g, "") || null;
+}
+
+function deriveWorkflowRefFromRoot(
+  filePath: string,
+  rootDir: string,
+  scopePrefix: "workspace" | "sys",
+): string | null {
+  const candidatePath = resolve(filePath);
+  const relativePath = relative(rootDir, candidatePath);
+  if (
+    !relativePath ||
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    extname(relativePath) !== ".yaml"
+  ) {
+    return null;
+  }
+
+  const segments = relativePath.split(sep).filter(Boolean);
+  if (segments.length !== 3) {
+    return null;
+  }
+
+  const [surface, target, workflowFile] = segments;
+  const workflowName = basename(workflowFile, ".yaml");
+  const parts = [
+    scopePrefix,
+    slugifyWorkflowPathSegment(surface),
+    slugifyWorkflowPathSegment(target),
+    slugifyWorkflowPathSegment(workflowName),
+  ].filter((part): part is string => Boolean(part));
+
+  return parts.length === 4 ? parts.join(".") : null;
+}
+
+export function deriveWorkflowRefFromFilePath(filePath: string): string | null {
+  return (
+    deriveWorkflowRefFromRoot(
+      filePath,
+      FAST_BROWSER_WORKFLOWS_ROOT,
+      "workspace",
+    ) ||
+    deriveWorkflowRefFromRoot(
+      filePath,
+      FAST_BROWSER_GLOBAL_WORKFLOWS_ROOT,
+      "sys",
+    )
+  );
+}
+
 export function parseWorkflowFileMetadata(
   raw: string,
 ): Omit<WorkflowFileMetadata, "filePath"> {
@@ -1955,6 +2265,7 @@ export function parseWorkflowFileMetadata(
       ? (document.metadata as Record<string, unknown>)
       : null;
   return {
+    workflowRef: DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID,
     preferredProfileName: normalizeWorkflowScalar(
       typeof metadata?.preferredProfile === "string"
         ? metadata.preferredProfile
@@ -1979,6 +2290,9 @@ export function readWorkflowFileMetadata(
   return {
     filePath,
     ...parseWorkflowFileMetadata(raw),
+    workflowRef:
+      deriveWorkflowRefFromFilePath(filePath) ??
+      DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID,
   };
 }
 
@@ -2088,8 +2402,11 @@ async function runCodexBrowserLoginWorkflow(
     profileName,
     String(options?.codexBin || "codex").trim() || "codex",
   );
+  const workflowRef =
+    deriveWorkflowRefFromFilePath(CODEX_ROTATE_ACCOUNT_FLOW_FILE) ??
+    DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID;
   return await runFastBrowserDaemonWorkflow(
-    CODEX_ROTATE_ACCOUNT_FLOW_ID,
+    workflowRef,
     {
       mode: "codex_login",
       codex_bin: codexBin,
@@ -2172,7 +2489,7 @@ export async function completeCodexLoginViaWorkflow(
   const retryDelaysMs =
     Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
       ? options.retryDelaysMs
-      : [30_000, 60_000, 120_000, 240_000, 300_000];
+      : null;
   const note = typeof options?.onNote === "function" ? options.onNote : null;
   const restoreState =
     typeof options?.restoreState === "function" ? options.restoreState : null;
@@ -2276,19 +2593,20 @@ export async function completeCodexLoginViaWorkflow(
           if (nextAction === "retry_attempt") {
             restoreState?.();
             if (attempt < maxAttempts) {
-              const delayMs =
-                retryDelaysMs[
-                  Math.min(attempt - 1, retryDelaysMs.length - 1)
-                ] ?? 30_000;
+              const delayMs = getCodexLoginRetryDelayMs(
+                retryReason,
+                attempt,
+                retryDelaysMs,
+              );
               const retryReasonLabel = retryReason
                 ? retryReason.replace(/_/g, " ")
                 : "needs another retry";
-              if (retryReason === "retryable_timeout") {
+              if (shouldResetCodexLoginSessionForRetry(retryReason, attempt)) {
                 codexSession = null;
               }
               note?.(
                 `OpenAI ${retryReasonLabel} for ${email}${currentUrl ? ` (${currentUrl})` : ""}. ` +
-                  `${retryReason === "retryable_timeout" ? "Starting a fresh Codex auth session. " : ""}` +
+                  `${shouldResetCodexLoginSessionForRetry(retryReason, attempt) ? "Starting a fresh Codex auth session. " : ""}` +
                   `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
               );
               await sleep(delayMs);
@@ -2328,9 +2646,11 @@ export async function completeCodexLoginViaWorkflow(
             message,
           );
         if (verificationArtifactPending && attempt < maxAttempts) {
-          const delayMs =
-            retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ??
-            30_000;
+          const delayMs = getCodexLoginRetryDelayMs(
+            "verification_artifact_pending",
+            attempt,
+            retryDelaysMs,
+          );
           note?.(
             `OpenAI verification is not ready for ${email}. ` +
               `Waiting ${Math.round(delayMs / 1000)}s before retrying the same managed-profile flow.`,
@@ -2339,9 +2659,11 @@ export async function completeCodexLoginViaWorkflow(
           continue;
         }
         if (deviceAuthRateLimited && attempt < maxAttempts) {
-          const delayMs =
-            retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] ??
-            30_000;
+          const delayMs = getCodexLoginRetryDelayMs(
+            "device_auth_rate_limit",
+            attempt,
+            retryDelaysMs,
+          );
           note?.(
             `Codex device authorization is rate limited for ${email}. ` +
               `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
@@ -2383,6 +2705,16 @@ function normalizeCredentialRecordMap(
 
 function normalizeCredentialRecord(raw: unknown): StoredCredential | null {
   if (!isRecord(raw)) {
+    return null;
+  }
+  if (
+    typeof raw.email !== "string" ||
+    typeof raw.profile_name !== "string" ||
+    typeof raw.base_email !== "string" ||
+    typeof raw.suffix !== "number" ||
+    typeof raw.created_at !== "string" ||
+    typeof raw.updated_at !== "string"
+  ) {
     return null;
   }
   const normalized = { ...raw } as Record<string, unknown>;

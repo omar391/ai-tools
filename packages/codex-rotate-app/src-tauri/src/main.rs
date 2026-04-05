@@ -1,3 +1,4 @@
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
 use codex_rotate_core::paths::resolve_paths as resolve_core_paths;
 use codex_rotate_core::pool::{load_pool, rotate_next_internal, NextResult};
 use codex_rotate_core::quota::CachedQuotaState;
@@ -308,9 +309,13 @@ struct StatusSnapshot {
 #[derive(Clone, Default)]
 struct TrayRuntime {
     pool_file: PathBuf,
+    auth_file: PathBuf,
     inventory_count: Option<usize>,
     inventory_modified_at: Option<SystemTime>,
     inventory_exists: bool,
+    auth_summary: Option<AuthSummary>,
+    auth_modified_at: Option<SystemTime>,
+    auth_exists: bool,
     last_rendered: Option<RenderedSnapshot>,
 }
 
@@ -333,10 +338,11 @@ fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
 }
 
 impl SharedTrayRuntime {
-    fn new(pool_file: PathBuf) -> Self {
+    fn new(pool_file: PathBuf, auth_file: PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TrayRuntime {
                 pool_file,
+                auth_file,
                 ..TrayRuntime::default()
             })),
         }
@@ -371,6 +377,35 @@ impl SharedTrayRuntime {
         runtime.last_rendered = Some(rendered.clone());
         true
     }
+
+    fn refresh_auth_summary(&self, snapshot: &mut StatusSnapshot) -> bool {
+        let mut runtime = self.inner.lock().expect("tray runtime mutex");
+        let metadata = fs::metadata(&runtime.auth_file).ok();
+        let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
+        let exists = metadata.is_some();
+        let cache_valid = runtime.auth_exists == exists && runtime.auth_modified_at == modified_at;
+
+        let mut changed = false;
+        if !cache_valid {
+            runtime.auth_exists = exists;
+            runtime.auth_modified_at = modified_at;
+            runtime.auth_summary = if exists {
+                load_codex_auth(&runtime.auth_file)
+                    .ok()
+                    .map(|auth| summarize_codex_auth(&auth))
+            } else {
+                None
+            };
+            changed = true;
+        }
+
+        if let Some(summary) = runtime.auth_summary.as_ref() {
+            snapshot.current_email = Some(summary.email.clone());
+            snapshot.current_plan = Some(summary.plan_type.clone());
+        }
+
+        changed
+    }
 }
 
 fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
@@ -379,6 +414,21 @@ fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
         return;
     };
     runtime.refresh_inventory_count(snapshot);
+}
+
+fn refresh_auth_summary(app: &AppHandle, snapshot: &mut StatusSnapshot) -> bool {
+    let Some(runtime) = app.try_state::<SharedTrayRuntime>() else {
+        if let Ok(paths) = resolve_core_paths() {
+            if let Ok(auth) = load_codex_auth(&paths.codex_auth_file) {
+                let summary = summarize_codex_auth(&auth);
+                snapshot.current_email = Some(summary.email);
+                snapshot.current_plan = Some(summary.plan_type);
+                return false;
+            }
+        }
+        return false;
+    };
+    runtime.refresh_auth_summary(snapshot)
 }
 
 fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
@@ -450,16 +500,21 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
 }
 
 fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) {
+    let auth_changed = {
+        let mut snapshot = status.inner.lock().expect("status mutex");
+        refresh_auth_summary(app, &mut snapshot)
+    };
     let next = match run_watch_iteration(WatchIterationOptions {
         port: Some(DEFAULT_PORT),
         after_signal_id: None,
         cooldown_ms: None,
-        force_quota_refresh,
+        force_quota_refresh: force_quota_refresh || auth_changed,
     }) {
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             let previous_displayed_email = snapshot.current_email.clone();
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             if let Some(live) = result.live.as_ref() {
                 snapshot.current_email = Some(live.email.clone());
                 snapshot.current_plan = Some(live.plan_type.clone());
@@ -493,6 +548,7 @@ fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) 
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             snapshot.last_message = Some(format!("watch failed: {}", error));
             snapshot.clone()
         }
@@ -516,6 +572,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
             let mut snapshot = status.inner.lock().expect("status mutex");
             let previous_displayed_email = snapshot.current_email.clone();
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             match &result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -554,6 +611,7 @@ fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             snapshot.last_message = Some(format!("manual rotate failed: {}", error));
             snapshot.clone()
         }
@@ -566,6 +624,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
         Ok(result) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             if let Some(account) = result.account.as_ref() {
                 snapshot.current_email = account.email.clone();
                 snapshot.current_plan = account.plan_type.clone();
@@ -584,6 +643,7 @@ fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refr
         Err(error) => {
             let mut snapshot = status.inner.lock().expect("status mutex");
             refresh_inventory_count(app, &mut snapshot);
+            refresh_auth_summary(app, &mut snapshot);
             snapshot.last_message = Some(format!("account read failed: {}", error));
             snapshot.clone()
         }
@@ -604,9 +664,11 @@ fn main() {
             app.set_activation_policy(ActivationPolicy::Accessory);
 
             let status = SharedStatus::default();
-            let pool_file = resolve_core_paths()?.pool_file;
+            let core_paths = resolve_core_paths()?;
+            let pool_file = core_paths.pool_file;
+            let auth_file = core_paths.codex_auth_file;
             app.manage(status.clone());
-            app.manage(SharedTrayRuntime::new(pool_file));
+            app.manage(SharedTrayRuntime::new(pool_file, auth_file));
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
@@ -728,7 +790,10 @@ mod tests {
 
     #[test]
     fn tray_runtime_dedups_identical_rendered_snapshots() {
-        let runtime = SharedTrayRuntime::new(PathBuf::from("/tmp/accounts.json"));
+        let runtime = SharedTrayRuntime::new(
+            PathBuf::from("/tmp/accounts.json"),
+            PathBuf::from("/tmp/auth.json"),
+        );
         let rendered = sample_rendered_snapshot();
         assert!(runtime.begin_render(&rendered));
         assert!(!runtime.begin_render(&rendered));
@@ -736,7 +801,10 @@ mod tests {
 
     #[test]
     fn tray_runtime_allows_changed_rendered_snapshots() {
-        let runtime = SharedTrayRuntime::new(PathBuf::from("/tmp/accounts.json"));
+        let runtime = SharedTrayRuntime::new(
+            PathBuf::from("/tmp/accounts.json"),
+            PathBuf::from("/tmp/auth.json"),
+        );
         let rendered = sample_rendered_snapshot();
         let mut changed = rendered.clone();
         changed.status_text = "Status: rotated".to_string();
