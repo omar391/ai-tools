@@ -1547,6 +1547,10 @@ do:
       metadata:
         templateRef: replay_captured_auth_url
         description: "Open the captured Codex auth URL on the managed browser profile."
+        browser:
+          clearSiteDataForOrigins:
+            - "https://auth.openai.com"
+            - "https://chatgpt.com"
   - stabilize_entry_surface:
       metadata:
         templateRef: wait_for_openai_surface_ready
