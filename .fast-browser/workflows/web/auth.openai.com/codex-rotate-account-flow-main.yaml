@@ -1,0 +1,139 @@
+document:
+  dsl: 1.0.0
+  namespace: web-auth-openai-com
+  name: codex-rotate-account-flow-main
+  version: 1.0.0
+  summary: "Benchmark-selected codex-rotate OpenAI account flow that runs the best non-device workflow first and falls back to device authorization when needed."
+  metadata:
+    preferredProfile: dev-1
+    primaryTarget: primary
+    targets:
+      - id: primary
+        kind: web
+        match:
+          kind: host_pattern
+          value: "*"
+        target: auth.openai.com
+input:
+  schema:
+    format: json
+    document:
+      type: object
+      properties:
+        enabled:
+          default: true
+        mode:
+          default: codex_login
+        codex_bin:
+          default: codex
+        auth_url: {}
+        device_code: {}
+        callback_url: {}
+        callback_port: {}
+        codex_session_dir: {}
+        codex_login_pid: {}
+        codex_login_stdout_path: {}
+        codex_login_stderr_path: {}
+        codex_login_exit_path: {}
+        email: {}
+        account_login_locator:
+          type: object
+          format: secret-locator
+        full_name:
+          default: "M Omar Faruque"
+        birth_month:
+          default: 1
+        birth_day:
+          default: 24
+        birth_year:
+          default: 1990
+        prefer_signup_recovery:
+          default: "true"
+      required:
+        - email
+do:
+  - run_primary_non_device_flow:
+      metadata:
+        description: "Run the benchmark-selected primary OpenAI account flow."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
+      with:
+        version: 1.0.6
+        input:
+          enabled: "${inputs.enabled}"
+          mode: "codex_login"
+          codex_bin: "${inputs.codex_bin}"
+          auth_url: "${inputs.auth_url}"
+          callback_url: "${inputs.callback_url}"
+          callback_port: "${inputs.callback_port}"
+          codex_session_dir: "${inputs.codex_session_dir}"
+          codex_login_pid: "${inputs.codex_login_pid}"
+          codex_login_stdout_path: "${inputs.codex_login_stdout_path}"
+          codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
+          codex_login_exit_path: "${inputs.codex_login_exit_path}"
+          email: "${inputs.email}"
+          account_login_locator: "${inputs.account_login_locator}"
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+  - run_device_auth_fallback:
+      if: "${state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'complete'}"
+      metadata:
+        description: "Fallback to the experimental device-auth workflow when the primary flow does not complete."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth
+      with:
+        version: 1.0.0
+        input:
+          enabled: "${inputs.enabled}"
+          mode: "device_auth"
+          codex_bin: "${inputs.codex_bin}"
+          auth_url: "${inputs.auth_url}"
+          device_code: "${inputs.device_code}"
+          callback_url: "${inputs.callback_url}"
+          callback_port: "${inputs.callback_port}"
+          codex_session_dir: "${inputs.codex_session_dir}"
+          codex_login_pid: "${inputs.codex_login_pid}"
+          codex_login_stdout_path: "${inputs.codex_login_stdout_path}"
+          codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
+          codex_login_exit_path: "${inputs.codex_login_exit_path}"
+          email: "${inputs.email}"
+          account_login_locator: "${inputs.account_login_locator}"
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+  - finalize_selected_flow:
+      metadata:
+        description: "Return the primary outcome when it completed, otherwise return the device-auth fallback outcome."
+      run:
+        script:
+          language: javascript
+          code: |
+            const primary =
+              state.steps.run_primary_non_device_flow?.action?.result?.output || {};
+            const fallback =
+              state.steps.run_device_auth_fallback?.action?.result?.output || null;
+            const primaryComplete =
+              primary.success === true || primary.next_action === "complete";
+            const selected = primaryComplete || !fallback ? primary : fallback;
+
+            return {
+              ...(selected && typeof selected === "object" ? selected : {}),
+              selected_flow:
+                primaryComplete || !fallback
+                  ? "workspace.web.auth-openai-com.codex-rotate-account-flow"
+                  : "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+              primary_flow:
+                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+              fallback_flow:
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+              primary_completed: primaryComplete,
+              fallback_attempted: Boolean(fallback),
+              fallback_selected: !primaryComplete && Boolean(fallback),
+              selection_strategy:
+                "benchmark-selected-non-device-then-device-auth-fallback",
+            };
+output:
+  as: "${state.steps.finalize_selected_flow?.action?.value || {}}"

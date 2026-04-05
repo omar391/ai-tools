@@ -27,7 +27,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
         .join("workflows")
         .join("web")
         .join("auth.openai.com")
-        .join("codex-rotate-account-flow.yaml");
+        .join("codex-rotate-account-flow-main.yaml");
     Ok(CorePaths {
         codex_auth_file: codex_home.join("auth.json"),
         repo_root: repo_root.clone(),

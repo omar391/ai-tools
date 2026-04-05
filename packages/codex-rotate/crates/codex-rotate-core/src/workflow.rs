@@ -273,6 +273,11 @@ pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    let previous_auth = if options.restore_previous_auth_after_create {
+        load_codex_auth_if_exists()?
+    } else {
+        None
+    };
 
     if !options.force && !pool.accounts.is_empty() {
         let previous_index = pool.active_index;
@@ -331,6 +336,7 @@ pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
     let result = execute_create_flow(&options)?;
     let quota_summary = summarize_quota_for_create(&result);
     if options.restore_previous_auth_after_create {
+        restore_active_auth(previous_auth.as_ref())?;
         return Ok(format!(
             "{GREEN}OK{RESET} Created {} via \"{}\" from {}.\nQuota: {}\nCurrent session unchanged.",
             result.entry.label, result.profile_name, result.base_email, quota_summary

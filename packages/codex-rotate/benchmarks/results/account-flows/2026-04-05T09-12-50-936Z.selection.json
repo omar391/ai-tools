@@ -1,0 +1,10 @@
+{
+  "selected_non_device": {
+    "workflow_id": "original",
+    "workflow_ref": "workspace.web.auth-openai-com.codex-rotate-account-flow",
+    "workflow_file": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow.yaml",
+    "median_latency_ms": 197959,
+    "success_rate": 1
+  },
+  "selected_device_auth": null
+}

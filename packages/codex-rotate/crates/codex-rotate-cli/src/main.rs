@@ -98,6 +98,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
     let mut base_email = None;
     let mut force = false;
     let mut ignore_current = false;
+    let mut restore_previous_auth_after_create = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -109,17 +110,20 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
             "--ignore-current" => {
                 ignore_current = true;
             }
+            "--restore-auth" | "--restore-previous-auth" => {
+                restore_previous_auth_after_create = true;
+            }
             "--profile" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
                 profile_name = Some(value.clone());
                 index += 1;
             }
             "--base-email" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
                 base_email = Some(value.clone());
                 index += 1;
             }
@@ -136,7 +140,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
     }
 
     if positionals.len() > 1 {
-        return Err(anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--profile <managed-name>] [--base-email <email-family>]"));
+        return Err(anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"));
     }
 
     Ok(CreateCommandOptions {
@@ -150,7 +154,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
         base_email,
         force,
         ignore_current,
-        restore_previous_auth_after_create: false,
+        restore_previous_auth_after_create,
         require_usable_quota: false,
         source: CreateCommandSource::Manual,
     })

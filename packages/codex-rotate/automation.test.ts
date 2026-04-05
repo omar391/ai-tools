@@ -128,11 +128,11 @@ describe("templated email family helpers", () => {
 });
 
 describe("workflow metadata", () => {
-  test("reads preferred_profile from the unified local codex-rotate workflow", () => {
+  test("reads preferred_profile from the main local codex-rotate workflow", () => {
     const metadata = readWorkflowFileMetadata(CODEX_ROTATE_ACCOUNT_FLOW_FILE);
 
     expect(metadata.workflowRef).toBe(
-      "workspace.web.auth-openai-com.codex-rotate-account-flow",
+      "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
     );
     expect(metadata.preferredProfileName).toBe("dev-1");
     expect(metadata.preferredEmail).toBeNull();

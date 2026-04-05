@@ -1,0 +1,26 @@
+[
+  {
+    "competitor": "device-auth",
+    "workflow_id": "device-auth",
+    "workflow_ref": "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+    "workflow_file": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow-device-auth.yaml",
+    "track": "device_auth",
+    "task": "openai-account-create-device-auth",
+    "run_label": "device-auth-2026-04-05T09:24:35.621Z",
+    "cold": true,
+    "success": false,
+    "latency_ms": 448339,
+    "exit_status": 1,
+    "failure_mode": "anti_bot_gate",
+    "created_emails": [],
+    "new_pending_emails": ["bench.device.1@astronlab.com"],
+    "auth_before": "dev.27@astronlab.com",
+    "auth_after": "dev.27@astronlab.com",
+    "auth_restored": true,
+    "base_email": "bench.device.{n}@astronlab.com",
+    "notes": "left pending reservation(s): bench.device.1@astronlab.com",
+    "stdout_tail": null,
+    "stderr_tail": "[fast-browser] 2026-04-05T09:31:33.703Z codex-rotate-account-flow-device-auth/inspect_device_authorization_consent step: Refresh the final device-auth surface after any code submit. (action=playwright, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:31:33.711Z codex-rotate-account-flow-device-auth/inspect_device_authorization_consent done: Refresh the final device-auth surface after any code submit. (action=playwright, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:31:33.711Z codex-rotate-account-flow-device-auth/submit_device_authorization_consent step skip: Approve the final Codex device-auth consent step. (action=playwright, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:31:33.711Z codex-rotate-account-flow-device-auth/build_auth_outcome step: Build the final codex-rotate device-auth outcome from the latest cached OpenAI state. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:31:33.712Z codex-rotate-account-flow-device-auth/build_auth_outcome done: Build the final codex-rotate device-auth outcome from the latest cached OpenAI state. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:31:33.712Z codex-rotate-account-flow-device-auth/wait_for_codex_login_exit step: Wait for the detached codex device-auth process to exit after browser authorization completes. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:32:03.926Z codex-rotate-account-flow-device-auth/wait_for_codex_login_exit done: Wait for the detached codex device-auth process to exit after browser authorization completes. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:32:03.926Z codex-rotate-account-flow-device-auth/finalize_flow_summary step: Attach detached-session exit metadata to the normalized auth outcome. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:32:03.926Z codex-rotate-account-flow-device-auth/finalize_flow_summary done: Attach detached-session exit metadata to the normalized auth outcome. (action=run, url=https://auth.openai.com/create-account/password)\n[fast-browser] 2026-04-05T09:32:03.927Z codex-rotate-account-flow-device-auth workflow ok: workflow completed successfully\n[fast-browser] 2026-04-05T09:32:03.927Z codex-rotate-account-flow-device-auth workflow finish: workflow finished\nCodex device authorization did not complete.",
+    "measured_at": "2026-04-05T09:24:35.621Z"
+  }
+]

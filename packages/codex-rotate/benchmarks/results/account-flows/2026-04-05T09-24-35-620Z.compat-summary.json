@@ -1,0 +1,44 @@
+{
+  "groups": {
+    "device-auth::openai-account-create-device-auth::cold": {
+      "artifact_reuse_rate": 0.0,
+      "cost_usd": {
+        "amortized_cost_per_rerun": null,
+        "amortized_cost_per_success": null,
+        "cost_methods": ["unknown"],
+        "cost_to_first_success": null,
+        "total": 0
+      },
+      "failure_modes": {
+        "anti_bot_gate": 1
+      },
+      "latency_ms": {
+        "max": 448339.0,
+        "median": 448339.0,
+        "min": 448339.0,
+        "p90": 448339.0
+      },
+      "runs": 1,
+      "success_rate": 0.0,
+      "successes": 0,
+      "tokens": {
+        "amortized_tokens_per_rerun": null,
+        "amortized_tokens_per_success": null,
+        "token_methods": ["unknown"],
+        "tokens_to_first_success": null,
+        "total": 0
+      },
+      "turns": {
+        "assistant_avg": 0.0,
+        "assistant_total": 0,
+        "avg": 0.0,
+        "median": 0,
+        "tool_calls_avg": 0.0,
+        "tool_calls_total": 0,
+        "total": 0,
+        "user_avg": 0.0,
+        "user_total": 0
+      }
+    }
+  }
+}

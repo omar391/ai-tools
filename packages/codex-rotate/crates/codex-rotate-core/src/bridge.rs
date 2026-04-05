@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
 use tempfile::NamedTempFile;
 
 use crate::paths::resolve_paths;
@@ -15,9 +16,10 @@ struct BridgeRequest<'a, TPayload> {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct BridgeResponse<TPayload> {
+struct BridgeResponse {
     ok: bool,
-    result: Option<TPayload>,
+    #[serde(default)]
+    result: Value,
     error: Option<BridgeErrorPayload>,
 }
 
@@ -57,12 +59,12 @@ where
 
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let response = serde_json::from_slice::<BridgeResponse<TResult>>(&output.stdout).ok();
+    let response = serde_json::from_slice::<BridgeResponse>(&output.stdout).ok();
     if let Some(response) = response {
         if response.ok && output.status.success() {
-            return response
-                .result
-                .ok_or_else(|| anyhow!("Automation bridge returned no result for {command}."));
+            return serde_json::from_value(response.result).with_context(|| {
+                format!("Automation bridge returned an incompatible result for {command}.")
+            });
         }
 
         return Err(anyhow!(

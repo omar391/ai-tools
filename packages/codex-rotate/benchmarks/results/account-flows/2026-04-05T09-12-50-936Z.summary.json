@@ -1,0 +1,47 @@
+{
+  "groups": {
+    "original::openai-account-create-non-device::cold": {
+      "workflowId": "original",
+      "workflowRef": "workspace.web.auth-openai-com.codex-rotate-account-flow",
+      "workflowFile": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow.yaml",
+      "track": "non_device",
+      "runs": 1,
+      "successes": 1,
+      "successRate": 1,
+      "medianLatencyMs": 197959,
+      "bestLatencyMs": 197959,
+      "failureModes": {},
+      "latestRunLabel": "original-2026-04-05T09:12:50.938Z"
+    },
+    "stepwise::openai-account-create-non-device::cold": {
+      "workflowId": "stepwise",
+      "workflowRef": "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+      "workflowFile": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow-stepwise.yaml",
+      "track": "non_device",
+      "runs": 1,
+      "successes": 0,
+      "successRate": 0,
+      "medianLatencyMs": 74368,
+      "bestLatencyMs": 74368,
+      "failureModes": {
+        "anti_bot_gate": 1
+      },
+      "latestRunLabel": "stepwise-2026-04-05T09:16:08.900Z"
+    },
+    "minimal::openai-account-create-non-device::cold": {
+      "workflowId": "minimal",
+      "workflowRef": "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+      "workflowFile": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow-minimal.yaml",
+      "track": "non_device",
+      "runs": 1,
+      "successes": 0,
+      "successRate": 0,
+      "medianLatencyMs": 414693,
+      "bestLatencyMs": 414693,
+      "failureModes": {
+        "callback_missing": 1
+      },
+      "latestRunLabel": "minimal-2026-04-05T09:17:23.270Z"
+    }
+  }
+}

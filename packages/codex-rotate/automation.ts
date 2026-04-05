@@ -72,7 +72,7 @@ const CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT = resolve(
 );
 
 const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID =
-  "workspace.web.auth-openai-com.codex-rotate-account-flow";
+  "workspace.web.auth-openai-com.codex-rotate-account-flow-main";
 export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = resolve(
   process.env.CODEX_ROTATE_ACCOUNT_FLOW_FILE ||
     join(
@@ -81,7 +81,7 @@ export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = resolve(
       "workflows",
       "web",
       "auth.openai.com",
-      "codex-rotate-account-flow.yaml",
+      "codex-rotate-account-flow-main.yaml",
     ),
 );
 

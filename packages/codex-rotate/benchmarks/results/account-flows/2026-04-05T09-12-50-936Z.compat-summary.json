@@ -1,0 +1,122 @@
+{
+  "groups": {
+    "minimal::openai-account-create-non-device::cold": {
+      "artifact_reuse_rate": 0.0,
+      "cost_usd": {
+        "amortized_cost_per_rerun": null,
+        "amortized_cost_per_success": null,
+        "cost_methods": ["unknown"],
+        "cost_to_first_success": null,
+        "total": 0
+      },
+      "failure_modes": {
+        "callback_missing": 1
+      },
+      "latency_ms": {
+        "max": 414693.0,
+        "median": 414693.0,
+        "min": 414693.0,
+        "p90": 414693.0
+      },
+      "runs": 1,
+      "success_rate": 0.0,
+      "successes": 0,
+      "tokens": {
+        "amortized_tokens_per_rerun": null,
+        "amortized_tokens_per_success": null,
+        "token_methods": ["unknown"],
+        "tokens_to_first_success": null,
+        "total": 0
+      },
+      "turns": {
+        "assistant_avg": 0.0,
+        "assistant_total": 0,
+        "avg": 0.0,
+        "median": 0,
+        "tool_calls_avg": 0.0,
+        "tool_calls_total": 0,
+        "total": 0,
+        "user_avg": 0.0,
+        "user_total": 0
+      }
+    },
+    "original::openai-account-create-non-device::cold": {
+      "artifact_reuse_rate": 0.0,
+      "cost_usd": {
+        "amortized_cost_per_rerun": null,
+        "amortized_cost_per_success": 0.0,
+        "cost_methods": ["unknown"],
+        "cost_to_first_success": 0,
+        "total": 0
+      },
+      "failure_modes": {},
+      "latency_ms": {
+        "max": 197959.0,
+        "median": 197959.0,
+        "min": 197959.0,
+        "p90": 197959.0
+      },
+      "runs": 1,
+      "success_rate": 1.0,
+      "successes": 1,
+      "tokens": {
+        "amortized_tokens_per_rerun": null,
+        "amortized_tokens_per_success": 0.0,
+        "token_methods": ["unknown"],
+        "tokens_to_first_success": 0,
+        "total": 0
+      },
+      "turns": {
+        "assistant_avg": 0.0,
+        "assistant_total": 0,
+        "avg": 0.0,
+        "median": 0,
+        "tool_calls_avg": 0.0,
+        "tool_calls_total": 0,
+        "total": 0,
+        "user_avg": 0.0,
+        "user_total": 0
+      }
+    },
+    "stepwise::openai-account-create-non-device::cold": {
+      "artifact_reuse_rate": 0.0,
+      "cost_usd": {
+        "amortized_cost_per_rerun": null,
+        "amortized_cost_per_success": null,
+        "cost_methods": ["unknown"],
+        "cost_to_first_success": null,
+        "total": 0
+      },
+      "failure_modes": {
+        "anti_bot_gate": 1
+      },
+      "latency_ms": {
+        "max": 74368.0,
+        "median": 74368.0,
+        "min": 74368.0,
+        "p90": 74368.0
+      },
+      "runs": 1,
+      "success_rate": 0.0,
+      "successes": 0,
+      "tokens": {
+        "amortized_tokens_per_rerun": null,
+        "amortized_tokens_per_success": null,
+        "token_methods": ["unknown"],
+        "tokens_to_first_success": null,
+        "total": 0
+      },
+      "turns": {
+        "assistant_avg": 0.0,
+        "assistant_total": 0,
+        "avg": 0.0,
+        "median": 0,
+        "tool_calls_avg": 0.0,
+        "tool_calls_total": 0,
+        "total": 0,
+        "user_avg": 0.0,
+        "user_total": 0
+      }
+    }
+  }
+}

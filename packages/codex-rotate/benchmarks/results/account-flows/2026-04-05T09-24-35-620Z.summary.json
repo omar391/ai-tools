@@ -1,0 +1,19 @@
+{
+  "groups": {
+    "device-auth::openai-account-create-device-auth::cold": {
+      "workflowId": "device-auth",
+      "workflowRef": "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+      "workflowFile": "/Volumes/Projects/business/AstronLab/omar391/ai-tools/.fast-browser/workflows/web/auth.openai.com/codex-rotate-account-flow-device-auth.yaml",
+      "track": "device_auth",
+      "runs": 1,
+      "successes": 0,
+      "successRate": 0,
+      "medianLatencyMs": 448339,
+      "bestLatencyMs": 448339,
+      "failureModes": {
+        "anti_bot_gate": 1
+      },
+      "latestRunLabel": "device-auth-2026-04-05T09:24:35.621Z"
+    }
+  }
+}
