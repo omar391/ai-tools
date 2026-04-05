@@ -579,6 +579,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    let mut live_pool_index = None;
 
     output.push_line(String::new())?;
     output.push_line(format!("{BOLD}Codex Rotate Status{RESET}"))?;
@@ -588,24 +589,23 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         let auth = load_codex_auth(&paths.codex_auth_file)?;
         let email = extract_email_from_auth(&auth);
         let plan = extract_plan_from_auth(&auth);
+        let account_id = extract_account_id_from_auth(&auth);
         output.push_line(format!(
             "  {BOLD}Auth file target:{RESET} {CYAN}{}{RESET}  ({})",
             email, plan
         ))?;
         output.push_line(format!(
             "  {BOLD}Account ID:{RESET}       {}",
-            extract_account_id_from_auth(&auth)
+            account_id
         ))?;
         output.push_line(format!(
             "  {BOLD}Last refresh:{RESET}     {}",
             auth.last_refresh
         ))?;
 
-        if let Some(index) = pool
-            .accounts
-            .iter()
-            .position(|entry| entry.account_id == extract_account_id_from_auth(&auth))
-        {
+        live_pool_index = find_pool_account_index_by_identity(&pool, &account_id, &email);
+
+        if let Some(index) = live_pool_index {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, true)?;
             dirty |= inspection.updated;
@@ -713,7 +713,34 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         pool.accounts.len()
     ))?;
 
-    if let Some(active) = pool.accounts.get(pool.active_index) {
+    if let Some(index) = live_pool_index {
+        if let Some(active) = pool.accounts.get(index) {
+            output.push_line(format!(
+                "  {BOLD}Active slot:{RESET}      {} [{}/{}]",
+                active.label,
+                index + 1,
+                pool.accounts.len()
+            ))?;
+            if let Some(alias) = &active.alias {
+                output.push_line(format!("  {BOLD}Active alias:{RESET}     {}", alias))?;
+            }
+        }
+    } else if paths.codex_auth_file.exists() {
+        output.push_line(format!(
+            "  {BOLD}Active slot:{RESET}      {YELLOW}not in pool{RESET}"
+        ))?;
+        if let Some(active) = pool.accounts.get(pool.active_index) {
+            output.push_line(format!(
+                "  {BOLD}Pool pointer:{RESET}     {} [{}/{}]",
+                active.label,
+                pool.active_index + 1,
+                pool.accounts.len()
+            ))?;
+            if let Some(alias) = &active.alias {
+                output.push_line(format!("  {BOLD}Pointer alias:{RESET}    {}", alias))?;
+            }
+        }
+    } else if let Some(active) = pool.accounts.get(pool.active_index) {
         output.push_line(format!(
             "  {BOLD}Active slot:{RESET}      {} [{}/{}]",
             active.label,
@@ -938,10 +965,10 @@ pub(crate) fn sync_pool_active_account_from_codex(
     }
     let current_auth = load_codex_auth(auth_path)?;
     let current_account_id = extract_account_id_from_auth(&current_auth);
-    let Some(current_index) = pool.accounts.iter().position(|entry| {
-        entry.account_id == current_account_id
-            || entry.auth.tokens.account_id == current_auth.tokens.account_id
-    }) else {
+    let current_email = extract_email_from_auth(&current_auth);
+    let Some(current_index) =
+        find_pool_account_index_by_identity(pool, &current_account_id, &current_email)
+    else {
         return Ok(false);
     };
 
@@ -951,6 +978,27 @@ pub(crate) fn sync_pool_active_account_from_codex(
         changed = true;
     }
     Ok(apply_auth_to_account(&mut pool.accounts[current_index], current_auth) || changed)
+}
+
+fn find_pool_account_index_by_identity(
+    pool: &Pool,
+    account_id: &str,
+    email: &str,
+) -> Option<usize> {
+    if let Some(index) = pool.accounts.iter().position(|entry| {
+        entry.account_id == account_id || entry.auth.tokens.account_id == account_id
+    }) {
+        return Some(index);
+    }
+
+    let normalized_email = email.trim().to_lowercase();
+    if normalized_email.is_empty() || normalized_email == "unknown" {
+        return None;
+    }
+
+    pool.accounts
+        .iter()
+        .position(|entry| entry.email.trim().eq_ignore_ascii_case(&normalized_email))
 }
 
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
@@ -1633,6 +1681,44 @@ mod tests {
         assert_eq!(
             build_reusable_account_probe_order(1, 4, ReusableAccountProbeMode::OthersOnly),
             vec![2, 3, 0]
+        );
+    }
+
+    #[test]
+    fn pool_identity_lookup_prefers_account_id_match() {
+        let mut first = stored_entry(Some(true), None);
+        first.email = "dev.26@astronlab.com".to_string();
+        first.account_id = "acct-26".to_string();
+        first.auth.tokens.account_id = "acct-26".to_string();
+        let mut second = stored_entry(Some(true), None);
+        second.email = "dev.27@astronlab.com".to_string();
+        second.account_id = "acct-27".to_string();
+        second.auth.tokens.account_id = "acct-27".to_string();
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![first, second],
+        };
+
+        assert_eq!(
+            find_pool_account_index_by_identity(&pool, "acct-27", "dev.26@astronlab.com"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pool_identity_lookup_falls_back_to_email_match() {
+        let mut first = stored_entry(Some(true), None);
+        first.email = "dev.26@astronlab.com".to_string();
+        first.account_id = "acct-26".to_string();
+        first.auth.tokens.account_id = "acct-26".to_string();
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![first],
+        };
+
+        assert_eq!(
+            find_pool_account_index_by_identity(&pool, "missing", "dev.26@astronlab.com"),
+            Some(0)
         );
     }
 }
