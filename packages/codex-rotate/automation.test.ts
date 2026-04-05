@@ -588,6 +588,15 @@ describe("codex login retry policy", () => {
       true,
     );
   });
+
+  test("always recycles the codex auth session after a state mismatch", () => {
+    expect(shouldResetCodexLoginSessionForRetry("state_mismatch", 1)).toBe(
+      true,
+    );
+    expect(shouldResetCodexLoginSessionForRetry("state_mismatch", 2)).toBe(
+      true,
+    );
+  });
 });
 
 describe("legacy rotate-home cleanup", () => {

@@ -84,6 +84,11 @@ export const CODEX_ROTATE_ACCOUNT_FLOW_FILE = resolve(
       "codex-rotate-account-flow.yaml",
     ),
 );
+
+const CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE: "minimal" | "full" =
+  process.env.CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE === "full"
+    ? "full"
+    : "minimal";
 export const CODEX_ROTATE_OPENAI_TEMP_RUNTIME_KEY = "openai-account-runtime";
 const FAST_BROWSER_WORKFLOWS_ROOT = resolve(
   REPO_ROOT,
@@ -1841,7 +1846,10 @@ export function shouldResetCodexLoginSessionForRetry(
   retryReason: string | null,
   attempt: number,
 ): boolean {
-  return retryReason === "retryable_timeout" && attempt >= 2;
+  return (
+    retryReason === "state_mismatch" ||
+    (retryReason === "retryable_timeout" && attempt >= 2)
+  );
 }
 
 function parseFastBrowserProgressEventLine(
@@ -2454,7 +2462,8 @@ async function runCodexBrowserLoginWorkflow(
     {
       workflowRunStamp,
       retainTemporaryProfilesOnSuccess: Boolean(workflowRunStamp),
-      artifactMode: options?.artifactMode ?? "minimal",
+      artifactMode:
+        options?.artifactMode ?? CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE,
     },
   );
 }
@@ -2560,6 +2569,24 @@ export async function completeCodexLoginViaWorkflow(
             typeof flow.error_message === "string" && flow.error_message.trim()
               ? flow.error_message.trim()
               : null;
+          const consentError =
+            typeof flow.consent_error === "string" && flow.consent_error.trim()
+              ? flow.consent_error.trim()
+              : null;
+          const stateMismatch =
+            consentError === "state_mismatch" ||
+            (callbackComplete &&
+              flow.codex_login_exit_ok === false &&
+              /state mismatch/i.test(
+                [
+                  flow.headline,
+                  flow.codex_login_stderr_tail,
+                  flow.codex_login_stdout_tail,
+                  errorMessage,
+                ]
+                  .filter((value): value is string => typeof value === "string")
+                  .join("\n"),
+              ));
           const sawOauthConsent = flow.saw_oauth_consent === true;
           const existingAccountPrompt = flow.existing_account_prompt === true;
 
@@ -2615,6 +2642,27 @@ export async function completeCodexLoginViaWorkflow(
             throw new Error(
               errorMessage ??
                 `OpenAI could not complete the Codex login for ${email}.`,
+            );
+          }
+          if (stateMismatch) {
+            restoreState?.();
+            if (attempt < maxAttempts) {
+              const delayMs = getCodexLoginRetryDelayMs(
+                "state_mismatch",
+                attempt,
+                retryDelaysMs,
+              );
+              codexSession = null;
+              note?.(
+                `OpenAI returned a state mismatch during the Codex callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}. ` +
+                  `Starting a fresh Codex auth session and retrying in ${Math.round(delayMs / 1000)}s.`,
+              );
+              await sleep(delayMs);
+              break;
+            }
+            throw new Error(
+              errorMessage ??
+                `OpenAI returned a state mismatch during the Codex callback for ${email}${currentUrl ? ` (${currentUrl})` : ""}.`,
             );
           }
           if (!callbackComplete && !success) {

@@ -219,6 +219,13 @@ struct BridgeEnsureSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BridgeFindSecretPayload<'a> {
+    profile_name: &'a str,
+    email: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
@@ -642,18 +649,27 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         }
         return Ok(result);
     }
+    let account_login_locator = build_openai_account_login_locator(&created_email);
     if !reusing_pending {
-        let generated_password = generate_password(18);
-        let _: CodexRotateSecretRef = run_automation_bridge(
-            "ensure-account-secret-ref",
-            BridgeEnsureSecretPayload {
+        let existing_secret_ref: Option<CodexRotateSecretRef> = run_automation_bridge(
+            "find-account-secret-ref",
+            BridgeFindSecretPayload {
                 profile_name: &profile_name,
                 email: &created_email,
-                password: &generated_password,
             },
         )?;
+        if existing_secret_ref.is_none() {
+            let generated_password = generate_password(18);
+            let _: CodexRotateSecretRef = run_automation_bridge(
+                "ensure-account-secret-ref",
+                BridgeEnsureSecretPayload {
+                    profile_name: &profile_name,
+                    email: &created_email,
+                    password: &generated_password,
+                },
+            )?;
+        }
     }
-    let account_login_locator = build_openai_account_login_locator(&created_email);
     let pending = PendingCredential {
         stored: StoredCredential {
             email: created_email.clone(),
