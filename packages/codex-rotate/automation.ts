@@ -110,7 +110,7 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
-const DEFAULT_OPENAI_FULL_NAME = "M Omar Faruque";
+const DEFAULT_OPENAI_FULL_NAME = "Dev Astronlab";
 const DEFAULT_OPENAI_BIRTH_MONTH = 1;
 const DEFAULT_OPENAI_BIRTH_DAY = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR = 1990;

@@ -37,7 +37,7 @@ input:
           type: object
           format: secret-locator
         full_name:
-          default: "M Omar Faruque"
+          default: "Dev Astronlab"
         birth_month:
           default: 1
         birth_day:

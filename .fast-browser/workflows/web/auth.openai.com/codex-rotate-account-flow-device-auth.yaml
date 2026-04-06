@@ -42,7 +42,7 @@ input:
           type: object
           format: secret-locator
         full_name:
-          default: "M Omar Faruque"
+          default: "Dev Astronlab"
         birth_month:
           default: 1
         birth_day:
@@ -721,7 +721,7 @@ do:
           mode: "device_auth_continue"
           auth_url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
           email: "${inputs.email}"
-          full_name: "M Omar Faruque"
+          full_name: "Dev Astronlab"
           birth_month: 1
           birth_day: 24
           birth_year: 1990

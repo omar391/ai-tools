@@ -39,7 +39,7 @@ input:
           type: object
           format: secret-locator
         full_name:
-          default: "M Omar Faruque"
+          default: "Dev Astronlab"
         birth_month:
           default: 1
         birth_day:
@@ -673,7 +673,7 @@ use:
       with:
         body:
           script: |
-            const fullName = String(args.full_name || "M Omar Faruque").trim();
+            const fullName = String(args.full_name || "Dev Astronlab").trim();
             const month = String(args.birth_month || "1").trim();
             const day = String(args.birth_day || "24").trim();
             const year = String(args.birth_year || "1990").trim();
