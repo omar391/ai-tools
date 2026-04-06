@@ -1,8 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::pool::{other_usable_account_exists, rotate_next_internal, NextResult};
@@ -20,12 +21,15 @@ use crate::logs::{
     read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
 };
 use crate::paths::resolve_paths;
+use crate::thread_recovery::{
+    read_latest_quota_exhaustion_log_id, run_thread_recovery_iteration, RecoveryIterationOptions,
+};
 
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 10;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct WatchState {
     pub last_signal_id: Option<i64>,
     pub last_checked_at: Option<String>,
@@ -33,6 +37,8 @@ pub struct WatchState {
     pub last_rotation_at: Option<String>,
     pub last_rotation_reason: Option<String>,
     pub last_rotated_email: Option<String>,
+    pub last_thread_recovery_log_id: Option<i64>,
+    pub thread_recovery_pending: bool,
     pub quota: Option<CachedQuotaState>,
 }
 
@@ -99,15 +105,7 @@ pub fn write_watch_state(state: &WatchState) -> Result<()> {
         .with_context(|| format!("Failed to create {}.", paths.rotate_app_home.display()))?;
     let path = paths.rotate_app_home.join("watch-state.json");
     let raw = serde_json::to_string_pretty(state)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("Failed to write {}.", path.display()))?;
-    file.write_all(raw.as_bytes())?;
-    Ok(())
+    write_file_atomically(&path, &raw)
 }
 
 pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterationResult> {
@@ -161,30 +159,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     );
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
-        let mut refreshed_current = false;
-        match decision.rotation_command {
-            Some(RotationCommand::Next) => {
-                let next_result = rotate_next_internal()?;
-                let summary = match next_result {
-                    NextResult::Rotated { summary, .. }
-                    | NextResult::Stayed { summary, .. }
-                    | NextResult::Created { summary, .. } => summary,
-                };
-                rotation = Some(summary);
-            }
-            Some(RotationCommand::Create) => {
-                cmd_create(CreateCommandOptions {
-                    force: true,
-                    ignore_current: true,
-                    restore_previous_auth_after_create: true,
-                    source: CreateCommandSource::Manual,
-                    ..CreateCommandOptions::default()
-                })?;
-                refreshed_current = true;
-            }
-            None => {}
-        }
-        if rotation.is_some() || refreshed_current {
+        rotation = execute_watch_rotation(decision.rotation_command)?;
+        if rotation.is_some() {
             live = Some(switch_live_account_to_current_auth(
                 Some(port),
                 false,
@@ -202,7 +178,19 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         rotated = rotation.is_some();
     }
 
-    let next_state = WatchState {
+    let usage_limit_signal_seen = decision
+        .signals
+        .iter()
+        .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
+    let mut thread_recovery_log_id = previous_state.last_thread_recovery_log_id;
+    if thread_recovery_log_id.is_none()
+        && !previous_state.thread_recovery_pending
+        && !usage_limit_signal_seen
+    {
+        thread_recovery_log_id = read_latest_quota_exhaustion_log_id()?;
+    }
+
+    let mut next_state = WatchState {
         last_signal_id: decision.last_signal_id,
         last_checked_at: Some(now_iso()),
         last_live_email: live
@@ -230,8 +218,35 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         } else {
             previous_state.last_rotated_email.clone()
         },
+        last_thread_recovery_log_id: thread_recovery_log_id,
+        thread_recovery_pending: previous_state.thread_recovery_pending,
         quota: quota_cache,
     };
+    if should_run_thread_recovery(&previous_state, usage_limit_signal_seen, rotated) {
+        match run_thread_recovery_iteration(RecoveryIterationOptions {
+            port: Some(port),
+            current_live_email: live
+                .as_ref()
+                .map(|value| value.email.clone())
+                .or_else(|| next_state.last_live_email.as_ref().map(ToOwned::to_owned)),
+            current_quota_usable: next_state.quota.as_ref().map(|quota| quota.usable),
+            current_primary_quota_left_percent: next_state
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.primary_quota_left_percent),
+            rotated,
+            last_log_id: next_state.last_thread_recovery_log_id,
+            pending: next_state.thread_recovery_pending,
+        }) {
+            Ok(recovery) => {
+                next_state.last_thread_recovery_log_id = recovery.last_log_id;
+                next_state.thread_recovery_pending = recovery.pending;
+            }
+            Err(error) => {
+                eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
+            }
+        }
+    }
     write_watch_state_if_needed(&previous_state, &next_state)?;
 
     Ok(WatchIterationResult {
@@ -241,6 +256,49 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         rotation,
         live,
     })
+}
+
+fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<AuthSummary>> {
+    match command {
+        Some(RotationCommand::Next) => {
+            let next_result = rotate_next_internal()?;
+            Ok(Some(match next_result {
+                NextResult::Rotated { summary, .. }
+                | NextResult::Stayed { summary, .. }
+                | NextResult::Created { summary, .. } => summary,
+            }))
+        }
+        Some(RotationCommand::Create) => {
+            let create_attempt = || {
+                cmd_create(CreateCommandOptions {
+                    force: true,
+                    ignore_current: true,
+                    require_usable_quota: true,
+                    restore_previous_auth_after_create: false,
+                    source: CreateCommandSource::Next,
+                    ..CreateCommandOptions::default()
+                })
+            };
+            match create_attempt() {
+                Ok(_) => {}
+                Err(error) if is_retryable_watch_create_error(&error) => {
+                    create_attempt()?;
+                }
+                Err(error) => return Err(error),
+            }
+
+            let paths = resolve_paths()?;
+            let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
+            Ok(Some(summarize_codex_auth(&refreshed_auth)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn is_retryable_watch_create_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Daemon closed the socket before sending a response")
+        || (message.contains("fast-browser workflow ") && message.contains(" exited with status 1"))
 }
 
 pub fn refresh_quota_cache(
@@ -456,6 +514,69 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn should_run_thread_recovery(
+    previous: &WatchState,
+    usage_limit_signal_seen: bool,
+    rotated: bool,
+) -> bool {
+    usage_limit_signal_seen || rotated || previous.thread_recovery_pending
+}
+
+fn write_file_atomically(path: &Path, raw: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to resolve parent directory for {}.", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state.json");
+
+    for attempt in 0..8 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{}-{attempt}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(mut file) => {
+                let write_result = (|| -> Result<()> {
+                    file.write_all(raw.as_bytes())?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(error)
+                        .with_context(|| format!("Failed to write {}.", temp_path.display()));
+                }
+                fs::rename(&temp_path, path).with_context(|| {
+                    format!(
+                        "Failed to atomically replace {} with {}.",
+                        path.display(),
+                        temp_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to create {}.", temp_path.display()));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Failed to allocate a temporary watch state file for {}.",
+        path.display()
+    ))
+}
+
 fn write_watch_state_if_needed(previous: &WatchState, next: &WatchState) -> Result<()> {
     if should_persist_watch_state(previous, next) {
         write_watch_state(next)?;
@@ -477,6 +598,7 @@ fn should_persist_watch_state(previous: &WatchState, next: &WatchState) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn plan_rotation_uses_create_for_low_quota() {
@@ -516,6 +638,20 @@ mod tests {
         let plan = plan_rotation(Some(&assessment), &[], true);
         assert!(!plan.0);
         assert_eq!(plan.2, None);
+    }
+
+    #[test]
+    fn retryable_watch_create_error_matches_fast_browser_exit() {
+        let error = anyhow!(
+            "fast-browser workflow workspace.web.auth-openai-com.codex-rotate-account-flow-main exited with status 1."
+        );
+        assert!(is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn retryable_watch_create_error_ignores_non_transient_failures() {
+        let error = anyhow!("quota inspection unavailable");
+        assert!(!is_retryable_watch_create_error(&error));
     }
 
     #[test]
@@ -597,5 +733,34 @@ mod tests {
             ..previous.clone()
         };
         assert!(should_persist_watch_state(&previous, &next));
+    }
+
+    #[test]
+    fn watch_state_write_keeps_thread_recovery_progress() {
+        let previous = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+            last_thread_recovery_log_id: Some(10),
+            thread_recovery_pending: true,
+            ..WatchState::default()
+        };
+        let next = WatchState {
+            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+            last_thread_recovery_log_id: Some(11),
+            thread_recovery_pending: false,
+            ..previous.clone()
+        };
+        assert!(should_persist_watch_state(&previous, &next));
+    }
+
+    #[test]
+    fn thread_recovery_runs_for_pending_state() {
+        assert!(should_run_thread_recovery(
+            &WatchState {
+                thread_recovery_pending: true,
+                ..WatchState::default()
+            },
+            false,
+            false
+        ));
     }
 }
