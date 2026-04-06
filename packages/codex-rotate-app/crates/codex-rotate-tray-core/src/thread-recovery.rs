@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -17,6 +19,8 @@ const CONTINUE_INPUT: &str = "continue";
 const MCP_RESPONSE_TIMEOUT_MS: u64 = 8_000;
 const HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT: u8 = 10;
 const OTEL_METADATA_LOOKUP_WINDOW: i64 = 2_000;
+const THREAD_RESUME_READY_TIMEOUT_MS: u64 = 5_000;
+const THREAD_RESUME_READY_POLL_MS: u64 = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -73,13 +77,6 @@ struct ThreadSummary {
 struct ThreadStatus {
     #[serde(rename = "type")]
     kind: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ThreadListing {
-    id: String,
-    cwd: Option<String>,
-    status_kind: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,19 +183,16 @@ fn resolve_quota_exhaustion_event(
         return Ok(RecoveryResolution::Dropped);
     }
 
-    let thread_listing = match read_thread_listing(port, &event.thread_id) {
-        Ok(listing) => listing,
+    let thread_summary = match read_thread_summary(port, &event.thread_id) {
+        Ok(summary) => summary,
         Err(error) => {
-            eprintln!(
-                "codex-rotate: failed to list thread {} for recovery: {error:#}",
-                event.thread_id
-            );
+            eprintln!("codex-rotate: failed to read thread {}: {error:#}", event.thread_id);
             None
         }
     };
-    let thread_status_kind = thread_listing
+    let thread_status_kind = thread_summary
         .as_ref()
-        .and_then(|thread| thread.status_kind.as_deref());
+        .map(|thread| thread.status.kind.as_str());
 
     if matches!(thread_status_kind, Some("active")) {
         return Ok(RecoveryResolution::Blocked);
@@ -212,11 +206,10 @@ fn resolve_quota_exhaustion_event(
         return Ok(RecoveryResolution::Blocked);
     }
 
-    let _ = send_thread_resume(port, &event.thread_id);
-    let cwd = match read_thread_summary(port, &event.thread_id) {
-        Ok(Some(thread)) => thread.cwd,
-        Ok(None) => thread_listing.and_then(|thread| thread.cwd),
-        Err(_) => thread_listing.and_then(|thread| thread.cwd),
+    let cwd = match thread_summary {
+        Some(thread) if thread_ready_for_continue(&thread.status.kind) => thread.cwd,
+        Some(thread) => wait_for_thread_ready(port, &event.thread_id, thread.cwd)?,
+        None => wait_for_thread_ready(port, &event.thread_id, None)?,
     };
 
     match send_continue_turn(port, &event.thread_id, cwd) {
@@ -467,55 +460,49 @@ fn read_thread_summary(port: u16, thread_id: &str) -> Result<Option<ThreadSummar
     Ok(Some(envelope.thread))
 }
 
-fn read_thread_listing(port: u16, thread_id: &str) -> Result<Option<ThreadListing>> {
-    let response: Value = send_codex_app_request(port, "thread/list", json!({}))?;
-    let mut listing = None;
-    collect_thread_listing(&response, thread_id, &mut listing);
-    Ok(listing)
+fn thread_ready_for_continue(status_kind: &str) -> bool {
+    matches!(status_kind, "active" | "idle")
 }
 
-fn collect_thread_listing(value: &Value, thread_id: &str, listing: &mut Option<ThreadListing>) {
-    if listing.is_some() {
-        return;
-    }
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_thread_listing(item, thread_id, listing);
-                if listing.is_some() {
-                    return;
+fn wait_for_thread_ready(
+    port: u16,
+    thread_id: &str,
+    initial_cwd: Option<String>,
+) -> Result<Option<String>> {
+    send_thread_resume(port, thread_id)
+        .with_context(|| format!("Failed to resume thread {thread_id} before continue."))?;
+
+    let deadline = Instant::now() + Duration::from_millis(THREAD_RESUME_READY_TIMEOUT_MS);
+    let mut cwd = initial_cwd;
+    loop {
+        match read_thread_summary(port, thread_id) {
+            Ok(Some(thread)) => {
+                if thread.cwd.is_some() {
+                    cwd = thread.cwd.clone();
+                }
+                if thread_ready_for_continue(&thread.status.kind) {
+                    return Ok(thread.cwd.or(cwd));
                 }
             }
-        }
-        Value::Object(map) => {
-            let matches_id = map.get("id").and_then(Value::as_str) == Some(thread_id);
-            if matches_id {
-                let status_kind = map
-                    .get("status")
-                    .and_then(Value::as_object)
-                    .and_then(|status| status.get("type"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                let cwd = map
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                *listing = Some(ThreadListing {
-                    id: thread_id.to_string(),
-                    cwd,
-                    status_kind,
-                });
-                return;
-            }
-            for child in map.values() {
-                collect_thread_listing(child, thread_id, listing);
-                if listing.is_some() {
-                    return;
-                }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "codex-rotate: failed to read resumed thread {} while waiting: {error:#}",
+                    thread_id
+                );
             }
         }
-        _ => {}
+
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(THREAD_RESUME_READY_POLL_MS));
     }
+
+    Err(anyhow!(
+        "Thread {thread_id} did not become ready after resume within {}ms.",
+        THREAD_RESUME_READY_TIMEOUT_MS
+    ))
 }
 
 fn send_thread_resume(port: u16, thread_id: &str) -> Result<()> {
