@@ -127,13 +127,13 @@ describe("templated email family helpers", () => {
     ).toBe(24);
   });
 
-  test("only accepts the default dev template as an implicit create hint", () => {
+  test("accepts templated families and rejects Gmail for implicit create hints", () => {
     expect(shouldUseDefaultCreateFamilyHint("dev.{n}@astronlab.com")).toBe(
       true,
     );
     expect(
       shouldUseDefaultCreateFamilyHint("bench.device.{n}@astronlab.com"),
-    ).toBe(false);
+    ).toBe(true);
     expect(shouldUseDefaultCreateFamilyHint("dev.user@gmail.com")).toBe(false);
   });
 });
@@ -734,6 +734,9 @@ describe("create resolution helpers", () => {
     expect(shouldUseDefaultCreateFamilyHint("dev.{N}@astronlab.com")).toBe(
       true,
     );
+    expect(
+      shouldUseDefaultCreateFamilyHint("bench.device.{N}@astronlab.com"),
+    ).toBe(true);
   });
 
   test("accepts an explicit templated base email family", () => {
@@ -1188,6 +1191,41 @@ describe("pending credential reuse", () => {
       "1.dev.astronlab@gmail.com",
     );
   });
+
+  test("prefers the higher-frontier template pending family", () => {
+    const store = normalizeCredentialStore({
+      pending: {
+        "bench.device.300@astronlab.com": {
+          email: "bench.device.300@astronlab.com",
+          account_secret_ref: makeSecretRef("bw-bench-device-3"),
+          profile_name: "dev-1",
+          base_email: "bench.device.{n}@astronlab.com",
+          suffix: 300,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T17:00:00.000Z",
+          updated_at: "2026-04-06T17:00:00.000Z",
+          started_at: "2026-04-06T17:00:00.000Z",
+        },
+        "dev.30@astronlab.com": {
+          email: "dev.30@astronlab.com",
+          account_secret_ref: makeSecretRef("bw-dev-30"),
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          suffix: 30,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T16:00:00.000Z",
+          updated_at: "2026-04-06T16:00:00.000Z",
+          started_at: "2026-04-06T16:00:00.000Z",
+        },
+      },
+    });
+
+    expect(selectPendingBaseEmailHintForProfile(store, "dev-1")).toBe(
+      "dev.{n}@astronlab.com",
+    );
+  });
 });
 
 describe("stored base-email hints", () => {
@@ -1234,6 +1272,34 @@ describe("stored base-email hints", () => {
 
     expect(selectStoredBaseEmailHint(store, "dev-1")).toBe(
       "1.dev.astronlab@gmail.com",
+    );
+  });
+
+  test("prefers the higher-frontier template family over a newer lower-frontier one", () => {
+    const store = normalizeCredentialStore({
+      families: {
+        "dev-1::bench.device.{n}@astronlab.com": {
+          profile_name: "dev-1",
+          base_email: "bench.device.{n}@astronlab.com",
+          next_suffix: 300,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T17:00:00.000Z",
+          last_created_email: "bench.device.299@astronlab.com",
+        },
+        "dev-1::dev.{n}@astronlab.com": {
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          next_suffix: 30,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T16:00:00.000Z",
+          last_created_email: "dev.29@astronlab.com",
+        },
+      },
+      pending: {},
+    });
+
+    expect(selectStoredBaseEmailHint(store, "dev-1")).toBe(
+      "dev.{n}@astronlab.com",
     );
   });
 });

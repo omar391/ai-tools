@@ -1072,6 +1072,20 @@ export function selectPendingBaseEmailHintForProfile(
   }
 
   matches.sort((left, right) => {
+    const leftPriority = getCreateFamilyHintPriority(
+      left.base_email || left.email,
+      (left.suffix || 0) + 1,
+    );
+    const rightPriority = getCreateFamilyHintPriority(
+      right.base_email || right.email,
+      (right.suffix || 0) + 1,
+    );
+    if (leftPriority.familyRank !== rightPriority.familyRank) {
+      return rightPriority.familyRank - leftPriority.familyRank;
+    }
+    if (leftPriority.frontier !== rightPriority.frontier) {
+      return rightPriority.frontier - leftPriority.frontier;
+    }
     const leftStartedAt = parseSortableTimestamp(
       left.started_at || left.created_at || left.updated_at,
     );
@@ -1101,6 +1115,32 @@ export function selectPendingBaseEmailHintForProfile(
     return normalizeBaseEmailFamily(rawEmail);
   } catch {
     return null;
+  }
+}
+
+function getCreateFamilyHintPriority(
+  baseEmail: string | null | undefined,
+  frontier: number,
+): { familyRank: number; frontier: number } {
+  const normalizedFrontier = Math.max(1, Number(frontier) || 0);
+  if (!baseEmail) {
+    return { familyRank: 0, frontier: normalizedFrontier };
+  }
+  try {
+    const parsed = parseEmailFamily(baseEmail);
+    return {
+      familyRank:
+        parsed.mode === "template"
+          ? parsed.domainPart === "astronlab.com" &&
+            parsed.templatePrefix === "dev." &&
+            parsed.templateSuffix === ""
+            ? 2
+            : 1
+          : 0,
+      frontier: normalizedFrontier,
+    };
+  } catch {
+    return { familyRank: 0, frontier: normalizedFrontier };
   }
 }
 
@@ -1279,10 +1319,14 @@ export function selectStoredBaseEmailHint(
   store: CredentialStore,
   profileName: string,
 ): string | null {
-  const candidates = new Map<string, { count: number; updatedAt: number }>();
+  const candidates = new Map<
+    string,
+    { count: number; updatedAt: number; frontier: number }
+  >();
   const remember = (
     rawEmail: string | null | undefined,
     updatedAt: string | null | undefined,
+    frontier: number,
   ): void => {
     if (!rawEmail) return;
     let baseEmail: string;
@@ -1296,12 +1340,13 @@ export function selectStoredBaseEmailHint(
     candidates.set(baseEmail, {
       count: (existing?.count ?? 0) + 1,
       updatedAt: Math.max(existing?.updatedAt ?? 0, updatedAtValue),
+      frontier: Math.max(existing?.frontier ?? 1, Number(frontier) || 0, 1),
     });
   };
 
   for (const family of Object.values(store.families)) {
     if (family.profile_name === profileName) {
-      remember(family.base_email, family.updated_at);
+      remember(family.base_email, family.updated_at, family.next_suffix || 1);
     }
   }
   for (const pending of Object.values(store.pending)) {
@@ -1309,12 +1354,27 @@ export function selectStoredBaseEmailHint(
       remember(
         pending.base_email || pending.email,
         pending.updated_at || pending.started_at,
+        (pending.suffix || 0) + 1,
       );
     }
   }
 
   return (
     [...candidates.entries()].sort((left, right) => {
+      const leftPriority = getCreateFamilyHintPriority(
+        left[0],
+        left[1].frontier,
+      );
+      const rightPriority = getCreateFamilyHintPriority(
+        right[0],
+        right[1].frontier,
+      );
+      if (leftPriority.familyRank !== rightPriority.familyRank) {
+        return rightPriority.familyRank - leftPriority.familyRank;
+      }
+      if (leftPriority.frontier !== rightPriority.frontier) {
+        return rightPriority.frontier - leftPriority.frontier;
+      }
       if (left[1].count !== right[1].count) {
         return right[1].count - left[1].count;
       }
@@ -2419,10 +2479,7 @@ export function shouldUseDefaultCreateFamilyHint(
     return false;
   }
   try {
-    return (
-      normalizeBaseEmailFamily(baseEmail) ===
-      normalizeBaseEmailFamily("dev.{N}@astronlab.com")
-    );
+    return parseEmailFamily(baseEmail).mode === "template";
   } catch {
     return false;
   }

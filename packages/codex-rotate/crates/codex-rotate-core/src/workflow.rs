@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -1555,9 +1556,40 @@ fn resolve_create_base_email(
 
 fn should_use_default_create_family_hint(base_email: Option<&str>) -> bool {
     base_email
-        .and_then(|value| normalize_base_email_family(value).ok())
-        .map(|value| value == DEFAULT_CREATE_BASE_EMAIL)
+        .and_then(|value| parse_email_family(value).ok())
+        .map(|value| matches!(value.mode, EmailFamilyMode::Template { .. }))
         .unwrap_or(false)
+}
+
+fn create_family_hint_priority(base_email: &str, frontier_suffix: u32) -> (u8, u32) {
+    let family_rank = parse_email_family(base_email)
+        .ok()
+        .map(|value| match value.mode {
+            EmailFamilyMode::Template { prefix, suffix }
+                if value.domain_part == "astronlab.com"
+                    && prefix == "dev."
+                    && suffix.is_empty() =>
+            {
+                2
+            }
+            EmailFamilyMode::Template { .. } => 1,
+            EmailFamilyMode::GmailPlus => 0,
+        })
+        .unwrap_or(0);
+    (family_rank, frontier_suffix.max(1))
+}
+
+fn compare_create_family_hint_priority(
+    left_base_email: &str,
+    left_frontier_suffix: u32,
+    right_base_email: &str,
+    right_frontier_suffix: u32,
+) -> Ordering {
+    create_family_hint_priority(left_base_email, left_frontier_suffix)
+        .cmp(&create_family_hint_priority(
+            right_base_email,
+            right_frontier_suffix,
+        ))
 }
 
 fn make_credential_family_key(profile_name: &str, base_email: &str) -> Result<String> {
@@ -1791,19 +1823,27 @@ fn select_pending_base_email_hint_for_profile(
         .cloned()
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
-        parse_sortable_timestamp(
-            left.started_at
-                .as_deref()
-                .or(Some(left.stored.created_at.as_str()))
-                .or(Some(left.stored.updated_at.as_str())),
+        compare_create_family_hint_priority(
+            &right.stored.base_email,
+            right.stored.suffix.saturating_add(1),
+            &left.stored.base_email,
+            left.stored.suffix.saturating_add(1),
         )
-        .cmp(&parse_sortable_timestamp(
-            right
-                .started_at
-                .as_deref()
-                .or(Some(right.stored.created_at.as_str()))
-                .or(Some(right.stored.updated_at.as_str())),
-        ))
+        .then_with(|| {
+            parse_sortable_timestamp(
+                left.started_at
+                    .as_deref()
+                    .or(Some(left.stored.created_at.as_str()))
+                    .or(Some(left.stored.updated_at.as_str())),
+            )
+            .cmp(&parse_sortable_timestamp(
+                right
+                    .started_at
+                    .as_deref()
+                    .or(Some(right.stored.created_at.as_str()))
+                    .or(Some(right.stored.updated_at.as_str())),
+            ))
+        })
         .then_with(|| left.stored.suffix.cmp(&right.stored.suffix))
         .then_with(|| {
             parse_sortable_timestamp(Some(left.stored.updated_at.as_str())).cmp(
@@ -1819,8 +1859,8 @@ fn select_pending_base_email_hint_for_profile(
 }
 
 fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) -> Option<String> {
-    let mut candidates = HashMap::<String, (u32, i64)>::new();
-    let mut remember = |raw_email: Option<&str>, updated_at: Option<&str>| {
+    let mut candidates = HashMap::<String, (u32, i64, u32)>::new();
+    let mut remember = |raw_email: Option<&str>, updated_at: Option<&str>, frontier_suffix: u32| {
         let Some(raw_email) = raw_email else {
             return;
         };
@@ -1828,9 +1868,10 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
             return;
         };
         let updated_at_value = parse_sortable_timestamp(updated_at);
-        let entry = candidates.entry(base_email).or_insert((0, 0));
+        let entry = candidates.entry(base_email).or_insert((0, 0, 1));
         entry.0 += 1;
         entry.1 = entry.1.max(updated_at_value);
+        entry.2 = entry.2.max(frontier_suffix.max(1));
     };
 
     for family in store
@@ -1838,7 +1879,11 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
         .values()
         .filter(|entry| entry.profile_name == profile_name)
     {
-        remember(Some(&family.base_email), Some(&family.updated_at));
+        remember(
+            Some(&family.base_email),
+            Some(&family.updated_at),
+            family.next_suffix,
+        );
     }
     for pending in store
         .pending
@@ -1851,15 +1896,15 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
                 .started_at
                 .as_deref()
                 .or(Some(pending.stored.updated_at.as_str())),
+            pending.stored.suffix.saturating_add(1),
         );
     }
 
     candidates
         .into_iter()
         .max_by(|left, right| {
-            left.1
-                 .0
-                .cmp(&right.1 .0)
+            compare_create_family_hint_priority(&left.0, left.1 .2, &right.0, right.1 .2)
+                .then_with(|| left.1 .0.cmp(&right.1 .0))
                 .then_with(|| left.1 .1.cmp(&right.1 .1))
                 .then_with(|| right.0.cmp(&left.0))
         })
@@ -2156,16 +2201,96 @@ mod tests {
     }
 
     #[test]
-    fn implicit_create_family_hint_accepts_only_default_dev_template() {
+    fn implicit_create_family_hint_accepts_template_families_only() {
         assert!(should_use_default_create_family_hint(Some(
             "dev.{n}@astronlab.com"
         )));
-        assert!(!should_use_default_create_family_hint(Some(
+        assert!(should_use_default_create_family_hint(Some(
             "bench.device.{n}@astronlab.com"
         )));
         assert!(!should_use_default_create_family_hint(Some(
             "dev.user@gmail.com"
         )));
+    }
+
+    #[test]
+    fn stored_base_email_hint_prefers_higher_frontier_template_family() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::bench.device.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "bench.device.{n}@astronlab.com".to_string(),
+                next_suffix: 300,
+                created_at: "2026-04-06T00:00:00.000Z".to_string(),
+                updated_at: "2026-04-06T17:00:00.000Z".to_string(),
+                last_created_email: Some("bench.device.299@astronlab.com".to_string()),
+            },
+        );
+        store.families.insert(
+            "dev-1::dev.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.{n}@astronlab.com".to_string(),
+                next_suffix: 30,
+                created_at: "2026-04-06T00:00:00.000Z".to_string(),
+                updated_at: "2026-04-06T16:00:00.000Z".to_string(),
+                last_created_email: Some("dev.29@astronlab.com".to_string()),
+            },
+        );
+
+        assert_eq!(
+            select_stored_base_email_hint(&store, "dev-1").as_deref(),
+            Some("dev.{n}@astronlab.com")
+        );
+    }
+
+    #[test]
+    fn pending_base_email_hint_prefers_higher_frontier_template_family() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "bench.device.300@astronlab.com".to_string(),
+            PendingCredential {
+                stored: StoredCredential {
+                    email: "bench.device.300@astronlab.com".to_string(),
+                    profile_name: "dev-1".to_string(),
+                    base_email: "bench.device.{n}@astronlab.com".to_string(),
+                    suffix: 300,
+                    selector: None,
+                    alias: None,
+                    birth_month: None,
+                    birth_day: None,
+                    birth_year: None,
+                    created_at: "2026-04-06T17:00:00.000Z".to_string(),
+                    updated_at: "2026-04-06T17:00:00.000Z".to_string(),
+                },
+                started_at: Some("2026-04-06T17:00:00.000Z".to_string()),
+            },
+        );
+        store.pending.insert(
+            "dev.30@astronlab.com".to_string(),
+            PendingCredential {
+                stored: StoredCredential {
+                    email: "dev.30@astronlab.com".to_string(),
+                    profile_name: "dev-1".to_string(),
+                    base_email: "dev.{n}@astronlab.com".to_string(),
+                    suffix: 30,
+                    selector: None,
+                    alias: None,
+                    birth_month: None,
+                    birth_day: None,
+                    birth_year: None,
+                    created_at: "2026-04-06T16:00:00.000Z".to_string(),
+                    updated_at: "2026-04-06T16:00:00.000Z".to_string(),
+                },
+                started_at: Some("2026-04-06T16:00:00.000Z".to_string()),
+            },
+        );
+
+        assert_eq!(
+            select_pending_base_email_hint_for_profile(&store, "dev-1", None).as_deref(),
+            Some("dev.{n}@astronlab.com")
+        );
     }
 
     #[test]
