@@ -781,8 +781,7 @@ mod tests {
             plan_text: "Plan: free".to_string(),
             quota_text: "Quota: 5h 80% left".to_string(),
             status_text: "Status: watch healthy".to_string(),
-            rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com"
-                .to_string(),
+            rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com".to_string(),
             tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
             quota_percent: Some(80),
         }

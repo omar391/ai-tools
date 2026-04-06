@@ -2165,7 +2165,10 @@ mod tests {
             "dev.22@astronlab.com".to_string(),
             "dev.23@astronlab.com".to_string(),
         ];
-        assert_eq!(derive_family_frontier_suffix("dev.{n}@astronlab.com", &known), 24);
+        assert_eq!(
+            derive_family_frontier_suffix("dev.{n}@astronlab.com", &known),
+            24
+        );
     }
 
     #[test]
@@ -2233,7 +2236,10 @@ mod tests {
         ));
         let family = store.families.get("dev-1::dev.{n}@astronlab.com").unwrap();
         assert_eq!(family.next_suffix, 25);
-        assert_eq!(family.last_created_email.as_deref(), Some("dev.24@astronlab.com"));
+        assert_eq!(
+            family.last_created_email.as_deref(),
+            Some("dev.24@astronlab.com")
+        );
         assert!(store.pending.is_empty());
     }
 }

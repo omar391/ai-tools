@@ -26,7 +26,10 @@ pub(crate) fn load_rotate_state_json() -> Result<Value> {
     }
 }
 
-pub(crate) fn write_rotate_state_json(state: &Value, remove_legacy_credentials: bool) -> Result<()> {
+pub(crate) fn write_rotate_state_json(
+    state: &Value,
+    remove_legacy_credentials: bool,
+) -> Result<()> {
     let paths = resolve_paths()?;
     if let Some(parent) = paths.pool_file.parent() {
         fs::create_dir_all(parent)

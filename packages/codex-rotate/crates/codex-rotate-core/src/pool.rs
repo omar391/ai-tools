@@ -594,10 +594,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
             "  {BOLD}Auth file target:{RESET} {CYAN}{}{RESET}  ({})",
             email, plan
         ))?;
-        output.push_line(format!(
-            "  {BOLD}Account ID:{RESET}       {}",
-            account_id
-        ))?;
+        output.push_line(format!("  {BOLD}Account ID:{RESET}       {}", account_id))?;
         output.push_line(format!(
             "  {BOLD}Last refresh:{RESET}     {}",
             auth.last_refresh
@@ -837,7 +834,10 @@ pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
         "active_index".to_string(),
         Value::Number(pool.active_index.into()),
     );
-    object.insert("accounts".to_string(), serde_json::to_value(&pool.accounts)?);
+    object.insert(
+        "accounts".to_string(),
+        serde_json::to_value(&pool.accounts)?,
+    );
     write_rotate_state_json(&state, false)
 }
 
