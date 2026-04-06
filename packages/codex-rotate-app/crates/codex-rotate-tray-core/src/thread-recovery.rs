@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -19,8 +19,7 @@ const CONTINUE_INPUT: &str = "continue";
 const MCP_RESPONSE_TIMEOUT_MS: u64 = 8_000;
 const HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT: u8 = 10;
 const OTEL_METADATA_LOOKUP_WINDOW: i64 = 2_000;
-const THREAD_RESUME_READY_TIMEOUT_MS: u64 = 5_000;
-const THREAD_RESUME_READY_POLL_MS: u64 = 200;
+const THREAD_RESUME_SETTLE_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -208,8 +207,26 @@ fn resolve_quota_exhaustion_event(
 
     let cwd = match thread_summary {
         Some(thread) if thread_ready_for_continue(&thread.status.kind) => thread.cwd,
-        Some(thread) => wait_for_thread_ready(port, &event.thread_id, thread.cwd)?,
-        None => wait_for_thread_ready(port, &event.thread_id, None)?,
+        Some(thread) => match prepare_thread_for_continue(port, &event.thread_id, thread.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                eprintln!(
+                    "codex-rotate: thread {} could not be resumed for continue: {error:#}",
+                    event.thread_id
+                );
+                return Ok(RecoveryResolution::Blocked);
+            }
+        },
+        None => match prepare_thread_for_continue(port, &event.thread_id, None) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                eprintln!(
+                    "codex-rotate: thread {} could not be resumed for continue: {error:#}",
+                    event.thread_id
+                );
+                return Ok(RecoveryResolution::Blocked);
+            }
+        },
     };
 
     match send_continue_turn(port, &event.thread_id, cwd) {
@@ -464,45 +481,28 @@ fn thread_ready_for_continue(status_kind: &str) -> bool {
     matches!(status_kind, "active" | "idle")
 }
 
-fn wait_for_thread_ready(
+fn prepare_thread_for_continue(
     port: u16,
     thread_id: &str,
     initial_cwd: Option<String>,
 ) -> Result<Option<String>> {
     send_thread_resume(port, thread_id)
         .with_context(|| format!("Failed to resume thread {thread_id} before continue."))?;
+    // Codex can accept a new turn shortly after resume even while `thread/read`
+    // still reports `systemError`, so do not gate on a status transition here.
+    sleep(Duration::from_millis(THREAD_RESUME_SETTLE_MS));
 
-    let deadline = Instant::now() + Duration::from_millis(THREAD_RESUME_READY_TIMEOUT_MS);
-    let mut cwd = initial_cwd;
-    loop {
-        match read_thread_summary(port, thread_id) {
-            Ok(Some(thread)) => {
-                if thread.cwd.is_some() {
-                    cwd = thread.cwd.clone();
-                }
-                if thread_ready_for_continue(&thread.status.kind) {
-                    return Ok(thread.cwd.or(cwd));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!(
-                    "codex-rotate: failed to read resumed thread {} while waiting: {error:#}",
-                    thread_id
-                );
-            }
+    match read_thread_summary(port, thread_id) {
+        Ok(Some(thread)) => Ok(thread.cwd.or(initial_cwd)),
+        Ok(None) => Ok(initial_cwd),
+        Err(error) => {
+            eprintln!(
+                "codex-rotate: failed to refresh thread {} after resume: {error:#}",
+                thread_id
+            );
+            Ok(initial_cwd)
         }
-
-        if Instant::now() >= deadline {
-            break;
-        }
-        sleep(Duration::from_millis(THREAD_RESUME_READY_POLL_MS));
     }
-
-    Err(anyhow!(
-        "Thread {thread_id} did not become ready after resume within {}ms.",
-        THREAD_RESUME_READY_TIMEOUT_MS
-    ))
 }
 
 fn send_thread_resume(port: u16, thread_id: &str) -> Result<()> {

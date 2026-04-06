@@ -246,6 +246,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             }
             Err(error) => {
                 eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
+                next_state.thread_recovery_pending = true;
             }
         }
     }
