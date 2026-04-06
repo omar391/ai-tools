@@ -6,7 +6,9 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
-use codex_rotate_core::pool::{other_usable_account_exists, rotate_next_internal, NextResult};
+use codex_rotate_core::pool::{
+    load_pool, other_usable_account_exists, rotate_next_internal, NextResult, Pool,
+};
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
@@ -269,6 +271,14 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
             }))
         }
         Some(RotationCommand::Create) => {
+            let paths = resolve_paths()?;
+            let previous_summary = if paths.codex_auth_file.exists() {
+                Some(summarize_codex_auth(&load_codex_auth(
+                    &paths.codex_auth_file,
+                )?))
+            } else {
+                None
+            };
             let create_attempt = || {
                 cmd_create(CreateCommandOptions {
                     force: true,
@@ -282,17 +292,76 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
             match create_attempt() {
                 Ok(_) => {}
                 Err(error) if is_retryable_watch_create_error(&error) => {
-                    create_attempt()?;
+                    if let Err(retry_error) = create_attempt() {
+                        if let Some(summary) =
+                            recover_completed_watch_create(previous_summary.as_ref())?
+                        {
+                            return Ok(Some(summary));
+                        }
+                        return Err(retry_error);
+                    }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(summary) =
+                        recover_completed_watch_create(previous_summary.as_ref())?
+                    {
+                        return Ok(Some(summary));
+                    }
+                    return Err(error);
+                }
             }
 
-            let paths = resolve_paths()?;
             let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
             Ok(Some(summarize_codex_auth(&refreshed_auth)))
         }
         None => Ok(None),
     }
+}
+
+fn recover_completed_watch_create(
+    previous_summary: Option<&AuthSummary>,
+) -> Result<Option<AuthSummary>> {
+    let paths = resolve_paths()?;
+    if !paths.codex_auth_file.exists() {
+        return Ok(None);
+    }
+    let current_auth = load_codex_auth(&paths.codex_auth_file)?;
+    let current_summary = summarize_codex_auth(&current_auth);
+    let pool = load_pool()?;
+    if created_account_already_materialized(previous_summary, &current_summary, &pool) {
+        return Ok(Some(current_summary));
+    }
+    Ok(None)
+}
+
+fn created_account_already_materialized(
+    previous_summary: Option<&AuthSummary>,
+    current_summary: &AuthSummary,
+    pool: &Pool,
+) -> bool {
+    if previous_summary
+        .map(|previous| same_auth_summary(previous, current_summary))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let current_account_id = current_summary.account_id.trim();
+    let current_email = normalize_email_for_match(&current_summary.email);
+    pool.accounts.iter().any(|entry| {
+        entry.account_id.trim() == current_account_id
+            || entry.auth.tokens.account_id.trim() == current_account_id
+            || normalize_email_for_match(&entry.email) == current_email
+    })
+}
+
+fn same_auth_summary(left: &AuthSummary, right: &AuthSummary) -> bool {
+    left.account_id.trim() == right.account_id.trim()
+        || normalize_email_for_match(&left.email) == normalize_email_for_match(&right.email)
+}
+
+fn normalize_email_for_match(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
 }
 
 fn is_retryable_watch_create_error(error: &anyhow::Error) -> bool {
@@ -652,6 +721,69 @@ mod tests {
     fn retryable_watch_create_error_ignores_non_transient_failures() {
         let error = anyhow!("quota inspection unavailable");
         assert!(!is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn created_account_materialized_requires_a_new_auth_target() {
+        let previous = AuthSummary {
+            email: "dev.1@astronlab.com".to_string(),
+            account_id: "acct-1".to_string(),
+            plan_type: "free".to_string(),
+        };
+        let pool = Pool {
+            active_index: 0,
+            accounts: Vec::new(),
+        };
+        assert!(!created_account_already_materialized(
+            Some(&previous),
+            &previous,
+            &pool
+        ));
+    }
+
+    #[test]
+    fn created_account_materialized_accepts_new_auth_present_in_pool() {
+        let previous = AuthSummary {
+            email: "dev.1@astronlab.com".to_string(),
+            account_id: "acct-1".to_string(),
+            plan_type: "free".to_string(),
+        };
+        let current = AuthSummary {
+            email: "dev.2@astronlab.com".to_string(),
+            account_id: "acct-2".to_string(),
+            plan_type: "free".to_string(),
+        };
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![codex_rotate_core::pool::AccountEntry {
+                label: "dev.2@astronlab.com_free".to_string(),
+                alias: None,
+                email: "dev.2@astronlab.com".to_string(),
+                account_id: "acct-2".to_string(),
+                plan_type: "free".to_string(),
+                auth: codex_rotate_core::auth::CodexAuth {
+                    auth_mode: "chatgpt".to_string(),
+                    openai_api_key: None,
+                    tokens: codex_rotate_core::auth::AuthTokens {
+                        id_token: "id".to_string(),
+                        access_token: "access".to_string(),
+                        refresh_token: None,
+                        account_id: "acct-2".to_string(),
+                    },
+                    last_refresh: "2026-04-06T00:00:00.000Z".to_string(),
+                },
+                added_at: "2026-04-06T00:00:00.000Z".to_string(),
+                last_quota_usable: None,
+                last_quota_summary: None,
+                last_quota_blocker: None,
+                last_quota_checked_at: None,
+            }],
+        };
+        assert!(created_account_already_materialized(
+            Some(&previous),
+            &current,
+            &pool
+        ));
     }
 
     #[test]
