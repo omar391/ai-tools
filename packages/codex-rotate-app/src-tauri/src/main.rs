@@ -560,7 +560,7 @@ fn next_watch_interval(status: &SharedStatus) -> Duration {
     let snapshot = status.inner.lock().expect("status mutex");
     let seconds = match snapshot.current_quota_percent {
         Some(percent) if percent <= 2 => CRITICAL_QUOTA_INTERVAL_SECONDS,
-        Some(percent) if percent <= 10 => LOW_QUOTA_INTERVAL_SECONDS,
+        Some(percent) if percent <= 20 => LOW_QUOTA_INTERVAL_SECONDS,
         _ => DEFAULT_INTERVAL_SECONDS,
     };
     Duration::from_secs(seconds)
@@ -810,5 +810,35 @@ mod tests {
         changed.status_text = "Status: rotated".to_string();
         assert!(runtime.begin_render(&rendered));
         assert!(runtime.begin_render(&changed));
+    }
+
+    #[test]
+    fn next_watch_interval_uses_low_quota_interval_at_twenty_percent() {
+        let status = SharedStatus::default();
+        status
+            .inner
+            .lock()
+            .expect("status mutex")
+            .current_quota_percent = Some(20);
+
+        assert_eq!(
+            next_watch_interval(&status),
+            Duration::from_secs(LOW_QUOTA_INTERVAL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn next_watch_interval_uses_default_interval_above_twenty_percent() {
+        let status = SharedStatus::default();
+        status
+            .inner
+            .lock()
+            .expect("status mutex")
+            .current_quota_percent = Some(21);
+
+        assert_eq!(
+            next_watch_interval(&status),
+            Duration::from_secs(DEFAULT_INTERVAL_SECONDS)
+        );
     }
 }

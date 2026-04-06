@@ -27,7 +27,7 @@ use crate::thread_recovery::{
     read_latest_quota_exhaustion_log_id, run_thread_recovery_iteration, RecoveryIterationOptions,
 };
 
-pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 10;
+pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 20;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -673,10 +673,10 @@ mod tests {
     #[test]
     fn plan_rotation_uses_create_for_low_quota() {
         let assessment = DecisionQuotaAssessment {
-            summary: "5h 10% left".to_string(),
+            summary: "5h 20% left".to_string(),
             usable: true,
             blocker: None,
-            primary_quota_left_percent: Some(10),
+            primary_quota_left_percent: Some(20),
         };
         let plan = plan_rotation(Some(&assessment), &[], false);
         assert!(plan.0);
@@ -700,10 +700,10 @@ mod tests {
     #[test]
     fn plan_rotation_skips_create_for_low_quota_when_other_account_is_usable() {
         let assessment = DecisionQuotaAssessment {
-            summary: "5h 10% left".to_string(),
+            summary: "5h 20% left".to_string(),
             usable: true,
             blocker: None,
-            primary_quota_left_percent: Some(10),
+            primary_quota_left_percent: Some(20),
         };
         let plan = plan_rotation(Some(&assessment), &[], true);
         assert!(!plan.0);
