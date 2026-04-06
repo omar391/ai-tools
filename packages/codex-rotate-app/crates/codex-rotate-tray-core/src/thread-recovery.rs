@@ -185,7 +185,10 @@ fn resolve_quota_exhaustion_event(
     let thread_summary = match read_thread_summary(port, &event.thread_id) {
         Ok(summary) => summary,
         Err(error) => {
-            eprintln!("codex-rotate: failed to read thread {}: {error:#}", event.thread_id);
+            eprintln!(
+                "codex-rotate: failed to read thread {}: {error:#}",
+                event.thread_id
+            );
             None
         }
     };

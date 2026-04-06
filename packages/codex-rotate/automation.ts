@@ -2418,7 +2418,14 @@ export function shouldUseDefaultCreateFamilyHint(
   if (!baseEmail) {
     return false;
   }
-  return parseEmailFamily(baseEmail).mode !== "gmail_plus";
+  try {
+    return (
+      normalizeBaseEmailFamily(baseEmail) ===
+      normalizeBaseEmailFamily("dev.{N}@astronlab.com")
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function runCodexBrowserLoginWorkflow(

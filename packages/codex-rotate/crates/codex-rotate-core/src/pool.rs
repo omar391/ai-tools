@@ -21,7 +21,8 @@ use crate::quota::{
 };
 use crate::state::{load_rotate_state_json, write_rotate_state_json};
 use crate::workflow::{
-    cmd_create, create_next_fallback_options, reconcile_added_account_credential_state,
+    cmd_create, create_next_fallback_options, is_auto_create_retry_stopped_for_reusable_account,
+    reconcile_added_account_credential_state,
 };
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -416,7 +417,13 @@ pub fn rotate_next_internal() -> Result<NextResult> {
     if dirty {
         save_pool(&pool)?;
     }
-    let output = cmd_create(create_next_fallback_options())?;
+    let output = match cmd_create(create_next_fallback_options()) {
+        Ok(output) => output,
+        Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
+            return rotate_next_internal();
+        }
+        Err(error) => return Err(error),
+    };
     let auth = load_codex_auth(&paths.codex_auth_file)?;
     Ok(NextResult::Created {
         summary: summarize_codex_auth(&auth),

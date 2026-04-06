@@ -126,6 +126,16 @@ describe("templated email family helpers", () => {
       ]),
     ).toBe(24);
   });
+
+  test("only accepts the default dev template as an implicit create hint", () => {
+    expect(shouldUseDefaultCreateFamilyHint("dev.{n}@astronlab.com")).toBe(
+      true,
+    );
+    expect(
+      shouldUseDefaultCreateFamilyHint("bench.device.{n}@astronlab.com"),
+    ).toBe(false);
+    expect(shouldUseDefaultCreateFamilyHint("dev.user@gmail.com")).toBe(false);
+  });
 });
 
 describe("workflow metadata", () => {

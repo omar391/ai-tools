@@ -12,7 +12,10 @@ use codex_rotate_core::pool::{
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
-use codex_rotate_core::workflow::{cmd_create, CreateCommandOptions, CreateCommandSource};
+use codex_rotate_core::workflow::{
+    cmd_create, is_auto_create_retry_stopped_for_reusable_account, CreateCommandOptions,
+    CreateCommandSource,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::hook::{
@@ -185,12 +188,17 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
     let mut thread_recovery_log_id = previous_state.last_thread_recovery_log_id;
-    if thread_recovery_log_id.is_none()
-        && !previous_state.thread_recovery_pending
-        && !usage_limit_signal_seen
-    {
-        thread_recovery_log_id = read_latest_quota_exhaustion_log_id()?;
+    let mut latest_quota_exhaustion_log_id = None;
+    if !previous_state.thread_recovery_pending && !usage_limit_signal_seen && !rotated {
+        latest_quota_exhaustion_log_id = read_latest_quota_exhaustion_log_id()?;
+        if thread_recovery_log_id.is_none() {
+            thread_recovery_log_id = latest_quota_exhaustion_log_id;
+        }
     }
+    let quota_exhaustion_log_advanced = latest_quota_exhaustion_log_id
+        .zip(thread_recovery_log_id)
+        .map(|(latest, current)| latest > current)
+        .unwrap_or(false);
 
     let mut next_state = WatchState {
         last_signal_id: decision.last_signal_id,
@@ -224,7 +232,12 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         thread_recovery_pending: previous_state.thread_recovery_pending,
         quota: quota_cache,
     };
-    if should_run_thread_recovery(&previous_state, usage_limit_signal_seen, rotated) {
+    if should_run_thread_recovery(
+        &previous_state,
+        usage_limit_signal_seen,
+        rotated,
+        quota_exhaustion_log_advanced,
+    ) {
         match run_thread_recovery_iteration(RecoveryIterationOptions {
             port: Some(port),
             current_live_email: live
@@ -292,8 +305,24 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
             };
             match create_attempt() {
                 Ok(_) => {}
+                Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
+                    let next_result = rotate_next_internal()?;
+                    return Ok(Some(match next_result {
+                        NextResult::Rotated { summary, .. }
+                        | NextResult::Stayed { summary, .. }
+                        | NextResult::Created { summary, .. } => summary,
+                    }));
+                }
                 Err(error) if is_retryable_watch_create_error(&error) => {
                     if let Err(retry_error) = create_attempt() {
+                        if is_auto_create_retry_stopped_for_reusable_account(&retry_error) {
+                            let next_result = rotate_next_internal()?;
+                            return Ok(Some(match next_result {
+                                NextResult::Rotated { summary, .. }
+                                | NextResult::Stayed { summary, .. }
+                                | NextResult::Created { summary, .. } => summary,
+                            }));
+                        }
                         if let Some(summary) =
                             recover_completed_watch_create(previous_summary.as_ref())?
                         {
@@ -588,8 +617,12 @@ fn should_run_thread_recovery(
     previous: &WatchState,
     usage_limit_signal_seen: bool,
     rotated: bool,
+    quota_exhaustion_log_advanced: bool,
 ) -> bool {
-    usage_limit_signal_seen || rotated || previous.thread_recovery_pending
+    usage_limit_signal_seen
+        || rotated
+        || previous.thread_recovery_pending
+        || quota_exhaustion_log_advanced
 }
 
 fn write_file_atomically(path: &Path, raw: &str) -> Result<()> {
@@ -892,6 +925,27 @@ mod tests {
                 thread_recovery_pending: true,
                 ..WatchState::default()
             },
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn thread_recovery_runs_when_quota_exhaustion_log_advances() {
+        assert!(should_run_thread_recovery(
+            &WatchState::default(),
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn thread_recovery_stays_idle_without_signal_rotation_pending_or_new_log() {
+        assert!(!should_run_thread_recovery(
+            &WatchState::default(),
+            false,
             false,
             false
         ));

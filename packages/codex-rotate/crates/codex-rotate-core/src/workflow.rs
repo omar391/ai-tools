@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -35,6 +37,9 @@ const DEFAULT_OPENAI_BIRTH_DAY: u8 = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR: u16 = 1990;
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
+const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
+const AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT: &str =
+    "Automatic account creation stopped retrying because a reusable account is now available.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateCommandSource {
@@ -92,6 +97,12 @@ struct CreateCommandResult {
     inspection: Option<AccountInspection>,
     profile_name: String,
     base_email: String,
+}
+
+#[derive(Debug)]
+enum CreateFlowAttemptFailure {
+    Fatal(anyhow::Error),
+    Retryable(anyhow::Error),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -535,17 +546,128 @@ pub fn reconcile_added_account_credential_state(entry: &AccountEntry) -> Result<
 }
 
 fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandResult> {
+    let mut attempt = 1usize;
+    loop {
+        match execute_create_flow_attempt(options) {
+            Ok(result) => return Ok(result),
+            Err(CreateFlowAttemptFailure::Retryable(error))
+                if should_retry_create_until_usable(options) =>
+            {
+                if reusable_account_exists_for_auto_create_retry(options)? {
+                    return Err(anyhow!(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT));
+                }
+                eprintln!(
+                    "{YELLOW}WARN{RESET} Automatic account creation attempt {attempt} failed: {error}. Retrying with a fresh account in {}s.",
+                    AUTO_CREATE_RETRY_DELAY.as_secs()
+                );
+                attempt = attempt.saturating_add(1);
+                thread::sleep(AUTO_CREATE_RETRY_DELAY);
+            }
+            Err(CreateFlowAttemptFailure::Retryable(error))
+            | Err(CreateFlowAttemptFailure::Fatal(error)) => return Err(error),
+        }
+    }
+}
+
+fn fatal<T>(result: Result<T>) -> std::result::Result<T, CreateFlowAttemptFailure> {
+    result.map_err(CreateFlowAttemptFailure::Fatal)
+}
+
+fn should_retry_create_until_usable(options: &CreateCommandOptions) -> bool {
+    options.require_usable_quota && matches!(options.source, CreateCommandSource::Next)
+}
+
+pub fn is_auto_create_retry_stopped_for_reusable_account(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT)
+}
+
+fn reusable_account_exists_for_auto_create_retry(options: &CreateCommandOptions) -> Result<bool> {
     let paths = resolve_paths()?;
-    let previous_auth = load_codex_auth_if_exists()?;
-    let mut store = load_credential_store()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+
+    if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
+        return Ok(false);
+    }
+
+    let mut reasons = Vec::new();
+    let skip_indices = HashSet::new();
+    let mode = if options.ignore_current {
+        ReusableAccountProbeMode::OthersOnly
+    } else {
+        ReusableAccountProbeMode::CurrentFirst
+    };
+    let (candidate, candidate_dirty) = find_next_usable_account(
+        &mut pool,
+        &paths.codex_auth_file,
+        mode,
+        &mut reasons,
+        dirty,
+        &skip_indices,
+    )?;
+    if candidate_dirty {
+        save_pool(&pool)?;
+    }
+    Ok(candidate.is_some())
+}
+
+fn prepare_next_auto_create_attempt(
+    store: &mut CredentialStore,
+    family_key: &str,
+    profile_name: &str,
+    base_email: &str,
+    suffix: u32,
+    created_email: &str,
+    started_at: &str,
+) -> Result<()> {
+    let normalized_email = normalize_email_key(created_email);
+    if !store.pending.contains_key(&normalized_email) {
+        return Ok(());
+    }
+
+    store.pending.remove(&normalized_email);
+    let updated_at = now_iso();
+    let next_suffix = suffix.saturating_add(1);
+    if let Some(family) = store.families.get_mut(family_key) {
+        family.next_suffix = family.next_suffix.max(next_suffix);
+        family.updated_at = updated_at;
+    } else {
+        store.families.insert(
+            family_key.to_string(),
+            CredentialFamily {
+                profile_name: profile_name.to_string(),
+                base_email: base_email.to_string(),
+                next_suffix,
+                created_at: started_at.to_string(),
+                updated_at,
+                last_created_email: None,
+            },
+        );
+    }
+
+    save_credential_store(store)
+}
+
+fn execute_create_flow_attempt(
+    options: &CreateCommandOptions,
+) -> std::result::Result<CreateCommandResult, CreateFlowAttemptFailure> {
+    let paths = fatal(resolve_paths())?;
+    let previous_auth = fatal(load_codex_auth_if_exists())?;
+    let mut store = fatal(load_credential_store())?;
     let workflow_file = resolve_account_flow_file_for_create(&paths, options);
     let workflow_file_display = workflow_file.display().to_string();
-    let workflow_metadata = read_workflow_file_metadata(&workflow_file)?;
-    let profile_name = resolve_managed_profile_name(
+    let workflow_metadata = fatal(read_workflow_file_metadata(&workflow_file))?;
+    let profile_name = fatal(resolve_managed_profile_name(
         options.profile_name.as_deref(),
         workflow_metadata.preferred_profile_name.as_deref(),
         Some(workflow_file_display.as_str()),
-    )?;
+    ))?;
     let pending_base_hint_raw = if options.base_email.is_some() {
         None
     } else {
@@ -560,16 +682,16 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         .as_deref()
         .filter(|value| should_use_default_create_family_hint(Some(value)))
         .map(ToOwned::to_owned);
-    let base_email = resolve_create_base_email(
+    let base_email = fatal(resolve_create_base_email(
         options.base_email.as_deref(),
         pending_base_hint
             .as_deref()
             .or(stored_base_hint.as_deref())
             .or(workflow_metadata.preferred_email.as_deref()),
-    )?;
+    ))?;
 
-    let pool = load_pool()?;
-    let family_key = make_credential_family_key(&profile_name, &base_email)?;
+    let pool = fatal(load_pool())?;
+    let family_key = fatal(make_credential_family_key(&profile_name, &base_email))?;
     let family = store.families.get(&family_key).cloned();
     let started_at = now_iso();
     let known_emails = collect_known_account_emails(&pool, &store);
@@ -582,14 +704,14 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
         Some(entry) => entry.stored.suffix,
-        None => compute_next_account_family_suffix(
+        None => fatal(compute_next_account_family_suffix(
             &base_email,
             family
                 .as_ref()
                 .map(|entry| entry.next_suffix)
                 .unwrap_or_else(|| derive_family_frontier_suffix(&base_email, &known_emails)),
             known_emails,
-        )?,
+        ))?,
     };
     let created_email = existing_pending
         .as_ref()
@@ -620,7 +742,8 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         let auth = previous_auth
             .as_ref()
             .cloned()
-            .ok_or_else(|| anyhow!("Current Codex auth disappeared before create could finish."))?;
+            .ok_or_else(|| anyhow!("Current Codex auth disappeared before create could finish."))
+            .map_err(CreateFlowAttemptFailure::Fatal)?;
         let result = finalize_created_account(
             &mut store,
             family.as_ref(),
@@ -655,9 +778,28 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
             &auth,
             started_at.as_str(),
             previous_auth.as_ref(),
-        )?;
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if should_retry_create_until_usable(options) {
+                    fatal(restore_active_auth(previous_auth.as_ref()))?;
+                    fatal(prepare_next_auto_create_attempt(
+                        &mut store,
+                        &family_key,
+                        &profile_name,
+                        &base_email,
+                        suffix,
+                        &created_email,
+                        started_at.as_str(),
+                    ))?;
+                    return Err(CreateFlowAttemptFailure::Retryable(error));
+                }
+                return Err(CreateFlowAttemptFailure::Fatal(error));
+            }
+        };
         if options.restore_previous_auth_after_create {
-            restore_active_auth(previous_auth.as_ref())?;
+            fatal(restore_active_auth(previous_auth.as_ref()))?;
         }
         return Ok(result);
     }
@@ -669,7 +811,8 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
                 profile_name: &profile_name,
                 email: &created_email,
             },
-        )?;
+        )
+        .map_err(CreateFlowAttemptFailure::Fatal)?;
         if existing_secret_ref.is_none() {
             let generated_password = generate_password(18);
             let _: CodexRotateSecretRef = run_automation_bridge(
@@ -679,7 +822,8 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
                     email: &created_email,
                     password: &generated_password,
                 },
-            )?;
+            )
+            .map_err(CreateFlowAttemptFailure::Fatal)?;
         }
     }
     let pending = PendingCredential {
@@ -708,7 +852,7 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
     store
         .pending
         .insert(normalize_email_key(&created_email), pending.clone());
-    save_credential_store(&store)?;
+    fatal(save_credential_store(&store))?;
 
     let login_result = run_complete_codex_login(
         &profile_name,
@@ -721,21 +865,46 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         Some(&birth_date),
     );
     if let Err(error) = login_result {
-        restore_active_auth(previous_auth.as_ref())?;
-        save_credential_store(&store)?;
-        return Err(error);
+        fatal(restore_active_auth(previous_auth.as_ref()))?;
+        if should_retry_create_until_usable(options) {
+            fatal(prepare_next_auto_create_attempt(
+                &mut store,
+                &family_key,
+                &profile_name,
+                &base_email,
+                suffix,
+                &created_email,
+                started_at.as_str(),
+            ))?;
+            return Err(CreateFlowAttemptFailure::Retryable(error));
+        }
+        fatal(save_credential_store(&store))?;
+        return Err(CreateFlowAttemptFailure::Fatal(error));
     }
 
-    let auth = load_current_auth()?;
+    let auth = fatal(load_current_auth())?;
     let logged_in_email = summarize_codex_auth(&auth).email;
     if normalize_email_key(&logged_in_email) != normalize_email_key(&created_email) {
-        restore_active_auth(previous_auth.as_ref())?;
-        save_credential_store(&store)?;
-        return Err(anyhow!(
+        let error = anyhow!(
             "Expected {}, but Codex logged into {}.",
             created_email,
             logged_in_email
-        ));
+        );
+        fatal(restore_active_auth(previous_auth.as_ref()))?;
+        if should_retry_create_until_usable(options) {
+            fatal(prepare_next_auto_create_attempt(
+                &mut store,
+                &family_key,
+                &profile_name,
+                &base_email,
+                suffix,
+                &created_email,
+                started_at.as_str(),
+            ))?;
+            return Err(CreateFlowAttemptFailure::Retryable(error));
+        }
+        fatal(save_credential_store(&store))?;
+        return Err(CreateFlowAttemptFailure::Fatal(error));
     }
 
     let result = finalize_created_account(
@@ -750,10 +919,29 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
         &auth,
         started_at.as_str(),
         previous_auth.as_ref(),
-    )?;
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if should_retry_create_until_usable(options) {
+                fatal(restore_active_auth(previous_auth.as_ref()))?;
+                fatal(prepare_next_auto_create_attempt(
+                    &mut store,
+                    &family_key,
+                    &profile_name,
+                    &base_email,
+                    suffix,
+                    &created_email,
+                    started_at.as_str(),
+                ))?;
+                return Err(CreateFlowAttemptFailure::Retryable(error));
+            }
+            return Err(CreateFlowAttemptFailure::Fatal(error));
+        }
+    };
 
     if options.restore_previous_auth_after_create {
-        restore_active_auth(previous_auth.as_ref())?;
+        fatal(restore_active_auth(previous_auth.as_ref()))?;
     }
 
     Ok(result)
@@ -1367,8 +1555,8 @@ fn resolve_create_base_email(
 
 fn should_use_default_create_family_hint(base_email: Option<&str>) -> bool {
     base_email
-        .and_then(|value| parse_email_family(value).ok())
-        .map(|value| matches!(value.mode, EmailFamilyMode::Template { .. }))
+        .and_then(|value| normalize_base_email_family(value).ok())
+        .map(|value| value == DEFAULT_CREATE_BASE_EMAIL)
         .unwrap_or(false)
 }
 
@@ -1965,6 +2153,19 @@ mod tests {
         assert_eq!(value.birth_month, 1);
         assert_eq!(value.birth_day, 24);
         assert_eq!(value.birth_year, 1990);
+    }
+
+    #[test]
+    fn implicit_create_family_hint_accepts_only_default_dev_template() {
+        assert!(should_use_default_create_family_hint(Some(
+            "dev.{n}@astronlab.com"
+        )));
+        assert!(!should_use_default_create_family_hint(Some(
+            "bench.device.{n}@astronlab.com"
+        )));
+        assert!(!should_use_default_create_family_hint(Some(
+            "dev.user@gmail.com"
+        )));
     }
 
     #[test]
