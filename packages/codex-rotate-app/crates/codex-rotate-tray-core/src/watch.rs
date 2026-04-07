@@ -28,6 +28,7 @@ use crate::logs::{
 use crate::paths::resolve_paths;
 use crate::thread_recovery::{
     read_latest_quota_exhaustion_log_id, run_thread_recovery_iteration, RecoveryIterationOptions,
+    ThreadRecoveryEvent,
 };
 
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 20;
@@ -44,6 +45,7 @@ pub struct WatchState {
     pub last_rotated_email: Option<String>,
     pub last_thread_recovery_log_id: Option<i64>,
     pub thread_recovery_pending: bool,
+    pub thread_recovery_pending_events: Vec<ThreadRecoveryEvent>,
     pub quota: Option<CachedQuotaState>,
 }
 
@@ -230,6 +232,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         },
         last_thread_recovery_log_id: thread_recovery_log_id,
         thread_recovery_pending: previous_state.thread_recovery_pending,
+        thread_recovery_pending_events: previous_state.thread_recovery_pending_events.clone(),
         quota: quota_cache,
     };
     if should_run_thread_recovery(
@@ -252,14 +255,17 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             rotated,
             last_log_id: next_state.last_thread_recovery_log_id,
             pending: next_state.thread_recovery_pending,
+            pending_events: next_state.thread_recovery_pending_events.clone(),
         }) {
             Ok(recovery) => {
                 next_state.last_thread_recovery_log_id = recovery.last_log_id;
                 next_state.thread_recovery_pending = recovery.pending;
+                next_state.thread_recovery_pending_events = recovery.pending_events;
             }
             Err(error) => {
                 eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
-                next_state.thread_recovery_pending = true;
+                next_state.thread_recovery_pending =
+                    next_state.thread_recovery_pending || !next_state.thread_recovery_pending_events.is_empty();
             }
         }
     }

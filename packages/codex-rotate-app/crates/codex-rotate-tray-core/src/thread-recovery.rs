@@ -21,11 +21,24 @@ const HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT: u8 = 10;
 const OTEL_METADATA_LOOKUP_WINDOW: i64 = 2_000;
 const THREAD_RESUME_SETTLE_MS: u64 = 1_000;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRecoveryEvent {
+    pub source_log_id: i64,
+    pub source_ts: i64,
+    pub thread_id: String,
+    pub exhausted_turn_id: Option<String>,
+    pub exhausted_email: Option<String>,
+    pub exhausted_account_id: Option<String>,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryIterationResult {
     pub last_log_id: Option<i64>,
     pub pending: bool,
+    pub pending_events: Vec<ThreadRecoveryEvent>,
     pub detected: usize,
     pub continued_thread_ids: Vec<String>,
     pub dropped_thread_ids: Vec<String>,
@@ -40,17 +53,7 @@ pub struct RecoveryIterationOptions {
     pub rotated: bool,
     pub last_log_id: Option<i64>,
     pub pending: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct QuotaExhaustionEvent {
-    source_log_id: i64,
-    source_ts: i64,
-    thread_id: String,
-    exhausted_turn_id: Option<String>,
-    exhausted_email: Option<String>,
-    exhausted_account_id: Option<String>,
-    message: String,
+    pub pending_events: Vec<ThreadRecoveryEvent>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -85,6 +88,13 @@ enum RecoveryResolution {
     Blocked,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecoveryProcessingResult {
+    continued_thread_ids: Vec<String>,
+    dropped_thread_ids: Vec<String>,
+    pending_events: Vec<ThreadRecoveryEvent>,
+}
+
 pub fn read_latest_quota_exhaustion_log_id() -> Result<Option<i64>> {
     let paths = resolve_paths()?;
     let connection = open_logs_connection(&paths.codex_logs_db_file)?;
@@ -103,6 +113,7 @@ pub fn run_thread_recovery_iteration(
         return Ok(RecoveryIterationResult {
             last_log_id,
             pending: false,
+            pending_events: Vec::new(),
             detected: 0,
             continued_thread_ids: Vec::new(),
             dropped_thread_ids: Vec::new(),
@@ -111,10 +122,12 @@ pub fn run_thread_recovery_iteration(
 
     let detected_events =
         scan_quota_exhaustion_events(&connection, options.last_log_id, MAX_RECOVERY_SCAN_EVENTS)?;
-    if detected_events.is_empty() {
+    let candidate_events = merge_thread_recovery_events(&options.pending_events, detected_events);
+    if candidate_events.is_empty() {
         return Ok(RecoveryIterationResult {
             last_log_id: options.last_log_id,
             pending: false,
+            pending_events: Vec::new(),
             detected: 0,
             continued_thread_ids: Vec::new(),
             dropped_thread_ids: Vec::new(),
@@ -133,48 +146,35 @@ pub fn run_thread_recovery_iteration(
         options.current_quota_usable,
         options.current_primary_quota_left_percent,
     );
-
-    let mut last_log_id = options.last_log_id;
-    let mut continued_thread_ids = Vec::new();
-    let mut dropped_thread_ids = Vec::new();
-    let mut pending = false;
-
-    for event in &detected_events {
-        match resolve_quota_exhaustion_event(
+    let processing = process_thread_recovery_events(&candidate_events, |event| {
+        resolve_quota_exhaustion_event(
             &connection,
             port,
             event,
             &current_live_email,
             can_continue_without_email,
-        )? {
-            RecoveryResolution::Continued => {
-                continued_thread_ids.push(event.thread_id.clone());
-                last_log_id = Some(event.source_log_id);
-            }
-            RecoveryResolution::Dropped => {
-                dropped_thread_ids.push(event.thread_id.clone());
-                last_log_id = Some(event.source_log_id);
-            }
-            RecoveryResolution::Blocked => {
-                pending = true;
-                break;
-            }
-        }
-    }
+        )
+    })?;
+    let last_log_id = candidate_events
+        .iter()
+        .map(|event| event.source_log_id)
+        .max()
+        .or(options.last_log_id);
 
     Ok(RecoveryIterationResult {
         last_log_id,
-        pending,
-        detected: detected_events.len(),
-        continued_thread_ids,
-        dropped_thread_ids,
+        pending: !processing.pending_events.is_empty(),
+        pending_events: processing.pending_events,
+        detected: candidate_events.len(),
+        continued_thread_ids: processing.continued_thread_ids,
+        dropped_thread_ids: processing.dropped_thread_ids,
     })
 }
 
 fn resolve_quota_exhaustion_event(
     connection: &Connection,
     port: u16,
-    event: &QuotaExhaustionEvent,
+    event: &ThreadRecoveryEvent,
     current_live_email: &Option<String>,
     can_continue_without_email: bool,
 ) -> Result<RecoveryResolution> {
@@ -184,6 +184,13 @@ fn resolve_quota_exhaustion_event(
 
     let thread_summary = match read_thread_summary(port, &event.thread_id) {
         Ok(summary) => summary,
+        Err(error) if is_terminal_thread_recovery_error(&error) => {
+            eprintln!(
+                "codex-rotate: dropping exhausted thread {} after terminal thread/read failure: {error:#}",
+                event.thread_id
+            );
+            return Ok(RecoveryResolution::Dropped);
+        }
         Err(error) => {
             eprintln!(
                 "codex-rotate: failed to read thread {}: {error:#}",
@@ -212,6 +219,13 @@ fn resolve_quota_exhaustion_event(
         Some(thread) if thread_ready_for_continue(&thread.status.kind) => thread.cwd,
         Some(thread) => match prepare_thread_for_continue(port, &event.thread_id, thread.cwd) {
             Ok(cwd) => cwd,
+            Err(error) if is_terminal_thread_recovery_error(&error) => {
+                eprintln!(
+                    "codex-rotate: dropping exhausted thread {} after terminal resume failure: {error:#}",
+                    event.thread_id
+                );
+                return Ok(RecoveryResolution::Dropped);
+            }
             Err(error) => {
                 eprintln!(
                     "codex-rotate: thread {} could not be resumed for continue: {error:#}",
@@ -234,6 +248,13 @@ fn resolve_quota_exhaustion_event(
 
     match send_continue_turn(port, &event.thread_id, cwd) {
         Ok(()) => Ok(RecoveryResolution::Continued),
+        Err(error) if is_terminal_thread_recovery_error(&error) => {
+            eprintln!(
+                "codex-rotate: dropping exhausted thread {} after terminal continue failure: {error:#}",
+                event.thread_id
+            );
+            Ok(RecoveryResolution::Dropped)
+        }
         Err(error) => {
             eprintln!(
                 "codex-rotate: failed to continue thread {} after quota recovery: {error:#}",
@@ -246,7 +267,7 @@ fn resolve_quota_exhaustion_event(
 
 fn thread_has_newer_user_turn(
     connection: &Connection,
-    event: &QuotaExhaustionEvent,
+    event: &ThreadRecoveryEvent,
 ) -> Result<bool> {
     let thread_marker = format!("thread.id={}", event.thread_id);
     let mut statement = connection.prepare(
@@ -283,7 +304,7 @@ fn scan_quota_exhaustion_events(
     connection: &Connection,
     after_log_id: Option<i64>,
     limit: usize,
-) -> Result<Vec<QuotaExhaustionEvent>> {
+) -> Result<Vec<ThreadRecoveryEvent>> {
     let mut statement = connection.prepare(
         r#"
 select id, ts, feedback_log_body
@@ -342,7 +363,7 @@ fn parse_codex_core_quota_exhaustion_event(
     source_log_id: i64,
     source_ts: i64,
     body: &str,
-) -> Result<Option<QuotaExhaustionEvent>> {
+) -> Result<Option<ThreadRecoveryEvent>> {
     let thread_id = extract_token_field(body, "thread.id=")
         .or_else(|| extract_until(body, "session_loop{thread_id=", "}:"));
     let Some(thread_id) = thread_id else {
@@ -359,7 +380,7 @@ fn parse_codex_core_quota_exhaustion_event(
     }
     .unwrap_or_default();
 
-    Ok(Some(QuotaExhaustionEvent {
+    Ok(Some(ThreadRecoveryEvent {
         source_log_id,
         source_ts,
         thread_id,
@@ -464,6 +485,65 @@ fn can_continue_without_email(
             && current_primary_quota_left_percent
                 .map(|percent| percent > HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT)
                 .unwrap_or(false))
+}
+
+fn merge_thread_recovery_events(
+    pending_events: &[ThreadRecoveryEvent],
+    detected_events: Vec<ThreadRecoveryEvent>,
+) -> Vec<ThreadRecoveryEvent> {
+    let mut merged = std::collections::BTreeMap::<String, ThreadRecoveryEvent>::new();
+    for event in pending_events.iter().chain(detected_events.iter()) {
+        match merged.get(&event.thread_id) {
+            Some(existing) if existing.source_log_id >= event.source_log_id => {}
+            _ => {
+                merged.insert(event.thread_id.clone(), event.clone());
+            }
+        }
+    }
+    let mut events = merged.into_values().collect::<Vec<_>>();
+    events.sort_by_key(|event| event.source_log_id);
+    events
+}
+
+fn process_thread_recovery_events<F>(
+    events: &[ThreadRecoveryEvent],
+    mut resolver: F,
+) -> Result<RecoveryProcessingResult>
+where
+    F: FnMut(&ThreadRecoveryEvent) -> Result<RecoveryResolution>,
+{
+    let mut continued_thread_ids = Vec::new();
+    let mut dropped_thread_ids = Vec::new();
+    let mut pending_events = Vec::new();
+
+    for event in events {
+        match resolver(event)? {
+            RecoveryResolution::Continued => {
+                continued_thread_ids.push(event.thread_id.clone());
+            }
+            RecoveryResolution::Dropped => {
+                dropped_thread_ids.push(event.thread_id.clone());
+            }
+            RecoveryResolution::Blocked => {
+                pending_events.push(event.clone());
+            }
+        }
+    }
+
+    Ok(RecoveryProcessingResult {
+        continued_thread_ids,
+        dropped_thread_ids,
+        pending_events,
+    })
+}
+
+fn is_terminal_thread_recovery_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("no rollout found for thread id")
+        || message.contains("thread not found")
+        || message.contains("no thread found")
+        || message.contains("unknown thread")
+        || message.contains("does not exist")
 }
 
 fn read_thread_summary(port: u16, thread_id: &str) -> Result<Option<ThreadSummary>> {
@@ -794,7 +874,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             )
             .unwrap();
 
-        let event = QuotaExhaustionEvent {
+        let event = ThreadRecoveryEvent {
             source_log_id: 10,
             source_ts: 1775445612,
             thread_id: "thread-123".to_string(),
@@ -863,5 +943,93 @@ insert into logs (id, ts, target, feedback_log_body) values
         assert!(!can_continue_without_email(false, Some(true), Some(10)));
         assert!(!can_continue_without_email(false, Some(false), Some(100)));
         assert!(!can_continue_without_email(false, None, None));
+    }
+
+    #[test]
+    fn merge_thread_recovery_events_keeps_latest_event_per_thread() {
+        let merged = merge_thread_recovery_events(
+            &[ThreadRecoveryEvent {
+                source_log_id: 10,
+                source_ts: 10,
+                thread_id: "thread-a".to_string(),
+                exhausted_turn_id: Some("turn-1".to_string()),
+                exhausted_email: Some("a@example.com".to_string()),
+                exhausted_account_id: None,
+                message: "You've hit your usage limit.".to_string(),
+            }],
+            vec![
+                ThreadRecoveryEvent {
+                    source_log_id: 11,
+                    source_ts: 11,
+                    thread_id: "thread-b".to_string(),
+                    exhausted_turn_id: Some("turn-2".to_string()),
+                    exhausted_email: Some("b@example.com".to_string()),
+                    exhausted_account_id: None,
+                    message: "You've hit your usage limit.".to_string(),
+                },
+                ThreadRecoveryEvent {
+                    source_log_id: 12,
+                    source_ts: 12,
+                    thread_id: "thread-a".to_string(),
+                    exhausted_turn_id: Some("turn-3".to_string()),
+                    exhausted_email: Some("a@example.com".to_string()),
+                    exhausted_account_id: None,
+                    message: "You've hit your usage limit.".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].thread_id, "thread-b");
+        assert_eq!(merged[0].source_log_id, 11);
+        assert_eq!(merged[1].thread_id, "thread-a");
+        assert_eq!(merged[1].source_log_id, 12);
+    }
+
+    #[test]
+    fn process_thread_recovery_events_keeps_blocked_events_without_starving_later_threads() {
+        let events = vec![
+            ThreadRecoveryEvent {
+                source_log_id: 10,
+                source_ts: 10,
+                thread_id: "thread-a".to_string(),
+                exhausted_turn_id: Some("turn-a".to_string()),
+                exhausted_email: None,
+                exhausted_account_id: None,
+                message: "You've hit your usage limit.".to_string(),
+            },
+            ThreadRecoveryEvent {
+                source_log_id: 11,
+                source_ts: 11,
+                thread_id: "thread-b".to_string(),
+                exhausted_turn_id: Some("turn-b".to_string()),
+                exhausted_email: None,
+                exhausted_account_id: None,
+                message: "You've hit your usage limit.".to_string(),
+            },
+        ];
+
+        let result = process_thread_recovery_events(&events, |event| {
+            Ok(if event.thread_id == "thread-a" {
+                RecoveryResolution::Blocked
+            } else {
+                RecoveryResolution::Continued
+            })
+        })
+        .unwrap();
+
+        assert_eq!(result.continued_thread_ids, vec!["thread-b".to_string()]);
+        assert_eq!(result.pending_events.len(), 1);
+        assert_eq!(result.pending_events[0].thread_id, "thread-a");
+    }
+
+    #[test]
+    fn terminal_thread_recovery_error_matches_missing_rollout() {
+        assert!(is_terminal_thread_recovery_error(&anyhow!(
+            "Codex thread/resume request failed: {{\"code\":-32600,\"message\":\"no rollout found for thread id thread-123\"}}"
+        )));
+        assert!(!is_terminal_thread_recovery_error(&anyhow!(
+            "Timed out waiting for thread/resume response from Codex."
+        )));
     }
 }
