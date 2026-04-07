@@ -44,6 +44,10 @@ type RotateState = {
   active_index?: number | null;
 };
 
+type RotateStateSnapshot =
+  | { exists: false }
+  | { exists: true; content: string };
+
 type Snapshot = {
   authEmail: string | null;
   accountEmails: Set<string>;
@@ -125,7 +129,7 @@ const BENCHMARK_CANDIDATES: BenchmarkCandidate[] = [
     track: "non_device",
     filePath: join(WORKFLOW_ROOT, "codex-rotate-account-flow.yaml"),
     workflowRef: "workspace.web.auth-openai-com.codex-rotate-account-flow",
-    baseEmail: "bench.original.{n}@astronlab.com",
+    baseEmail: "dev.{n}@astronlab.com",
   },
   {
     id: "stepwise",
@@ -133,7 +137,7 @@ const BENCHMARK_CANDIDATES: BenchmarkCandidate[] = [
     filePath: join(WORKFLOW_ROOT, "codex-rotate-account-flow-stepwise.yaml"),
     workflowRef:
       "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
-    baseEmail: "bench.stepwise.{n}@astronlab.com",
+    baseEmail: "dev.{n}@astronlab.com",
   },
   {
     id: "minimal",
@@ -141,7 +145,7 @@ const BENCHMARK_CANDIDATES: BenchmarkCandidate[] = [
     filePath: join(WORKFLOW_ROOT, "codex-rotate-account-flow-minimal.yaml"),
     workflowRef:
       "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-    baseEmail: "bench.minimal.{n}@astronlab.com",
+    baseEmail: "dev.{n}@astronlab.com",
   },
   {
     id: "device-auth",
@@ -149,7 +153,7 @@ const BENCHMARK_CANDIDATES: BenchmarkCandidate[] = [
     filePath: join(WORKFLOW_ROOT, "codex-rotate-account-flow-device-auth.yaml"),
     workflowRef:
       "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
-    baseEmail: "bench.device.{n}@astronlab.com",
+    baseEmail: "dev.{n}@astronlab.com",
   },
 ];
 
@@ -379,12 +383,16 @@ async function benchmarkCandidate(
   const startedAt = new Date().toISOString();
   const startedMs = performance.now();
   let result: { exitStatus: number | null; stdout: string; stderr: string };
-  let after: Snapshot;
+  let after = before;
   try {
     result = await runCommandWithCapture(command, env, candidate.id);
     after = readSnapshot();
   } finally {
-    restoreRotateStateFile(rotateStateSnapshot);
+    restoreRotateStateFile(rotateStateSnapshot, {
+      profileName: options.profileName,
+      baseEmail: options.baseEmail,
+      reservedEmails: collectReservedEmails(before, after, options.baseEmail),
+    });
   }
   const latencyMs = Math.round(performance.now() - startedMs);
   const createdEmails = [...after.accountEmails].filter(
@@ -554,9 +562,7 @@ function readRotateState(): RotateState {
   }
 }
 
-function snapshotRotateStateFile():
-  | { exists: false }
-  | { exists: true; content: string } {
+function snapshotRotateStateFile(): RotateStateSnapshot {
   if (!existsSync(ROTATE_STATE_PATH)) {
     return { exists: false };
   }
@@ -567,15 +573,130 @@ function snapshotRotateStateFile():
 }
 
 function restoreRotateStateFile(
-  snapshot: { exists: false } | { exists: true; content: string },
+  snapshot: RotateStateSnapshot,
+  options?: {
+    profileName?: string;
+    baseEmail?: string;
+    reservedEmails?: string[];
+  },
 ): void {
+  let restoredState: RotateState = {};
   if (snapshot.exists) {
     writeFileSync(ROTATE_STATE_PATH, snapshot.content);
-    return;
-  }
-  if (existsSync(ROTATE_STATE_PATH)) {
+    restoredState = readRotateState();
+  } else if (existsSync(ROTATE_STATE_PATH)) {
     rmSync(ROTATE_STATE_PATH);
   }
+
+  const reservedEmails = options?.reservedEmails || [];
+  if (reservedEmails.length === 0) {
+    return;
+  }
+  const profileName = normalizeText(options?.profileName);
+  const baseEmail = normalizeBaseEmail(options?.baseEmail);
+  if (!profileName || !baseEmail || !baseEmail.includes("{n}")) {
+    return;
+  }
+
+  let highestSuffix = -1;
+  let highestEmail: string | null = null;
+  for (const email of reservedEmails) {
+    const suffix = extractTemplateSuffix(email, baseEmail);
+    if (suffix !== null && suffix > highestSuffix) {
+      highestSuffix = suffix;
+      highestEmail = email;
+    }
+  }
+  if (highestSuffix < 0 || !highestEmail) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const familyKey = `${profileName}::${baseEmail}`;
+  const families = (restoredState.families ||= {});
+  const existing = families[familyKey];
+  families[familyKey] = {
+    profile_name: profileName,
+    base_email: baseEmail,
+    next_suffix: Math.max(
+      Number(existing?.next_suffix || 1),
+      highestSuffix + 1,
+    ),
+    created_at:
+      typeof existing?.created_at === "string" && existing.created_at.length > 0
+        ? existing.created_at
+        : now,
+    updated_at: now,
+    last_created_email: highestEmail,
+  };
+  writeFileSync(
+    ROTATE_STATE_PATH,
+    `${JSON.stringify(restoredState, null, 2)}\n`,
+  );
+}
+
+function collectReservedEmails(
+  before: Snapshot,
+  after: Snapshot,
+  baseEmail: string,
+): string[] {
+  const reserved = new Set<string>();
+  const candidates = [
+    ...after.accountEmails,
+    ...after.pendingEmails,
+    after.authEmail,
+  ];
+  for (const candidate of candidates) {
+    const email = normalizeEmail(candidate);
+    if (!email) continue;
+    if (before.accountEmails.has(email) || before.pendingEmails.has(email)) {
+      continue;
+    }
+    if (extractTemplateSuffix(email, baseEmail) !== null) {
+      reserved.add(email);
+    }
+  }
+  return [...reserved];
+}
+
+function normalizeBaseEmail(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return null;
+  return trimmed.replaceAll("{N}", "{n}");
+}
+
+function normalizeText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function extractTemplateSuffix(
+  email: string,
+  baseEmail: string,
+): number | null {
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedBaseEmail = normalizeBaseEmail(baseEmail);
+  if (!normalizedEmail || !normalizedBaseEmail) return null;
+  const markerIndex = normalizedBaseEmail.indexOf("{n}");
+  if (markerIndex === -1) return null;
+  const prefix = normalizedBaseEmail.slice(0, markerIndex);
+  const suffix = normalizedBaseEmail.slice(markerIndex + 3);
+  if (
+    !normalizedEmail.startsWith(prefix) ||
+    !normalizedEmail.endsWith(suffix) ||
+    normalizedEmail.length <= prefix.length + suffix.length
+  ) {
+    return null;
+  }
+  const numericPart = normalizedEmail.slice(
+    prefix.length,
+    normalizedEmail.length - suffix.length,
+  );
+  if (!/^\d+$/.test(numericPart)) return null;
+  const parsed = Number.parseInt(numericPart, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function readAuthEmail(): string | null {

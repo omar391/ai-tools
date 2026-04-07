@@ -2206,7 +2206,7 @@ mod tests {
             "dev.{n}@astronlab.com"
         )));
         assert!(should_use_default_create_family_hint(Some(
-            "bench.device.{n}@astronlab.com"
+            "qa.{n}@astronlab.com"
         )));
         assert!(!should_use_default_create_family_hint(Some(
             "dev.user@gmail.com"
@@ -2217,14 +2217,14 @@ mod tests {
     fn stored_base_email_hint_prefers_higher_frontier_template_family() {
         let mut store = CredentialStore::default();
         store.families.insert(
-            "dev-1::bench.device.{n}@astronlab.com".to_string(),
+            "dev-1::qa.{n}@astronlab.com".to_string(),
             CredentialFamily {
                 profile_name: "dev-1".to_string(),
-                base_email: "bench.device.{n}@astronlab.com".to_string(),
+                base_email: "qa.{n}@astronlab.com".to_string(),
                 next_suffix: 300,
                 created_at: "2026-04-06T00:00:00.000Z".to_string(),
                 updated_at: "2026-04-06T17:00:00.000Z".to_string(),
-                last_created_email: Some("bench.device.299@astronlab.com".to_string()),
+                last_created_email: Some("qa.299@astronlab.com".to_string()),
             },
         );
         store.families.insert(
@@ -2249,12 +2249,12 @@ mod tests {
     fn pending_base_email_hint_prefers_higher_frontier_template_family() {
         let mut store = CredentialStore::default();
         store.pending.insert(
-            "bench.device.300@astronlab.com".to_string(),
+            "qa.300@astronlab.com".to_string(),
             PendingCredential {
                 stored: StoredCredential {
-                    email: "bench.device.300@astronlab.com".to_string(),
+                    email: "qa.300@astronlab.com".to_string(),
                     profile_name: "dev-1".to_string(),
-                    base_email: "bench.device.{n}@astronlab.com".to_string(),
+                    base_email: "qa.{n}@astronlab.com".to_string(),
                     suffix: 300,
                     selector: None,
                     alias: None,

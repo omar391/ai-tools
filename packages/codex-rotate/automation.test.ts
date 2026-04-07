@@ -131,9 +131,7 @@ describe("templated email family helpers", () => {
     expect(shouldUseDefaultCreateFamilyHint("dev.{n}@astronlab.com")).toBe(
       true,
     );
-    expect(
-      shouldUseDefaultCreateFamilyHint("bench.device.{n}@astronlab.com"),
-    ).toBe(true);
+    expect(shouldUseDefaultCreateFamilyHint("qa.{n}@astronlab.com")).toBe(true);
     expect(shouldUseDefaultCreateFamilyHint("dev.user@gmail.com")).toBe(false);
   });
 });
@@ -734,9 +732,7 @@ describe("create resolution helpers", () => {
     expect(shouldUseDefaultCreateFamilyHint("dev.{N}@astronlab.com")).toBe(
       true,
     );
-    expect(
-      shouldUseDefaultCreateFamilyHint("bench.device.{N}@astronlab.com"),
-    ).toBe(true);
+    expect(shouldUseDefaultCreateFamilyHint("qa.{N}@astronlab.com")).toBe(true);
   });
 
   test("accepts an explicit templated base email family", () => {
@@ -1195,11 +1191,11 @@ describe("pending credential reuse", () => {
   test("prefers the higher-frontier template pending family", () => {
     const store = normalizeCredentialStore({
       pending: {
-        "bench.device.300@astronlab.com": {
-          email: "bench.device.300@astronlab.com",
+        "qa.300@astronlab.com": {
+          email: "qa.300@astronlab.com",
           account_secret_ref: makeSecretRef("bw-bench-device-3"),
           profile_name: "dev-1",
-          base_email: "bench.device.{n}@astronlab.com",
+          base_email: "qa.{n}@astronlab.com",
           suffix: 300,
           selector: null,
           alias: null,
@@ -1278,13 +1274,13 @@ describe("stored base-email hints", () => {
   test("prefers the higher-frontier template family over a newer lower-frontier one", () => {
     const store = normalizeCredentialStore({
       families: {
-        "dev-1::bench.device.{n}@astronlab.com": {
+        "dev-1::qa.{n}@astronlab.com": {
           profile_name: "dev-1",
-          base_email: "bench.device.{n}@astronlab.com",
+          base_email: "qa.{n}@astronlab.com",
           next_suffix: 300,
           created_at: "2026-04-06T00:00:00.000Z",
           updated_at: "2026-04-06T17:00:00.000Z",
-          last_created_email: "bench.device.299@astronlab.com",
+          last_created_email: "qa.299@astronlab.com",
         },
         "dev-1::dev.{n}@astronlab.com": {
           profile_name: "dev-1",
