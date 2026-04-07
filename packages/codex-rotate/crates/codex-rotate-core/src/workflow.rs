@@ -700,9 +700,11 @@ fn execute_create_flow_attempt(
         workflow_metadata.preferred_profile_name.as_deref(),
         Some(workflow_file_display.as_str()),
     ))?;
-    let base_email = fatal(resolve_create_base_email(
+    let base_email = fatal(resolve_create_base_email_for_profile(
+        &store,
+        &profile_name,
         options.base_email.as_deref(),
-        Some(store.default_create_base_email.as_str()),
+        options.alias.as_deref(),
     ))?;
 
     let pool = fatal(load_pool())?;
@@ -1302,10 +1304,7 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
     }
     if migrate_legacy_non_default_families {
         families.retain(|_, family| {
-            !should_drop_legacy_non_default_family(
-                &family.base_email,
-                &default_create_base_email,
-            )
+            !should_drop_legacy_non_default_family(&family.base_email, &default_create_base_email)
         });
     }
     let mut pending = normalize_pending_credential_map(raw.get("pending"))
@@ -1614,6 +1613,20 @@ fn resolve_create_base_email(
     normalize_base_email_family(DEFAULT_CREATE_BASE_EMAIL)
 }
 
+fn resolve_create_base_email_for_profile(
+    store: &CredentialStore,
+    profile_name: &str,
+    requested_base_email: Option<&str>,
+    alias: Option<&str>,
+) -> Result<String> {
+    let discovered_base_email = if requested_base_email.is_none() {
+        select_pending_base_email_hint_for_profile(store, profile_name, alias)
+    } else {
+        None
+    };
+    resolve_create_base_email(requested_base_email, discovered_base_email.as_deref())
+}
+
 fn make_credential_family_key(profile_name: &str, base_email: &str) -> Result<String> {
     Ok(format!(
         "{}::{}",
@@ -1828,6 +1841,91 @@ fn select_pending_credential_for_family(
     matches.into_iter().next()
 }
 
+fn select_pending_base_email_hint_for_profile(
+    store: &CredentialStore,
+    profile_name: &str,
+    alias: Option<&str>,
+) -> Option<String> {
+    let normalized_alias = normalize_alias(alias);
+    let mut matches = store
+        .pending
+        .values()
+        .filter(|entry| {
+            entry.stored.profile_name == profile_name
+                && (normalized_alias.is_none()
+                    || normalize_alias(entry.stored.alias.as_deref()) == normalized_alias)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        let left_priority =
+            get_create_family_hint_priority(&left.stored.base_email, left.stored.suffix + 1);
+        let right_priority =
+            get_create_family_hint_priority(&right.stored.base_email, right.stored.suffix + 1);
+        left_priority
+            .family_rank
+            .cmp(&right_priority.family_rank)
+            .reverse()
+            .then_with(|| {
+                left_priority
+                    .frontier
+                    .cmp(&right_priority.frontier)
+                    .reverse()
+            })
+            .then_with(|| {
+                parse_sortable_timestamp(
+                    left.started_at
+                        .as_deref()
+                        .or(Some(left.stored.created_at.as_str()))
+                        .or(Some(left.stored.updated_at.as_str())),
+                )
+                .cmp(&parse_sortable_timestamp(
+                    right
+                        .started_at
+                        .as_deref()
+                        .or(Some(right.stored.created_at.as_str()))
+                        .or(Some(right.stored.updated_at.as_str())),
+                ))
+            })
+            .then_with(|| left.stored.suffix.cmp(&right.stored.suffix))
+            .then_with(|| {
+                parse_sortable_timestamp(Some(left.stored.updated_at.as_str())).cmp(
+                    &parse_sortable_timestamp(Some(right.stored.updated_at.as_str())),
+                )
+            })
+    });
+
+    matches
+        .into_iter()
+        .find_map(|entry| normalize_base_email_family(&entry.stored.base_email).ok())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CreateFamilyHintPriority {
+    family_rank: u8,
+    frontier: u32,
+}
+
+fn get_create_family_hint_priority(base_email: &str, frontier: u32) -> CreateFamilyHintPriority {
+    let normalized_frontier = frontier.max(1);
+    let family_rank = parse_email_family(base_email)
+        .ok()
+        .map(|parsed| match parsed.mode {
+            EmailFamilyMode::Template { prefix, suffix } => {
+                if parsed.domain_part == "astronlab.com" && prefix == "dev." && suffix.is_empty() {
+                    2
+                } else {
+                    1
+                }
+            }
+            EmailFamilyMode::GmailPlus => 0,
+        })
+        .unwrap_or(0);
+    CreateFamilyHintPriority {
+        family_rank,
+        frontier: normalized_frontier,
+    }
+}
 
 fn resolve_relogin_credential(
     store: &CredentialStore,
@@ -2094,6 +2192,31 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{stamp}"))
     }
 
+    fn make_pending(
+        email: &str,
+        profile_name: &str,
+        base_email: &str,
+        suffix: u32,
+        created_at: &str,
+    ) -> PendingCredential {
+        PendingCredential {
+            stored: StoredCredential {
+                email: email.to_string(),
+                profile_name: profile_name.to_string(),
+                base_email: base_email.to_string(),
+                suffix,
+                selector: None,
+                alias: None,
+                birth_month: None,
+                birth_day: None,
+                birth_year: None,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+            },
+            started_at: Some(created_at.to_string()),
+        }
+    }
+
     #[test]
     fn stored_credentials_used_only_for_non_manual_relogin() {
         let stored = StoredCredential {
@@ -2125,7 +2248,9 @@ mod tests {
 
     #[test]
     fn stored_relogin_honors_logout_setting() {
-        assert!(should_logout_before_stored_relogin(&ReloginOptions::default()));
+        assert!(should_logout_before_stored_relogin(
+            &ReloginOptions::default()
+        ));
         assert!(!should_logout_before_stored_relogin(&ReloginOptions {
             logout_first: false,
             ..ReloginOptions::default()
@@ -2145,6 +2270,94 @@ mod tests {
         let store = normalize_credential_store(json!({}));
         assert_eq!(store.version, 4);
         assert_eq!(store.default_create_base_email, "dev.{n}@astronlab.com");
+    }
+
+    #[test]
+    fn select_pending_base_email_hint_prefers_dev_template_family() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "qa.300@astronlab.com".to_string(),
+            make_pending(
+                "qa.300@astronlab.com",
+                "dev-1",
+                "qa.{n}@astronlab.com",
+                300,
+                "2026-04-06T17:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "dev.30@astronlab.com".to_string(),
+            make_pending(
+                "dev.30@astronlab.com",
+                "dev-1",
+                "dev.{n}@astronlab.com",
+                30,
+                "2026-04-06T16:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            select_pending_base_email_hint_for_profile(&store, "dev-1", None).as_deref(),
+            Some("dev.{n}@astronlab.com")
+        );
+    }
+
+    #[test]
+    fn resolve_create_base_email_for_profile_uses_pending_hint_before_new_default_family() {
+        let mut store = CredentialStore::default();
+        store.default_create_base_email = "qa.{n}@astronlab.com".to_string();
+        store.pending.insert(
+            "qa.300@astronlab.com".to_string(),
+            make_pending(
+                "qa.300@astronlab.com",
+                "dev-1",
+                "qa.{n}@astronlab.com",
+                300,
+                "2026-04-06T17:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            resolve_create_base_email_for_profile(&store, "dev-1", None, None).unwrap(),
+            "qa.{n}@astronlab.com"
+        );
+    }
+
+    #[test]
+    fn resolve_create_base_email_for_profile_falls_back_to_dev_default_for_new_creates() {
+        let mut store = CredentialStore::default();
+        store.default_create_base_email = "qa.{n}@astronlab.com".to_string();
+
+        assert_eq!(
+            resolve_create_base_email_for_profile(&store, "dev-1", None, None).unwrap(),
+            "dev.{n}@astronlab.com"
+        );
+    }
+
+    #[test]
+    fn resolve_create_base_email_for_profile_respects_explicit_override() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "dev.30@astronlab.com".to_string(),
+            make_pending(
+                "dev.30@astronlab.com",
+                "dev-1",
+                "dev.{n}@astronlab.com",
+                30,
+                "2026-04-06T16:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            resolve_create_base_email_for_profile(
+                &store,
+                "dev-1",
+                Some("qa.{n}@astronlab.com"),
+                None,
+            )
+            .unwrap(),
+            "qa.{n}@astronlab.com"
+        );
     }
 
     #[test]
@@ -2194,14 +2407,14 @@ mod tests {
         }));
         assert_eq!(store.version, 4);
         assert_eq!(store.default_create_base_email, "dev.{n}@astronlab.com");
-        assert!(store
-            .families
-            .contains_key("dev-1::dev.{n}@astronlab.com"));
+        assert!(store.families.contains_key("dev-1::dev.{n}@astronlab.com"));
         assert!(!store
             .families
             .contains_key("dev-1::bench.devicefix.{n}@astronlab.com"));
         assert!(store.pending.contains_key("dev.35@astronlab.com"));
-        assert!(!store.pending.contains_key("bench.devicefix.8@astronlab.com"));
+        assert!(!store
+            .pending
+            .contains_key("bench.devicefix.8@astronlab.com"));
     }
 
     #[test]
