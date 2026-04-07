@@ -1,21 +1,25 @@
 use codex_rotate_runtime::dev_refresh::{
-    daemon_socket_is_older_than_binary, detect_local_cli_build,
-    local_cli_sources_newer_than_binary, rebuild_local_cli, stop_running_daemons,
+    current_process_local_tray_build, daemon_socket_is_older_than_binary, detect_local_cli_build,
+    local_cli_sources_newer_than_binary, local_tray_sources_newer_than_binary, rebuild_local_cli,
+    rebuild_local_tray, schedule_tray_relaunch_process, spawn_detached_process,
+    stop_running_daemons,
 };
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, subscribe, StatusSnapshot,
 };
+use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const DAEMON_START_ATTEMPTS: usize = 40;
+const LOCAL_BUILD_DAEMON_START_ATTEMPTS: usize = 240;
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DAEMON_START_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const TRAY_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Default)]
 pub struct SharedRenderState {
@@ -63,14 +67,29 @@ pub fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
         _ => "Last rotation: none".to_string(),
     };
 
+    let status_body = match (
+        snapshot.last_message.as_deref(),
+        snapshot.next_tick_at.as_deref(),
+    ) {
+        (Some(message), Some(next_tick_at)) => {
+            format!("{message} (next tick {next_tick_at})")
+        }
+        (Some(message), None) => message.to_string(),
+        (None, Some(next_tick_at)) => format!("next tick {next_tick_at}"),
+        (None, None) => "starting".to_string(),
+    };
+
     RenderedSnapshot {
         account_text: format!(
             "Account: {}",
             snapshot.current_email.as_deref().unwrap_or("unknown")
         ),
-        inventory_text: match snapshot.inventory_count {
-            Some(count) => format!("Inventory: {count} account(s)"),
-            None => "Inventory: unknown".to_string(),
+        inventory_text: match (snapshot.inventory_active_slot, snapshot.inventory_count) {
+            (Some(slot), Some(count)) if count > 0 && slot <= count => {
+                format!("Inventory: {slot}/{count} account(s)")
+            }
+            (_, Some(count)) => format!("Inventory: {count} account(s)"),
+            (_, None) => "Inventory: unknown".to_string(),
         },
         plan_text: format!(
             "Plan: {}",
@@ -80,10 +99,7 @@ pub fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
             "Quota: {}",
             snapshot.current_quota.as_deref().unwrap_or("unknown")
         ),
-        status_text: format!(
-            "Status: {}",
-            snapshot.last_message.as_deref().unwrap_or("starting")
-        ),
+        status_text: format!("Status: {}", status_body),
         rotation_text,
         tooltip_text: match snapshot.current_quota_percent {
             Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
@@ -121,22 +137,29 @@ pub fn resolve_cli_binary() -> Result<PathBuf, String> {
 }
 
 pub fn ensure_daemon_running() -> Result<(), String> {
-    ensure_daemon_running_with(DAEMON_START_POLL_INTERVAL, DAEMON_START_ATTEMPTS)
+    let cli_binary = resolve_cli_binary()?;
+    let max_attempts = if detect_local_cli_build(&cli_binary).is_some() {
+        LOCAL_BUILD_DAEMON_START_ATTEMPTS
+    } else {
+        DAEMON_START_ATTEMPTS
+    };
+    ensure_daemon_running_with(&cli_binary, DAEMON_START_POLL_INTERVAL, max_attempts)
 }
 
-fn ensure_daemon_running_with(poll_interval: Duration, max_attempts: usize) -> Result<(), String> {
-    let cli_binary = resolve_cli_binary()?;
+fn ensure_daemon_running_with(
+    cli_binary: &Path,
+    poll_interval: Duration,
+    max_attempts: usize,
+) -> Result<(), String> {
     refresh_local_daemon_if_needed(&cli_binary, poll_interval, max_attempts)?;
     if daemon_is_reachable() {
         return Ok(());
     }
-    let _child = Command::new(&cli_binary)
-        .arg("daemon")
-        .arg("run")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    log_tray_info(format!(
+        "Launching Codex Rotate daemon via {}.",
+        cli_binary.display()
+    ));
+    spawn_detached_process(cli_binary, &["daemon", "run"])
         .map_err(|error| format!("Failed to launch {}: {}", cli_binary.display(), error))?;
 
     for _ in 0..max_attempts {
@@ -192,6 +215,33 @@ fn wait_for_daemon_state(reachable: bool, poll_interval: Duration, max_attempts:
     daemon_is_reachable() == reachable
 }
 
+pub fn maybe_refresh_current_tray() -> Result<bool, String> {
+    let Some(build) = current_process_local_tray_build() else {
+        return Ok(false);
+    };
+    let sources_newer_than_binary = local_tray_sources_newer_than_binary(&build)
+        .map_err(|error| format!("Failed to inspect local tray freshness: {error}"))?;
+    if !sources_newer_than_binary {
+        return Ok(false);
+    }
+
+    log_tray_info(format!(
+        "Local tray sources changed. Rebuilding {}.",
+        build.tray_binary.display()
+    ));
+    rebuild_local_tray(&build)
+        .map_err(|error| format!("Failed to rebuild local codex-rotate tray: {error}"))?;
+    log_tray_info("Scheduling tray relaunch after rebuild.");
+    schedule_tray_relaunch(&build.tray_binary)
+        .map_err(|error| format!("Failed to relaunch local tray: {error}"))?;
+    Ok(true)
+}
+
+fn schedule_tray_relaunch(tray_binary: &Path) -> Result<(), String> {
+    schedule_tray_relaunch_process(tray_binary)
+        .map_err(|error| format!("Failed to relaunch local tray: {error}"))
+}
+
 pub fn spawn_subscription_loop<F>(on_snapshot: F)
 where
     F: FnMut(StatusSnapshot) + Send + 'static,
@@ -212,7 +262,9 @@ where
         }
 
         if let Err(error) = ensure_daemon_running() {
-            on_snapshot(error_snapshot(format!("daemon start failed: {}", error)));
+            let message = format!("daemon start failed: {}", error);
+            log_tray_error(&message);
+            on_snapshot(error_snapshot(message));
             if sleep_or_stop(&stop, DAEMON_START_RETRY_DELAY) {
                 return;
             }
@@ -222,10 +274,9 @@ where
         let mut subscription = match subscribe() {
             Ok(subscription) => subscription,
             Err(error) => {
-                on_snapshot(error_snapshot(format!(
-                    "daemon subscribe failed: {}",
-                    error
-                )));
+                let message = format!("daemon subscribe failed: {}", error);
+                log_tray_error(&message);
+                on_snapshot(error_snapshot(message));
                 if sleep_or_stop(&stop, DAEMON_START_RETRY_DELAY) {
                     return;
                 }
@@ -240,12 +291,42 @@ where
             match subscription.recv() {
                 Ok(snapshot) => on_snapshot(snapshot),
                 Err(error) => {
-                    on_snapshot(error_snapshot(format!("daemon disconnected: {}", error)));
+                    let message = format!("daemon disconnected: {}", error);
+                    log_tray_error(&message);
+                    on_snapshot(error_snapshot(message));
                     if sleep_or_stop(&stop, DAEMON_RECONNECT_DELAY) {
                         return;
                     }
                     break;
                 }
+            }
+        }
+    })
+}
+
+pub fn spawn_tray_refresh_loop_controlled<F, G>(
+    stop: Arc<AtomicBool>,
+    mut on_restarted: F,
+    mut on_error: G,
+) -> thread::JoinHandle<()>
+where
+    F: FnMut() + Send + 'static,
+    G: FnMut(String) + Send + 'static,
+{
+    thread::spawn(move || loop {
+        if sleep_or_stop(&stop, TRAY_REFRESH_CHECK_INTERVAL) {
+            return;
+        }
+        match maybe_refresh_current_tray() {
+            Ok(true) => {
+                log_tray_info("Tray refresh completed; exiting stale tray instance.");
+                on_restarted();
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log_tray_error(format!("tray refresh failed: {error}"));
+                on_error(error)
             }
         }
     })
@@ -282,7 +363,7 @@ mod tests {
     fn sample_rendered_snapshot() -> RenderedSnapshot {
         RenderedSnapshot {
             account_text: "Account: dev.1@astronlab.com".to_string(),
-            inventory_text: "Inventory: 3 account(s)".to_string(),
+            inventory_text: "Inventory: 2/3 account(s)".to_string(),
             plan_text: "Plan: free".to_string(),
             quota_text: "Quota: 5h 80% left".to_string(),
             status_text: "Status: watch healthy".to_string(),
@@ -311,6 +392,35 @@ mod tests {
         changed.status_text = "Status: rotated".to_string();
         assert!(render_state.begin_render(&rendered));
         assert!(render_state.begin_render(&changed));
+    }
+
+    #[test]
+    fn rendered_snapshot_appends_next_tick_to_idle_status() {
+        let snapshot = StatusSnapshot {
+            last_message: Some("watch healthy".to_string()),
+            next_tick_at: Some("8:15:30 PM".to_string()),
+            ..StatusSnapshot::default()
+        };
+
+        let rendered = rendered_snapshot(&snapshot);
+
+        assert_eq!(
+            rendered.status_text,
+            "Status: watch healthy (next tick 8:15:30 PM)"
+        );
+    }
+
+    #[test]
+    fn rendered_snapshot_shows_inventory_slot_and_total() {
+        let snapshot = StatusSnapshot {
+            inventory_active_slot: Some(2),
+            inventory_count: Some(3),
+            ..StatusSnapshot::default()
+        };
+
+        let rendered = rendered_snapshot(&snapshot);
+
+        assert_eq!(rendered.inventory_text, "Inventory: 2/3 account(s)");
     }
 
     #[test]

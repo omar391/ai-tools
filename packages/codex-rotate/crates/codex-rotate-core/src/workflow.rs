@@ -16,7 +16,9 @@ use crate::auth::{
     extract_account_id_from_auth, load_codex_auth, summarize_codex_auth, write_codex_auth,
     CodexAuth,
 };
-use crate::bridge::run_automation_bridge;
+use crate::bridge::{
+    run_automation_bridge, run_automation_bridge_with_progress, AutomationProgressCallback,
+};
 use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::pool::{
     cmd_add, find_next_usable_account, format_account_summary_for_display, inspect_account,
@@ -305,6 +307,13 @@ enum EmailFamilyMode {
 }
 
 pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
+    cmd_create_with_progress(options, None)
+}
+
+pub fn cmd_create_with_progress(
+    options: CreateCommandOptions,
+    progress: Option<AutomationProgressCallback>,
+) -> Result<String> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
@@ -369,7 +378,7 @@ pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
         save_pool(&pool)?;
     }
 
-    let result = execute_create_flow(&options)?;
+    let result = execute_create_flow_with_progress(&options, progress)?;
     let quota_summary = summarize_quota_for_create(&result);
     if options.restore_previous_auth_after_create {
         restore_active_auth(previous_auth.as_ref())?;
@@ -402,6 +411,14 @@ pub fn migrate_legacy_credential_store_if_needed() -> Result<bool> {
 }
 
 pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
+    cmd_relogin_with_progress(selector, options, None)
+}
+
+pub fn cmd_relogin_with_progress(
+    selector: &str,
+    options: ReloginOptions,
+    progress: Option<AutomationProgressCallback>,
+) -> Result<String> {
     let selection = {
         let pool = load_pool()?;
         resolve_account_selector(&pool, selector)?
@@ -437,6 +454,7 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
                 None,
                 None,
                 None,
+                progress.clone(),
             )
         })();
         if let Err(error) = login_result {
@@ -507,6 +525,10 @@ pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
         }
     }
 
+    report_progress(
+        progress.as_ref(),
+        format!("Opening Codex login flow for {expected_email}."),
+    );
     run_codex_command(["login"])?;
 
     let auth = load_current_auth()?;
@@ -597,17 +619,28 @@ pub fn reconcile_added_account_credential_state(entry: &AccountEntry) -> Result<
     Ok(dirty)
 }
 
-fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandResult> {
+fn execute_create_flow_with_progress(
+    options: &CreateCommandOptions,
+    progress: Option<AutomationProgressCallback>,
+) -> Result<CreateCommandResult> {
     let mut attempt = 1usize;
     loop {
-        match execute_create_flow_attempt(options) {
+        match execute_create_flow_attempt(options, progress.clone()) {
             Ok(result) => return Ok(result),
             Err(CreateFlowAttemptFailure::Retryable(error))
+            | Err(CreateFlowAttemptFailure::Fatal(error))
                 if should_retry_create_until_usable(options) =>
             {
                 if reusable_account_exists_for_auto_create_retry(options)? {
                     return Err(anyhow!(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT));
                 }
+                report_progress(
+                    progress.as_ref(),
+                    format!(
+                        "Automatic account creation attempt {attempt} failed: {error}. Retrying in {}s.",
+                        AUTO_CREATE_RETRY_DELAY.as_secs()
+                    ),
+                );
                 eprintln!(
                     "{YELLOW}WARN{RESET} Automatic account creation attempt {attempt} failed: {error}. Retrying with a fresh account in {}s.",
                     AUTO_CREATE_RETRY_DELAY.as_secs()
@@ -618,6 +651,12 @@ fn execute_create_flow(options: &CreateCommandOptions) -> Result<CreateCommandRe
             Err(CreateFlowAttemptFailure::Retryable(error))
             | Err(CreateFlowAttemptFailure::Fatal(error)) => return Err(error),
         }
+    }
+}
+
+fn report_progress(progress: Option<&AutomationProgressCallback>, message: impl Into<String>) {
+    if let Some(progress) = progress {
+        progress(message.into());
     }
 }
 
@@ -708,6 +747,7 @@ fn prepare_next_auto_create_attempt(
 
 fn execute_create_flow_attempt(
     options: &CreateCommandOptions,
+    progress: Option<AutomationProgressCallback>,
 ) -> std::result::Result<CreateCommandResult, CreateFlowAttemptFailure> {
     let paths = fatal(resolve_paths())?;
     let previous_auth = fatal(load_codex_auth_if_exists())?;
@@ -771,11 +811,32 @@ fn execute_create_flow_attempt(
         started_at: Some(started_at.clone()),
     });
     let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
+    report_progress(
+        progress.as_ref(),
+        if reusing_pending {
+            format!(
+                "Reusing pending account {} via {}.",
+                created_email, profile_name
+            )
+        } else {
+            format!(
+                "Creating {} via {} from {}.",
+                created_email, profile_name, base_email
+            )
+        },
+    );
     if previous_auth
         .as_ref()
         .map(|auth| auth_matches_target_email(auth, &created_email))
         .unwrap_or(false)
     {
+        report_progress(
+            progress.as_ref(),
+            format!(
+                "{} is already the active Codex auth. Finalizing.",
+                created_email
+            ),
+        );
         let auth = previous_auth
             .as_ref()
             .cloned()
@@ -815,6 +876,7 @@ fn execute_create_flow_attempt(
             &auth,
             started_at.as_str(),
             previous_auth.as_ref(),
+            progress.clone(),
         );
         let result = match result {
             Ok(result) => result,
@@ -842,6 +904,10 @@ fn execute_create_flow_attempt(
     }
     let account_login_locator = build_openai_account_login_locator(&created_email);
     if !reusing_pending {
+        report_progress(
+            progress.as_ref(),
+            format!("Preparing password secret for {}.", created_email),
+        );
         let existing_secret_ref: Option<CodexRotateSecretRef> = run_automation_bridge(
             "find-account-secret-ref",
             BridgeFindSecretPayload {
@@ -891,6 +957,10 @@ fn execute_create_flow_attempt(
         .insert(normalize_email_key(&created_email), pending.clone());
     fatal(save_credential_store(&store))?;
 
+    report_progress(
+        progress.as_ref(),
+        format!("Starting managed login for {}.", created_email),
+    );
     let login_result = run_complete_codex_login(
         &profile_name,
         &created_email,
@@ -900,6 +970,7 @@ fn execute_create_flow_attempt(
         Some(started_at.as_str()),
         Some(true),
         Some(&birth_date),
+        progress.clone(),
     );
     if let Err(error) = login_result {
         fatal(restore_active_auth(previous_auth.as_ref()))?;
@@ -944,6 +1015,10 @@ fn execute_create_flow_attempt(
         return Err(CreateFlowAttemptFailure::Fatal(error));
     }
 
+    report_progress(
+        progress.as_ref(),
+        format!("Managed login finished for {}. Finalizing.", created_email),
+    );
     let result = finalize_created_account(
         &mut store,
         family.as_ref(),
@@ -956,6 +1031,7 @@ fn execute_create_flow_attempt(
         &auth,
         started_at.as_str(),
         previous_auth.as_ref(),
+        progress.clone(),
     );
     let result = match result {
         Ok(result) => result,
@@ -1000,9 +1076,18 @@ fn finalize_created_account(
     auth: &CodexAuth,
     started_at: &str,
     previous_auth: Option<&CodexAuth>,
+    progress: Option<AutomationProgressCallback>,
 ) -> Result<CreateCommandResult> {
     let created_email = pending.stored.email.clone();
+    report_progress(
+        progress.as_ref(),
+        format!("Adding {} to the account pool.", created_email),
+    );
     let _ = cmd_add(options.alias.as_deref())?;
+    report_progress(
+        progress.as_ref(),
+        format!("Inspecting quota for {}.", created_email),
+    );
     let inspected = inspect_pool_entry_by_account_id(&extract_account_id_from_auth(auth))?
         .ok_or_else(|| {
             anyhow!(
@@ -1075,6 +1160,11 @@ fn finalize_created_account(
             }
         }
     }
+
+    report_progress(
+        progress.as_ref(),
+        format!("Created {} with usable quota.", inspected.entry.label),
+    );
 
     Ok(CreateCommandResult {
         entry: inspected.entry,
@@ -1175,6 +1265,7 @@ fn run_complete_codex_login(
     workflow_run_stamp: Option<&str>,
     prefer_signup_recovery: Option<bool>,
     birth_date: Option<&AdultBirthDate>,
+    progress: Option<AutomationProgressCallback>,
 ) -> Result<()> {
     let fallback_birth_date;
     let birth_date = match birth_date {
@@ -1194,7 +1285,7 @@ fn run_complete_codex_login(
         birth_day: Some(birth_date.birth_day),
         birth_year: Some(birth_date.birth_year),
     };
-    let _: Value = run_automation_bridge(
+    let _: Value = run_automation_bridge_with_progress(
         "complete-codex-login",
         BridgeCompleteLoginPayload {
             profile_name,
@@ -1202,6 +1293,7 @@ fn run_complete_codex_login(
             account_login_locator,
             options: Some(options),
         },
+        progress,
     )?;
     Ok(())
 }
@@ -2991,6 +3083,25 @@ document:
         assert!(!should_logout_before_stored_relogin(&ReloginOptions {
             logout_first: false,
             ..ReloginOptions::default()
+        }));
+    }
+
+    #[test]
+    fn auto_create_retry_gate_only_applies_to_next_with_quota_requirement() {
+        assert!(should_retry_create_until_usable(&CreateCommandOptions {
+            require_usable_quota: true,
+            source: CreateCommandSource::Next,
+            ..CreateCommandOptions::default()
+        }));
+        assert!(!should_retry_create_until_usable(&CreateCommandOptions {
+            require_usable_quota: false,
+            source: CreateCommandSource::Next,
+            ..CreateCommandOptions::default()
+        }));
+        assert!(!should_retry_create_until_usable(&CreateCommandOptions {
+            require_usable_quota: true,
+            source: CreateCommandSource::Manual,
+            ..CreateCommandOptions::default()
         }));
     }
 

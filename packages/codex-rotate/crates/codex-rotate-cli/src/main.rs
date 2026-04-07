@@ -1,26 +1,31 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::pool::{
-    cmd_add, cmd_list_stream, cmd_next, cmd_prev, cmd_remove, cmd_status_stream,
+    cmd_add, cmd_list_stream, cmd_next_with_progress, cmd_prev, cmd_remove, cmd_status_stream,
 };
 use codex_rotate_core::workflow::{
-    cmd_create, cmd_relogin, CreateCommandOptions, CreateCommandSource, ReloginOptions,
+    cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions,
+    CreateCommandSource, ReloginOptions,
 };
 use codex_rotate_runtime::daemon::run_daemon_forever;
+use codex_rotate_runtime::dev_refresh::{
+    clear_tray_service_registration, detect_local_tray_build, launch_tray_process,
+    local_tray_sources_newer_than_binary, rebuild_local_tray, stop_running_trays,
+};
 use codex_rotate_runtime::ipc::{
-    daemon_is_reachable, invoke, CreateInvocation, InvokeAction, ReloginInvocation,
+    daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
 };
 
 const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -50,15 +55,26 @@ fn run() -> Result<()> {
             &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
         )?,
         Some("create") | Some("new") => {
-            write_output(&mut stdout, &cmd_create(parse_create_options(&args[1..])?)?)?
+            write_output(
+                &mut stdout,
+                &cmd_create_with_progress(
+                    parse_create_options(&args[1..])?,
+                    cli_progress_callback(),
+                )?,
+            )?
         }
-        Some("next") | Some("n") => write_output(&mut stdout, &cmd_next()?)?,
+        Some("next") | Some("n") => {
+            write_output(&mut stdout, &cmd_next_with_progress(cli_progress_callback())?)?
+        }
         Some("prev") | Some("p") => write_output(&mut stdout, &cmd_prev()?)?,
         Some("list") | Some("ls") => cmd_list_stream(&mut stdout)?,
         Some("status") | Some("s") => cmd_status_stream(&mut stdout)?,
         Some("relogin") | Some("reauth") => {
             let (selector, options) = parse_relogin_options(&args[1..])?;
-            write_output(&mut stdout, &cmd_relogin(&selector, options)?)?
+            write_output(
+                &mut stdout,
+                &cmd_relogin_with_progress(&selector, options, cli_progress_callback())?,
+            )?
         }
         Some("remove") | Some("rm") => write_output(
             &mut stdout,
@@ -87,22 +103,67 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         }),
         Some("next") | Some("n") => Some(InvokeAction::Next),
         Some("prev") | Some("p") => Some(InvokeAction::Prev),
-        Some("list") | Some("ls") => Some(InvokeAction::List),
-        Some("status") | Some("s") => Some(InvokeAction::Status),
         Some("relogin") | Some("reauth") => Some(InvokeAction::Relogin {
             options: parse_relogin_invocation(args)?,
         }),
         Some("remove") | Some("rm") => Some(InvokeAction::Remove {
             selector: parse_remove_selector(args)?.to_string(),
         }),
-        Some("daemon") | Some("tray") | None | Some("help") | Some("--help") | Some("-h") => None,
+        Some("list")
+        | Some("ls")
+        | Some("status")
+        | Some("s")
+        | Some("daemon")
+        | Some("tray")
+        | None
+        | Some("help")
+        | Some("--help")
+        | Some("-h") => None,
         Some(_) => None,
     };
 
     Ok(match action {
-        Some(action) => Some(invoke(action)?),
+        Some(action) => {
+            if command_streams_progress(command) {
+                spawn_daemon_progress_printer();
+            }
+            Some(invoke(action)?)
+        }
         None => None,
     })
+}
+
+fn cli_progress_callback() -> Option<Arc<dyn Fn(String) + Send + Sync>> {
+    Some(Arc::new(|message| eprintln!("{message}")))
+}
+
+fn spawn_daemon_progress_printer() {
+    thread::spawn(|| {
+        let Ok(mut subscription) = subscribe() else {
+            return;
+        };
+        if subscription.recv().is_err() {
+            return;
+        }
+        while let Ok(snapshot) = subscription.recv() {
+            let Some(message) = snapshot.last_message else {
+                continue;
+            };
+            eprintln!("{message}");
+        }
+    });
+}
+
+fn command_streams_progress(command: Option<&str>) -> bool {
+    matches!(
+        command,
+        Some("create")
+            | Some("new")
+            | Some("next")
+            | Some("n")
+            | Some("relogin")
+            | Some("reauth")
+    )
 }
 
 fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
@@ -124,8 +185,13 @@ fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
     match command {
         "open" => write_output(writer, &tray_open_message()?),
         "status" => {
-            if tray_is_running()? {
+            let tray_running = tray_is_running()?;
+            if tray_running && daemon_is_reachable() {
                 write_output(writer, "Codex Rotate tray is running.")
+            } else if tray_running {
+                Err(anyhow!(
+                    "Codex Rotate tray is running but the daemon is unavailable."
+                ))
             } else {
                 Err(anyhow!("Codex Rotate tray is not running."))
             }
@@ -148,27 +214,21 @@ fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
 
 fn tray_open_message() -> Result<String> {
     let tray_binary = resolve_tray_binary()?;
+    refresh_local_tray_if_needed(&tray_binary)?;
     if tray_is_running_with_path(&tray_binary)? {
-        return Ok("Codex Rotate tray is already running.".to_string());
+        if daemon_is_reachable() {
+            return Ok("Codex Rotate tray is already running.".to_string());
+        }
+        stop_running_trays(&tray_binary)?;
+        clear_tray_service_registration();
+        if !wait_for_tray_state(&tray_binary, false) {
+            return Err(anyhow!(
+                "Timed out waiting for the unhealthy Codex Rotate tray to stop."
+            ));
+        }
     }
 
-    #[cfg(unix)]
-    let mut command = {
-        let mut command = Command::new("nohup");
-        command.arg(&tray_binary);
-        command
-    };
-
-    #[cfg(not(unix))]
-    let mut command = Command::new(&tray_binary);
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _child = command
-        .spawn()
-        .with_context(|| format!("Failed to start {}.", tray_binary.display()))?;
+    launch_tray_binary(&tray_binary)?;
 
     if wait_for_tray_state(&tray_binary, true) {
         return Ok("Started Codex Rotate tray.".to_string());
@@ -183,6 +243,7 @@ fn tray_quit_message() -> Result<String> {
     let tray_binary = resolve_tray_binary()?;
     let process_ids = list_running_tray_process_ids(&tray_binary)?;
     if process_ids.is_empty() {
+        clear_tray_service_registration();
         return Ok("Codex Rotate tray is not running.".to_string());
     }
 
@@ -190,6 +251,7 @@ fn tray_quit_message() -> Result<String> {
         stop_process(process_id)
             .with_context(|| format!("Failed to stop tray pid {}.", process_id))?;
     }
+    clear_tray_service_registration();
 
     if wait_for_tray_state(&tray_binary, false) {
         return Ok("Stopped Codex Rotate tray.".to_string());
@@ -207,6 +269,31 @@ fn tray_is_running() -> Result<bool> {
 
 fn tray_is_running_with_path(tray_binary: &Path) -> Result<bool> {
     Ok(!list_running_tray_process_ids(tray_binary)?.is_empty())
+}
+
+fn refresh_local_tray_if_needed(tray_binary: &Path) -> Result<()> {
+    let Some(build) = detect_local_tray_build(tray_binary) else {
+        return Ok(());
+    };
+    let sources_newer_than_binary = local_tray_sources_newer_than_binary(&build)?;
+    if !sources_newer_than_binary {
+        return Ok(());
+    }
+
+    rebuild_local_tray(&build)?;
+    if tray_is_running_with_path(tray_binary)? {
+        stop_running_trays(tray_binary)?;
+        if !wait_for_tray_state(tray_binary, false) {
+            return Err(anyhow!(
+                "Timed out waiting for the stale Codex Rotate tray to stop."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn launch_tray_binary(tray_binary: &Path) -> Result<()> {
+    launch_tray_process(tray_binary)
 }
 
 fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
@@ -281,10 +368,33 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
         return Ok(stdout
             .lines()
             .map(str::trim)
-            .filter(|line| line.contains(&tray_binary))
+            .filter(|line| {
+                let mut parts = line.split_whitespace();
+                let _pid = parts.next();
+                let first = parts.next();
+                let second = parts.next();
+                command_tokens_match_binary(first, second, &tray_binary)
+            })
             .filter_map(|line| line.split_whitespace().next().and_then(parse_process_id))
             .collect::<Vec<_>>());
     }
+}
+
+fn command_tokens_match_binary(first: Option<&str>, second: Option<&str>, binary: &str) -> bool {
+    first == Some(binary) || (shell_like_command(first) && second == Some(binary))
+}
+
+fn shell_like_command(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    let Some(name) = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    matches!(name, "sh" | "bash" | "zsh" | "dash")
 }
 
 fn stop_process(process_id: u32) -> Result<()> {
@@ -605,24 +715,6 @@ mod tests {
         result
     }
 
-    fn with_env_var<T>(name: &str, value: &str, test: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
-        let previous = std::env::var_os(name);
-        unsafe {
-            std::env::set_var(name, value);
-        }
-        let result = test();
-        match previous {
-            Some(previous) => unsafe {
-                std::env::set_var(name, previous);
-            },
-            None => unsafe {
-                std::env::remove_var(name);
-            },
-        }
-        result
-    }
-
     #[cfg(unix)]
     fn spawn_proxy_server(response_output: &str) -> std::thread::JoinHandle<Result<ClientRequest>> {
         let socket_path = daemon_socket_path().expect("daemon socket path");
@@ -735,28 +827,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tray_command_can_launch_report_and_stop_tray_binary() {
-        let fixture_root = unique_temp_dir("codex-rotate-tray-cli");
-        fs::create_dir_all(&fixture_root).expect("fixture root");
-        let tray_stub_path = fixture_root.join("codex-rotate-tray");
-        let started_path = fixture_root.join("started.txt");
-        fs::write(
-            &tray_stub_path,
-            format!(
-                "#!/bin/sh\ntrap 'exit 0' TERM INT\nprintf 'started\\n' > \"{}\"\nwhile true; do\n  sleep 1\ndone\n",
-                started_path.display()
-            ),
-        )
-        .expect("write tray stub");
-        let mut permissions = fs::metadata(&tray_stub_path)
-            .expect("tray stub metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&tray_stub_path, permissions).expect("set tray stub permissions");
+        with_rotate_home(|| -> Result<()> {
+            let fixture_root = unique_temp_dir("codex-rotate-tray-cli");
+            fs::create_dir_all(&fixture_root).expect("fixture root");
+            let tray_stub_path = fixture_root.join("codex-rotate-tray");
+            let started_path = fixture_root.join("started.txt");
+            fs::write(
+                &tray_stub_path,
+                format!(
+                    "#!/bin/sh\ntrap 'exit 0' TERM INT\nprintf 'started\\n' > \"{}\"\nwhile true; do\n  sleep 1\ndone\n",
+                    started_path.display()
+                ),
+            )
+            .expect("write tray stub");
+            let mut permissions = fs::metadata(&tray_stub_path)
+                .expect("tray stub metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tray_stub_path, permissions).expect("set tray stub permissions");
 
-        with_env_var(
-            "CODEX_ROTATE_TRAY_BIN",
-            tray_stub_path.to_str().expect("utf8 tray path"),
-            || -> Result<()> {
+            let previous_tray_bin = std::env::var_os("CODEX_ROTATE_TRAY_BIN");
+            unsafe {
+                std::env::set_var("CODEX_ROTATE_TRAY_BIN", &tray_stub_path);
+            }
+
+            let test_result = (|| -> Result<()> {
                 let mut output = Vec::new();
                 run_tray_command(&mut output, &["open".to_string()])?;
                 assert_eq!(
@@ -770,11 +865,11 @@ mod tests {
                 }
                 assert!(started_path.exists(), "tray stub should have started");
 
-                let mut output = Vec::new();
-                run_tray_command(&mut output, &["status".to_string()])?;
-                assert_eq!(
-                    String::from_utf8(output).expect("utf8").trim(),
-                    "Codex Rotate tray is running."
+                let error = run_tray_command(&mut Vec::new(), &["status".to_string()])
+                    .expect_err("tray without daemon should be unhealthy");
+                assert!(
+                    error.to_string().contains("daemon is unavailable"),
+                    "{error}"
                 );
 
                 let mut output = Vec::new();
@@ -788,11 +883,19 @@ mod tests {
                     .expect_err("tray should be stopped");
                 assert!(error.to_string().contains("not running"));
                 Ok(())
-            },
-        )
-        .expect("tray command");
+            })();
 
-        fs::remove_dir_all(&fixture_root).ok();
+            match previous_tray_bin {
+                Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_BIN", value) },
+                None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_BIN") },
+            }
+
+            test_result?;
+
+            fs::remove_dir_all(&fixture_root).ok();
+            Ok(())
+        })
+        .expect("tray command");
     }
 
     #[test]
@@ -874,10 +977,6 @@ mod tests {
             (Some("n"), Vec::new(), InvokeAction::Next),
             (Some("prev"), Vec::new(), InvokeAction::Prev),
             (Some("p"), Vec::new(), InvokeAction::Prev),
-            (Some("list"), Vec::new(), InvokeAction::List),
-            (Some("ls"), Vec::new(), InvokeAction::List),
-            (Some("status"), Vec::new(), InvokeAction::Status),
-            (Some("s"), Vec::new(), InvokeAction::Status),
             (
                 Some("relogin"),
                 vec![
@@ -951,5 +1050,20 @@ mod tests {
             Ok(())
         })
         .expect("no daemon path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_dispatch_bypasses_read_only_commands_even_with_daemon() {
+        with_rotate_home(|| {
+            let handle = spawn_reachable_daemon();
+            let list_output = try_run_via_daemon(Some("list"), &[])?;
+            let status_output = try_run_via_daemon(Some("status"), &[])?;
+            assert!(list_output.is_none());
+            assert!(status_output.is_none());
+            handle.join().expect("reachable daemon thread")?;
+            Ok(())
+        })
+        .expect("read-only commands should stay local");
     }
 }

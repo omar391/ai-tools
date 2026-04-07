@@ -9,15 +9,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{Duration as ChronoDuration, Local, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::pool::{
-    cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, load_pool, rotate_next_internal,
-    NextResult,
+    cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
+    rotate_next_internal_with_progress, NextResult,
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
-    cmd_create, cmd_relogin, migrate_legacy_credential_store_if_needed, CreateCommandOptions,
-    CreateCommandSource, ReloginOptions,
+    cmd_create_with_progress, cmd_relogin_with_progress,
+    migrate_legacy_credential_store_if_needed, CreateCommandOptions, CreateCommandSource,
+    ReloginOptions,
 };
 
 use crate::dev_refresh::{
@@ -31,6 +33,7 @@ use crate::ipc::{
 };
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
+use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{refresh_quota_cache, run_watch_iteration, WatchIterationOptions, WatchState};
 
 const DEFAULT_PORT: u16 = 9333;
@@ -62,29 +65,26 @@ impl DaemonState {
 #[derive(Clone, Default)]
 struct SharedDaemon {
     state: Arc<Mutex<DaemonState>>,
+    snapshot_cache: Arc<Mutex<StatusSnapshot>>,
     subscribers: Arc<Mutex<Vec<Sender<StatusSnapshot>>>>,
 }
 
 impl SharedDaemon {
     fn new() -> Self {
+        let state = DaemonState::new();
+        let snapshot = state.snapshot.clone();
         Self {
-            state: Arc::new(Mutex::new(DaemonState::new())),
+            state: Arc::new(Mutex::new(state)),
+            snapshot_cache: Arc::new(Mutex::new(snapshot)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn snapshot(&self) -> StatusSnapshot {
-        self.state
+        self.snapshot_cache
             .lock()
-            .expect("daemon state mutex")
-            .snapshot
+            .expect("snapshot cache mutex")
             .clone()
-    }
-
-    fn broadcast(&self) {
-        let snapshot = self.snapshot();
-        let mut subscribers = self.subscribers.lock().expect("subscriber mutex");
-        subscribers.retain(|sender| sender.send(snapshot.clone()).is_ok());
     }
 
     fn add_subscriber(&self, sender: Sender<StatusSnapshot>) {
@@ -92,6 +92,25 @@ impl SharedDaemon {
             .lock()
             .expect("subscriber mutex")
             .push(sender);
+    }
+
+    fn publish_snapshot(&self, snapshot: StatusSnapshot) {
+        {
+            let mut cache = self.snapshot_cache.lock().expect("snapshot cache mutex");
+            *cache = snapshot.clone();
+        }
+        let mut subscribers = self.subscribers.lock().expect("subscriber mutex");
+        subscribers.retain(|sender| sender.send(snapshot.clone()).is_ok());
+    }
+
+    fn publish_state_snapshot(&self) {
+        let snapshot = self
+            .state
+            .lock()
+            .expect("daemon state mutex")
+            .snapshot
+            .clone();
+        self.publish_snapshot(snapshot);
     }
 }
 
@@ -132,11 +151,15 @@ pub fn run_daemon_forever() -> Result<()> {
 
         let listener = UnixListener::bind(&paths.daemon_socket)
             .with_context(|| format!("Failed to bind {}.", paths.daemon_socket.display()))?;
+        log_daemon_info(format!(
+            "Daemon listening on {}.",
+            paths.daemon_socket.display()
+        ));
         let _socket_guard = SocketGuard(paths.daemon_socket.clone());
         let daemon = SharedDaemon::new();
 
         initialize_runtime(&daemon);
-        daemon.broadcast();
+        daemon.publish_state_snapshot();
         spawn_watch_loop(daemon.clone());
 
         for stream in listener.incoming() {
@@ -147,7 +170,11 @@ pub fn run_daemon_forever() -> Result<()> {
                         let _ = handle_client(daemon, stream);
                     });
                 }
-                Err(error) => eprintln!("codex-rotate: daemon accept failed: {error}"),
+                Err(error) => {
+                    let message = format!("daemon accept failed: {error}");
+                    log_daemon_error(&message);
+                    eprintln!("codex-rotate: {message}");
+                }
             }
         }
         Ok(())
@@ -189,17 +216,24 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
     }
 
     thread::spawn(move || loop {
+        daemon.clear_next_tick();
         match maybe_refresh_local_daemon_process() {
             Ok(true) => std::process::exit(0),
             Ok(false) => {}
             Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
         }
-        let result = daemon.with_state_mut(|state| run_watch_check(state, false));
+        let progress_daemon = daemon.clone();
+        let progress: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |message| progress_daemon.set_progress_message(message));
+        let result =
+            daemon.with_state_mut(|state| run_watch_check(state, false, Some(progress.clone())));
         if let Err(error) = result {
             daemon.set_error_message(format!("watch failed: {error}"));
         }
-        daemon.broadcast();
-        thread::sleep(next_watch_interval(daemon.snapshot().current_quota_percent));
+        daemon.publish_state_snapshot();
+        let interval = next_watch_interval(daemon.snapshot().current_quota_percent);
+        daemon.set_next_tick(next_tick_label(interval));
+        thread::sleep(interval);
     });
 }
 
@@ -220,17 +254,21 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
         }
         ClientRequest::Invoke { action } => {
             let mut writer = stream;
+            let action_name = format!("{action:?}");
             let response = match daemon.handle_invoke(action) {
                 Ok(output) => ServerMessage::Result {
                     ok: true,
                     output: Some(output),
                     error: None,
                 },
-                Err(error) => ServerMessage::Result {
-                    ok: false,
-                    output: None,
-                    error: Some(error.to_string()),
-                },
+                Err(error) => {
+                    log_daemon_error(format!("invoke {action_name} failed: {error:#}"));
+                    ServerMessage::Result {
+                        ok: false,
+                        output: None,
+                        error: Some(error.to_string()),
+                    }
+                }
             };
             write_message(&mut writer, &response)?;
         }
@@ -241,11 +279,40 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
 
 impl SharedDaemon {
     fn set_error_message(&self, message: String) {
-        {
+        log_daemon_error(&message);
+        let snapshot = {
             let mut state = self.state.lock().expect("daemon state mutex");
             state.snapshot.last_message = Some(message);
-        }
-        self.broadcast();
+            state.snapshot.next_tick_at = None;
+            state.snapshot.clone()
+        };
+        self.publish_snapshot(snapshot);
+    }
+
+    fn set_progress_message(&self, message: String) {
+        log_daemon_info(&message);
+        let mut snapshot = self.snapshot();
+        snapshot.last_message = Some(message);
+        snapshot.next_tick_at = None;
+        self.publish_snapshot(snapshot);
+    }
+
+    fn set_next_tick(&self, next_tick_at: String) {
+        let snapshot = {
+            let mut state = self.state.lock().expect("daemon state mutex");
+            state.snapshot.next_tick_at = Some(next_tick_at);
+            state.snapshot.clone()
+        };
+        self.publish_snapshot(snapshot);
+    }
+
+    fn clear_next_tick(&self) {
+        let snapshot = {
+            let mut state = self.state.lock().expect("daemon state mutex");
+            state.snapshot.next_tick_at = None;
+            state.snapshot.clone()
+        };
+        self.publish_snapshot(snapshot);
     }
 
     fn with_state_mut<T, F>(&self, operation: F) -> Result<T>
@@ -257,19 +324,26 @@ impl SharedDaemon {
     }
 
     fn handle_invoke(&self, action: InvokeAction) -> Result<String> {
-        let result = self.with_state_mut(|state| run_invoke_action(state, action));
-        self.broadcast();
+        let result = run_invoke_action(self, action);
+        self.publish_state_snapshot();
         result
     }
 }
 
 fn maybe_refresh_local_daemon_process() -> Result<bool> {
+    if takeover_requested() {
+        return Ok(false);
+    }
     let Some(build) = current_process_local_cli_build() else {
         return Ok(false);
     };
     let daemon_socket = crate::ipc::daemon_socket_path()?;
     let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)?;
     if sources_newer_than_binary {
+        log_daemon_info(format!(
+            "Local CLI/runtime sources changed. Rebuilding {}.",
+            build.cli_binary.display()
+        ));
         rebuild_local_cli(&build)?;
     }
     let binary_newer_than_running_socket =
@@ -277,6 +351,10 @@ fn maybe_refresh_local_daemon_process() -> Result<bool> {
     if !sources_newer_than_binary && !binary_newer_than_running_socket {
         return Ok(false);
     }
+    log_daemon_info(format!(
+        "Refreshing daemon with rebuilt binary {}.",
+        build.cli_binary.display()
+    ));
 
     Command::new(&build.cli_binary)
         .arg("daemon")
@@ -309,41 +387,59 @@ fn wait_for_previous_daemon_to_release_socket() {
     }
 }
 
-fn run_invoke_action(state: &mut DaemonState, action: InvokeAction) -> Result<String> {
+fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<String> {
     match action {
-        InvokeAction::Status => {
+        InvokeAction::Status => daemon.with_state_mut(|state| {
             refresh_static_snapshot(state);
             cmd_status()
-        }
-        InvokeAction::List => {
+        }),
+        InvokeAction::List => daemon.with_state_mut(|state| {
             refresh_static_snapshot(state);
             cmd_list()
-        }
-        InvokeAction::Add { alias } => {
+        }),
+        InvokeAction::Add { alias } => daemon.with_state_mut(|state| {
             let output = cmd_add(alias.as_deref())?;
             refresh_static_snapshot(state);
             state.snapshot.last_message = Some(first_line(&output));
             Ok(output)
+        }),
+        InvokeAction::Next => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| run_manual_next(state, Some(progress)))
         }
-        InvokeAction::Next => run_manual_next(state),
-        InvokeAction::Prev => run_manual_prev(state),
-        InvokeAction::Create { options } => run_manual_create(state, options),
-        InvokeAction::Relogin { options } => run_manual_relogin(state, options),
-        InvokeAction::Remove { selector } => {
+        InvokeAction::Prev => daemon.with_state_mut(run_manual_prev),
+        InvokeAction::Create { options } => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| run_manual_create(state, options, Some(progress)))
+        }
+        InvokeAction::Relogin { options } => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| run_manual_relogin(state, options, Some(progress)))
+        }
+        InvokeAction::Remove { selector } => daemon.with_state_mut(|state| {
             let output = cmd_remove(&selector)?;
             refresh_static_snapshot(state);
             state.snapshot.last_message = Some(first_line(&output));
             Ok(output)
-        }
-        InvokeAction::Refresh => {
-            run_watch_check(state, true)?;
+        }),
+        InvokeAction::Refresh => daemon.with_state_mut(|state| {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            run_watch_check(state, true, Some(progress))?;
             Ok(state
                 .snapshot
                 .last_message
                 .clone()
                 .unwrap_or_else(|| "watch healthy".to_string()))
-        }
-        InvokeAction::OpenManaged => {
+        }),
+        InvokeAction::OpenManaged => daemon.with_state_mut(|state| {
             ensure_debug_codex_instance(None, Some(managed_codex_port()), None, None)?;
             refresh_live_account_state(state, true)?;
             Ok(state
@@ -351,20 +447,26 @@ fn run_invoke_action(state: &mut DaemonState, action: InvokeAction) -> Result<St
                 .last_message
                 .clone()
                 .unwrap_or_else(|| "launcher ready".to_string()))
-        }
+        }),
     }
 }
 
-fn run_watch_check(state: &mut DaemonState, force_quota_refresh: bool) -> Result<()> {
+fn run_watch_check(
+    state: &mut DaemonState,
+    force_quota_refresh: bool,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<()> {
     let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
     let auth_changed = refresh_auth_summary(&mut state.snapshot);
+    state.snapshot.next_tick_at = None;
 
     let result = run_watch_iteration(WatchIterationOptions {
         port: Some(port),
         after_signal_id: None,
         cooldown_ms: None,
         force_quota_refresh: force_quota_refresh || auth_changed,
+        progress,
     })?;
 
     refresh_inventory_count(&mut state.snapshot);
@@ -400,10 +502,13 @@ fn run_watch_check(state: &mut DaemonState, force_quota_refresh: bool) -> Result
     Ok(())
 }
 
-fn run_manual_next(state: &mut DaemonState) -> Result<String> {
+fn run_manual_next(
+    state: &mut DaemonState,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
     let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = rotate_next_internal()?;
+    let result = rotate_next_internal_with_progress(progress)?;
     refresh_static_snapshot(state);
     if let Some(summary) = next_result_summary(&result) {
         state.snapshot.last_rotation_from_email = previous_displayed_email;
@@ -447,8 +552,12 @@ fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
     Ok(output)
 }
 
-fn run_manual_create(state: &mut DaemonState, options: CreateInvocation) -> Result<String> {
-    let output = cmd_create(CreateCommandOptions {
+fn run_manual_create(
+    state: &mut DaemonState,
+    options: CreateInvocation,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
+    let output = cmd_create_with_progress(CreateCommandOptions {
         alias: options.alias,
         profile_name: options.profile_name,
         base_email: options.base_email,
@@ -457,7 +566,7 @@ fn run_manual_create(state: &mut DaemonState, options: CreateInvocation) -> Resu
         restore_previous_auth_after_create: options.restore_previous_auth_after_create,
         require_usable_quota: options.require_usable_quota,
         source: CreateCommandSource::Manual,
-    })?;
+    }, progress)?;
     refresh_static_snapshot(state);
     refresh_quota_state(state, true);
     state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
@@ -468,14 +577,16 @@ fn run_manual_create(state: &mut DaemonState, options: CreateInvocation) -> Resu
 fn run_manual_relogin(
     state: &mut DaemonState,
     options: crate::ipc::ReloginInvocation,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
-    let output = cmd_relogin(
+    let output = cmd_relogin_with_progress(
         &options.selector,
         ReloginOptions {
             allow_email_change: options.allow_email_change,
             logout_first: options.logout_first,
             manual_login: options.manual_login,
         },
+        progress,
     )?;
     refresh_static_snapshot(state);
     refresh_quota_state(state, true);
@@ -497,7 +608,13 @@ fn refresh_static_snapshot(state: &mut DaemonState) {
 }
 
 fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
-    snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
+    if let Ok(overview) = current_pool_overview() {
+        snapshot.inventory_count = Some(overview.inventory_count);
+        snapshot.inventory_active_slot = overview.inventory_active_slot;
+    } else {
+        snapshot.inventory_count = None;
+        snapshot.inventory_active_slot = None;
+    }
 }
 
 fn refresh_auth_summary(snapshot: &mut StatusSnapshot) -> bool {
@@ -555,6 +672,15 @@ fn next_watch_interval(current_quota_percent: Option<u8>) -> Duration {
         _ => DEFAULT_INTERVAL_SECONDS,
     };
     Duration::from_secs(seconds)
+}
+
+fn next_tick_label(interval: Duration) -> String {
+    let next_tick = Utc::now()
+        + ChronoDuration::from_std(interval).unwrap_or_else(|_| ChronoDuration::seconds(0));
+    next_tick
+        .with_timezone(&Local)
+        .format("%-I:%M:%S %p")
+        .to_string()
 }
 
 fn first_line(output: &str) -> String {
@@ -722,5 +848,28 @@ mod tests {
         assert!(rotate_home.join("profile").join("marker.txt").exists());
         assert!(!legacy_home.exists());
         fs::remove_dir_all(&fake_home).ok();
+    }
+
+    #[test]
+    fn takeover_child_skips_local_daemon_refresh() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let previous_takeover = std::env::var_os(DAEMON_TAKEOVER_ENV);
+
+        unsafe {
+            std::env::set_var(DAEMON_TAKEOVER_ENV, "1");
+        }
+
+        let result = maybe_refresh_local_daemon_process().expect("refresh result");
+
+        match previous_takeover {
+            Some(value) => unsafe {
+                std::env::set_var(DAEMON_TAKEOVER_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(DAEMON_TAKEOVER_ENV);
+            },
+        }
+
+        assert!(!result);
     }
 }

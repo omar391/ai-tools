@@ -41,6 +41,7 @@ impl RuntimeCapabilities {
 pub struct StatusSnapshot {
     pub current_email: Option<String>,
     pub inventory_count: Option<usize>,
+    pub inventory_active_slot: Option<usize>,
     pub current_plan: Option<String>,
     pub current_quota: Option<String>,
     pub current_quota_percent: Option<u8>,
@@ -48,6 +49,7 @@ pub struct StatusSnapshot {
     pub last_rotation_to_email: Option<String>,
     pub last_rotation_reason: Option<String>,
     pub last_message: Option<String>,
+    pub next_tick_at: Option<String>,
     pub capabilities: RuntimeCapabilities,
 }
 

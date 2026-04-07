@@ -63,9 +63,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
             .unwrap_or(default_account_flow_file),
         asset_root,
         automation_bridge_entrypoint,
-        node_bin: std::env::var("CODEX_ROTATE_NODE_BIN")
-            .or_else(|_| std::env::var("NODE_BIN"))
-            .unwrap_or_else(|_| "node".to_string()),
+        node_bin: resolve_node_binary(),
     })
 }
 
@@ -81,4 +79,79 @@ fn repo_root() -> Result<PathBuf> {
         .join("..")
         .canonicalize()
         .context("Failed to resolve repository root.")
+}
+
+fn resolve_node_binary() -> String {
+    let candidates = [
+        std::env::var_os("CODEX_ROTATE_NODE_BIN").map(PathBuf::from),
+        std::env::var_os("NODE_BIN").map(PathBuf::from),
+        std::env::var_os("NODE").map(PathBuf::from),
+        find_binary_in_path("node"),
+        Some(PathBuf::from("/opt/homebrew/opt/node@22/bin/node")),
+        Some(PathBuf::from("/opt/homebrew/bin/node")),
+        Some(PathBuf::from("/usr/local/bin/node")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "node".to_string()
+}
+
+fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_node_binary;
+    use std::fs;
+
+    #[test]
+    fn resolve_node_binary_prefers_override() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let expected = tempdir.path().join("node");
+        fs::write(&expected, "").expect("write node override");
+
+        let previous_override = std::env::var_os("CODEX_ROTATE_NODE_BIN");
+        let previous_node_bin = std::env::var_os("NODE_BIN");
+        let previous_node = std::env::var_os("NODE");
+        let previous_path = std::env::var_os("PATH");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_NODE_BIN", &expected);
+            std::env::remove_var("NODE_BIN");
+            std::env::remove_var("NODE");
+            std::env::remove_var("PATH");
+        }
+
+        let resolved = resolve_node_binary();
+
+        match previous_override {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_NODE_BIN", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_NODE_BIN") },
+        }
+        match previous_node_bin {
+            Some(value) => unsafe { std::env::set_var("NODE_BIN", value) },
+            None => unsafe { std::env::remove_var("NODE_BIN") },
+        }
+        match previous_node {
+            Some(value) => unsafe { std::env::set_var("NODE", value) },
+            None => unsafe { std::env::remove_var("NODE") },
+        }
+        match previous_path {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(resolved, expected.to_string_lossy());
+    }
 }

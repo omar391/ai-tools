@@ -148,6 +148,58 @@ const LEGACY_ROTATE_HOME_DIR_PATTERNS = [/^codex-login-browser-shim-.+$/];
 const LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS = [/^codex-login-managed-.+$/];
 const CURRENT_CODEX_LOGIN_WRAPPER_PATTERN =
   /^codex-login-[a-z0-9._-]+-[0-9a-f]{12}$/;
+const FAST_BROWSER_SECRET_BROKER_SOCKET = join(
+  FAST_BROWSER_DAEMON_DIR,
+  "secrets.sock",
+);
+const FAST_BROWSER_SECRET_BROKER_PID = join(
+  FAST_BROWSER_DAEMON_DIR,
+  "secrets.pid",
+);
+const FAST_BROWSER_SECRET_BROKEN_CWD_PATTERN =
+  /(process\.cwd failed|uv_cwd|ENOENT:\s*process\.cwd|current working directory was likely removed)/i;
+
+function getProcessCwdSafe(): string | null {
+  try {
+    return process.cwd();
+  } catch {
+    return null;
+  }
+}
+
+function resolveStableWorkingDirectory(): string {
+  const candidates = [
+    process.env.CODEX_ROTATE_SAFE_CWD,
+    REPO_ROOT,
+    process.env.CODEX_ROTATE_HOME,
+    DEFAULT_ROTATE_HOME,
+    homedir(),
+  ]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean)
+    .map((value) => resolve(value));
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return homedir();
+}
+
+function ensureProcessWorkingDirectory(): void {
+  const current = getProcessCwdSafe();
+  if (current && existsSync(current)) {
+    return;
+  }
+  const fallback = resolveStableWorkingDirectory();
+  if (existsSync(fallback)) {
+    process.chdir(fallback);
+  }
+}
+
+ensureProcessWorkingDirectory();
 
 export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   return (
@@ -157,11 +209,14 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
 }
 
 function resolvePlaywrightModulePath(): string {
+  const currentWorkingDirectory = getProcessCwdSafe();
   const override = process.env.CODEX_ROTATE_PLAYWRIGHT_MODULE?.trim();
   const directCandidates = [
     override ? resolve(override) : null,
     join(REPO_ROOT, "node_modules", "playwright"),
-    join(process.cwd(), "node_modules", "playwright"),
+    currentWorkingDirectory
+      ? join(currentWorkingDirectory, "node_modules", "playwright")
+      : null,
   ].filter((value): value is string => Boolean(value));
   for (const candidate of directCandidates) {
     if (existsSync(candidate)) {
@@ -501,35 +556,37 @@ async function resolveOptionalCodexRotateSecretLocator(
   if (!locator) {
     return null;
   }
-  const {
-    ensureDaemonSecretStoreReadyInteractive,
-    resolveDaemonSecretLocator,
-  } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-  if (isStoreBackedSecretLocator(locator)) {
-    await ensureDaemonSecretStoreReadyInteractive({
-      profileName,
-      store: locator.store ?? "bitwarden-cli",
-      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
-    });
-  }
-  try {
-    const response = await resolveDaemonSecretLocator({
-      profileName,
-      locator,
-    });
-    if (!response?.ok) {
-      throw new Error(
-        response?.error?.message ||
-          "fast-browser failed to resolve the requested secret locator.",
-      );
+  return await withBitwardenSecretBrokerRecovery(async () => {
+    const {
+      ensureDaemonSecretStoreReadyInteractive,
+      resolveDaemonSecretLocator,
+    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+    if (isStoreBackedSecretLocator(locator)) {
+      await ensureDaemonSecretStoreReadyInteractive({
+        profileName,
+        store: locator.store ?? "bitwarden-cli",
+        promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+      });
     }
-    return locator;
-  } catch (error) {
-    if (isMissingOptionalSecretLocatorError(locator, error)) {
-      return null;
+    try {
+      const response = await resolveDaemonSecretLocator({
+        profileName,
+        locator,
+      });
+      if (!response?.ok) {
+        throw new Error(
+          response?.error?.message ||
+            "fast-browser failed to resolve the requested secret locator.",
+        );
+      }
+      return locator;
+    } catch (error) {
+      if (isMissingOptionalSecretLocatorError(locator, error)) {
+        return null;
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 }
 
 export async function ensureBitwardenCliAccountSecretRef(
@@ -556,37 +613,39 @@ export async function ensureBitwardenCliAccountSecretRef(
     );
   }
 
-  const {
-    ensureDaemonLoginSecretRef,
-    ensureDaemonSecretStoreReadyInteractive,
-  } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-  await ensureDaemonSecretStoreReadyInteractive({
-    profileName: normalizedProfileName,
-    store: "bitwarden-cli",
-    promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+  return await withBitwardenSecretBrokerRecovery(async () => {
+    const {
+      ensureDaemonLoginSecretRef,
+      ensureDaemonSecretStoreReadyInteractive,
+    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+    await ensureDaemonSecretStoreReadyInteractive({
+      profileName: normalizedProfileName,
+      store: "bitwarden-cli",
+      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+    });
+    const response = await ensureDaemonLoginSecretRef({
+      profileName: normalizedProfileName,
+      store: "bitwarden-cli",
+      name: buildCodexRotateAccountSecretName(normalizedEmail),
+      username: normalizedEmail,
+      password: normalizedPassword,
+      notes: `Managed by codex-rotate for ${normalizedEmail}.`,
+      uris: OPENAI_ACCOUNT_SECRET_URIS,
+    });
+    if (!response?.ok) {
+      throw new Error(
+        response?.error?.message ||
+          `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
+      );
+    }
+    const ref = normalizeCodexRotateSecretRef(response?.ref);
+    if (!ref) {
+      throw new Error(
+        `Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`,
+      );
+    }
+    return ref;
   });
-  const response = await ensureDaemonLoginSecretRef({
-    profileName: normalizedProfileName,
-    store: "bitwarden-cli",
-    name: buildCodexRotateAccountSecretName(normalizedEmail),
-    username: normalizedEmail,
-    password: normalizedPassword,
-    notes: `Managed by codex-rotate for ${normalizedEmail}.`,
-    uris: OPENAI_ACCOUNT_SECRET_URIS,
-  });
-  if (!response?.ok) {
-    throw new Error(
-      response?.error?.message ||
-        `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
-    );
-  }
-  const ref = normalizeCodexRotateSecretRef(response?.ref);
-  if (!ref) {
-    throw new Error(
-      `Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`,
-    );
-  }
-  return ref;
 }
 
 async function findBitwardenCliAccountSecretRefWithOptions(
@@ -609,26 +668,30 @@ async function findBitwardenCliAccountSecretRefWithOptions(
     );
   }
 
-  const { ensureDaemonSecretStoreReadyInteractive, findDaemonLoginSecretRef } =
-    await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-  await ensureDaemonSecretStoreReadyInteractive({
-    profileName: normalizedProfileName,
-    store: "bitwarden-cli",
-    promptIfLocked,
+  return await withBitwardenSecretBrokerRecovery(async () => {
+    const {
+      ensureDaemonSecretStoreReadyInteractive,
+      findDaemonLoginSecretRef,
+    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+    await ensureDaemonSecretStoreReadyInteractive({
+      profileName: normalizedProfileName,
+      store: "bitwarden-cli",
+      promptIfLocked,
+    });
+    const response = await findDaemonLoginSecretRef({
+      profileName: normalizedProfileName,
+      store: "bitwarden-cli",
+      username: normalizedEmail,
+      uris: OPENAI_ACCOUNT_SECRET_URIS,
+    });
+    if (!response?.ok) {
+      throw new Error(
+        response?.error?.message ||
+          `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalizedEmail}.`,
+      );
+    }
+    return normalizeCodexRotateSecretRef(response?.ref);
   });
-  const response = await findDaemonLoginSecretRef({
-    profileName: normalizedProfileName,
-    store: "bitwarden-cli",
-    username: normalizedEmail,
-    uris: OPENAI_ACCOUNT_SECRET_URIS,
-  });
-  if (!response?.ok) {
-    throw new Error(
-      response?.error?.message ||
-        `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalizedEmail}.`,
-    );
-  }
-  return normalizeCodexRotateSecretRef(response?.ref);
 }
 
 export async function findBitwardenCliAccountSecretRef(
@@ -661,50 +724,53 @@ export async function deleteBitwardenCliAccountSecretRef(
     );
   }
 
-  const { ensureDaemonSecretStoreReadyInteractive } = await import(
-    FAST_BROWSER_DAEMON_CLIENT_MODULE
-  );
-  await ensureDaemonSecretStoreReadyInteractive({
-    profileName: normalizedProfileName,
-    store: "bitwarden-cli",
-    promptIfLocked: false,
-  });
-
-  const ref = await findBitwardenCliAccountSecretRefWithOptions(
-    normalizedProfileName,
-    normalizedEmail,
-    false,
-  );
-  if (!ref) {
-    return false;
-  }
-
-  const { buildBitwardenCliEnv } = await import(
-    FAST_BROWSER_BITWARDEN_SESSION_MODULE
-  );
-  const result = spawnSync(
-    BITWARDEN_BINARY,
-    ["delete", "item", ref.object_id],
-    {
-      env: buildBitwardenCliEnv(process.env),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 60_000,
-    },
-  );
-  if (result.error) {
-    throw result.error;
-  }
-  if ((result.status ?? 1) !== 0) {
-    const detail = [result.stderr, result.stdout]
-      .map((value) => String(value || "").trim())
-      .find((value) => value.length > 0);
-    throw new Error(
-      detail ||
-        `Bitwarden CLI failed while deleting the vault item for ${normalizedEmail}.`,
+  return await withBitwardenSecretBrokerRecovery(async () => {
+    const { ensureDaemonSecretStoreReadyInteractive } = await import(
+      FAST_BROWSER_DAEMON_CLIENT_MODULE
     );
-  }
-  return true;
+    await ensureDaemonSecretStoreReadyInteractive({
+      profileName: normalizedProfileName,
+      store: "bitwarden-cli",
+      promptIfLocked: false,
+    });
+
+    const ref = await findBitwardenCliAccountSecretRefWithOptions(
+      normalizedProfileName,
+      normalizedEmail,
+      false,
+    );
+    if (!ref) {
+      return false;
+    }
+
+    const { buildBitwardenCliEnv } = await import(
+      FAST_BROWSER_BITWARDEN_SESSION_MODULE
+    );
+    const result = spawnSync(
+      BITWARDEN_BINARY,
+      ["delete", "item", ref.object_id],
+      {
+        cwd: resolveStableWorkingDirectory(),
+        env: buildBitwardenCliEnv(process.env),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 60_000,
+      },
+    );
+    if (result.error) {
+      throw result.error;
+    }
+    if ((result.status ?? 1) !== 0) {
+      const detail = [result.stderr, result.stdout]
+        .map((value) => String(value || "").trim())
+        .find((value) => value.length > 0);
+      throw new Error(
+        detail ||
+          `Bitwarden CLI failed while deleting the vault item for ${normalizedEmail}.`,
+      );
+    }
+    return true;
+  });
 }
 
 async function sleep(milliseconds: number): Promise<void> {
@@ -759,6 +825,33 @@ async function requestFastBrowserDaemonShutdown(
     const { sendDaemonRequest } = await import(protocolModuleUrl);
     const response = await sendDaemonRequest(
       socketPath,
+      { method: "shutdown" },
+      10_000,
+    );
+    return response?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+async function requestFastBrowserSecretBrokerShutdown(): Promise<boolean> {
+  const protocolModuleUrl = pathToFileURL(
+    resolve(
+      REPO_ROOT,
+      "..",
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "daemon",
+      "protocol.mjs",
+    ),
+  ).href;
+
+  try {
+    const { sendDaemonRequest } = await import(protocolModuleUrl);
+    const response = await sendDaemonRequest(
+      FAST_BROWSER_SECRET_BROKER_SOCKET,
       { method: "shutdown" },
       10_000,
     );
@@ -857,6 +950,62 @@ async function waitForManagedProfileShutdown(
   }
 
   return !isProcessAlive(pid);
+}
+
+async function resetFastBrowserSecretBroker(): Promise<void> {
+  const hadSocket = existsSync(FAST_BROWSER_SECRET_BROKER_SOCKET);
+  const hadPid = Boolean(readPidIfExists(FAST_BROWSER_SECRET_BROKER_PID));
+
+  let shutdownAccepted = !hadSocket;
+  if (hadSocket) {
+    shutdownAccepted = await requestFastBrowserSecretBrokerShutdown();
+  }
+
+  if (
+    !shutdownAccepted &&
+    !requestDaemonProcessTermination(FAST_BROWSER_SECRET_BROKER_PID) &&
+    hadPid
+  ) {
+    throw new Error(
+      "fast-browser secret broker did not accept a normal shutdown request. Stop it cleanly and retry.",
+    );
+  }
+
+  const exitedCleanly = await waitForManagedProfileShutdown(
+    FAST_BROWSER_SECRET_BROKER_PID,
+    20_000,
+  );
+  if (!exitedCleanly) {
+    throw new Error(
+      "fast-browser secret broker is still running after a normal shutdown request. Stop it cleanly and retry.",
+    );
+  }
+
+  try {
+    if (hadSocket && existsSync(FAST_BROWSER_SECRET_BROKER_SOCKET)) {
+      unlinkSync(FAST_BROWSER_SECRET_BROKER_SOCKET);
+    }
+  } catch {}
+
+  try {
+    if (hadPid && existsSync(FAST_BROWSER_SECRET_BROKER_PID)) {
+      unlinkSync(FAST_BROWSER_SECRET_BROKER_PID);
+    }
+  } catch {}
+}
+
+async function withBitwardenSecretBrokerRecovery<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!shouldResetFastBrowserSecretBrokerForBrokenCwd(error)) {
+      throw error;
+    }
+    await resetFastBrowserSecretBroker();
+    return await operation();
+  }
 }
 
 async function resetManagedProfileRuntime(
@@ -1524,10 +1673,37 @@ async function runFastBrowserDaemonWorkflow(
       result = await executeBridge();
     }
   }
-  const response = parseFastBrowserJson<FastBrowserDaemonRunResponse>(
-    { status: result.status, stdout: result.stdout },
-    `fast-browser workflow ${workflowRef}`,
-  );
+  let response: FastBrowserDaemonRunResponse;
+  try {
+    response = parseFastBrowserJson<FastBrowserDaemonRunResponse>(
+      { status: result.status, stdout: result.stdout },
+      `fast-browser workflow ${workflowRef}`,
+    );
+  } catch (error) {
+    const combinedOutput = [
+      result.stdout,
+      result.stderr,
+      error instanceof Error ? error.message : String(error || ""),
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (!(await resetStuckFastBrowserDaemon(profileName, combinedOutput))) {
+      throw error;
+    }
+    result = await executeBridge();
+    if (typeof result.status === "number" && result.status !== 0) {
+      const retryOutput = [result.stdout, result.stderr]
+        .filter(Boolean)
+        .join("\n");
+      if (await resetStuckFastBrowserDaemon(profileName, retryOutput)) {
+        result = await executeBridge();
+      }
+    }
+    response = parseFastBrowserJson<FastBrowserDaemonRunResponse>(
+      { status: result.status, stdout: result.stdout },
+      `fast-browser workflow ${workflowRef}`,
+    );
+  }
 
   if (!response?.ok || !response.result) {
     throw buildFastBrowserWorkflowError(workflowRef, response);
@@ -1561,6 +1737,11 @@ async function resetStuckFastBrowserDaemon(
     return true;
   }
 
+  if (shouldResetFastBrowserRuntimeForBrokenCwd(output)) {
+    await resetManagedProfileRuntime(profileName, null);
+    return true;
+  }
+
   return false;
 }
 
@@ -1568,6 +1749,22 @@ export function shouldResetFastBrowserDaemonForSocketClose(
   output: string | null | undefined,
 ): boolean {
   return FAST_BROWSER_DAEMON_SOCKET_CLOSED_PATTERN.test(String(output || ""));
+}
+
+export function shouldResetFastBrowserRuntimeForBrokenCwd(
+  output: string | Error | null | undefined,
+): boolean {
+  const text =
+    output instanceof Error
+      ? `${output.message}\n${output.stack || ""}`
+      : String(output || "");
+  return FAST_BROWSER_SECRET_BROKEN_CWD_PATTERN.test(text);
+}
+
+export function shouldResetFastBrowserSecretBrokerForBrokenCwd(
+  output: string | Error | null | undefined,
+): boolean {
+  return shouldResetFastBrowserRuntimeForBrokenCwd(output);
 }
 
 export function inspectManagedProfiles(): ManagedProfilesInspection {
@@ -1979,6 +2176,18 @@ export async function completeCodexLoginViaWorkflow(
               `Waiting ${Math.round(delayMs / 1000)}s before retrying.`,
           );
           await sleep(delayMs);
+          continue;
+        }
+        if (
+          shouldResetFastBrowserRuntimeForBrokenCwd(message) &&
+          attempt < maxAttempts
+        ) {
+          note?.(
+            `Managed profile "${profileName}" hit a broken working-directory runtime state for ${email}. ` +
+              "Restarting the managed runtime before retrying.",
+          );
+          await resetManagedProfileRuntime(profileName, null);
+          await sleep(1000);
           continue;
         }
         throw error;

@@ -1,7 +1,12 @@
 use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
+use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
+use codex_rotate_runtime::dev_refresh::clear_tray_service_registration;
 use codex_rotate_tray::{
-    error_snapshot, rendered_snapshot, spawn_subscription_loop, SharedRenderState,
+    error_snapshot, rendered_snapshot, spawn_subscription_loop_controlled,
+    spawn_tray_refresh_loop_controlled, SharedRenderState,
 };
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread;
 use tauri::{
     image::Image,
@@ -307,7 +312,9 @@ fn run_on_main_thread(app: &AppHandle, snapshot: StatusSnapshot) {
 
 fn spawn_invoke(app: AppHandle, action: InvokeAction) {
     thread::spawn(move || {
+        let action_name = format!("{action:?}");
         if let Err(error) = invoke(action) {
+            log_tray_error(format!("tray invoke {action_name} failed: {error}"));
             run_on_main_thread(&app, error_snapshot(error.to_string()));
         }
     });
@@ -384,14 +391,45 @@ fn main() {
                         "launch" => spawn_invoke(app.clone(), InvokeAction::OpenManaged),
                         "check" => spawn_invoke(app.clone(), InvokeAction::Refresh),
                         "rotate" => spawn_invoke(app.clone(), InvokeAction::Next),
-                        "quit" => app_handle.exit(0),
+                        "quit" => {
+                            clear_tray_service_registration();
+                            app_handle.exit(0);
+                        }
                         _ => {}
                     }
                 })
                 .build(app)?;
+            log_tray_info("Tray started.");
 
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let subscription_stop = stop.clone();
             let app_handle = app.handle().clone();
-            spawn_subscription_loop(move |snapshot| run_on_main_thread(&app_handle, snapshot));
+            spawn_subscription_loop_controlled(subscription_stop, move |snapshot| {
+                run_on_main_thread(&app_handle, snapshot)
+            });
+
+            let refresh_stop = stop.clone();
+            let refresh_app = app.handle().clone();
+            let error_app = app.handle().clone();
+            spawn_tray_refresh_loop_controlled(
+                refresh_stop,
+                move || {
+                    log_tray_info("Tray rebuild detected; exiting current tray instance.");
+                    let _ = refresh_app.run_on_main_thread({
+                        let refresh_app = refresh_app.clone();
+                        move || {
+                            refresh_app.exit(0);
+                        }
+                    });
+                },
+                move |error| {
+                    run_on_main_thread(
+                        &error_app,
+                        error_snapshot(format!("tray refresh failed: {error}")),
+                    )
+                },
+            );
             Ok(())
         })
         .run(tauri::generate_context!())

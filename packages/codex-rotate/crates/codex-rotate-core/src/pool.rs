@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -21,8 +21,8 @@ use crate::quota::{
 };
 use crate::state::{load_rotate_state_json, write_rotate_state_json};
 use crate::workflow::{
-    cmd_create, create_next_fallback_options, is_auto_create_retry_stopped_for_reusable_account,
-    reconcile_added_account_credential_state,
+    cmd_create, cmd_create_with_progress, create_next_fallback_options,
+    is_auto_create_retry_stopped_for_reusable_account, reconcile_added_account_credential_state,
 };
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -68,6 +68,12 @@ pub struct AccountInspection {
     pub usage: Option<UsageResponse>,
     pub error: Option<String>,
     pub updated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolOverview {
+    pub inventory_count: usize,
+    pub inventory_active_slot: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,7 +288,11 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
 }
 
 pub fn cmd_next() -> Result<String> {
-    match rotate_next_internal()? {
+    cmd_next_with_progress(None)
+}
+
+pub fn cmd_next_with_progress(progress: Option<Arc<dyn Fn(String) + Send + Sync>>) -> Result<String> {
+    match rotate_next_internal_with_progress(progress)? {
         NextResult::Rotated { message, .. }
         | NextResult::Stayed { message, .. }
         | NextResult::Created {
@@ -292,14 +302,19 @@ pub fn cmd_next() -> Result<String> {
 }
 
 pub fn rotate_next_internal() -> Result<NextResult> {
+    rotate_next_internal_with_progress(None)
+}
+
+pub fn rotate_next_internal_with_progress(
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<NextResult> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     if pool.accounts.is_empty() {
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
-
-    let mut dirty = normalize_pool_entries(&mut pool);
-    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -417,10 +432,14 @@ pub fn rotate_next_internal() -> Result<NextResult> {
     if dirty {
         save_pool(&pool)?;
     }
-    let output = match cmd_create(create_next_fallback_options()) {
+    let output = match progress.clone() {
+        Some(progress) => cmd_create_with_progress(create_next_fallback_options(), Some(progress)),
+        None => cmd_create(create_next_fallback_options()),
+    };
+    let output = match output {
         Ok(output) => output,
         Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
-            return rotate_next_internal();
+            return rotate_next_internal_with_progress(progress);
         }
         Err(error) => return Err(error),
     };
@@ -434,16 +453,20 @@ pub fn rotate_next_internal() -> Result<NextResult> {
 pub fn cmd_prev() -> Result<String> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     if pool.accounts.is_empty() {
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     if pool.accounts.len() == 1 {
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Err(anyhow!(
             "Only 1 account in pool. Add more with: codex-rotate add"
         ));
     }
 
-    let _ = sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     let previous_index = pool.active_index;
     pool.active_index = (pool.active_index + pool.accounts.len() - 1) % pool.accounts.len();
     let next = pool.accounts[pool.active_index].clone();
@@ -478,13 +501,16 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     if pool.accounts.is_empty() {
         output.push_line(format!(
             "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"
         ))?;
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Ok(());
     }
-    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
 
     let mut usable_count = 0;
     let mut exhausted_count = 0;
@@ -522,28 +548,13 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         if let Some(alias) = alias {
             output.push_line(format!("    {DIM}alias{RESET}  {}", alias))?;
         }
-        let inspection =
-            inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
-        dirty |= inspection.updated;
-        if let Some(usage) = inspection.usage.as_ref() {
-            if has_usable_quota(usage) {
-                usable_count += 1;
-            } else {
-                exhausted_count += 1;
-            }
-            output.push_line(format!(
-                "    {DIM}quota{RESET}  {}",
-                format_compact_quota(usage)
-            ))?;
-        } else {
-            unavailable_count += 1;
-            output.push_line(format!(
-                "    {DIM}quota{RESET}  unavailable ({})",
-                inspection
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ))?;
+        let quota_line = format_cached_quota_line(&pool.accounts[index]);
+        match pool.accounts[index].last_quota_usable {
+            Some(true) => usable_count += 1,
+            Some(false) => exhausted_count += 1,
+            None => unavailable_count += 1,
         }
+        output.push_line(format!("    {DIM}quota{RESET}  {}", quota_line))?;
     }
 
     if dirty {
@@ -570,10 +581,50 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     Ok(())
 }
 
+fn format_cached_quota_line(entry: &AccountEntry) -> String {
+    let checked_suffix = entry
+        .last_quota_checked_at
+        .as_deref()
+        .map(|value| format!(" {DIM}(cached {value}){RESET}"))
+        .unwrap_or_default();
+
+    if let Some(summary) = entry.last_quota_summary.as_deref() {
+        return format!("{summary}{checked_suffix}");
+    }
+
+    if let Some(blocker) = entry.last_quota_blocker.as_deref() {
+        return format!("unavailable ({blocker}){checked_suffix}");
+    }
+
+    if entry.last_quota_checked_at.is_some() {
+        return format!("unavailable (quota probe failed){checked_suffix}");
+    }
+
+    "unknown (run codex-rotate status or rotate to refresh)".to_string()
+}
+
 pub fn cmd_status() -> Result<String> {
     let mut emitter = LineEmitter::buffered();
     cmd_status_impl(&mut emitter)?;
     Ok(emitter.finish())
+}
+
+pub fn current_pool_overview() -> Result<PoolOverview> {
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    if dirty {
+        save_pool(&pool)?;
+    }
+    Ok(PoolOverview {
+        inventory_count: pool.accounts.len(),
+        inventory_active_slot: if pool.accounts.is_empty() {
+            None
+        } else {
+            Some(pool.active_index.saturating_add(1))
+        },
+    })
 }
 
 pub fn cmd_status_stream(writer: &mut dyn Write) -> Result<()> {
@@ -971,15 +1022,43 @@ pub(crate) fn sync_pool_active_account_from_codex(
         return Ok(false);
     }
     let current_auth = load_codex_auth(auth_path)?;
+    sync_pool_active_account_from_auth(pool, current_auth)
+}
+
+fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) -> Result<bool> {
     let current_account_id = extract_account_id_from_auth(&current_auth);
     let current_email = extract_email_from_auth(&current_auth);
+    let normalized_email = normalize_email_for_label(&current_email);
+
+    if normalized_email == "unknown" {
+        return Ok(false);
+    }
+
+    let current_plan_type = extract_plan_from_auth(&current_auth);
+    let current_label = build_account_label(&current_email, &current_plan_type);
+    let mut changed = false;
+
     let Some(current_index) =
         find_pool_account_index_by_identity(pool, &current_account_id, &current_email)
     else {
-        return Ok(false);
+        pool.accounts.push(AccountEntry {
+            label: current_label,
+            alias: None,
+            email: current_email,
+            account_id: current_account_id,
+            plan_type: current_plan_type,
+            auth: current_auth,
+            added_at: now_iso(),
+            last_quota_usable: None,
+            last_quota_summary: None,
+            last_quota_blocker: None,
+            last_quota_checked_at: None,
+        });
+        pool.active_index = pool.accounts.len() - 1;
+        let _ = reconcile_added_account_credential_state(&pool.accounts[pool.active_index])?;
+        return Ok(true);
     };
 
-    let mut changed = false;
     if pool.active_index != current_index {
         pool.active_index = current_index;
         changed = true;
@@ -1628,6 +1707,9 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use serde_json::json;
+    use std::sync::Mutex;
 
     fn stored_entry(usable: Option<bool>, checked_at: Option<&str>) -> AccountEntry {
         AccountEntry {
@@ -1652,6 +1734,39 @@ mod tests {
             last_quota_summary: None,
             last_quota_blocker: None,
             last_quota_checked_at: checked_at.map(ToOwned::to_owned),
+        }
+    }
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn make_jwt(payload: serde_json::Value) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{payload}.signature")
+    }
+
+    fn make_auth(email: &str, account_id: &str, plan_type: &str) -> CodexAuth {
+        CodexAuth {
+            auth_mode: "chatgpt".to_string(),
+            openai_api_key: None,
+            tokens: crate::auth::AuthTokens {
+                access_token: make_jwt(json!({
+                    "https://api.openai.com/profile": {
+                        "email": email
+                    },
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": account_id,
+                        "chatgpt_plan_type": plan_type
+                    }
+                })),
+                id_token: make_jwt(json!({
+                    "email": email
+                })),
+                refresh_token: Some("refresh".to_string()),
+                account_id: account_id.to_string(),
+            },
+            last_refresh: "2026-04-07T00:00:00.000Z".to_string(),
         }
     }
 
@@ -1728,4 +1843,85 @@ mod tests {
             Some(0)
         );
     }
+
+    #[test]
+    fn cached_list_quota_line_uses_saved_summary() {
+        let mut entry = stored_entry(Some(true), Some("2026-04-07T00:00:00.000Z"));
+        entry.last_quota_summary = Some("7d 90% left".to_string());
+
+        let rendered = format_cached_quota_line(&entry);
+
+        assert!(rendered.contains("7d 90% left"));
+        assert!(rendered.contains("cached 2026-04-07T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn cached_list_quota_line_marks_unchecked_entries_without_network_lookup() {
+        let entry = stored_entry(None, None);
+
+        let rendered = format_cached_quota_line(&entry);
+
+        assert_eq!(
+            rendered,
+            "unknown (run codex-rotate status or rotate to refresh)"
+        );
+    }
+
+    #[test]
+    fn sync_pool_active_account_adds_missing_current_auth_to_pool() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+        }
+
+        let result = (|| -> Result<()> {
+            let mut pool = Pool {
+                active_index: 0,
+                accounts: vec![stored_entry(Some(true), None)],
+            };
+
+            let changed = sync_pool_active_account_from_auth(
+                &mut pool,
+                make_auth("dev.35@astronlab.com", "acct-35", "free"),
+            )?;
+
+            assert!(changed);
+            assert_eq!(pool.accounts.len(), 2);
+            assert_eq!(pool.active_index, 1);
+            assert_eq!(pool.accounts[1].email, "dev.35@astronlab.com");
+            assert_eq!(pool.accounts[1].account_id, "acct-35");
+            assert_eq!(pool.accounts[1].label, "dev.35@astronlab.com_free");
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_ROTATE_HOME");
+            },
+        }
+        result.expect("sync should materialize current auth into pool");
+    }
+
+    #[test]
+    fn sync_pool_active_account_skips_unknown_email_auth() {
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![stored_entry(Some(true), None)],
+        };
+
+        let changed =
+            sync_pool_active_account_from_auth(&mut pool, make_auth("unknown", "acct-35", "free"))
+                .expect("sync should succeed");
+
+        assert!(!changed);
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(pool.active_index, 0);
+    }
+
 }

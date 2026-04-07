@@ -6,6 +6,7 @@ pub mod ipc;
 pub mod launcher;
 pub mod logs;
 pub mod paths;
+pub mod runtime_log;
 #[path = "thread-recovery.rs"]
 pub mod thread_recovery;
 pub mod watch;

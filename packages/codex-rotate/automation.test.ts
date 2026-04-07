@@ -24,6 +24,8 @@ import {
   shouldResetCodexLoginSessionForRetry,
   shouldPromptForCodexRotateSecretUnlock,
   shouldResetFastBrowserDaemonForSocketClose,
+  shouldResetFastBrowserRuntimeForBrokenCwd,
+  shouldResetFastBrowserSecretBrokerForBrokenCwd,
 } from "./automation.ts";
 
 describe("temporary profile naming", () => {
@@ -57,6 +59,61 @@ describe("fast-browser daemon recovery", () => {
     expect(shouldResetFastBrowserDaemonForSocketClose("other failure")).toBe(
       false,
     );
+  });
+
+  test("detects broken working-directory bitwarden failures as secret-broker resets", () => {
+    expect(
+      shouldResetFastBrowserSecretBrokerForBrokenCwd(
+        "Command failed: bw status\nError: ENOENT: process.cwd failed with error no such file or directory, uv_cwd",
+      ),
+    ).toBe(true);
+    expect(
+      shouldResetFastBrowserSecretBrokerForBrokenCwd(
+        "Bitwarden CLI is locked.",
+      ),
+    ).toBe(false);
+  });
+
+  test("detects broken working-directory failures as managed-runtime resets too", () => {
+    expect(
+      shouldResetFastBrowserRuntimeForBrokenCwd(
+        "ENOENT: process.cwd failed with error no such file or directory, the current working directory was likely removed without changing the working directory, uv_cwd",
+      ),
+    ).toBe(true);
+    expect(shouldResetFastBrowserRuntimeForBrokenCwd("other failure")).toBe(
+      false,
+    );
+  });
+
+  test("automation module still imports when the original cwd is deleted", () => {
+    const automationModuleUrl = new URL("./automation.ts", import.meta.url)
+      .href;
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "-e",
+        `
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tempDir = mkdtempSync(join(tmpdir(), "codex-rotate-deleted-cwd-"));
+process.chdir(tempDir);
+rmSync(tempDir, { recursive: true, force: true });
+
+const automation = await import(${JSON.stringify(automationModuleUrl)});
+console.log(typeof automation.shouldResetFastBrowserSecretBrokerForBrokenCwd);
+`,
+      ],
+      {
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("function");
   });
 });
 

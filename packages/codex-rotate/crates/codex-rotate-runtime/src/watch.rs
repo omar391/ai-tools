@@ -1,19 +1,20 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::pool::{
-    load_pool, other_usable_account_exists, rotate_next_internal, NextResult, Pool,
+    load_pool, other_usable_account_exists, rotate_next_internal_with_progress, NextResult, Pool,
 };
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
 use codex_rotate_core::workflow::{
-    cmd_create, is_auto_create_retry_stopped_for_reusable_account, CreateCommandOptions,
-    CreateCommandSource,
+    cmd_create_with_progress, is_auto_create_retry_stopped_for_reusable_account,
+    CreateCommandOptions, CreateCommandSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,7 @@ use crate::logs::{
     read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
 };
 use crate::paths::resolve_paths;
+use crate::runtime_log::log_daemon_error;
 use crate::thread_recovery::{
     read_latest_quota_exhaustion_log_id, run_thread_recovery_iteration, RecoveryIterationOptions,
     ThreadRecoveryEvent,
@@ -91,6 +93,7 @@ pub struct WatchIterationOptions {
     pub after_signal_id: Option<i64>,
     pub cooldown_ms: Option<u64>,
     pub force_quota_refresh: bool,
+    pub progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 pub fn read_watch_state() -> Result<WatchState> {
@@ -161,7 +164,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     );
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
-        rotation = execute_watch_rotation(decision.rotation_command)?;
+        rotation = execute_watch_rotation(decision.rotation_command, options.progress.clone())?;
         if rotation.is_some() {
             live = Some(switch_live_account_to_current_auth(
                 Some(port),
@@ -258,6 +261,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 next_state.thread_recovery_pending_events = recovery.pending_events;
             }
             Err(error) => {
+                log_daemon_error(format!("thread recovery iteration failed: {error:#}"));
                 eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
                 next_state.thread_recovery_pending = next_state.thread_recovery_pending
                     || !next_state.thread_recovery_pending_events.is_empty();
@@ -275,10 +279,13 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     })
 }
 
-fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<AuthSummary>> {
+fn execute_watch_rotation(
+    command: Option<RotationCommand>,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<Option<AuthSummary>> {
     match command {
         Some(RotationCommand::Next) => {
-            let next_result = rotate_next_internal()?;
+            let next_result = rotate_next_internal_with_progress(progress.clone())?;
             Ok(Some(match next_result {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -286,6 +293,9 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
             }))
         }
         Some(RotationCommand::Create) => {
+            if let Some(progress) = progress.as_ref() {
+                progress("Auto rotation is creating a replacement account.".to_string());
+            }
             let paths = resolve_paths()?;
             let previous_summary = if paths.codex_auth_file.exists() {
                 Some(summarize_codex_auth(&load_codex_auth(
@@ -295,19 +305,22 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
                 None
             };
             let create_attempt = || {
-                cmd_create(CreateCommandOptions {
-                    force: true,
-                    ignore_current: true,
-                    require_usable_quota: true,
-                    restore_previous_auth_after_create: false,
-                    source: CreateCommandSource::Next,
-                    ..CreateCommandOptions::default()
-                })
+                cmd_create_with_progress(
+                    CreateCommandOptions {
+                        force: true,
+                        ignore_current: true,
+                        require_usable_quota: true,
+                        restore_previous_auth_after_create: false,
+                        source: CreateCommandSource::Next,
+                        ..CreateCommandOptions::default()
+                    },
+                    progress.clone(),
+                )
             };
             match create_attempt() {
                 Ok(_) => {}
                 Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
-                    let next_result = rotate_next_internal()?;
+                    let next_result = rotate_next_internal_with_progress(progress.clone())?;
                     return Ok(Some(match next_result {
                         NextResult::Rotated { summary, .. }
                         | NextResult::Stayed { summary, .. }
@@ -317,7 +330,8 @@ fn execute_watch_rotation(command: Option<RotationCommand>) -> Result<Option<Aut
                 Err(error) if is_retryable_watch_create_error(&error) => {
                     if let Err(retry_error) = create_attempt() {
                         if is_auto_create_retry_stopped_for_reusable_account(&retry_error) {
-                            let next_result = rotate_next_internal()?;
+                            let next_result =
+                                rotate_next_internal_with_progress(progress.clone())?;
                             return Ok(Some(match next_result {
                                 NextResult::Rotated { summary, .. }
                                 | NextResult::Stayed { summary, .. }

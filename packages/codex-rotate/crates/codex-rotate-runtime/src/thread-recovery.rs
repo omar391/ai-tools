@@ -12,6 +12,7 @@ use crate::cdp::{invalidate_local_codex_connection, with_local_codex_connection}
 use crate::hook::read_live_account;
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::resolve_paths;
+use crate::runtime_log::log_daemon_error;
 
 const DEFAULT_PORT: u16 = 9333;
 const MAX_RECOVERY_SCAN_EVENTS: usize = 32;
@@ -185,6 +186,10 @@ fn resolve_quota_exhaustion_event(
     let thread_summary = match read_thread_summary(port, &event.thread_id) {
         Ok(summary) => summary,
         Err(error) if is_terminal_thread_recovery_error(&error) => {
+            log_daemon_error(format!(
+                "dropping exhausted thread {} after terminal thread/read failure: {error:#}",
+                event.thread_id
+            ));
             eprintln!(
                 "codex-rotate: dropping exhausted thread {} after terminal thread/read failure: {error:#}",
                 event.thread_id
@@ -192,6 +197,10 @@ fn resolve_quota_exhaustion_event(
             return Ok(RecoveryResolution::Dropped);
         }
         Err(error) => {
+            log_daemon_error(format!(
+                "failed to read thread {}: {error:#}",
+                event.thread_id
+            ));
             eprintln!(
                 "codex-rotate: failed to read thread {}: {error:#}",
                 event.thread_id
@@ -220,6 +229,10 @@ fn resolve_quota_exhaustion_event(
         Some(thread) => match prepare_thread_for_continue(port, &event.thread_id, thread.cwd) {
             Ok(cwd) => cwd,
             Err(error) if is_terminal_thread_recovery_error(&error) => {
+                log_daemon_error(format!(
+                    "dropping exhausted thread {} after terminal resume failure: {error:#}",
+                    event.thread_id
+                ));
                 eprintln!(
                     "codex-rotate: dropping exhausted thread {} after terminal resume failure: {error:#}",
                     event.thread_id
@@ -227,6 +240,10 @@ fn resolve_quota_exhaustion_event(
                 return Ok(RecoveryResolution::Dropped);
             }
             Err(error) => {
+                log_daemon_error(format!(
+                    "thread {} could not be resumed for continue: {error:#}",
+                    event.thread_id
+                ));
                 eprintln!(
                     "codex-rotate: thread {} could not be resumed for continue: {error:#}",
                     event.thread_id
@@ -237,6 +254,10 @@ fn resolve_quota_exhaustion_event(
         None => match prepare_thread_for_continue(port, &event.thread_id, None) {
             Ok(cwd) => cwd,
             Err(error) => {
+                log_daemon_error(format!(
+                    "thread {} could not be resumed for continue: {error:#}",
+                    event.thread_id
+                ));
                 eprintln!(
                     "codex-rotate: thread {} could not be resumed for continue: {error:#}",
                     event.thread_id
@@ -249,6 +270,10 @@ fn resolve_quota_exhaustion_event(
     match send_continue_turn(port, &event.thread_id, cwd) {
         Ok(()) => Ok(RecoveryResolution::Continued),
         Err(error) if is_terminal_thread_recovery_error(&error) => {
+            log_daemon_error(format!(
+                "dropping exhausted thread {} after terminal continue failure: {error:#}",
+                event.thread_id
+            ));
             eprintln!(
                 "codex-rotate: dropping exhausted thread {} after terminal continue failure: {error:#}",
                 event.thread_id
@@ -256,6 +281,10 @@ fn resolve_quota_exhaustion_event(
             Ok(RecoveryResolution::Dropped)
         }
         Err(error) => {
+            log_daemon_error(format!(
+                "failed to continue thread {} after quota recovery: {error:#}",
+                event.thread_id
+            ));
             eprintln!(
                 "codex-rotate: failed to continue thread {} after quota recovery: {error:#}",
                 event.thread_id
@@ -579,6 +608,10 @@ fn prepare_thread_for_continue(
         Ok(Some(thread)) => Ok(thread.cwd.or(initial_cwd)),
         Ok(None) => Ok(initial_cwd),
         Err(error) => {
+            log_daemon_error(format!(
+                "failed to refresh thread {} after resume: {error:#}",
+                thread_id
+            ));
             eprintln!(
                 "codex-rotate: failed to refresh thread {} after resume: {error:#}",
                 thread_id

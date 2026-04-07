@@ -301,9 +301,11 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
         normalized(&direct_next.stdout),
         normalized(&proxied_next.stdout)
     );
-    assert_eq!(
+    assert!(
+        normalized(&proxied_next.stderr).ends_with(&normalized(&direct_next.stderr)),
+        "expected proxied stderr to end with direct stderr.\ndirect:\n{}\n\nproxied:\n{}",
         normalized(&direct_next.stderr),
-        normalized(&proxied_next.stderr)
+        normalized(&proxied_next.stderr),
     );
 
     assert_eq!(second_daemon.code, 0);
