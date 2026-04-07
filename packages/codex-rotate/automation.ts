@@ -64,6 +64,18 @@ const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
     "client.mjs",
   ),
 ).href;
+const FAST_BROWSER_BITWARDEN_SESSION_MODULE = pathToFileURL(
+  resolve(
+    REPO_ROOT,
+    "..",
+    "ai-rules",
+    "skills",
+    "fast-browser",
+    "lib",
+    "secret-adapters",
+    "bitwarden-session.mjs",
+  ),
+).href;
 const CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT = resolve(
   MODULE_DIR,
   "codex-login-managed-browser-opener.mjs",
@@ -126,6 +138,7 @@ const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS = [
 const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS = [
   30_000, 60_000, 120_000, 240_000, 300_000,
 ] as const;
+const BITWARDEN_BINARY = process.env.CODEX_ROTATE_BW_BIN?.trim() || "bw";
 const FAST_BROWSER_PLAYWRIGHT_MODULE = resolvePlaywrightModulePath();
 const FAST_BROWSER_NODE_PATH = dirname(FAST_BROWSER_PLAYWRIGHT_MODULE);
 const LEGACY_ROTATE_HOME_FILE_PATTERNS = [
@@ -622,7 +635,8 @@ export function normalizeCredentialStore(
     ).filter(
       ([email, record]) =>
         !inventoryEmails.has(normalizePendingEmailKey(email)) &&
-        !pendingIsSupersededByInventory(record, inventoryEmails),
+        !pendingIsSupersededByInventory(record, inventoryEmails) &&
+        shouldKeepPendingCredential(record.base_email),
     ),
   );
   if (shouldMigrateLegacyNonDefaultFamilies) {
@@ -661,6 +675,14 @@ function shouldDropLegacyNonDefaultFamily(
       (parsed.templatePrefix?.startsWith("bench") === true ||
         parsed.templatePrefix?.includes("devicefix") === true)
     );
+  } catch {
+    return false;
+  }
+}
+
+function shouldKeepPendingCredential(baseEmail: string): boolean {
+  try {
+    return normalizeBaseEmailFamily(baseEmail) === DEFAULT_CREATE_BASE_EMAIL;
   } catch {
     return false;
   }
@@ -833,9 +855,10 @@ export async function ensureBitwardenCliAccountSecretRef(
   return ref;
 }
 
-export async function findBitwardenCliAccountSecretRef(
+async function findBitwardenCliAccountSecretRefWithOptions(
   profileName: string,
   email: string,
+  promptIfLocked: boolean,
 ): Promise<CodexRotateSecretRef | null> {
   const normalizedProfileName = String(profileName || "").trim();
   const normalizedEmail = String(email || "")
@@ -857,7 +880,7 @@ export async function findBitwardenCliAccountSecretRef(
   await ensureDaemonSecretStoreReadyInteractive({
     profileName: normalizedProfileName,
     store: "bitwarden-cli",
-    promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+    promptIfLocked,
   });
   const response = await findDaemonLoginSecretRef({
     profileName: normalizedProfileName,
@@ -872,6 +895,82 @@ export async function findBitwardenCliAccountSecretRef(
     );
   }
   return normalizeCodexRotateSecretRef(response?.ref);
+}
+
+export async function findBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+): Promise<CodexRotateSecretRef | null> {
+  return findBitwardenCliAccountSecretRefWithOptions(
+    profileName,
+    email,
+    shouldPromptForCodexRotateSecretUnlock(),
+  );
+}
+
+export async function deleteBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+): Promise<boolean> {
+  const normalizedProfileName = String(profileName || "").trim();
+  const normalizedEmail = String(email || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedProfileName) {
+    throw new Error(
+      "Bitwarden account secret deletion requires a managed profile name.",
+    );
+  }
+  if (!normalizedEmail) {
+    throw new Error(
+      "Bitwarden account secret deletion requires a non-empty email.",
+    );
+  }
+
+  const { ensureDaemonSecretStoreReadyInteractive } = await import(
+    FAST_BROWSER_DAEMON_CLIENT_MODULE
+  );
+  await ensureDaemonSecretStoreReadyInteractive({
+    profileName: normalizedProfileName,
+    store: "bitwarden-cli",
+    promptIfLocked: false,
+  });
+
+  const ref = await findBitwardenCliAccountSecretRefWithOptions(
+    normalizedProfileName,
+    normalizedEmail,
+    false,
+  );
+  if (!ref) {
+    return false;
+  }
+
+  const { buildBitwardenCliEnv } = await import(
+    FAST_BROWSER_BITWARDEN_SESSION_MODULE
+  );
+  const result = spawnSync(
+    BITWARDEN_BINARY,
+    ["delete", "item", ref.object_id],
+    {
+      env: buildBitwardenCliEnv(process.env),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
+    },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  if ((result.status ?? 1) !== 0) {
+    const detail = [result.stderr, result.stdout]
+      .map((value) => String(value || "").trim())
+      .find((value) => value.length > 0);
+    throw new Error(
+      detail ||
+        `Bitwarden CLI failed while deleting the vault item for ${normalizedEmail}.`,
+    );
+  }
+  return true;
 }
 
 export function loadCredentialStore(): CredentialStore {

@@ -265,6 +265,49 @@ describe("credential store normalization", () => {
     ]);
     expect(Object.keys(store.pending)).toEqual(["dev.35@astronlab.com"]);
   });
+
+  test("drops non-dev pending entries even in version 4 state", () => {
+    const store = normalizeCredentialStore({
+      version: 4,
+      pending: {
+        "qa.300@astronlab.com": {
+          email: "qa.300@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "qa.{n}@astronlab.com",
+          suffix: 300,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T17:00:00.000Z",
+          updated_at: "2026-04-06T17:00:00.000Z",
+          started_at: "2026-04-06T17:00:00.000Z",
+        },
+        "dev.user+1@gmail.com": {
+          email: "dev.user+1@gmail.com",
+          profile_name: "dev-1",
+          base_email: "dev.user@gmail.com",
+          suffix: 1,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T18:00:00.000Z",
+          updated_at: "2026-04-06T18:00:00.000Z",
+          started_at: "2026-04-06T18:00:00.000Z",
+        },
+        "dev.35@astronlab.com": {
+          email: "dev.35@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          suffix: 35,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T19:00:00.000Z",
+          updated_at: "2026-04-06T19:00:00.000Z",
+          started_at: "2026-04-06T19:00:00.000Z",
+        },
+      },
+    } as never);
+
+    expect(Object.keys(store.pending)).toEqual(["dev.35@astronlab.com"]);
+  });
 });
 
 describe("temporary profile naming", () => {
@@ -1117,7 +1160,10 @@ describe("credential store state-file merge", () => {
 
 describe("pending credential reuse", () => {
   test("drains the oldest pending credential for the same family first", () => {
-    const store = normalizeCredentialStore({
+    const store = {
+      version: 4,
+      default_create_base_email: "dev.{n}@astronlab.com",
+      families: {},
       pending: {
         "dev.user+1@gmail.com": {
           email: "dev.user+1@gmail.com",
@@ -1144,7 +1190,7 @@ describe("pending credential reuse", () => {
           started_at: "2026-03-20T03:00:00.000Z",
         },
       },
-    });
+    } as Parameters<typeof selectPendingCredentialForFamily>[0];
 
     expect(
       selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")
@@ -1153,7 +1199,10 @@ describe("pending credential reuse", () => {
   });
 
   test("can restrict reuse to a matching alias when provided", () => {
-    const store = normalizeCredentialStore({
+    const store = {
+      version: 4,
+      default_create_base_email: "dev.{n}@astronlab.com",
+      families: {},
       pending: {
         "dev.user+2@gmail.com": {
           email: "dev.user+2@gmail.com",
@@ -1180,7 +1229,7 @@ describe("pending credential reuse", () => {
           started_at: "2026-03-20T03:00:00.000Z",
         },
       },
-    });
+    } as Parameters<typeof selectPendingCredentialForFamily>[0];
 
     expect(
       selectPendingCredentialForFamily(
@@ -1193,7 +1242,10 @@ describe("pending credential reuse", () => {
   });
 
   test("still prefers the lowest suffix even if a newer pending entry was touched later", () => {
-    const store = normalizeCredentialStore({
+    const store = {
+      version: 4,
+      default_create_base_email: "dev.{n}@astronlab.com",
+      families: {},
       pending: {
         "dev.user+1@gmail.com": {
           email: "dev.user+1@gmail.com",
@@ -1220,7 +1272,7 @@ describe("pending credential reuse", () => {
           started_at: "2026-03-20T00:10:00.000Z",
         },
       },
-    });
+    } as Parameters<typeof selectPendingCredentialForFamily>[0];
 
     expect(
       selectPendingCredentialForFamily(store, "dev-1", "dev.user@gmail.com")
@@ -1229,7 +1281,10 @@ describe("pending credential reuse", () => {
   });
 
   test("prefers the oldest pending family for a profile before switching to a newly discovered family", () => {
-    const store = normalizeCredentialStore({
+    const store = {
+      version: 4,
+      default_create_base_email: "dev.{n}@astronlab.com",
+      families: {},
       pending: {
         "1.dev.astronlab+1@gmail.com": {
           email: "1.dev.astronlab+1@gmail.com",
@@ -1256,7 +1311,7 @@ describe("pending credential reuse", () => {
           started_at: "2026-03-21T00:00:00.000Z",
         },
       },
-    });
+    } as Parameters<typeof selectPendingBaseEmailHintForProfile>[0];
 
     expect(selectPendingBaseEmailHintForProfile(store, "dev-1")).toBe(
       "1.dev.astronlab@gmail.com",
@@ -1264,7 +1319,10 @@ describe("pending credential reuse", () => {
   });
 
   test("prefers the higher-frontier template pending family", () => {
-    const store = normalizeCredentialStore({
+    const store = {
+      version: 4,
+      default_create_base_email: "dev.{n}@astronlab.com",
+      families: {},
       pending: {
         "qa.300@astronlab.com": {
           email: "qa.300@astronlab.com",
@@ -1291,7 +1349,7 @@ describe("pending credential reuse", () => {
           started_at: "2026-04-06T16:00:00.000Z",
         },
       },
-    });
+    } as Parameters<typeof selectPendingBaseEmailHintForProfile>[0];
 
     expect(selectPendingBaseEmailHintForProfile(store, "dev-1")).toBe(
       "dev.{n}@astronlab.com",

@@ -240,6 +240,13 @@ struct BridgeFindSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BridgeDeleteSecretPayload<'a> {
+    profile_name: &'a str,
+    email: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
@@ -1235,7 +1242,19 @@ fn codex_bin() -> String {
 fn load_credential_store() -> Result<CredentialStore> {
     let _ = migrate_legacy_credential_store_if_needed()?;
     let state = load_rotate_state_json()?;
-    Ok(normalize_credential_store(state))
+    let raw_pending = normalize_pending_credential_map(state.get("pending"));
+    let store = normalize_credential_store(state);
+    let dropped_non_dev_pending = raw_pending
+        .into_values()
+        .filter(|record| should_drop_non_dev_pending_credential(&record.stored.base_email))
+        .collect::<Vec<_>>();
+
+    if !dropped_non_dev_pending.is_empty() {
+        save_credential_store(&store)?;
+        cleanup_dropped_non_dev_pending_secrets(&dropped_non_dev_pending);
+    }
+
+    Ok(store)
 }
 
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
@@ -1269,6 +1288,24 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
         object.insert("pending".to_string(), pending);
     }
     write_rotate_state_json(&state)
+}
+
+fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
+    for record in records {
+        let result = run_automation_bridge::<_, bool>(
+            "delete-account-secret-ref",
+            BridgeDeleteSecretPayload {
+                profile_name: &record.stored.profile_name,
+                email: &record.stored.email,
+            },
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "{YELLOW}WARN{RESET} Failed to remove stale Bitwarden secret for {}: {}",
+                record.stored.email, error
+            );
+        }
+    }
 }
 
 fn normalize_credential_store(raw: Value) -> CredentialStore {
@@ -1312,6 +1349,7 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
         .filter(|(email, record)| {
             !inventory_emails.contains(email)
                 && !pending_is_superseded_by_inventory(record, &inventory_emails)
+                && !should_drop_non_dev_pending_credential(&record.stored.base_email)
         })
         .collect::<HashMap<_, _>>();
     if migrate_legacy_non_default_families {
@@ -1350,6 +1388,12 @@ fn should_drop_legacy_non_default_family(base_email: &str, default_base_email: &
         }
         EmailFamilyMode::GmailPlus => false,
     }
+}
+
+fn should_drop_non_dev_pending_credential(base_email: &str) -> bool {
+    normalize_base_email_family(base_email)
+        .map(|value| value != DEFAULT_CREATE_BASE_EMAIL)
+        .unwrap_or(true)
 }
 
 fn collect_inventory_emails_from_state(raw: &Value) -> HashSet<String> {
@@ -2415,6 +2459,51 @@ mod tests {
         assert!(!store
             .pending
             .contains_key("bench.devicefix.8@astronlab.com"));
+    }
+
+    #[test]
+    fn normalize_credential_store_drops_non_dev_pending_even_in_v4_state() {
+        let store = normalize_credential_store(json!({
+            "version": 4,
+            "pending": {
+                "qa.300@astronlab.com": {
+                    "email": "qa.300@astronlab.com",
+                    "profile_name": "dev-1",
+                    "base_email": "qa.{n}@astronlab.com",
+                    "suffix": 300,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-06T17:00:00.000Z",
+                    "updated_at": "2026-04-06T17:00:00.000Z",
+                    "started_at": "2026-04-06T17:00:00.000Z"
+                },
+                "dev.user+1@gmail.com": {
+                    "email": "dev.user+1@gmail.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev.user@gmail.com",
+                    "suffix": 1,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-06T18:00:00.000Z",
+                    "updated_at": "2026-04-06T18:00:00.000Z",
+                    "started_at": "2026-04-06T18:00:00.000Z"
+                },
+                "dev.35@astronlab.com": {
+                    "email": "dev.35@astronlab.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "suffix": 35,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-06T19:00:00.000Z",
+                    "updated_at": "2026-04-06T19:00:00.000Z",
+                    "started_at": "2026-04-06T19:00:00.000Z"
+                }
+            }
+        }));
+        assert_eq!(store.pending.keys().cloned().collect::<Vec<_>>(), vec![
+            "dev.35@astronlab.com".to_string()
+        ]);
     }
 
     #[test]

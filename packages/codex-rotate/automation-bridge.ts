@@ -8,6 +8,7 @@ import type {
 } from "./automation.ts";
 import {
   completeCodexLoginViaWorkflow,
+  deleteBitwardenCliAccountSecretRef,
   ensureBitwardenCliAccountSecretRef,
   findBitwardenCliAccountSecretRef,
   inspectManagedProfiles,
@@ -26,6 +27,10 @@ type BridgeRequest =
     }
   | {
       command: "find-account-secret-ref";
+      payload: { profileName: string; email: string };
+    }
+  | {
+      command: "delete-account-secret-ref";
       payload: { profileName: string; email: string };
     }
   | {
@@ -91,6 +96,11 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
       );
     case "find-account-secret-ref":
       return await findBitwardenCliAccountSecretRef(
+        request.payload.profileName,
+        request.payload.email,
+      );
+    case "delete-account-secret-ref":
+      return await deleteBitwardenCliAccountSecretRef(
         request.payload.profileName,
         request.payload.email,
       );
