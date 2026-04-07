@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow.workspace = true
 codex-rotate-core = { path = "../codex-rotate-core" }
+codex-rotate-runtime = { path = "../codex-rotate-runtime" }

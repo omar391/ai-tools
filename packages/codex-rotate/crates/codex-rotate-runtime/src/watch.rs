@@ -1,6 +1,5 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -75,7 +74,6 @@ pub struct RotationDecision {
     pub should_rotate: bool,
     pub reason: Option<String>,
     pub rotation_command: Option<RotationCommand>,
-    pub rotation_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,22 +95,19 @@ pub struct WatchIterationOptions {
 
 pub fn read_watch_state() -> Result<WatchState> {
     let paths = resolve_paths()?;
-    if !paths.rotate_app_home.join("watch-state.json").exists() {
+    if !paths.watch_state_file.exists() {
         return Ok(WatchState::default());
     }
-    let raw = fs::read_to_string(paths.rotate_app_home.join("watch-state.json"))
-        .context("Failed to read watch-state.json.")?;
+    let raw =
+        fs::read_to_string(&paths.watch_state_file).context("Failed to read watch-state.json.")?;
     let state = serde_json::from_str::<WatchState>(&raw).unwrap_or_default();
     Ok(state)
 }
 
 pub fn write_watch_state(state: &WatchState) -> Result<()> {
     let paths = resolve_paths()?;
-    fs::create_dir_all(&paths.rotate_app_home)
-        .with_context(|| format!("Failed to create {}.", paths.rotate_app_home.display()))?;
-    let path = paths.rotate_app_home.join("watch-state.json");
     let raw = serde_json::to_string_pretty(state)?;
-    write_file_atomically(&path, &raw)
+    write_file_atomically(&paths.watch_state_file, &raw)
 }
 
 pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterationResult> {
@@ -264,8 +259,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             }
             Err(error) => {
                 eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
-                next_state.thread_recovery_pending =
-                    next_state.thread_recovery_pending || !next_state.thread_recovery_pending_events.is_empty();
+                next_state.thread_recovery_pending = next_state.thread_recovery_pending
+                    || !next_state.thread_recovery_pending_events.is_empty();
             }
         }
     }
@@ -518,7 +513,6 @@ fn decide_rotation(
             should_rotate: plan.0,
             reason: plan.1,
             rotation_command: plan.2,
-            rotation_args: plan.3,
         },
         quota_cache,
     ))
@@ -646,12 +640,26 @@ fn write_file_atomically(path: &Path, raw: &str) -> Result<()> {
             std::process::id(),
             Utc::now().timestamp_micros()
         ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp_path)
-        {
+        let open_result = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&temp_path)
+            }
+            #[cfg(not(unix))]
+            {
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temp_path)
+            }
+        };
+
+        match open_result {
             Ok(mut file) => {
                 let write_result = (|| -> Result<()> {
                     file.write_all(raw.as_bytes())?;

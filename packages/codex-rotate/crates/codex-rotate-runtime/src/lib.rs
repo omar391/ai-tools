@@ -1,5 +1,7 @@
 pub mod cdp;
+pub mod daemon;
 pub mod hook;
+pub mod ipc;
 pub mod launcher;
 pub mod logs;
 pub mod paths;

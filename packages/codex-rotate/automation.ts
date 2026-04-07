@@ -46,8 +46,7 @@ const FAST_BROWSER_SCRIPT_DEFAULT = resolve(
 const FAST_BROWSER_SCRIPT =
   process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST_BROWSER_SCRIPT_DEFAULT;
 const FAST_BROWSER_RUNTIME =
-  process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME ??
-  (process.versions.bun ? "node" : process.execPath);
+  process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME ?? "node";
 const FAST_BROWSER_PLAYWRIGHT_MODULE = join(
   REPO_ROOT,
   "node_modules",
@@ -143,7 +142,6 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
 }
 
 export let ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
-export let LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 
 export function getCodexRotateHome(): string {
   return ROTATE_HOME;
@@ -152,7 +150,6 @@ export function getCodexRotateHome(): string {
 export function setCodexRotateHomeForTesting(rootDir: string | null): void {
   ROTATE_HOME = resolve(rootDir || DEFAULT_ROTATE_HOME);
   ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
-  LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 }
 
 export interface CredentialFamily {
@@ -487,26 +484,12 @@ function readPrivateJsonRecord(
 }
 
 function loadRotateStateDocument(): Record<string, unknown> {
-  const state = existsSync(ROTATE_STATE_FILE)
+  return existsSync(ROTATE_STATE_FILE)
     ? readPrivateJsonRecord(
         ROTATE_STATE_FILE,
         `Invalid rotate state at ${ROTATE_STATE_FILE}`,
       )
     : {};
-
-  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
-    const legacyStore = normalizeCredentialStore(
-      parseJson<LegacyCredentialStore>(
-        readFileSync(LEGACY_CREDENTIALS_FILE, "utf8"),
-        `Invalid credential store at ${LEGACY_CREDENTIALS_FILE}`,
-      ),
-    );
-    state.version = legacyStore.version;
-    state.families = legacyStore.families;
-    state.pending = serializeCredentialRecordMap(legacyStore.pending);
-  }
-
-  return state;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -784,7 +767,7 @@ export async function findBitwardenCliAccountSecretRef(
 }
 
 export function loadCredentialStore(): CredentialStore {
-  if (!existsSync(ROTATE_STATE_FILE) && !existsSync(LEGACY_CREDENTIALS_FILE)) {
+  if (!existsSync(ROTATE_STATE_FILE)) {
     return normalizeCredentialStore(null);
   }
 
@@ -810,9 +793,6 @@ export function saveCredentialStore(store: CredentialStore): void {
     delete nextState.pending;
   }
   writePrivateJson(ROTATE_STATE_FILE, nextState);
-  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
-    unlinkSync(LEGACY_CREDENTIALS_FILE);
-  }
 }
 
 const EMAIL_FAMILY_PLACEHOLDER = "{n}";
@@ -1643,7 +1623,7 @@ function ensureFastBrowserPlaywright(): void {
   if (!existsSync(FAST_BROWSER_PLAYWRIGHT_MODULE)) {
     throw new Error(
       `Playwright is not installed in ${REPO_ROOT}. ` +
-        'Run "bun install" after adding the playwright dependency before using create/relogin automation.',
+        "Install the repo dependencies before using create/relogin automation.",
     );
   }
 }

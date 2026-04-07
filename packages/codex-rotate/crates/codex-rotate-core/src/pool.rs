@@ -845,7 +845,7 @@ pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
         "accounts".to_string(),
         serde_json::to_value(&pool.accounts)?,
     );
-    write_rotate_state_json(&state, false)
+    write_rotate_state_json(&state)
 }
 
 fn extract_email_from_auth(auth: &CodexAuth) -> String {

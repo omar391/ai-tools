@@ -15,7 +15,6 @@ import {
   buildCodexLoginManagedBrowserWrapperPath,
   buildAccountFamilyEmail,
   CODEX_ROTATE_ACCOUNT_FLOW_FILE,
-  LEGACY_CREDENTIALS_FILE,
   ROTATE_STATE_FILE,
   buildCodexRotateOpenAiTempProfileName,
   cleanupLegacyCodexRotateArtifacts,
@@ -929,7 +928,7 @@ describe("credential store normalization", () => {
 });
 
 describe("credential store state-file merge", () => {
-  test("writes credential state into accounts.json and removes legacy credentials.json", () => {
+  test("writes credential state into accounts.json without a separate credential file", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-state-"));
     const previousRotateHome = getCodexRotateHome();
 
@@ -940,11 +939,6 @@ describe("credential store state-file merge", () => {
         JSON.stringify({
           active_index: 2,
           accounts: [{ email: "dev.22@astronlab.com" }],
-        }),
-      );
-      writeFileSync(
-        LEGACY_CREDENTIALS_FILE,
-        JSON.stringify({
           version: 3,
           families: {
             "dev-1::dev.{n}@astronlab.com": {
@@ -989,7 +983,6 @@ describe("credential store state-file merge", () => {
       expect(
         merged.families?.["dev-1::dev.{n}@astronlab.com"]?.next_suffix,
       ).toBe(23);
-      expect(existsSync(LEGACY_CREDENTIALS_FILE)).toBe(false);
     } finally {
       setCodexRotateHomeForTesting(previousRotateHome);
       rmSync(fixtureRoot, { recursive: true, force: true });

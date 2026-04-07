@@ -39,11 +39,21 @@ where
         NamedTempFile::new().context("Failed to create automation bridge request file.")?;
     request_file.write_all(&request)?;
     request_file.flush()?;
-    let child = Command::new(&paths.bun_bin)
+    let mut process = Command::new(&paths.node_bin);
+    if paths
+        .automation_bridge_entrypoint
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("ts")
+    {
+        process.arg("--experimental-strip-types");
+    }
+    let child = process
         .arg(&paths.automation_bridge_entrypoint)
         .arg("--request-file")
         .arg(request_file.path())
-        .current_dir(&paths.repo_root)
+        .current_dir(&paths.asset_root)
+        .env("CODEX_ROTATE_ASSET_ROOT", paths.asset_root.as_os_str())
         .env("CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -52,7 +62,7 @@ where
         .with_context(|| {
             format!(
                 "Failed to run {} {}.",
-                paths.bun_bin,
+                paths.node_bin,
                 paths.automation_bridge_entrypoint.display()
             )
         })?;

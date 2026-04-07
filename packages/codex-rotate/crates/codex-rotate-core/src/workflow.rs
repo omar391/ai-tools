@@ -18,7 +18,7 @@ use crate::auth::{
     CodexAuth,
 };
 use crate::bridge::run_automation_bridge;
-use crate::paths::resolve_paths;
+use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::pool::{
     cmd_add, find_next_usable_account, format_account_summary_for_display, inspect_account,
     load_pool, normalize_pool_entries, resolve_account_selector, save_pool,
@@ -361,6 +361,23 @@ pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
         "{GREEN}OK{RESET} Created {} via \"{}\" from {}.\nQuota: {}",
         result.entry.label, result.profile_name, result.base_email, quota_summary
     ))
+}
+
+pub fn migrate_legacy_credential_store_if_needed() -> Result<bool> {
+    let legacy_file = legacy_credentials_file()?;
+    if !legacy_file.exists() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(&legacy_file)
+        .with_context(|| format!("Failed to read {}.", legacy_file.display()))?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("Invalid credential store at {}.", legacy_file.display()))?;
+    let store = normalize_credential_store(parsed);
+    save_credential_store(&store)?;
+    fs::remove_file(&legacy_file)
+        .with_context(|| format!("Failed to remove {}.", legacy_file.display()))?;
+    Ok(true)
 }
 
 pub fn cmd_relogin(selector: &str, options: ReloginOptions) -> Result<String> {
@@ -1217,21 +1234,9 @@ fn codex_bin() -> String {
 }
 
 fn load_credential_store() -> Result<CredentialStore> {
-    let paths = resolve_paths()?;
+    let _ = migrate_legacy_credential_store_if_needed()?;
     let state = load_rotate_state_json()?;
-    let mut store = normalize_credential_store(state);
-    if paths.credentials_file.exists() {
-        let raw = fs::read_to_string(&paths.credentials_file)
-            .with_context(|| format!("Failed to read {}.", paths.credentials_file.display()))?;
-        let parsed: Value = serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "Invalid credential store at {}.",
-                paths.credentials_file.display()
-            )
-        })?;
-        store = normalize_credential_store(parsed);
-    }
-    Ok(store)
+    Ok(normalize_credential_store(state))
 }
 
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
@@ -1258,7 +1263,7 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
             object.insert("pending".to_string(), pending);
         }
     }
-    write_rotate_state_json(&state, true)
+    write_rotate_state_json(&state)
 }
 
 fn normalize_credential_store(raw: Value) -> CredentialStore {
@@ -1585,11 +1590,9 @@ fn compare_create_family_hint_priority(
     right_base_email: &str,
     right_frontier_suffix: u32,
 ) -> Ordering {
-    create_family_hint_priority(left_base_email, left_frontier_suffix)
-        .cmp(&create_family_hint_priority(
-            right_base_email,
-            right_frontier_suffix,
-        ))
+    create_family_hint_priority(left_base_email, left_frontier_suffix).cmp(
+        &create_family_hint_priority(right_base_email, right_frontier_suffix),
+    )
 }
 
 fn make_credential_family_key(profile_name: &str, base_email: &str) -> Result<String> {
@@ -2162,6 +2165,19 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
 
     #[test]
     fn stored_credentials_used_only_for_non_manual_relogin() {
@@ -2567,5 +2583,158 @@ mod tests {
             Some("dev.24@astronlab.com")
         );
         assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn migrates_legacy_credential_store_into_accounts_json() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let rotate_home = unique_temp_dir("codex-rotate-legacy-store");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        let accounts_path = rotate_home.join("accounts.json");
+        let legacy_path = rotate_home.join("credentials.json");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        }
+
+        let result = (|| -> Result<()> {
+            fs::write(
+                &accounts_path,
+                serde_json::json!({
+                    "active_index": 2,
+                    "accounts": [{ "email": "dev.22@astronlab.com" }],
+                })
+                .to_string(),
+            )?;
+            fs::write(
+                &legacy_path,
+                serde_json::json!({
+                    "version": 3,
+                    "families": {
+                        "dev-1::dev.{n}@astronlab.com": {
+                            "profile_name": "dev-1",
+                            "base_email": "dev.{n}@astronlab.com",
+                            "next_suffix": 23,
+                            "created_at": "2026-04-05T00:00:00.000Z",
+                            "updated_at": "2026-04-05T00:00:00.000Z",
+                            "last_created_email": "dev.22@astronlab.com"
+                        }
+                    },
+                    "pending": {
+                        "dev.23@astronlab.com": {
+                            "email": "dev.23@astronlab.com",
+                            "profile_name": "dev-1",
+                            "base_email": "dev.{n}@astronlab.com",
+                            "suffix": 23,
+                            "selector": null,
+                            "alias": null,
+                            "created_at": "2026-04-05T00:00:00.000Z",
+                            "updated_at": "2026-04-05T00:00:00.000Z",
+                            "started_at": "2026-04-05T00:00:00.000Z"
+                        }
+                    }
+                })
+                .to_string(),
+            )?;
+
+            assert!(migrate_legacy_credential_store_if_needed()?);
+
+            let merged: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&accounts_path)?)?;
+            assert_eq!(merged["active_index"], 2);
+            assert_eq!(merged["accounts"][0]["email"], "dev.22@astronlab.com");
+            assert_eq!(
+                merged["families"]["dev-1::dev.{n}@astronlab.com"]["next_suffix"],
+                23
+            );
+            assert_eq!(
+                merged["pending"]["dev.23@astronlab.com"]["email"],
+                "dev.23@astronlab.com"
+            );
+            assert!(!legacy_path.exists());
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_ROTATE_HOME");
+            },
+        }
+        fs::remove_dir_all(&rotate_home).ok();
+        result.expect("legacy credential migration");
+    }
+
+    #[test]
+    fn loading_credential_store_migrates_legacy_file_automatically() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let rotate_home = unique_temp_dir("codex-rotate-load-store");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        let legacy_path = rotate_home.join("credentials.json");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        }
+
+        let result = (|| -> Result<()> {
+            fs::write(
+                &legacy_path,
+                serde_json::json!({
+                    "version": 3,
+                    "families": {
+                        "dev-1::dev.{n}@astronlab.com": {
+                            "profile_name": "dev-1",
+                            "base_email": "dev.{n}@astronlab.com",
+                            "next_suffix": 23,
+                            "created_at": "2026-04-05T00:00:00.000Z",
+                            "updated_at": "2026-04-05T00:00:00.000Z",
+                            "last_created_email": "dev.22@astronlab.com"
+                        }
+                    },
+                    "pending": {
+                        "dev.23@astronlab.com": {
+                            "email": "dev.23@astronlab.com",
+                            "profile_name": "dev-1",
+                            "base_email": "dev.{n}@astronlab.com",
+                            "suffix": 23,
+                            "selector": null,
+                            "alias": null,
+                            "created_at": "2026-04-05T00:00:00.000Z",
+                            "updated_at": "2026-04-05T00:00:00.000Z",
+                            "started_at": "2026-04-05T00:00:00.000Z"
+                        }
+                    }
+                })
+                .to_string(),
+            )?;
+
+            let store = load_credential_store()?;
+            assert_eq!(
+                store
+                    .families
+                    .get("dev-1::dev.{n}@astronlab.com")
+                    .map(|family| family.next_suffix),
+                Some(23)
+            );
+            assert!(store.pending.contains_key("dev.23@astronlab.com"));
+            assert!(!legacy_path.exists());
+            assert!(rotate_home.join("accounts.json").exists());
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_ROTATE_HOME");
+            },
+        }
+        fs::remove_dir_all(&rotate_home).ok();
+        result.expect("load credential store migration");
     }
 }

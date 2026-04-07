@@ -3,12 +3,21 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
-  "module": "index.ts",
-  "devDependencies": {
-    "@types/bun": "latest",
-    "@types/node": "^25.3.0"
+  "bin": {
+    "codex-rotate": "./index.ts"
   },
-  "peerDependencies": {
-    "typescript": "^5.9.3"
+  "files": [
+    "index.ts",
+    "dist",
+    "automation.ts",
+    "automation-bridge.ts",
+    "codex-login-app-server-helper.mjs",
+    "codex-login-managed-browser-opener.mjs"
+  ],
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0"
   }
 }
