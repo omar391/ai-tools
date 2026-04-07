@@ -143,7 +143,7 @@ describe("workflow metadata", () => {
     expect(metadata.workflowRef).toBe(
       "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
     );
-    expect(metadata.preferredProfileName).toBe("dev-1-temp");
+    expect(metadata.preferredProfileName).toBe("dev-1");
     expect(metadata.preferredEmail).toBeNull();
   });
 
@@ -598,7 +598,7 @@ describe("automation bridge transport", () => {
         result?: { preferredProfileName?: string | null };
       };
       expect(response.ok).toBe(true);
-      expect(response.result?.preferredProfileName).toBe("dev-1-temp");
+      expect(response.result?.preferredProfileName).toBe("dev-1");
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }

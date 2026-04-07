@@ -5,7 +5,7 @@ document:
   version: 1.1.0
   summary: "Pure non-device stepwise OpenAI auth state machine with the former shared logic inlined."
   metadata:
-    preferredProfile: dev-1-temp
+    preferredProfile: dev-1
     primaryTarget: primary
     targets:
       - id: primary

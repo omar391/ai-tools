@@ -75,13 +75,13 @@ version: null
 
 ### Fields
 
-| Field | Type | Required | Meaning |
-| --- | --- | --- | --- |
-| `type` | string | yes | MUST be `secret_ref` |
-| `store` | string | yes | Adapter slug such as `local-file`, `bitwarden-cli`, `lastpass-cli`, `vault-kv`, `aws-secrets-manager`, `gcp-secret-manager`, or `azure-key-vault` |
-| `object_id` | string | yes | Opaque adapter-owned identifier |
-| `field_path` | string | no | JSON Pointer path for selecting a field from an object-shaped secret |
-| `version` | string or null | no | Optional adapter-owned version selector |
+| Field        | Type           | Required | Meaning                                                                                                                                           |
+| ------------ | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`       | string         | yes      | MUST be `secret_ref`                                                                                                                              |
+| `store`      | string         | yes      | Adapter slug such as `local-file`, `bitwarden-cli`, `lastpass-cli`, `vault-kv`, `aws-secrets-manager`, `gcp-secret-manager`, or `azure-key-vault` |
+| `object_id`  | string         | yes      | Opaque adapter-owned identifier                                                                                                                   |
+| `field_path` | string         | no       | JSON Pointer path for selecting a field from an object-shaped secret                                                                              |
+| `version`    | string or null | no       | Optional adapter-owned version selector                                                                                                           |
 
 ### Rules
 
@@ -141,7 +141,10 @@ type ResolvedSecretMetadata = {
 
 type ResolvedSecret =
   | { payload: string; metadata: ResolvedSecretMetadata }
-  | { payload: Record<string, unknown> | unknown[]; metadata: ResolvedSecretMetadata };
+  | {
+      payload: Record<string, unknown> | unknown[];
+      metadata: ResolvedSecretMetadata;
+    };
 
 interface SecretStoreAdapter {
   validateRef(ref: SecretRef): void;
@@ -237,17 +240,17 @@ Secret refs and resolved secret values have different allowed boundaries.
 
 ### Stable architecture seams
 
-| Seam | `secret_ref` allowed | Resolved value allowed | Policy |
-| --- | --- | --- | --- |
-| Workflow ingress | yes | no | Workflows, API requests, and schedulers may submit refs only |
-| Worker or daemon IPC | yes | no | Cross-process transport must carry refs, never plaintext |
-| Interpolation boundary | yes | no | Interpolation may move refs as structured values but must not resolve them |
-| Action execution boundary | yes | yes | Executor resolves immediately before use |
-| Logging and telemetry | redacted only | no | Use `redactRef(ref)` only |
-| Pause or resume payloads | yes | no | Session state may persist refs, never resolved values |
-| Persisted run state | yes | no | Store refs only when needed for replay semantics |
-| Semantic memory | no by default | no | Secret-related details should be excluded unless explicitly safe and redacted |
-| Artifacts | no by default | no | Screenshots, video, DOM dumps, and traces must not persist secrets |
+| Seam                      | `secret_ref` allowed | Resolved value allowed | Policy                                                                        |
+| ------------------------- | -------------------- | ---------------------- | ----------------------------------------------------------------------------- |
+| Workflow ingress          | yes                  | no                     | Workflows, API requests, and schedulers may submit refs only                  |
+| Worker or daemon IPC      | yes                  | no                     | Cross-process transport must carry refs, never plaintext                      |
+| Interpolation boundary    | yes                  | no                     | Interpolation may move refs as structured values but must not resolve them    |
+| Action execution boundary | yes                  | yes                    | Executor resolves immediately before use                                      |
+| Logging and telemetry     | redacted only        | no                     | Use `redactRef(ref)` only                                                     |
+| Pause or resume payloads  | yes                  | no                     | Session state may persist refs, never resolved values                         |
+| Persisted run state       | yes                  | no                     | Store refs only when needed for replay semantics                              |
+| Semantic memory           | no by default        | no                     | Secret-related details should be excluded unless explicitly safe and redacted |
+| Artifacts                 | no by default        | no                     | Screenshots, video, DOM dumps, and traces must not persist secrets            |
 
 ### Resolution lifecycle
 
@@ -334,11 +337,11 @@ References:
 
 ### HashiCorp Vault
 
-Vault KV v2 supports secret paths and field selection, which maps cleanly to the normalized `object_id` plus `field_path` model defined here.
+Vault KV version 2 supports secret paths and field selection, which maps cleanly to the normalized `object_id` plus `field_path` model defined here.
 
 References:
 
-- [Vault KV v2 read data](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2/cookbook/read-data)
+- [Vault KV secrets engine](https://developer.hashicorp.com/vault/docs/secrets/kv)
 - [Vault read command](https://developer.hashicorp.com/vault/docs/commands/read)
 
 ### JSON Pointer
