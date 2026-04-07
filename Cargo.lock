@@ -338,6 +338,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codex-rotate-core",
+ "codex-rotate-runtime",
 ]
 
 [[package]]
@@ -356,19 +357,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-rotate-tray"
-version = "1.0.0"
-dependencies = [
- "codex-rotate-core",
- "codex-rotate-tray-core",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
-name = "codex-rotate-tray-core"
+name = "codex-rotate-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -381,6 +370,18 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tungstenite",
+]
+
+[[package]]
+name = "codex-rotate-tray"
+version = "1.0.0"
+dependencies = [
+ "codex-rotate-core",
+ "codex-rotate-runtime",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 # ai-tools
 
-A Bun workspace monorepo of CLI utilities for managing AI coding assistants.
+A Rust-first workspace of local tools for managing AI coding assistants.
 
 ## Packages
 
@@ -9,34 +9,32 @@ A Bun workspace monorepo of CLI utilities for managing AI coding assistants.
 Rotate Codex CLI OAuth tokens across multiple ChatGPT accounts.
 
 ```sh
-codex-rotate add              # Snapshot current ~/.codex/auth.json into pool using email_plan as the key
-codex-rotate add work         # Same, but also keep "work" as an optional alias
-codex-rotate create           # Reuse a healthy account first; only create when needed, or force with --force
-codex-rotate next              # Swap to next account with usable quota
-codex-rotate prev              # Swap to previous account
-codex-rotate list              # Show all accounts with live quota info
-codex-rotate status            # Show current auth-file target details and quota
+codex-rotate add                # Snapshot current ~/.codex/auth.json into pool using email_plan as the key
+codex-rotate add work           # Same, but also keep "work" as an optional alias
+codex-rotate create             # Reuse a healthy account first; only create when needed, or force with --force
+codex-rotate next               # Swap to next account with usable quota
+codex-rotate prev               # Swap to previous account
+codex-rotate list               # Show all accounts with live quota info
+codex-rotate status             # Show current auth-file target details and quota
 codex-rotate relogin <selector> # Repair a dead entry; stored credentials are used automatically when available
 codex-rotate remove <selector>  # Remove account from pool
+codex-rotate daemon run         # Start the background daemon used by the tray shell
 ```
 
-`add` now defaults the pool key to `{email}_{plan-type}`. Old manual labels are preserved as optional aliases, and `relogin` / `remove` accept either the composite key, the alias, the full account id, the short account id shown in `list`, or the email when it is unique in the pool.
+`add` defaults the pool key to `{email}_{plan-type}`. Old manual labels are preserved as optional aliases, and `relogin` / `remove` accept either the composite key, the alias, the full account id, the short account id shown in `list`, or the email when it is unique in the pool.
 
-`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. New account passwords are stored in `~/.codex-rotate/credentials.json` with `0600` permissions. `create` now defaults to the local workflow `preferred_profile` (`dev-1`), defaults the email family to `dev.{N}@astronlab.com` unless you override it with `--base-email`, drains the oldest unfinished pending account in that family before allocating the next suffix, and reuses a healthy pool account before creating a new one unless you pass `--force`. `next` still auto-creates one new account when the existing pool is fully exhausted or unavailable.
+`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. Account inventory and credential metadata now live in `~/.codex-rotate/accounts.json`; the daemon-owned runtime state is `~/.codex-rotate/watch-state.json`, `~/.codex-rotate/profile/`, and `~/.codex-rotate/daemon.sock`.
 
-`relogin` now prefers stored credentials. Use `--manual-login` to force the legacy browser flow, `--device-auth` for device auth, `--keep-session` to skip `codex logout` for manual relogins, or `--allow-email-change` if you intentionally want to replace the selected entry with a different signed-in email.
+The tray is only a UI shell over the daemon. The CLI owns the watch loop, managed Codex launch, live account sync, and create/relogin orchestration.
 
-**Setup:**
+#### Setup
 
 ```sh
-bun install
+cargo build --package codex-rotate-cli
 
-# Add alias to ~/.zshrc
-alias codex-rotate='bun run /path/to/ai-tools/packages/codex-rotate/index.ts'
-source ~/.zshrc
+# Optional npm-style wrapper once the native binary is available
+node /path/to/ai-tools/packages/codex-rotate/index.ts help
 ```
-
-> **Note:** After running `codex-rotate next` or `prev`, **restart Codex** (re-open the IDE window) for it to pick up the new auth tokens. The rotation updates `~/.codex/auth.json` on disk, but the running Codex process caches the session in memory.
 
 ## Adding a new tool
 
@@ -49,7 +47,3 @@ packages/
     index.ts
     package.json
 ```
-
-## Requirements
-
-Any TypeScript-capable runtime: [Bun](https://bun.sh), [tsx](https://github.com/privatenumber/tsx), [Deno](https://deno.land), etc.

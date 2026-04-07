@@ -2,48 +2,48 @@
 
 ## Summary
 
-Codex Rotate is now a Rust-first local supervisor for Codex account rotation.
+Codex Rotate is now CLI-owned end to end.
 
-- The tray runtime is Tauri + Rust only.
-- The account pool, quota inspection, watch loop, launcher, CDP session sync, and create/relogin orchestration are Rust.
-- TypeScript remains only where it still adds value: `fast-browser` automation and the JSON-over-stdio bridge that calls it.
-- There is no longer a Bun control plane under `packages/codex-rotate-app`.
+- The Rust CLI and daemon own the watch loop, managed Codex launch, live account sync, quota refresh, thread recovery, and create/relogin orchestration.
+- The tray is a pure Tauri UI shell that starts or reattaches to the daemon and renders daemon snapshots over local IPC.
+- TypeScript remains only at the npm wrapper and fast-browser automation boundary.
+- `~/.codex-rotate-app` is a legacy migration source only and is removed after first successful migration.
 
 ## Runtime Map
 
-| Layer                  | Main files                                                                          | Responsibility                                                                        |
-| ---------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Tray shell             | `packages/codex-rotate-app/src-tauri/src/main.rs`                                   | Tray menu, background polling, user actions                                           |
-| Tray runtime core      | `packages/codex-rotate-app/crates/codex-rotate-tray-core/src/*.rs`                  | Watch loop, launcher, CDP, log ingestion, live-session sync                           |
-| Shared engine core     | `packages/codex-rotate/crates/codex-rotate-core/src/*.rs`                           | Auth parsing, quota cache, pool engine, create/relogin orchestration                  |
-| Rust CLI               | `packages/codex-rotate/crates/codex-rotate-cli/src/main.rs`                         | Stable `codex-rotate` command surface                                                 |
-| TS wrapper             | `packages/codex-rotate/index.ts`                                                    | Thin launcher into the Rust CLI                                                       |
-| TS automation boundary | `packages/codex-rotate/automation.ts`, `packages/codex-rotate/automation-bridge.ts` | `fast-browser`, workflow metadata, Bitwarden secret refs, managed-browser Codex login |
+| Layer               | Main files                                                                          | Responsibility                                                                        |
+| ------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Tray shell          | `packages/codex-rotate-app/src-tauri/src/main.rs`                                   | Menu, icon, daemon bootstrap, IPC subscription, user actions                          |
+| CLI daemon runtime  | `packages/codex-rotate/crates/codex-rotate-runtime/src/*.rs`                        | Watch loop, launcher, CDP, logs, live sync, thread recovery, daemon IPC               |
+| Shared engine core  | `packages/codex-rotate/crates/codex-rotate-core/src/*.rs`                           | Auth parsing, quota cache, pool engine, create/relogin orchestration                  |
+| Rust CLI            | `packages/codex-rotate/crates/codex-rotate-cli/src/main.rs`                         | Stable `codex-rotate` command surface and `daemon run`                                |
+| npm wrapper         | `packages/codex-rotate/index.ts`                                                    | Thin Node launcher into the shipped native CLI                                        |
+| Automation boundary | `packages/codex-rotate/automation.ts`, `packages/codex-rotate/automation-bridge.ts` | `fast-browser`, workflow metadata, Bitwarden secret refs, managed-browser Codex login |
 
 ## Component Diagram
 
 ```mermaid
 flowchart LR
   Tray["Tauri Tray<br/>main.rs"]
-  TrayCore["Tray Core<br/>watch.rs / hook.rs / launcher.rs"]
+  IPC["daemon.sock<br/>subscribe + invoke"]
+  Runtime["CLI Runtime Daemon<br/>codex-rotate-runtime"]
   Engine["Engine Core<br/>pool.rs / workflow.rs / quota.rs"]
   CLI["Rust CLI<br/>codex-rotate-cli"]
-  Wrapper["TS Wrapper<br/>packages/codex-rotate/index.ts"]
-  Bridge["TS Automation Bridge<br/>automation-bridge.ts"]
+  Wrapper["Node Wrapper<br/>packages/codex-rotate/index.ts"]
+  Bridge["Automation Bridge<br/>automation-bridge.ts"]
   Auto["Automation Engine<br/>automation.ts + fast-browser"]
-  Codex["Codex.app<br/>managed wrapper instance"]
-  OpenAI["OpenAI APIs<br/>OAuth + WHAM"]
-  Files["Local State Files<br/>auth.json / accounts.json / credentials.json / watch-state.json"]
+  Codex["Codex.app<br/>managed profile"]
+  Files["Local State<br/>auth.json / accounts.json / watch-state.json / profile"]
   Sqlite["Codex Logs SQLite<br/>logs_1.sqlite"]
 
-  Tray --> TrayCore
-  TrayCore --> Engine
-  CLI --> Engine
+  Tray --> IPC
+  CLI --> Runtime
   Wrapper --> CLI
-  TrayCore --> Codex
-  TrayCore --> Files
-  TrayCore --> Sqlite
-  Engine --> OpenAI
+  Runtime --> IPC
+  Runtime --> Engine
+  Runtime --> Codex
+  Runtime --> Files
+  Runtime --> Sqlite
   Engine --> Files
   Engine --> Bridge
   Bridge --> Auto
@@ -51,50 +51,20 @@ flowchart LR
 
 ## State and File Ownership
 
-| File                                   | Owner                | Notes                                                                                        |
-| -------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------- |
-| `~/.codex/auth.json`                   | Codex + Rust core    | Canonical active account tokens                                                              |
-| `~/.codex/logs_1.sqlite`               | Codex                | Signal source for `usage_limit_reached` and `account/rateLimits/updated`                     |
-| `~/.codex-rotate/accounts.json`        | Rust pool engine     | Account pool, active slot, cached per-account quota summaries                                |
-| `~/.codex-rotate/credentials.json`     | Rust workflow engine | Stored families, accounts, pending creates; backward-compatible with legacy password records |
-| `~/.codex-rotate-app/watch-state.json` | Tray runtime core    | Last signal cursor, cooldown, cached quota assessment                                        |
-| `~/.codex-rotate-app/session.json`     | Tray runtime core    | Wrapper Codex launch metadata                                                                |
-| `~/.codex-rotate-app/profile/`         | Tray runtime core    | Dedicated wrapper profile for remote-debugging                                               |
+| File                               | Owner              | Notes                                                                    |
+| ---------------------------------- | ------------------ | ------------------------------------------------------------------------ |
+| `~/.codex/auth.json`               | Codex + Rust core  | Canonical active account tokens                                          |
+| `~/.codex/logs_1.sqlite`           | Codex              | Signal source for quota and usage events                                 |
+| `~/.codex-rotate/accounts.json`    | Rust core          | Account pool plus credential metadata (`version`, `families`, `pending`) |
+| `~/.codex-rotate/watch-state.json` | CLI daemon runtime | Watch cursor, cooldown, cached quota assessment, thread-recovery state   |
+| `~/.codex-rotate/profile/`         | CLI daemon runtime | Dedicated managed Codex `--user-data-dir`                                |
+| `~/.codex-rotate/daemon.sock`      | CLI daemon runtime | Local IPC transport for CLI proxying and tray subscriptions              |
 
-## Data Flow
+Removed files:
 
-```mermaid
-flowchart TD
-  Logs["logs_1.sqlite"]
-  Auth["~/.codex/auth.json"]
-  Pool["accounts.json"]
-  Creds["credentials.json"]
-  Watch["watch-state.json"]
-  WatchLoop["tray-core/watch.rs"]
-  PoolEngine["engine/pool.rs"]
-  Workflow["engine/workflow.rs"]
-  Hook["tray-core/hook.rs + cdp.rs"]
-  Quota["engine/quota.rs"]
-  Bridge["automation-bridge.ts"]
-  Auto["automation.ts"]
-  WHAM["WHAM usage API"]
-
-  Logs --> WatchLoop
-  Auth --> WatchLoop
-  Watch --> WatchLoop
-  WatchLoop --> Quota
-  Quota --> WHAM
-  WatchLoop --> PoolEngine
-  WatchLoop --> Hook
-  Pool --> PoolEngine
-  Creds --> Workflow
-  Pool --> Workflow
-  Workflow --> Bridge
-  Bridge --> Auto
-  Workflow --> PoolEngine
-  Workflow --> Auth
-  Hook --> Auth
-```
+- `~/.codex-rotate/credentials.json`
+- `~/.codex-rotate/session.json`
+- `~/.codex-rotate-app/*`
 
 ## Hot Paths
 
@@ -102,190 +72,67 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-  participant Tray as Tauri Tray
-  participant Watch as Rust Watch Loop
+  participant Daemon as CLI Daemon
+  participant Watch as Runtime Watch Loop
   participant Logs as Codex Logs SQLite
-  participant Hook as Rust Hook/CDP
-  participant Quota as Rust Quota Cache
-  participant Pool as Rust Pool Engine
-  participant Codex as Codex.app
+  participant Hook as Hook/CDP
+  participant Quota as Quota Cache
+  participant Pool as Pool Engine
+  participant Tray as Tauri Tray
 
-  Tray->>Watch: run_watch_iteration()
-  Watch->>Codex: ensure debug instance exists
+  Daemon->>Watch: run_watch_iteration()
+  Watch->>Hook: ensure debug instance exists
   Watch->>Hook: read live account
-  Hook-->>Watch: live session summary
   Watch->>Logs: read new quota signals
   Watch->>Quota: reuse or refresh cached assessment
   alt quota unusable
     Watch->>Pool: rotate_next_internal()
-  else quota low
+  else quota low and no healthy reusable account
     Watch->>Pool: cmd_create(ignore_current=true)
-  else healthy
-    Watch-->>Tray: no rotation
   end
-  Watch->>Hook: switch live account if auth changed
-  Watch-->>Tray: updated state + summary
+  Watch-->>Daemon: updated watch-state + snapshot
+  Daemon-->>Tray: snapshot event
 ```
 
-### 2. `codex-rotate next`
+### 2. CLI command while daemon is running
 
 ```mermaid
 sequenceDiagram
+  participant User as codex-rotate
   participant CLI as Rust CLI
-  participant Pool as pool.rs
-  participant OpenAI as OAuth/WHAM
-  participant Files as accounts.json + auth.json
-  participant Workflow as workflow.rs
+  participant IPC as daemon.sock
+  participant Daemon as Runtime Daemon
+  participant Engine as Core Engine
 
-  CLI->>Pool: cmd_next()
-  Pool->>Files: load pool + current auth
-  Pool->>OpenAI: inspect candidate quota
-  alt reusable account found
-    Pool->>Files: update active_index + auth.json
-    Pool-->>CLI: rotate message
-  else none usable
-    Pool->>Workflow: cmd_create(require_usable_quota=true)
-    Workflow-->>Pool: created account summary
-    Pool-->>CLI: create message
-  end
+  User->>CLI: codex-rotate next
+  CLI->>IPC: invoke(next)
+  IPC->>Daemon: request
+  Daemon->>Engine: rotate_next_internal()
+  Engine-->>Daemon: result
+  Daemon-->>CLI: response
+  Daemon-->>IPC: snapshot event
 ```
 
-### 3. `codex-rotate create` / `relogin`
+## Cross-Platform Seams
 
-```mermaid
-sequenceDiagram
-  participant CLI as Rust CLI
-  participant Workflow as workflow.rs
-  participant Bridge as automation-bridge.ts
-  participant Auto as automation.ts
-  participant Codex as codex login
-  participant Files as credentials.json + auth.json + accounts.json
-
-  CLI->>Workflow: cmd_create() or cmd_relogin()
-  Workflow->>Files: load credential store and pool
-  Workflow->>Bridge: inspect-managed-profiles / read-workflow-metadata
-  Workflow->>Bridge: ensure-account-secret-ref
-  Workflow->>Bridge: complete-codex-login
-  Bridge->>Auto: fast-browser workflow
-  Auto->>Codex: managed-browser login flow
-  Codex-->>Files: refreshed auth.json
-  Workflow->>Files: cmd_add() + update credentials.json
-  Workflow-->>CLI: final summary
-```
-
-## Quota Cache Policy
-
-The watch loop still runs every 15 seconds, but WHAM is not called every 15 seconds anymore.
-
-Refresh rules:
-
-- Always refresh on startup if there is no cached quota state.
-- Refresh after rotate/create/relogin success.
-- Refresh when the auth account changes.
-- Refresh when `usage_limit_reached` is seen.
-- Refresh when `account/rateLimits/updated` is newer than the cached assessment.
-- Otherwise reuse cache until `nextRefreshAt`.
-
-TTL policy:
-
-- `>20%` primary quota left: 5 minutes
-- `10-20%`: 90 seconds
-- `<=10%`, unusable quota, or probe error: 30 seconds
-
-The cache is stored additively inside `watch-state.json`:
-
-```json
-{
-  "quota": {
-    "accountId": "acct_...",
-    "fetchedAt": "2026-04-03T12:00:00.000Z",
-    "nextRefreshAt": "2026-04-03T12:05:00.000Z",
-    "summary": "5h 40% left | week 0% left, 1d reset",
-    "usable": true,
-    "blocker": null,
-    "primaryQuotaLeftPercent": 40,
-    "error": null
-  }
-}
-```
+- Local control transport is isolated in `ipc.rs`.
+  macOS/Linux use `~/.codex-rotate/daemon.sock`.
+  Non-Unix targets currently return explicit unsupported errors instead of silently failing.
+- Private file writes are isolated in `codex-rotate-core/src/fs_security.rs`.
+- Managed Codex launch is isolated in `launcher.rs`.
+  macOS supports full launch today.
+  Other targets expose disabled capabilities and compile-safe fallbacks.
+- Tray UI behavior is driven by daemon capability flags rather than OS guesses.
 
 ## Remaining TypeScript Surface
 
-Only these runtime TS files remain intentional:
+Intentional TS/JS files:
 
 - `packages/codex-rotate/index.ts`
-  Thin Bun entrypoint that launches the Rust CLI.
+  Packaging wrapper only. It resolves and executes a shipped native CLI binary.
 - `packages/codex-rotate/automation-bridge.ts`
-  JSON-over-stdio bridge for the four automation commands.
+  JSON-over-stdio bridge for automation commands.
 - `packages/codex-rotate/automation.ts`
-  `fast-browser`, workflow metadata, Bitwarden secret refs, managed-browser wrapper, and Codex login automation.
-- `packages/codex-rotate/codex-login-managed-browser-opener.mjs`
-  Browser opener shim used by the managed Codex login wrapper.
-
-Everything that used to live in `packages/codex-rotate-app/*.ts` has been removed.
-
-## Design Notes
-
-### Why the split still exists
-
-The Rust core now owns all stable runtime logic. TypeScript remains only where the dependency stack is already JS-native and volatile:
-
-- `fast-browser`
-- Playwright-driven login automation
-- Bitwarden daemon helpers
-- workflow metadata parsing already coupled to the automation package
-
-That keeps the cross-language boundary narrow and explicit.
-
-### Why the tray is now cleaner
-
-Before this migration, the tray depended on a Bun controller layer inside `packages/codex-rotate-app`.
-
-Now:
-
-- tray menu actions call Rust directly
-- the watch loop is Rust only
-- live-account sync is Rust only
-- quota caching is Rust only
-- the Bun bridge is only entered during automation-specific flows
-
-## Risks
-
-### Tight coupling to Codex internals
-
-The launcher, CDP session control, and log parsing still depend on Codex desktop behavior remaining stable:
-
-- renderer message contract
-- wrapper app launch behavior
-- sqlite log strings for quota-related signals
-
-Those assumptions are now centralized in Rust, which is better, but they still exist.
-
-### Automation bridge still requires Bun and the sibling skill repo
-
-The steady-state tray path is Rust-only, but `create` and stored-credential `relogin` still require:
-
-- Bun
-- the shared `ai-rules` repo next to this repo
-- `fast-browser`
-- Playwright
-
-That is intentional for now, but it is still a deployment constraint.
-
-### Cross-process mutation is narrower, not fully serialized
-
-The migration removed the old Bun controller duplication, but concurrent tray actions can still overlap with CLI actions unless higher-level locking is added.
-
-## Better Spec
-
-The current architecture is now close to the intended split:
-
-- Rust owns the durable application/runtime model.
-- TS owns the browser automation edge.
-
-The next cleanup target should be hardening, not another language migration:
-
-1. Add a single-flight lock around rotate/create/relogin/watch side effects.
-2. Stream bridge stderr to the parent process without widening the JSON protocol.
-3. Add fixture-based compatibility tests for `create` and `relogin`.
-4. Add a small contract test suite for Codex CDP + log assumptions.
+  `fast-browser` integration and workflow helpers.
+- `packages/codex-rotate/automation.test.ts`
+  Automation-side tests only.

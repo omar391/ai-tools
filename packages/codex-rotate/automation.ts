@@ -45,14 +45,13 @@ const FAST_BROWSER_SCRIPT_DEFAULT = resolve(
 
 const FAST_BROWSER_SCRIPT =
   process.env.CODEX_ROTATE_FAST_BROWSER_SCRIPT ?? FAST_BROWSER_SCRIPT_DEFAULT;
+const NODE_BINARY =
+  process.env.CODEX_ROTATE_NODE_BIN?.trim() ||
+  process.env.NODE_BIN?.trim() ||
+  process.execPath ||
+  "node";
 const FAST_BROWSER_RUNTIME =
-  process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME ??
-  (process.versions.bun ? "node" : process.execPath);
-const FAST_BROWSER_PLAYWRIGHT_MODULE = join(
-  REPO_ROOT,
-  "node_modules",
-  "playwright",
-);
+  process.env.CODEX_ROTATE_FAST_BROWSER_RUNTIME ?? NODE_BINARY;
 const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
   resolve(
     REPO_ROOT,
@@ -110,6 +109,7 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
+const DEFAULT_CREATE_BASE_EMAIL = "dev.{n}@astronlab.com";
 const DEFAULT_OPENAI_FULL_NAME = "Dev Astronlab";
 const DEFAULT_OPENAI_BIRTH_MONTH = 1;
 const DEFAULT_OPENAI_BIRTH_DAY = 24;
@@ -126,6 +126,8 @@ const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS = [
 const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS = [
   30_000, 60_000, 120_000, 240_000, 300_000,
 ] as const;
+const FAST_BROWSER_PLAYWRIGHT_MODULE = resolvePlaywrightModulePath();
+const FAST_BROWSER_NODE_PATH = dirname(FAST_BROWSER_PLAYWRIGHT_MODULE);
 const LEGACY_ROTATE_HOME_FILE_PATTERNS = [
   /^codex-login-browser-capture-.*\.js$/,
   /^fast-browser-.*\.json$/,
@@ -142,8 +144,50 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   );
 }
 
+function resolvePlaywrightModulePath(): string {
+  const override = process.env.CODEX_ROTATE_PLAYWRIGHT_MODULE?.trim();
+  const directCandidates = [
+    override ? resolve(override) : null,
+    join(REPO_ROOT, "node_modules", "playwright"),
+    join(process.cwd(), "node_modules", "playwright"),
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of directCandidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  const siblingRepoMarker = join("packages", "codex-rotate", "package.json");
+  try {
+    for (const entry of readdirSync(dirname(REPO_ROOT), {
+      withFileTypes: true,
+    })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const siblingRoot = join(dirname(REPO_ROOT), entry.name);
+      if (siblingRoot === REPO_ROOT) {
+        continue;
+      }
+      if (!existsSync(join(siblingRoot, siblingRepoMarker))) {
+        continue;
+      }
+      const candidate = join(siblingRoot, "node_modules", "playwright");
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  } catch {}
+
+  return join(REPO_ROOT, "node_modules", "playwright");
+}
+
+function buildNodePathEnv(extraPath: string): string {
+  const entries = [extraPath, process.env.NODE_PATH || ""].filter(Boolean);
+  return entries.join(process.platform === "win32" ? ";" : ":");
+}
+
 export let ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
-export let LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 
 export function getCodexRotateHome(): string {
   return ROTATE_HOME;
@@ -152,7 +196,6 @@ export function getCodexRotateHome(): string {
 export function setCodexRotateHomeForTesting(rootDir: string | null): void {
   ROTATE_HOME = resolve(rootDir || DEFAULT_ROTATE_HOME);
   ROTATE_STATE_FILE = join(ROTATE_HOME, "accounts.json");
-  LEGACY_CREDENTIALS_FILE = join(ROTATE_HOME, "credentials.json");
 }
 
 export interface CredentialFamily {
@@ -216,13 +259,15 @@ export interface PendingCredential extends StoredCredential {
 }
 
 export interface CredentialStore {
-  version: 3;
+  version: 4;
+  default_create_base_email: string;
   families: Record<string, CredentialFamily>;
   pending: Record<string, PendingCredential>;
 }
 
 interface LegacyCredentialStore {
   version?: unknown;
+  default_create_base_email?: unknown;
   defaults?: unknown;
   families?: unknown;
   accounts?: unknown;
@@ -343,6 +388,9 @@ interface FastBrowserDaemonRunResponse {
 
 const FAST_BROWSER_DAEMON_TIMEOUT_PATTERN =
   /Timed out waiting for fast-browser daemon response from\s+(.+?\.sock)/i;
+const FAST_BROWSER_STARTUP_SILENCE_TIMEOUT_MS = 15_000;
+const FAST_BROWSER_DAEMON_SOCKET_CLOSED_PATTERN =
+  /Daemon closed the socket before sending a response/i;
 const FAST_BROWSER_EVENT_PREFIX = "__FAST_BROWSER_EVENT__";
 
 interface FastBrowserProgressEvent {
@@ -487,26 +535,12 @@ function readPrivateJsonRecord(
 }
 
 function loadRotateStateDocument(): Record<string, unknown> {
-  const state = existsSync(ROTATE_STATE_FILE)
+  return existsSync(ROTATE_STATE_FILE)
     ? readPrivateJsonRecord(
         ROTATE_STATE_FILE,
         `Invalid rotate state at ${ROTATE_STATE_FILE}`,
       )
     : {};
-
-  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
-    const legacyStore = normalizeCredentialStore(
-      parseJson<LegacyCredentialStore>(
-        readFileSync(LEGACY_CREDENTIALS_FILE, "utf8"),
-        `Invalid credential store at ${LEGACY_CREDENTIALS_FILE}`,
-      ),
-    );
-    state.version = legacyStore.version;
-    state.families = legacyStore.families;
-    state.pending = serializeCredentialRecordMap(legacyStore.pending);
-  }
-
-  return state;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -517,6 +551,16 @@ export function normalizeCredentialStore(
   raw: LegacyCredentialStore | null | undefined,
 ): CredentialStore {
   const inventoryEmails = collectInventoryEmailsFromState(raw);
+  const rawVersion =
+    typeof raw?.version === "number" && Number.isFinite(raw.version)
+      ? Number(raw.version)
+      : 0;
+  const defaultCreateBaseEmail =
+    typeof raw?.default_create_base_email === "string"
+      ? normalizeBaseEmailFamily(raw.default_create_base_email)
+      : normalizeBaseEmailFamily(DEFAULT_CREATE_BASE_EMAIL);
+  const shouldMigrateLegacyNonDefaultFamilies =
+    rawVersion < 4 || typeof raw?.default_create_base_email !== "string";
   const families = isRecord(raw?.families)
     ? ({ ...(raw.families as Record<string, CredentialFamily>) } as Record<
         string,
@@ -557,22 +601,69 @@ export function normalizeCredentialStore(
           : account.email,
     };
   }
-  return {
-    version: 3,
-    families,
-    pending: Object.fromEntries(
-      Object.entries(
-        normalizeCredentialRecordMap(raw?.pending) as Record<
-          string,
-          PendingCredential
-        >,
-      ).filter(
-        ([email, record]) =>
-          !inventoryEmails.has(normalizePendingEmailKey(email)) &&
-          !pendingIsSupersededByInventory(record, inventoryEmails),
-      ),
+  if (shouldMigrateLegacyNonDefaultFamilies) {
+    for (const [familyKey, family] of Object.entries(families)) {
+      if (
+        shouldDropLegacyNonDefaultFamily(
+          family.base_email,
+          defaultCreateBaseEmail,
+        )
+      ) {
+        delete families[familyKey];
+      }
+    }
+  }
+  const pending = Object.fromEntries(
+    Object.entries(
+      normalizeCredentialRecordMap(raw?.pending) as Record<
+        string,
+        PendingCredential
+      >,
+    ).filter(
+      ([email, record]) =>
+        !inventoryEmails.has(normalizePendingEmailKey(email)) &&
+        !pendingIsSupersededByInventory(record, inventoryEmails),
     ),
+  );
+  if (shouldMigrateLegacyNonDefaultFamilies) {
+    for (const [email, record] of Object.entries(pending)) {
+      if (
+        shouldDropLegacyNonDefaultFamily(
+          record.base_email,
+          defaultCreateBaseEmail,
+        )
+      ) {
+        delete pending[email];
+      }
+    }
+  }
+  return {
+    version: 4,
+    default_create_base_email: defaultCreateBaseEmail,
+    families,
+    pending,
   };
+}
+
+function shouldDropLegacyNonDefaultFamily(
+  baseEmail: string,
+  defaultCreateBaseEmail: string,
+): boolean {
+  try {
+    const normalized = normalizeBaseEmailFamily(baseEmail);
+    if (normalized === defaultCreateBaseEmail) {
+      return false;
+    }
+    const parsed = parseEmailFamily(normalized);
+    return (
+      parsed.domainPart === "astronlab.com" &&
+      parsed.mode === "template" &&
+      (parsed.templatePrefix?.startsWith("bench") === true ||
+        parsed.templatePrefix?.includes("devicefix") === true)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function collectInventoryEmailsFromState(
@@ -784,7 +875,7 @@ export async function findBitwardenCliAccountSecretRef(
 }
 
 export function loadCredentialStore(): CredentialStore {
-  if (!existsSync(ROTATE_STATE_FILE) && !existsSync(LEGACY_CREDENTIALS_FILE)) {
+  if (!existsSync(ROTATE_STATE_FILE)) {
     return normalizeCredentialStore(null);
   }
 
@@ -797,22 +888,21 @@ export function saveCredentialStore(store: CredentialStore): void {
   const nextState = loadRotateStateDocument();
   const serializedFamilies = store.families;
   const serializedPending = serializeCredentialRecordMap(store.pending);
-  const hasCredentialState =
-    Object.keys(serializedFamilies).length > 0 ||
-    Object.keys(serializedPending).length > 0;
-  if (hasCredentialState) {
-    nextState.version = 3;
+  nextState.version = 4;
+  nextState.default_create_base_email = normalizeBaseEmailFamily(
+    store.default_create_base_email || DEFAULT_CREATE_BASE_EMAIL,
+  );
+  if (Object.keys(serializedFamilies).length > 0) {
     nextState.families = serializedFamilies;
+  } else {
+    delete nextState.families;
+  }
+  if (Object.keys(serializedPending).length > 0) {
     nextState.pending = serializedPending;
   } else {
-    delete nextState.version;
-    delete nextState.families;
     delete nextState.pending;
   }
   writePrivateJson(ROTATE_STATE_FILE, nextState);
-  if (existsSync(LEGACY_CREDENTIALS_FILE)) {
-    unlinkSync(LEGACY_CREDENTIALS_FILE);
-  }
 }
 
 const EMAIL_FAMILY_PLACEHOLDER = "{n}";
@@ -1643,7 +1733,7 @@ function ensureFastBrowserPlaywright(): void {
   if (!existsSync(FAST_BROWSER_PLAYWRIGHT_MODULE)) {
     throw new Error(
       `Playwright is not installed in ${REPO_ROOT}. ` +
-        'Run "bun install" after adding the playwright dependency before using create/relogin automation.',
+        "Install the repo dependencies before using create/relogin automation.",
     );
   }
 }
@@ -1692,6 +1782,7 @@ function renderCodexLoginManagedBrowserWrapper(
   realCodexBin: string,
   profileName: string,
   shimDir: string,
+  nodeBin: string,
   openerPath: string,
   loginHelperPath: string,
 ): string {
@@ -1700,10 +1791,11 @@ function renderCodexLoginManagedBrowserWrapper(
     `export FAST_BROWSER_PROFILE=${shellSingleQuote(profileName)}`,
     `export BROWSER=${shellSingleQuote(openerPath)}`,
     `export PATH=${shellSingleQuote(shimDir)}:"$PATH"`,
+    `export CODEX_ROTATE_NODE_BIN=${shellSingleQuote(nodeBin)}`,
     `export CODEX_ROTATE_REAL_CODEX=${shellSingleQuote(realCodexBin)}`,
     'if [ "$1" = "login" ]; then',
     "  shift",
-    `  exec ${shellSingleQuote(loginHelperPath)} "$@"`,
+    `  exec ${shellSingleQuote(nodeBin)} ${shellSingleQuote(loginHelperPath)} "$@"`,
     "fi",
     `exec ${shellSingleQuote(realCodexBin)} \"$@\"`,
     "",
@@ -1712,12 +1804,13 @@ function renderCodexLoginManagedBrowserWrapper(
 
 function ensureCodexLoginManagedBrowserShims(
   shimDir: string,
+  nodeBin: string,
   openerPath: string,
 ): void {
   mkdirSync(shimDir, { recursive: true });
   const shimContent = [
     "#!/bin/sh",
-    `exec ${shellSingleQuote(openerPath)} \"$@\"`,
+    `exec ${shellSingleQuote(nodeBin)} ${shellSingleQuote(openerPath)} \"$@\"`,
     "",
   ].join("\n");
   for (const shimName of ["open", "xdg-open"]) {
@@ -1761,7 +1854,7 @@ export function ensureCodexLoginManagedBrowserWrapper(
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
   const loginHelperPath = resolveCodexLoginManagedLoginHelperPath();
   const shimDir = join(ROTATE_HOME, "bin", "codex-login-shims");
-  ensureCodexLoginManagedBrowserShims(shimDir, openerPath);
+  ensureCodexLoginManagedBrowserShims(shimDir, NODE_BINARY, openerPath);
   const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(
     profileName,
     codexBin,
@@ -1770,6 +1863,7 @@ export function ensureCodexLoginManagedBrowserWrapper(
     codexBin,
     profileName,
     shimDir,
+    NODE_BINARY,
     openerPath,
     loginHelperPath,
   );
@@ -2134,17 +2228,43 @@ async function runFastBrowserDaemonWorkflow(
   `;
   const executeBridge = async (): Promise<FastBrowserCommandResult> =>
     await new Promise((resolve, reject) => {
-      const child = spawn("node", ["--input-type=module", "-e", bridgeScript], {
-        cwd: REPO_ROOT,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const child = spawn(
+        NODE_BINARY,
+        ["--input-type=module", "-e", bridgeScript],
+        {
+          cwd: REPO_ROOT,
+          env: {
+            ...process.env,
+            FAST_BROWSER_WORKSPACE_ROOT: REPO_ROOT,
+            NODE_PATH: buildNodePathEnv(FAST_BROWSER_NODE_PATH),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let settled = false;
+      let sawFirstProgressEvent = false;
       let stdout = "";
       let stderr = "";
       let stderrBuffer = "";
+      const socketPath = join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
+      const startupSilenceTimer = setTimeout(() => {
+        if (settled || sawFirstProgressEvent) {
+          return;
+        }
+        settled = true;
+        child.kill("SIGKILL");
+        reject(
+          new Error(
+            `Timed out waiting for fast-browser daemon response from ${socketPath}`,
+          ),
+        );
+      }, FAST_BROWSER_STARTUP_SILENCE_TIMEOUT_MS);
 
       const flushStderrLine = (line: string): void => {
         const progressEvent = parseFastBrowserProgressEventLine(line);
         if (progressEvent) {
+          sawFirstProgressEvent = true;
+          clearTimeout(startupSilenceTimer);
           emitFastBrowserProgressEvent(progressEvent);
           return;
         }
@@ -2173,8 +2293,20 @@ async function runFastBrowserDaemonWorkflow(
         }
       });
 
-      child.once("error", reject);
+      child.once("error", (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(startupSilenceTimer);
+        reject(error);
+      });
       child.once("close", (code, signal) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(startupSilenceTimer);
         if (stderrBuffer.trim()) {
           flushStderrLine(stderrBuffer.trimEnd());
         }
@@ -2187,7 +2319,17 @@ async function runFastBrowserDaemonWorkflow(
       });
     });
 
-  let result = await executeBridge();
+  let result: FastBrowserCommandResult;
+  try {
+    result = await executeBridge();
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error || "");
+    if (!(await resetStuckFastBrowserDaemon(profileName, message))) {
+      throw error;
+    }
+    result = await executeBridge();
+  }
   if (typeof result.status === "number" && result.status !== 0) {
     const combinedOutput = [result.stdout, result.stderr]
       .filter(Boolean)
@@ -2223,12 +2365,23 @@ async function resetStuckFastBrowserDaemon(
   output: string | null | undefined,
 ): Promise<boolean> {
   const match = output?.match(FAST_BROWSER_DAEMON_TIMEOUT_PATTERN);
-  if (!match) {
-    return false;
+  if (match) {
+    await resetManagedProfileRuntime(profileName, match[1]?.trim() || null);
+    return true;
   }
 
-  await resetManagedProfileRuntime(profileName, match[1]?.trim() || null);
-  return true;
+  if (shouldResetFastBrowserDaemonForSocketClose(output)) {
+    await resetManagedProfileRuntime(profileName, null);
+    return true;
+  }
+
+  return false;
+}
+
+export function shouldResetFastBrowserDaemonForSocketClose(
+  output: string | null | undefined,
+): boolean {
+  return FAST_BROWSER_DAEMON_SOCKET_CLOSED_PATTERN.test(String(output || ""));
 }
 
 export function inspectManagedProfiles(): ManagedProfilesInspection {
@@ -2469,7 +2622,7 @@ export function resolveCreateBaseEmail(
   if (discoveredBaseEmail) {
     return normalizeBaseEmailFamily(discoveredBaseEmail);
   }
-  return normalizeBaseEmailFamily("dev.{N}@astronlab.com");
+  return normalizeBaseEmailFamily(DEFAULT_CREATE_BASE_EMAIL);
 }
 
 export function shouldUseDefaultCreateFamilyHint(
@@ -2898,7 +3051,10 @@ export function serializeCredentialStore(
   store: CredentialStore,
 ): CredentialStore {
   return {
-    version: 3,
+    version: 4,
+    default_create_base_email: normalizeBaseEmailFamily(
+      store.default_create_base_email || DEFAULT_CREATE_BASE_EMAIL,
+    ),
     families: store.families,
     pending: serializeCredentialRecordMap(store.pending) as Record<
       string,

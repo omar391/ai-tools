@@ -4,12 +4,16 @@ version = "1.0.0"
 description = "Codex Rotate Tray"
 edition = "2021"
 
+[[bin]]
+name = "codex-rotate-tray"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.0.1", features = [] }
 
 [dependencies]
 codex-rotate-core = { path = "../../codex-rotate/crates/codex-rotate-core" }
-codex-rotate-tray-core = { path = "../crates/codex-rotate-tray-core" }
+codex-rotate-runtime = { path = "../../codex-rotate/crates/codex-rotate-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.0.1", features = ["tray-icon"] }

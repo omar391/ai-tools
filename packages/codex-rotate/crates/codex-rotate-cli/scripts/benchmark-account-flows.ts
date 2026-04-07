@@ -1,6 +1,6 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S node --experimental-strip-types
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -94,12 +94,13 @@ type GroupSummary = {
 };
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
+const REPO_ROOT = resolve(MODULE_DIR, "..", "..", "..", "..", "..");
 const ROTATE_HOME = resolve(
   process.env.CODEX_ROTATE_HOME || join(homedir(), ".codex-rotate"),
 );
 const CODEX_HOME = resolve(process.env.CODEX_HOME || join(homedir(), ".codex"));
-const WRAPPER = join(REPO_ROOT, "packages", "codex-rotate", "index.ts");
+const CLI_BINARY_NAME =
+  process.platform === "win32" ? "codex-rotate.exe" : "codex-rotate";
 const WORKFLOW_ROOT = join(
   REPO_ROOT,
   ".fast-browser",
@@ -117,8 +118,15 @@ const RESULTS_ROOT = join(
 );
 const RAW_DIR = join(RESULTS_ROOT, "raw");
 const ROTATE_STATE_PATH = join(ROTATE_HOME, "accounts.json");
-const SUMMARY_SCRIPT =
-  "/Volumes/Projects/business/AstronLab/omar391/ai-rules/skills/competitive-benchmark-loop/scripts/summarize_benchmarks.py";
+const SUMMARY_SCRIPT = join(
+  REPO_ROOT,
+  "..",
+  "ai-rules",
+  "skills",
+  "competitive-benchmark-loop",
+  "scripts",
+  "summarize_benchmarks.py",
+);
 
 const DEFAULT_PROFILE = "dev-1";
 const DEFAULT_RUNS = 1;
@@ -361,9 +369,9 @@ async function benchmarkCandidate(
   const before = readSnapshot();
   const rotateStateSnapshot = snapshotRotateStateFile();
   const runLabel = `${candidate.id}-${new Date().toISOString()}`;
+  const cliBinary = resolveCliBinary();
   const command = [
-    "bun",
-    WRAPPER,
+    cliBinary,
     "create",
     "--force",
     "--restore-auth",
@@ -440,6 +448,25 @@ async function benchmarkCandidate(
     stderr_tail: tailText(result.stderr),
     measured_at: startedAt,
   };
+}
+
+function resolveCliBinary(): string {
+  const candidates = [
+    process.env.CODEX_ROTATE_BENCHMARK_CLI_BIN,
+    process.env.CODEX_ROTATE_CLI_BIN,
+    join(REPO_ROOT, "target", "debug", CLI_BINARY_NAME),
+    join(REPO_ROOT, "target", "release", CLI_BINARY_NAME),
+  ].filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `Unable to find the codex-rotate CLI binary. Checked:\n${candidates.map((candidate) => `- ${candidate}`).join("\n")}`,
+  );
 }
 
 function buildNotes(
@@ -774,18 +801,24 @@ function runSummaryScript(
   inputPath: string,
   outputPath: string,
 ): { groups: Record<string, unknown> } | null {
-  const summaryProcess = Bun.spawnSync(
-    ["python3", SUMMARY_SCRIPT, inputPath, "--output", outputPath],
+  if (!existsSync(SUMMARY_SCRIPT)) {
+    process.stderr.write(
+      `[benchmark] summarize_benchmarks.py missing at ${SUMMARY_SCRIPT}\n`,
+    );
+    return null;
+  }
+  const summaryProcess = spawnSync(
+    "python3",
+    [SUMMARY_SCRIPT, inputPath, "--output", outputPath],
     {
       cwd: REPO_ROOT,
       env: process.env,
-      stdout: "pipe",
-      stderr: "pipe",
+      encoding: "utf8",
     },
   );
-  if (summaryProcess.exitCode !== 0) {
+  if ((summaryProcess.status ?? 1) !== 0) {
     process.stderr.write(
-      `[benchmark] summarize_benchmarks.py failed: ${summaryProcess.stderr.toString()}\n`,
+      `[benchmark] summarize_benchmarks.py failed: ${summaryProcess.stderr || ""}\n`,
     );
     return null;
   }

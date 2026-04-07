@@ -1,30 +1,14 @@
-use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary};
-use codex_rotate_core::paths::resolve_paths as resolve_core_paths;
-use codex_rotate_core::pool::{load_pool, rotate_next_internal, NextResult};
-use codex_rotate_core::quota::CachedQuotaState;
-use codex_rotate_tray_core::hook::{read_live_account, switch_live_account_to_current_auth};
-use codex_rotate_tray_core::launcher::ensure_debug_codex_instance;
-use codex_rotate_tray_core::watch::{
-    refresh_quota_cache, run_watch_iteration, WatchIterationOptions,
+use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
+use codex_rotate_tray::{
+    error_snapshot, rendered_snapshot, spawn_subscription_loop, SharedRenderState,
 };
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, SystemTime},
-};
+use std::thread;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Manager,
 };
-
-const DEFAULT_PORT: u16 = 9333;
-const DEFAULT_INTERVAL_SECONDS: u64 = 15;
-const LOW_QUOTA_INTERVAL_SECONDS: u64 = 5;
-const CRITICAL_QUOTA_INTERVAL_SECONDS: u64 = 2;
 
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -272,16 +256,6 @@ fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
     Image::new_owned(rgba, width, height)
 }
 
-#[derive(Clone, Default)]
-struct SharedStatus {
-    inner: Arc<Mutex<StatusSnapshot>>,
-}
-
-#[derive(Clone)]
-struct SharedTrayRuntime {
-    inner: Arc<Mutex<TrayRuntime>>,
-}
-
 #[derive(Clone)]
 struct MenuHandles {
     account_item: MenuItem<tauri::Wry>,
@@ -290,191 +264,15 @@ struct MenuHandles {
     quota_item: MenuItem<tauri::Wry>,
     status_item: MenuItem<tauri::Wry>,
     last_rotation_item: MenuItem<tauri::Wry>,
-}
-
-#[derive(Clone, Default)]
-struct StatusSnapshot {
-    current_email: Option<String>,
-    inventory_count: Option<usize>,
-    current_plan: Option<String>,
-    current_quota: Option<String>,
-    current_quota_percent: Option<u8>,
-    last_rotation_from_email: Option<String>,
-    last_rotation_to_email: Option<String>,
-    last_rotation_reason: Option<String>,
-    last_message: Option<String>,
-    quota_cache: Option<CachedQuotaState>,
-}
-
-#[derive(Clone, Default)]
-struct TrayRuntime {
-    pool_file: PathBuf,
-    auth_file: PathBuf,
-    inventory_count: Option<usize>,
-    inventory_modified_at: Option<SystemTime>,
-    inventory_exists: bool,
-    auth_summary: Option<AuthSummary>,
-    auth_modified_at: Option<SystemTime>,
-    auth_exists: bool,
-    last_rendered: Option<RenderedSnapshot>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RenderedSnapshot {
-    account_text: String,
-    inventory_text: String,
-    plan_text: String,
-    quota_text: String,
-    status_text: String,
-    rotation_text: String,
-    tooltip_text: String,
-    quota_percent: Option<u8>,
-}
-
-fn set_quota_summary(snapshot: &mut StatusSnapshot, quota: &CachedQuotaState) {
-    snapshot.current_quota = Some(quota.summary.clone());
-    snapshot.current_quota_percent = quota.primary_quota_left_percent;
-    snapshot.quota_cache = Some(quota.clone());
-}
-
-impl SharedTrayRuntime {
-    fn new(pool_file: PathBuf, auth_file: PathBuf) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(TrayRuntime {
-                pool_file,
-                auth_file,
-                ..TrayRuntime::default()
-            })),
-        }
-    }
-
-    fn refresh_inventory_count(&self, snapshot: &mut StatusSnapshot) {
-        let mut runtime = self.inner.lock().expect("tray runtime mutex");
-        let metadata = fs::metadata(&runtime.pool_file).ok();
-        let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
-        let exists = metadata.is_some();
-        let cache_valid = runtime.inventory_count.is_some()
-            && runtime.inventory_exists == exists
-            && runtime.inventory_modified_at == modified_at;
-
-        if cache_valid {
-            snapshot.inventory_count = runtime.inventory_count;
-            return;
-        }
-
-        let count = load_pool().ok().map(|pool| pool.accounts.len());
-        runtime.inventory_count = count;
-        runtime.inventory_modified_at = modified_at;
-        runtime.inventory_exists = exists;
-        snapshot.inventory_count = count;
-    }
-
-    fn begin_render(&self, rendered: &RenderedSnapshot) -> bool {
-        let mut runtime = self.inner.lock().expect("tray runtime mutex");
-        if runtime.last_rendered.as_ref() == Some(rendered) {
-            return false;
-        }
-        runtime.last_rendered = Some(rendered.clone());
-        true
-    }
-
-    fn refresh_auth_summary(&self, snapshot: &mut StatusSnapshot) -> bool {
-        let mut runtime = self.inner.lock().expect("tray runtime mutex");
-        let metadata = fs::metadata(&runtime.auth_file).ok();
-        let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
-        let exists = metadata.is_some();
-        let cache_valid = runtime.auth_exists == exists && runtime.auth_modified_at == modified_at;
-
-        let mut changed = false;
-        if !cache_valid {
-            runtime.auth_exists = exists;
-            runtime.auth_modified_at = modified_at;
-            runtime.auth_summary = if exists {
-                load_codex_auth(&runtime.auth_file)
-                    .ok()
-                    .map(|auth| summarize_codex_auth(&auth))
-            } else {
-                None
-            };
-            changed = true;
-        }
-
-        if let Some(summary) = runtime.auth_summary.as_ref() {
-            snapshot.current_email = Some(summary.email.clone());
-            snapshot.current_plan = Some(summary.plan_type.clone());
-        }
-
-        changed
-    }
-}
-
-fn refresh_inventory_count(app: &AppHandle, snapshot: &mut StatusSnapshot) {
-    let Some(runtime) = app.try_state::<SharedTrayRuntime>() else {
-        snapshot.inventory_count = load_pool().ok().map(|pool| pool.accounts.len());
-        return;
-    };
-    runtime.refresh_inventory_count(snapshot);
-}
-
-fn refresh_auth_summary(app: &AppHandle, snapshot: &mut StatusSnapshot) -> bool {
-    let Some(runtime) = app.try_state::<SharedTrayRuntime>() else {
-        if let Ok(paths) = resolve_core_paths() {
-            if let Ok(auth) = load_codex_auth(&paths.codex_auth_file) {
-                let summary = summarize_codex_auth(&auth);
-                snapshot.current_email = Some(summary.email);
-                snapshot.current_plan = Some(summary.plan_type);
-                return false;
-            }
-        }
-        return false;
-    };
-    runtime.refresh_auth_summary(snapshot)
-}
-
-fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
-    let rotation_text = match (
-        snapshot.last_rotation_from_email.as_deref(),
-        snapshot.last_rotation_to_email.as_deref(),
-    ) {
-        (Some(from), Some(to)) if from != to => format!("Last rotation: {from} -> {to}"),
-        (_, Some(to)) => format!("Last rotation: {to}"),
-        _ => "Last rotation: none".to_string(),
-    };
-
-    RenderedSnapshot {
-        account_text: format!(
-            "Account: {}",
-            snapshot.current_email.as_deref().unwrap_or("unknown")
-        ),
-        inventory_text: match snapshot.inventory_count {
-            Some(count) => format!("Inventory: {count} account(s)"),
-            None => "Inventory: unknown".to_string(),
-        },
-        plan_text: format!(
-            "Plan: {}",
-            snapshot.current_plan.as_deref().unwrap_or("unknown")
-        ),
-        quota_text: format!(
-            "Quota: {}",
-            snapshot.current_quota.as_deref().unwrap_or("unknown")
-        ),
-        status_text: format!(
-            "Status: {}",
-            snapshot.last_message.as_deref().unwrap_or("starting")
-        ),
-        rotation_text,
-        tooltip_text: match snapshot.current_quota_percent {
-            Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
-            None => "Codex Rotate\nClick for status".to_string(),
-        },
-        quota_percent: snapshot.current_quota_percent,
-    }
+    launch_item: MenuItem<tauri::Wry>,
+    check_item: MenuItem<tauri::Wry>,
+    rotate_item: MenuItem<tauri::Wry>,
 }
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     let rendered = rendered_snapshot(&snapshot);
-    if let Some(runtime) = app.try_state::<SharedTrayRuntime>() {
-        if !runtime.begin_render(&rendered) {
+    if let Some(render_state) = app.try_state::<SharedRenderState>() {
+        if !render_state.begin_render(&rendered) {
             return;
         }
     }
@@ -490,6 +288,9 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
         let _ = menu
             .last_rotation_item
             .set_text(rendered.rotation_text.clone());
+        let _ = menu.launch_item.set_enabled(rendered.launch_enabled);
+        let _ = menu.check_item.set_enabled(rendered.check_enabled);
+        let _ = menu.rotate_item.set_enabled(rendered.rotate_enabled);
     }
 
     if let Some(tray) = app.tray_by_id("main") {
@@ -499,176 +300,29 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 }
 
-fn run_check(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) {
-    let auth_changed = {
-        let mut snapshot = status.inner.lock().expect("status mutex");
-        refresh_auth_summary(app, &mut snapshot)
-    };
-    let next = match run_watch_iteration(WatchIterationOptions {
-        port: Some(DEFAULT_PORT),
-        after_signal_id: None,
-        cooldown_ms: None,
-        force_quota_refresh: force_quota_refresh || auth_changed,
-    }) {
-        Ok(result) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            let previous_displayed_email = snapshot.current_email.clone();
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            if let Some(live) = result.live.as_ref() {
-                snapshot.current_email = Some(live.email.clone());
-                snapshot.current_plan = Some(live.plan_type.clone());
-            } else if let Some(email) = result.state.last_live_email.as_ref() {
-                snapshot.current_email = Some(email.clone());
-            }
-            if let Some(quota) = result.state.quota.as_ref() {
-                set_quota_summary(&mut snapshot, quota);
-            }
-            if result.rotated {
-                if let Some(rotation) = result.rotation.as_ref() {
-                    snapshot.last_rotation_from_email = previous_displayed_email;
-                    snapshot.last_rotation_to_email = Some(rotation.email.clone());
-                }
-                snapshot.last_rotation_reason = result.decision.reason.clone();
-                snapshot.last_message = Some(format!(
-                    "rotated: {}",
-                    result
-                        .decision
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "quota exhausted".to_string())
-                ));
-            } else if let Some(error) = result.decision.assessment_error.as_deref() {
-                snapshot.last_message = Some(format!("quota probe failed: {}", error));
-            } else {
-                snapshot.last_message = Some("watch healthy".to_string());
-            }
-            snapshot.clone()
-        }
-        Err(error) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            snapshot.last_message = Some(format!("watch failed: {}", error));
-            snapshot.clone()
-        }
-    };
-    update_snapshot(app, next);
+fn run_on_main_thread(app: &AppHandle, snapshot: StatusSnapshot) {
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || update_snapshot(&app_handle, snapshot));
 }
 
-fn next_watch_interval(status: &SharedStatus) -> Duration {
-    let snapshot = status.inner.lock().expect("status mutex");
-    let seconds = match snapshot.current_quota_percent {
-        Some(percent) if percent <= 2 => CRITICAL_QUOTA_INTERVAL_SECONDS,
-        Some(percent) if percent <= 20 => LOW_QUOTA_INTERVAL_SECONDS,
-        _ => DEFAULT_INTERVAL_SECONDS,
-    };
-    Duration::from_secs(seconds)
-}
-
-fn run_manual_rotation(app: &AppHandle, status: &SharedStatus) {
-    let next = match rotate_next_internal() {
-        Ok(result) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            let previous_displayed_email = snapshot.current_email.clone();
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            match &result {
-                NextResult::Rotated { summary, .. }
-                | NextResult::Stayed { summary, .. }
-                | NextResult::Created { summary, .. } => {
-                    snapshot.last_rotation_from_email = previous_displayed_email.clone();
-                    snapshot.last_rotation_to_email = Some(summary.email.clone());
-                }
-            }
-
-            match switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
-                Ok(live) => {
-                    snapshot.current_email = Some(live.email.clone());
-                    snapshot.current_plan = Some(live.plan_type.clone());
-                }
-                Err(error) => {
-                    snapshot.last_message = Some(format!("manual rotate failed: {}", error));
-                    return update_snapshot(app, snapshot.clone());
-                }
-            }
-
-            match refresh_quota_cache(true, snapshot.quota_cache.as_ref()) {
-                Ok(quota) => set_quota_summary(&mut snapshot, &quota),
-                Err(error) => {
-                    snapshot.last_message = Some(format!("quota refresh failed: {}", error))
-                }
-            }
-
-            snapshot.last_rotation_reason = Some("manual rotation".to_string());
-            snapshot.last_message = Some(match result {
-                NextResult::Rotated { .. } => "manual rotate succeeded".to_string(),
-                NextResult::Stayed { .. } => "manual rotate stayed on current account".to_string(),
-                NextResult::Created { .. } => "manual rotate created a fresh account".to_string(),
-            });
-            snapshot.clone()
+fn spawn_invoke(app: AppHandle, action: InvokeAction) {
+    thread::spawn(move || {
+        if let Err(error) = invoke(action) {
+            run_on_main_thread(&app, error_snapshot(error.to_string()));
         }
-        Err(error) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            snapshot.last_message = Some(format!("manual rotate failed: {}", error));
-            snapshot.clone()
-        }
-    };
-    update_snapshot(app, next);
-}
-
-fn refresh_live_account(app: &AppHandle, status: &SharedStatus, force_quota_refresh: bool) {
-    let next = match read_live_account(Some(DEFAULT_PORT)) {
-        Ok(result) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            if let Some(account) = result.account.as_ref() {
-                snapshot.current_email = account.email.clone();
-                snapshot.current_plan = account.plan_type.clone();
-            }
-            match refresh_quota_cache(force_quota_refresh, snapshot.quota_cache.as_ref()) {
-                Ok(quota) => set_quota_summary(&mut snapshot, &quota),
-                Err(error) => {
-                    snapshot.last_message = Some(format!("quota refresh failed: {}", error))
-                }
-            }
-            if snapshot.last_message.is_none() {
-                snapshot.last_message = Some("launcher ready".to_string());
-            }
-            snapshot.clone()
-        }
-        Err(error) => {
-            let mut snapshot = status.inner.lock().expect("status mutex");
-            refresh_inventory_count(app, &mut snapshot);
-            refresh_auth_summary(app, &mut snapshot);
-            snapshot.last_message = Some(format!("account read failed: {}", error));
-            snapshot.clone()
-        }
-    };
-    update_snapshot(app, next);
-}
-
-fn spawn_watch_loop(app: AppHandle, status: SharedStatus) {
-    thread::spawn(move || loop {
-        run_check(&app, &status, false);
-        thread::sleep(next_watch_interval(&status));
     });
 }
 
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(target_os = "macos")]
             app.set_activation_policy(ActivationPolicy::Accessory);
 
-            let status = SharedStatus::default();
-            let core_paths = resolve_core_paths()?;
-            let pool_file = core_paths.pool_file;
-            let auth_file = core_paths.codex_auth_file;
-            app.manage(status.clone());
-            app.manage(SharedTrayRuntime::new(pool_file, auth_file));
+            #[cfg(not(target_os = "macos"))]
+            let _ = ActivationPolicy::Regular;
+
+            app.manage(SharedRenderState::default());
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
@@ -698,7 +352,11 @@ fn main() {
                 quota_item: quota_item.clone(),
                 status_item: status_item.clone(),
                 last_rotation_item: last_rotation_item.clone(),
+                launch_item: launch_item.clone(),
+                check_item: check_item.clone(),
+                rotate_item: rotate_item.clone(),
             });
+
             let menu = Menu::with_items(
                 app,
                 &[
@@ -723,121 +381,19 @@ fn main() {
                 .on_menu_event({
                     let app = app.handle().clone();
                     move |app_handle, event| match event.id.as_ref() {
-                        "launch" => {
-                            let app = app.clone();
-                            let status = app.state::<SharedStatus>().inner().clone();
-                            thread::spawn(move || {
-                                let next = if let Err(error) = ensure_debug_codex_instance(
-                                    None,
-                                    Some(DEFAULT_PORT),
-                                    None,
-                                    None,
-                                ) {
-                                    let mut snapshot = status.inner.lock().expect("status mutex");
-                                    snapshot.last_message =
-                                        Some(format!("launch failed: {}", error));
-                                    snapshot.clone()
-                                } else {
-                                    refresh_live_account(&app, &status, true);
-                                    return;
-                                };
-                                update_snapshot(&app, next);
-                            });
-                        }
-                        "check" => {
-                            let app = app.clone();
-                            let status = app.state::<SharedStatus>().inner().clone();
-                            thread::spawn(move || run_check(&app, &status, true));
-                        }
-                        "rotate" => {
-                            let app = app.clone();
-                            let status = app.state::<SharedStatus>().inner().clone();
-                            thread::spawn(move || run_manual_rotation(&app, &status));
-                        }
+                        "launch" => spawn_invoke(app.clone(), InvokeAction::OpenManaged),
+                        "check" => spawn_invoke(app.clone(), InvokeAction::Refresh),
+                        "rotate" => spawn_invoke(app.clone(), InvokeAction::Next),
                         "quit" => app_handle.exit(0),
                         _ => {}
                     }
                 })
                 .build(app)?;
 
-            ensure_debug_codex_instance(None, Some(DEFAULT_PORT), None, None).ok();
-            refresh_live_account(&app.handle().clone(), &status, true);
-            spawn_watch_loop(app.handle().clone(), status);
-
+            let app_handle = app.handle().clone();
+            spawn_subscription_loop(move |snapshot| run_on_main_thread(&app_handle, snapshot));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("failed to run codex rotate tray");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_rendered_snapshot() -> RenderedSnapshot {
-        RenderedSnapshot {
-            account_text: "Account: dev.1@astronlab.com".to_string(),
-            inventory_text: "Inventory: 3 account(s)".to_string(),
-            plan_text: "Plan: free".to_string(),
-            quota_text: "Quota: 5h 80% left".to_string(),
-            status_text: "Status: watch healthy".to_string(),
-            rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com".to_string(),
-            tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
-            quota_percent: Some(80),
-        }
-    }
-
-    #[test]
-    fn tray_runtime_dedups_identical_rendered_snapshots() {
-        let runtime = SharedTrayRuntime::new(
-            PathBuf::from("/tmp/accounts.json"),
-            PathBuf::from("/tmp/auth.json"),
-        );
-        let rendered = sample_rendered_snapshot();
-        assert!(runtime.begin_render(&rendered));
-        assert!(!runtime.begin_render(&rendered));
-    }
-
-    #[test]
-    fn tray_runtime_allows_changed_rendered_snapshots() {
-        let runtime = SharedTrayRuntime::new(
-            PathBuf::from("/tmp/accounts.json"),
-            PathBuf::from("/tmp/auth.json"),
-        );
-        let rendered = sample_rendered_snapshot();
-        let mut changed = rendered.clone();
-        changed.status_text = "Status: rotated".to_string();
-        assert!(runtime.begin_render(&rendered));
-        assert!(runtime.begin_render(&changed));
-    }
-
-    #[test]
-    fn next_watch_interval_uses_low_quota_interval_at_twenty_percent() {
-        let status = SharedStatus::default();
-        status
-            .inner
-            .lock()
-            .expect("status mutex")
-            .current_quota_percent = Some(20);
-
-        assert_eq!(
-            next_watch_interval(&status),
-            Duration::from_secs(LOW_QUOTA_INTERVAL_SECONDS)
-        );
-    }
-
-    #[test]
-    fn next_watch_interval_uses_default_interval_above_twenty_percent() {
-        let status = SharedStatus::default();
-        status
-            .inner
-            .lock()
-            .expect("status mutex")
-            .current_quota_percent = Some(21);
-
-        assert_eq!(
-            next_watch_interval(&status),
-            Duration::from_secs(DEFAULT_INTERVAL_SECONDS)
-        );
-    }
 }

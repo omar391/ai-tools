@@ -1,10 +1,9 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
+use crate::fs_security::write_private_string;
 use crate::paths::resolve_paths;
 
 pub(crate) fn load_rotate_state_json() -> Result<Value> {
@@ -26,31 +25,8 @@ pub(crate) fn load_rotate_state_json() -> Result<Value> {
     }
 }
 
-pub(crate) fn write_rotate_state_json(
-    state: &Value,
-    remove_legacy_credentials: bool,
-) -> Result<()> {
+pub(crate) fn write_rotate_state_json(state: &Value) -> Result<()> {
     let paths = resolve_paths()?;
-    if let Some(parent) = paths.pool_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
     let raw = serde_json::to_string_pretty(state)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&paths.pool_file)
-        .with_context(|| format!("Failed to open {}.", paths.pool_file.display()))?;
-    file.write_all(raw.as_bytes())?;
-    if remove_legacy_credentials && paths.credentials_file.exists() {
-        fs::remove_file(&paths.credentials_file).with_context(|| {
-            format!(
-                "Failed to remove legacy credential store {}.",
-                paths.credentials_file.display()
-            )
-        })?;
-    }
-    Ok(())
+    write_private_string(&paths.pool_file, &raw)
 }

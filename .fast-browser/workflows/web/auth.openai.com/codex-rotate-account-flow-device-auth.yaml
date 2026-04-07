@@ -5,7 +5,7 @@ document:
   version: 1.3.0
   summary: "Managed-profile OpenAI device-auth flow that first reaches a normal authenticated ChatGPT session, then completes Codex device authorization inside the same workflow."
   metadata:
-    preferredProfile: dev-1
+    preferredProfile: dev-1-temp
     primaryTarget: primary
     targets:
       - id: primary
@@ -962,17 +962,11 @@ use:
       with:
         body:
           script: |
-            const fullName = String(args.full_name || "M Omar Faruque").trim();
-            const birthday = {
-              month: String(args.birth_month || "1").trim(),
-              day: String(args.birth_day || "24").trim(),
-              year: String(args.birth_year || "1990").trim(),
-            };
-            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-            const normalizedMonth = String(Number.parseInt(birthday.month, 10) || 1);
-            const normalizedDay = String(Number.parseInt(birthday.day, 10) || 1);
-            const isoBirthday = birthday.year + "-" + birthday.month.padStart(2, "0") + "-" + birthday.day.padStart(2, "0");
-            const monthAliases = {
+            const fullName = String(args.full_name || "Dev Astronlab").trim();
+            const month = String(args.birth_month || "1").trim();
+            const day = String(args.birth_day || "24").trim();
+            const year = String(args.birth_year || "1990").trim();
+            const monthNames = {
               "1": ["1", "01", "jan", "january"],
               "2": ["2", "02", "feb", "february"],
               "3": ["3", "03", "mar", "march"],
@@ -986,170 +980,105 @@ use:
               "11": ["11", "nov", "november"],
               "12": ["12", "dec", "december"],
             };
-            const monthTokens = (monthAliases[normalizedMonth] || [birthday.month, normalizedMonth]).map((value) => normalize(value).toLowerCase());
-            const dayTokens = [birthday.day, birthday.day.padStart(2, "0"), normalizedDay].map((value) => normalize(value));
-
-            const fillFirst = async (selectors, value) => {
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const monthTokens = (monthNames[month] || [month]).map((value) => normalize(value).toLowerCase());
+            const dayTokens = [day, day.padStart(2, "0")].map((value) => normalize(value));
+            const findVisible = async (selectors) => {
               for (const selector of selectors) {
-                const field = page.locator(selector).first();
-                if (!(await field.count().catch(() => 0))) {
+                const locator = page.locator(selector).first();
+                if (!(await locator.count().catch(() => 0))) {
                   continue;
                 }
-                if (!(await field.isVisible().catch(() => false))) {
+                if (!(await locator.isVisible().catch(() => false))) {
                   continue;
                 }
-                await field.scrollIntoViewIfNeeded().catch(() => {});
-                await field.fill(value).catch(() => {});
-                let nextValue = await field.inputValue().catch(() => null);
-                if ((typeof nextValue !== "string" || nextValue.length === 0) && typeof value === "string" && value.length > 0) {
-                  await field.click().catch(() => {});
-                  await field.pressSequentially(value, { delay: 20 }).catch(() => {});
-                  nextValue = await field.inputValue().catch(() => null);
-                }
-                if (typeof nextValue === "string" && nextValue.length > 0) {
-                  await field.evaluate((input) => {
-                    if (!(input instanceof HTMLInputElement)) {
-                      return;
-                    }
-                    input.dispatchEvent(new Event("input", { bubbles: true }));
-                    input.dispatchEvent(new Event("change", { bubbles: true }));
-                    input.dispatchEvent(new Event("blur", { bubbles: true }));
-                  }).catch(() => {});
-                  return true;
-                }
+                return locator;
               }
-              return false;
+              return null;
             };
-
-            const selectFirst = async (selectors, values) => {
-              for (const selector of selectors) {
-                const field = page.locator(selector).first();
-                if (!(await field.count().catch(() => 0))) {
-                  continue;
-                }
-                if (!(await field.isVisible().catch(() => false))) {
-                  continue;
-                }
-                for (const value of values) {
-                  const selected = await field.selectOption(value).catch(() => []);
-                  if (Array.isArray(selected) && selected.length > 0) {
-                    return true;
-                  }
-                  if (typeof value === "string") {
-                    const labeled = await field.selectOption({ label: value }).catch(() => []);
-                    if (Array.isArray(labeled) && labeled.length > 0) {
-                      return true;
-                    }
-                  }
-                }
-              }
-              return false;
+            const readInputValue = async (locator) => {
+              return await locator.inputValue().catch(() => null);
             };
-
-            const readFieldSummary = async (selector) => {
-              return await page.locator(selector).first().evaluate((node) => {
-                if (node instanceof HTMLSelectElement) {
-                  const selected = node.selectedOptions?.[0];
-                  return {
-                    value: String(node.value || ""),
-                    label: String(selected?.label || selected?.textContent || node.value || ""),
-                  };
+            const readSelectValue = async (locator) => {
+              return await locator.evaluate((node) => {
+                if (!(node instanceof HTMLSelectElement)) {
+                  return null;
                 }
-                if (node instanceof HTMLInputElement) {
-                  return {
-                    value: String(node.value || ""),
-                    label: String(node.value || ""),
-                  };
-                }
-                return null;
+                const selected = node.selectedOptions?.[0];
+                return {
+                  value: String(node.value || ""),
+                  label: String(selected?.label || selected?.textContent || node.value || ""),
+                };
               }).catch(() => null);
             };
-
-            const nameDone = await fillFirst([
+            const visibleSelects = [];
+            const selectCount = await page.locator("select").count().catch(() => 0);
+            for (let index = 0; index < selectCount; index += 1) {
+              const locator = page.locator("select").nth(index);
+              if (await locator.isVisible().catch(() => false)) {
+                visibleSelects.push(locator);
+              }
+            }
+            const nameField = await findVisible([
+              'input[name="name"]',
               'input[name*="name" i]',
               'input[autocomplete="name"]',
-              'input[placeholder*="Full name" i]',
-              'input[aria-label*="Full name" i]',
-            ], fullName);
-
-            let monthDone = await selectFirst(
-              ['select[name*="month" i]', 'select[aria-label*="month" i]'],
-              [birthday.month, normalizedMonth, "April", { label: "April" }, "Apr", { label: "Apr" }],
-            );
-            if (!monthDone) {
-              monthDone = await fillFirst(
-                ['input[name*="month" i]', 'input[aria-label*="month" i]', 'input[placeholder*="MM" i]'],
-                birthday.month,
-              );
+              'input[placeholder*="name" i]',
+            ]);
+            const monthField = await findVisible([
+              'select[name*="month" i]',
+              'select[aria-label*="month" i]',
+            ]) || visibleSelects[0] || null;
+            const dayField = await findVisible([
+              'select[name*="day" i]',
+              'select[aria-label*="day" i]',
+            ]) || visibleSelects[1] || null;
+            const yearField = await findVisible([
+              'select[name*="year" i]',
+              'select[aria-label*="year" i]',
+            ]) || visibleSelects[2] || null;
+            if (!nameField || !monthField || !dayField || !yearField) {
+              throw new Error("about-you-fields-not-found");
             }
-
-            let dayDone = await selectFirst(
-              ['select[name*="day" i]', 'select[aria-label*="day" i]'],
-              [birthday.day, normalizedDay, { label: normalizedDay }],
-            );
-            if (!dayDone) {
-              dayDone = await fillFirst(
-                ['input[name*="day" i]', 'input[aria-label*="day" i]', 'input[placeholder*="DD" i]'],
-                birthday.day,
-              );
-            }
-
-            let yearDone = await selectFirst(
-              ['select[name*="year" i]', 'select[aria-label*="year" i]'],
-              [birthday.year, { label: birthday.year }],
-            );
-            if (!yearDone) {
-              yearDone = await fillFirst(
-                ['input[name*="year" i]', 'input[aria-label*="year" i]', 'input[placeholder*="YYYY" i]'],
-                birthday.year,
-              );
-            }
-
-            if (!monthDone || !dayDone || !yearDone) {
-              const birthdaySelects = page.locator("select");
-              const selectCount = await birthdaySelects.count().catch(() => 0);
-              if (selectCount >= 3) {
-                await birthdaySelects.nth(0).selectOption([birthday.month, normalizedMonth]).catch(() => {});
-                await birthdaySelects.nth(1).selectOption([birthday.day, normalizedDay]).catch(() => {});
-                await birthdaySelects.nth(2).selectOption(birthday.year).catch(() => {});
+            await nameField.scrollIntoViewIfNeeded().catch(() => {});
+            await nameField.click().catch(() => {});
+            await nameField.fill(fullName).catch(() => {});
+            const selectValue = async (locator, targetValue, acceptedTokens = []) => {
+              const options = await locator.evaluate((node) => {
+                if (!(node instanceof HTMLSelectElement)) {
+                  return [];
+                }
+                return Array.from(node.options || []).map((option) => ({
+                  value: String(option.value || ""),
+                  label: String(option.label || option.textContent || ""),
+                }));
+              }).catch(() => []);
+              const normalizedTarget = normalize(targetValue).toLowerCase();
+              const normalizedAccepted = acceptedTokens.map((value) => normalize(value).toLowerCase());
+              const chosen = options.find((option) => {
+                const value = normalize(option.value).toLowerCase();
+                const label = normalize(option.label).toLowerCase();
+                return value === normalizedTarget
+                  || label === normalizedTarget
+                  || normalizedAccepted.includes(value)
+                  || normalizedAccepted.includes(label);
+              });
+              if (!chosen) {
+                throw new Error("about-you-option-not-found:" + String(targetValue));
               }
-            }
-
-            if (!monthDone || !dayDone || !yearDone) {
-              await fillFirst([
-                'input[name*="birthday" i]',
-                'input[aria-label*="birthday" i]',
-                'input[placeholder*="Birthday" i]',
-                'input[type="date"]',
-              ], birthday.month + "/" + birthday.day + "/" + birthday.year);
-              await fillFirst(['input[type="date"]'], isoBirthday);
-            }
-
-            const hiddenBirthdayWritten = await page.evaluate((value) => {
-              const hiddenBirthday = document.querySelector('input[name="birthday"]');
-              if (!(hiddenBirthday instanceof HTMLInputElement)) {
-                return false;
-              }
-              hiddenBirthday.value = value;
-              hiddenBirthday.dispatchEvent(new Event("input", { bubbles: true }));
-              hiddenBirthday.dispatchEvent(new Event("change", { bubbles: true }));
-              return true;
-            }, isoBirthday).catch(() => false);
-
+              await locator.selectOption({ value: chosen.value }).catch(async () => {
+                await locator.selectOption({ label: chosen.label }).catch(() => {});
+              });
+            };
+            await selectValue(monthField, month, monthTokens);
+            await selectValue(dayField, day, dayTokens);
+            await selectValue(yearField, year, [year]);
             await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
             await page.waitForTimeout(250).catch(() => {});
-
-            const nameActual = normalize(await page.locator([
-              'input[name*="name" i]',
-              'input[autocomplete="name"]',
-              'input[placeholder*="Full name" i]',
-              'input[aria-label*="Full name" i]',
-            ].join(", ")).first().inputValue().catch(() => ""));
-            const monthActual = await readFieldSummary('select[name*="month" i], select[aria-label*="month" i], input[name*="month" i], input[aria-label*="month" i], input[placeholder*="MM" i]');
-            const dayActual = await readFieldSummary('select[name*="day" i], select[aria-label*="day" i], input[name*="day" i], input[aria-label*="day" i], input[placeholder*="DD" i]');
-            const yearActual = await readFieldSummary('select[name*="year" i], select[aria-label*="year" i], input[name*="year" i], input[aria-label*="year" i], input[placeholder*="YYYY" i]');
-            const hiddenBirthday = await page.locator('input[name="birthday"]').first().inputValue().catch(() => null);
-
+            const nameActual = normalize(await readInputValue(nameField));
+            const monthActual = await readSelectValue(monthField);
+            const dayActual = await readSelectValue(dayField);
+            const yearActual = await readSelectValue(yearField);
             const submit = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]')
               .filter({ hasText: /continue|next|finish creating account|submit|verify/i })
               .first();
@@ -1158,33 +1087,264 @@ use:
             const submitText = submitFound
               ? await submit.evaluate((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).catch(() => null)
               : null;
-
-            const monthLabel = normalize(monthActual?.label || monthActual?.value || "").toLowerCase();
-            const dayLabel = normalize(dayActual?.label || dayActual?.value || "");
-            const yearLabel = normalize(yearActual?.label || yearActual?.value || "");
-            const hiddenBirthdayMatches = normalize(hiddenBirthday || "") === isoBirthday;
-            const monthMatches = monthTokens.includes(monthLabel) || hiddenBirthdayMatches;
-            const dayMatches = dayTokens.includes(dayLabel) || hiddenBirthdayMatches;
-            const yearMatches = yearLabel === normalize(birthday.year) || hiddenBirthdayMatches;
-            const ok = nameDone && nameActual === normalize(fullName) && monthMatches && dayMatches && yearMatches && submitDisabled === false;
-            if (!ok) {
-              throw new Error("about-you-fill-failed:" + JSON.stringify({
-                name_done: nameDone,
-                name_value: nameActual || null,
-                month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
-                day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
-                year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
-                hidden_birthday: normalize(hiddenBirthday || "") || null,
-                hidden_birthday_written: hiddenBirthdayWritten,
-                submit_disabled: submitDisabled,
-                submit_text: normalize(submitText || "") || null,
-              }));
+            const monthMatches = monthTokens.includes(normalize(monthActual?.label || monthActual?.value || "").toLowerCase());
+            const dayMatches = dayTokens.includes(normalize(dayActual?.label || dayActual?.value || ""));
+            const yearMatches = normalize(yearActual?.label || yearActual?.value || "") === normalize(year);
+            const result = {
+              ok: nameActual === normalize(fullName) && monthMatches && dayMatches && yearMatches && submitDisabled === false,
+              name_value: nameActual || null,
+              month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
+              day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
+              year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
+              submit_disabled: submitDisabled,
+              submit_text: normalize(submitText || "") || null,
+              error: null,
+            };
+            if (!result.ok) {
+              result.error = "about-you-form-not-ready";
+            }
+            if (!result.ok) {
+              throw new Error("about-you-fill-failed:" + JSON.stringify(result));
             }
             return {
-              ok: true,
+              ...result,
               current_url: page.url(),
-              hidden_birthday: hiddenBirthday || null,
             };
+    submit_openai_about_you_form:
+      metadata:
+        description: "Submit the OpenAI about-you form and verify that the flow advances to a valid next state."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const detectStage = async () => await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              const title = normalize(document.title || "");
+              const path = location.pathname;
+              const host = location.hostname;
+              const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const antiBotGate = /just a moment/i.test(title)
+                || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
+                || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
+              const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);
+              const sessionEnded = /your session has ended/i.test(bodyText);
+              const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);
+              const addPhonePrompt = /add-phone/i.test(path)
+                || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);
+              const aboutYou = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)
+                || /about-you/i.test(path);
+              const needsEmailVerification = verificationInput
+                || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
+                || /email-verification/i.test(path);
+              const oauthContinueVisible = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']")).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) {
+                  return false;
+                }
+                const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
+                return /continue to codex|continue to openai|authorize|allow|accept/i.test(text);
+              });
+              let stage = "unknown";
+              if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+                stage = "callback_complete";
+              } else if (antiBotGate) {
+                stage = "security_verification";
+              } else if (rateLimitExceeded) {
+                stage = "rate_limit";
+              } else if (sessionEnded) {
+                stage = "session_ended";
+              } else if (retryableTimeout) {
+                stage = "retryable_timeout";
+              } else if (addPhonePrompt) {
+                stage = "add_phone";
+              } else if (oauthContinueVisible) {
+                stage = "oauth_consent";
+              } else if (aboutYou) {
+                stage = "about_you";
+              } else if (needsEmailVerification) {
+                stage = "email_verification";
+              } else if (/\/log-in(?:\/|$)/i.test(path) && passwordInput) {
+                stage = "login_password";
+              } else if (/\/create-account(?:\/|$)/i.test(path) && passwordInput) {
+                stage = "signup_password";
+              } else if (passwordInput || verificationInput) {
+                stage = "auth_prompt";
+              }
+              return {
+                stage,
+                current_url: location.href,
+                headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+              };
+            });
+
+            const fieldSelectors = [
+              'input[name="name"]',
+              'input[name*="name" i]',
+              'input[autocomplete="name"]',
+              'input[placeholder*="name" i]',
+              'select[name*="month" i]',
+              'select[name*="day" i]',
+              'select[name*="year" i]',
+              'select',
+            ];
+            let field = null;
+            for (const selector of fieldSelectors) {
+              const candidate = page.locator(selector).first();
+              if (!(await candidate.count().catch(() => 0))) {
+                continue;
+              }
+              if (!(await candidate.isVisible().catch(() => false))) {
+                continue;
+              }
+              field = candidate;
+              break;
+            }
+            if (!field) {
+              throw new Error("about-you-submit-fields-not-found");
+            }
+
+            const allowedStages = new Set([
+              "add_phone",
+              "oauth_consent",
+              "email_verification",
+              "security_verification",
+              "retryable_timeout",
+              "rate_limit",
+              "session_ended",
+              "callback_complete",
+            ]);
+
+            const clickVisibleContinue = async () => {
+              const result = await field.evaluate((node) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (candidate) => {
+                  if (!(candidate instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(candidate);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = candidate.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const readLabel = (candidate) => {
+                  if (!(candidate instanceof Element)) {
+                    return "";
+                  }
+                  if (candidate instanceof HTMLInputElement) {
+                    return normalize(candidate.value || candidate.getAttribute("aria-label") || "");
+                  }
+                  return normalize(candidate.innerText || candidate.textContent || candidate.getAttribute("aria-label") || "");
+                };
+                const form = node instanceof Element ? node.closest("form") : null;
+                const scope = form || document;
+                const candidates = Array.from(scope.querySelectorAll("button, input[type='submit'], [role='button']"))
+                  .filter((candidate) => isVisible(candidate) && candidate.getAttribute("aria-disabled") !== "true" && !candidate.hasAttribute("disabled"));
+                const preferred = candidates.find((candidate) => {
+                  const label = readLabel(candidate);
+                  const isSubmitNode = (candidate instanceof HTMLButtonElement && candidate.type === "submit")
+                    || (candidate instanceof HTMLInputElement && candidate.type === "submit");
+                  return isSubmitNode && /continue|next|finish creating account|submit|verify|allow|authorize|accept/i.test(label);
+                }) || candidates.find((candidate) => /continue|next|finish creating account|submit|verify|allow|authorize|accept/i.test(readLabel(candidate)));
+                if (preferred instanceof HTMLElement) {
+                  preferred.click();
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click",
+                    label: readLabel(preferred) || null,
+                  };
+                }
+                if (form instanceof HTMLFormElement) {
+                  form.requestSubmit();
+                  return {
+                    ok: true,
+                    strategy: "form-request-submit",
+                    label: null,
+                  };
+                }
+                return null;
+              }).catch(() => null);
+              return result;
+            };
+
+            const attempts = [
+              async () => clickVisibleContinue(),
+              async () => {
+                await field.press("Enter").catch(() => {});
+                return { strategy: "press-enter", label: null };
+              },
+              async () => {
+                await field.evaluate((node) => {
+                  if (node instanceof HTMLElement) {
+                    node.blur();
+                  }
+                  const form = node instanceof Element ? node.closest("form") : null;
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                  }
+                }).catch(() => {});
+                return { strategy: "request-submit", label: null };
+              },
+            ];
+
+            const waitForTransition = async (sameStage, timeoutMs = 8000) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
+            const transitions = [];
+            for (const attempt of attempts) {
+              const performed = await attempt();
+              if (!performed) {
+                continue;
+              }
+              const after = await waitForTransition("about_you");
+              transitions.push({ ...performed, ...after });
+              if (allowedStages.has(after.stage) && after.stage !== "about_you") {
+                return {
+                  ok: true,
+                  strategy: performed.strategy,
+                  next_stage: after.stage,
+                  current_url: after.current_url,
+                  headline: after.headline,
+                  transitions,
+                };
+              }
+            }
+
+            const finalState = await detectStage();
+            throw new Error("about-you-submit-stuck:" + String(finalState.stage || "unknown") + ":" + String(finalState.current_url || page.url()));
     submit_openai_password_form:
       metadata:
         description: "Submit the current OpenAI password form and verify that the flow leaves the password stage."
@@ -2104,7 +2264,7 @@ do:
       metadata:
         description: "Detect whether this run is reusing an already-issued device-auth challenge and should skip the fresh ChatGPT preparation branch."
       set:
-        reuse_device_auth_session: "${(() => { const authUrl = String(inputs.auth_url || '').trim(); const deviceCode = String(inputs.device_code || '').trim(); return authUrl !== '' && deviceCode !== ''; })()}"
+        reuse_device_auth_session: "${String(inputs.auth_url || '').trim() !== '' && String(inputs.device_code || '').trim() !== ''}"
   - clear_prepare_device_auth_site_state:
       if: "${state.vars.reuse_device_auth_session !== true}"
       metadata:
@@ -2118,24 +2278,10 @@ do:
       with:
         body:
           url: "https://chatgpt.com/?codex_rotate_public_entry=device_auth_prepare_reset"
-  - force_prepare_chatgpt_logout:
-      if: "${state.vars.reuse_device_auth_session !== true}"
-      metadata:
-        description: "Visit the explicit ChatGPT logout URL before starting the fresh device-auth prepare path."
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "https://chatgpt.com/auth/logout"
-  - wait_after_prepare_chatgpt_logout:
-      if: "${state.steps.force_prepare_chatgpt_logout?.action?.ok === true && state.steps.force_prepare_chatgpt_logout?.action?.skipped !== true}"
-      metadata:
-        description: "Let the explicit ChatGPT logout redirect settle before reopening the public entry."
-      wait:
-        milliseconds: 1200
   - reopen_public_chatgpt_entry_for_prepare:
-      if: "${(state.steps.force_prepare_chatgpt_logout?.action?.ok === true && state.steps.force_prepare_chatgpt_logout?.action?.skipped !== true) || (state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true)}"
+      if: "${state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true}"
       metadata:
-        description: "Reopen the public ChatGPT entry after clearing site state so the prepare flow starts from a known public shell."
+        description: "Open the public ChatGPT entry after clearing site state so the prepare flow starts from a known public shell."
       call: afn.driver.browser.navigate
       with:
         body:
@@ -2158,28 +2304,88 @@ do:
       with:
         body:
           script: |
-            const title = await page.title().catch(() => "");
-            const bodyText = await page.locator("body").innerText().catch(() => "");
-            const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
-            const currentUrl = page.url();
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const readShell = async () => {
+              const title = await page.title().catch(() => "");
+              return await page.evaluate((titleText) => {
+                const normalizeInner = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const buttons = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']"))
+                  .filter((node) => isVisible(node))
+                  .map((node) => {
+                    if (node instanceof HTMLInputElement) {
+                      return normalizeInner(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalizeInner(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  })
+                  .filter(Boolean)
+                  .slice(0, 20);
+                const bodyText = normalizeInner(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                return {
+                  current_url: location.href,
+                  title: normalizeInner(titleText || document.title || ""),
+                  body_text: bodyText,
+                  visible_buttons: buttons,
+                };
+              }, title);
+            };
+            let latest = await readShell();
+            let reloaded = false;
+            for (let attempt = 0; attempt < 24; attempt += 1) {
+              const combinedText = normalize([latest.title, latest.body_text, ...(latest.visible_buttons || [])].join(" "));
+              const hasRenderableShell = combinedText.length > 0;
+              if (hasRenderableShell) {
+                break;
+              }
+              if (!reloaded && /chatgpt\.com/i.test(String(latest.current_url || page.url()))) {
+                await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+                reloaded = true;
+              }
+              await page.waitForTimeout(500).catch(() => {});
+              latest = await readShell();
+            }
+            const combinedText = normalize([latest.title, latest.body_text, ...(latest.visible_buttons || [])].join(" "));
+            const currentUrl = String(latest.current_url || page.url());
             const chatGptShell = /chatgpt\.com/i.test(currentUrl);
-            const settingsShell = chatGptShell && /general|notifications|personalization|apps|data controls|security|account/i.test(normalizedText);
-            const securityOpen = chatGptShell && /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText);
-            const composerShell = chatGptShell && /new chat|search chats|chat history|what are you working on|what’s on your mind today|where should we begin/i.test(normalizedText);
-            const sessionExpired = chatGptShell && /your session has expired|please log in again to continue using the app/i.test(normalizedText);
-            const publicShellSignals = chatGptShell && /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started|where should we begin/i.test(normalizedText);
-            const loginCtaVisible = chatGptShell && /(?:^|\b)log in(?:\b|$)|sign up for free|get started/i.test(normalizedText);
-            const accountReady = (securityOpen || composerShell) && !sessionExpired && !loginCtaVisible && !publicShellSignals;
+            const logoutUrl = /chatgpt\.com\/auth\/logout/i.test(currentUrl);
+            const settingsShell = chatGptShell && /general|notifications|personalization|apps|data controls|security|account/i.test(combinedText);
+            const securityOpen = chatGptShell && /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(combinedText);
+            const composerShell = chatGptShell && /new chat|search chats|chat history|projects|what are you working on|what’s on your mind today|where should we begin|upgrade plan|explore gpts/i.test(combinedText);
+            const sessionExpired = chatGptShell && /your session has expired|please log in again to continue using the app/i.test(combinedText);
+            const publicShellSignals = chatGptShell && /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started|where should we begin/i.test(combinedText);
+            const loginCtaVisible = (latest.visible_buttons || []).some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
+            const signupCtaVisible = (latest.visible_buttons || []).some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
+            const blankShell = chatGptShell && combinedText.length === 0;
+            const accountReady = (securityOpen || settingsShell || composerShell) && !sessionExpired && !loginCtaVisible && !signupCtaVisible && !publicShellSignals;
             return {
               ok: true,
               current_url: currentUrl,
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              stage: sessionExpired || loginCtaVisible || publicShellSignals ? "public_chatgpt" : (accountReady ? "app_shell" : "unknown"),
-              account_ready: false,
+              headline: latest.body_text.split("\n").map((value) => value.trim()).filter(Boolean)[0] || latest.title || null,
+              stage: blankShell
+                ? "blank_chatgpt"
+                : (logoutUrl || sessionExpired || loginCtaVisible || signupCtaVisible || publicShellSignals
+                    ? "public_chatgpt"
+                    : (accountReady ? "app_shell" : "unknown")),
+              account_ready: accountReady,
               settings_shell: settingsShell,
               security_open: securityOpen,
               session_expired: sessionExpired,
               login_cta_visible: loginCtaVisible,
+              signup_cta_visible: signupCtaVisible,
+              logout_url: logoutUrl,
+              blank_shell: blankShell,
+              visible_buttons: latest.visible_buttons || [],
+              body_text_length: latest.body_text.length,
             };
   - cache_effective_prepare_public_entry_state:
       if: "${state.vars.reuse_device_auth_session !== true}"
@@ -2188,15 +2394,15 @@ do:
       set:
         effective_prepare_public_entry_state: "${state.steps.inspect_prepare_public_chatgpt_entry?.action || {}}"
   - click_prepare_signup_button:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.account_ready !== true && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.inspect_prepare_public_chatgpt_entry?.action?.stage === 'public_chatgpt' && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
       metadata:
         templateRef: click_chatgpt_signup_button
-        description: "Open the ChatGPT signup entry from the public shell during the local device-auth prepare branch."
+        description: "Open the ChatGPT signup entry from the logged-out shell during the local device-auth prepare branch."
   - click_prepare_login_button:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.account_ready !== true && (String(inputs.prefer_signup_recovery ?? 'true') === 'false' || state.steps.click_prepare_signup_button?.action?.ok !== true)}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.inspect_prepare_public_chatgpt_entry?.action?.stage === 'public_chatgpt' && (String(inputs.prefer_signup_recovery ?? 'true') === 'false' || state.steps.click_prepare_signup_button?.action?.ok !== true)}"
       metadata:
         templateRef: click_chatgpt_login_button
-        description: "Open the ChatGPT login entry from the public shell during the local device-auth prepare branch."
+        description: "Open the ChatGPT login entry from the logged-out shell during the local device-auth prepare branch."
   - wait_after_prepare_login_button:
       if: "${(state.steps.click_prepare_signup_button?.action?.ok === true && state.steps.click_prepare_signup_button?.action?.skipped !== true) || (state.steps.click_prepare_login_button?.action?.ok === true && state.steps.click_prepare_login_button?.action?.skipped !== true)}"
       metadata:
@@ -2258,7 +2464,7 @@ do:
       metadata:
         description: "Cache the effective prepare login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_prepare_login_entry_state: "${(() => { const afterLanding = state.steps.classify_prepare_login_entry_after_auth_landing?.action; if (afterLanding && afterLanding.skipped !== true && (afterLanding.stage || afterLanding.current_url)) { return afterLanding; } const initial = state.steps.classify_prepare_login_entry?.action; if (initial && initial.skipped !== true && (initial.stage || initial.current_url)) { return initial; } return {}; })()}"
+        effective_prepare_login_entry_state: "${(state.steps.classify_prepare_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_prepare_login_entry_after_auth_landing?.action?.stage || state.steps.classify_prepare_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_prepare_login_entry_after_auth_landing?.action : (((state.steps.classify_prepare_login_entry?.action?.skipped !== true) && (state.steps.classify_prepare_login_entry?.action?.stage || state.steps.classify_prepare_login_entry?.action?.current_url)) ? state.steps.classify_prepare_login_entry?.action : {})}"
   - fill_prepare_login_email:
       if: "${state.vars.effective_prepare_login_entry_state?.stage === 'login_email' || state.vars.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.vars.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_prepare_login_entry_state?.email_input === true)}"
       metadata:
@@ -2618,200 +2824,273 @@ do:
   - fill_prepare_signup_about_you:
       if: "${state.steps.classify_prepare_after_signup_password_gate?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_submit?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_retry?.action?.follow_up_step === true}"
       metadata:
-        description: "Set the visible OpenAI full-name field during the prepare signup branch."
+        description: "Fill the OpenAI about-you form during the prepare signup branch."
+        mode: headless_ok
+        targetRef: primary
         browser:
           screenshot: true
       call: afn.driver.browser.type
       with:
         body:
-          selector: "input[name*='name' i], input[autocomplete='name'], input[placeholder*='Full name' i], input[aria-label*='Full name' i]"
-          text: "${String(inputs.full_name || 'Dev Astronlab').trim()}"
+          selector: 'input[name="name"], input[name*="name" i], input[autocomplete="name"], input[placeholder*="name" i]'
+          text: "${inputs.full_name}"
           dispatch_events_after_fill: true
           blur_after_fill: true
           settle_ms: 250
   - set_prepare_signup_birthday:
       if: "${state.steps.fill_prepare_signup_about_you?.action?.ok === true && state.steps.fill_prepare_signup_about_you?.action?.skipped !== true}"
       metadata:
-        description: "Set the visible OpenAI birthday controls during the prepare signup branch."
-        browser:
-          screenshot: true
+        description: "Set the OpenAI about-you birthday selectors during the prepare signup branch."
         mode: headless_ok
         targetRef: primary
+        browser:
+          screenshot: true
       call: afn.driver.browser.exec_script
       with:
         body:
           script: |
-            const birthMonth = String(args.birth_month || "1").trim();
-            const birthDay = String(args.birth_day || "24").trim();
-            const birthYear = String(args.birth_year || "1990").trim();
-            const payload = { birthMonth, birthDay, birthYear };
-            const result = await page.evaluate((payload) => {
-              const birthMonth = String(payload.birthMonth || "1").trim();
-              const birthDay = String(payload.birthDay || "24").trim();
-              const birthYear = String(payload.birthYear || "1990").trim();
-              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-              const monthNumber = String(Number.parseInt(birthMonth, 10) || 1);
-              const dayNumber = String(Number.parseInt(birthDay, 10) || 1);
-              const isoBirthday = birthYear + "-" + birthMonth.padStart(2, "0") + "-" + birthDay.padStart(2, "0");
-              const monthTokens = {
-                "1": ["1", "01", "jan", "january"],
-                "2": ["2", "02", "feb", "february"],
-                "3": ["3", "03", "mar", "march"],
-                "4": ["4", "04", "apr", "april"],
-                "5": ["5", "05", "may"],
-                "6": ["6", "06", "jun", "june"],
-                "7": ["7", "07", "jul", "july"],
-                "8": ["8", "08", "aug", "august"],
-                "9": ["9", "09", "sep", "sept", "september"],
-                "10": ["10", "oct", "october"],
-                "11": ["11", "nov", "november"],
-                "12": ["12", "dec", "december"],
-              };
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
+            const month = String(args.birth_month || "1").trim();
+            const day = String(args.birth_day || "24").trim();
+            const year = String(args.birth_year || "1990").trim();
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const monthTokens = ({
+              "1": ["1", "01", "jan", "january"],
+              "2": ["2", "02", "feb", "february"],
+              "3": ["3", "03", "mar", "march"],
+              "4": ["4", "04", "apr", "april"],
+              "5": ["5", "05", "may"],
+              "6": ["6", "06", "jun", "june"],
+              "7": ["7", "07", "jul", "july"],
+              "8": ["8", "08", "aug", "august"],
+              "9": ["9", "09", "sep", "sept", "september"],
+              "10": ["10", "oct", "october"],
+              "11": ["11", "nov", "november"],
+              "12": ["12", "dec", "december"],
+            }[month] || [month]).map((value) => normalize(value).toLowerCase());
+            const dayTokens = [day, day.padStart(2, "0")].map((value) => normalize(value));
+            const visibleSelects = [];
+            const selectCount = await page.locator("select").count().catch(() => 0);
+            for (let index = 0; index < selectCount; index += 1) {
+              const locator = page.locator("select").nth(index);
+              if (await locator.isVisible().catch(() => false)) {
+                visibleSelects.push(locator);
+              }
+            }
+            const findVisibleSelect = async (selectors, fallbackIndex) => {
+              for (const selector of selectors) {
+                const locator = page.locator(selector).first();
+                if (!(await locator.count().catch(() => 0))) {
+                  continue;
+                }
+                if (!(await locator.isVisible().catch(() => false))) {
+                  continue;
+                }
+                return locator;
+              }
+              return visibleSelects[fallbackIndex] || null;
+            };
+            const chooseOption = async (locator, targetValue, acceptedTokens = []) => {
+              const options = await locator.evaluate((node) => {
+                if (!(node instanceof HTMLSelectElement)) {
+                  return [];
+                }
+                return Array.from(node.options || []).map((option) => ({
+                  value: String(option.value || ""),
+                  label: String(option.label || option.textContent || ""),
+                }));
+              }).catch(() => []);
+              const normalizedTarget = normalize(targetValue).toLowerCase();
+              const accepted = acceptedTokens.map((value) => normalize(value).toLowerCase());
+              return options.find((option) => {
+                const value = normalize(option.value).toLowerCase();
+                const label = normalize(option.label).toLowerCase();
+                return value === normalizedTarget
+                  || label === normalizedTarget
+                  || accepted.includes(value)
+                  || accepted.includes(label);
+              }) || null;
+            };
+            const setOptionValue = async (locator, optionValue) => {
+              return await locator.evaluate((node, value) => {
+                if (!(node instanceof HTMLSelectElement)) {
                   return false;
                 }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
+                const option = Array.from(node.options || []).find((candidate) => String(candidate.value || "") === String(value));
+                if (!option) {
                   return false;
                 }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const dispatch = (node) => {
+                node.focus();
+                node.value = option.value;
+                option.selected = true;
                 node.dispatchEvent(new Event("input", { bubbles: true }));
                 node.dispatchEvent(new Event("change", { bubbles: true }));
                 node.dispatchEvent(new Event("blur", { bubbles: true }));
-              };
-              const visibleSelects = Array.from(document.querySelectorAll("select"))
-                .filter((node) => node instanceof HTMLSelectElement && isVisible(node));
-              const chooseOption = (node, tokens) => {
+                return true;
+              }, optionValue).catch(() => false);
+            };
+            const readSelected = async (locator) => {
+              return await locator.evaluate((node) => {
                 if (!(node instanceof HTMLSelectElement)) {
-                  return "";
+                  return null;
                 }
-                const option = Array.from(node.options).find((candidate) => {
-                  const value = normalize(candidate.value).toLowerCase();
-                  const label = normalize(candidate.label || candidate.textContent || "").toLowerCase();
-                  return tokens.some((token) => token === value || token === label);
-                });
-                if (!option) {
-                  return "";
-                }
-                node.value = option.value;
-                dispatch(node);
-                return normalize(option.label || option.textContent || option.value);
-              };
-              let monthValue = chooseOption(visibleSelects[0], monthTokens[monthNumber] || [birthMonth.toLowerCase(), monthNumber]);
-              let dayValue = chooseOption(visibleSelects[1], [birthDay.toLowerCase(), birthDay.padStart(2, "0").toLowerCase(), dayNumber.toLowerCase()]);
-              let yearValue = chooseOption(visibleSelects[2], [birthYear.toLowerCase()]);
-              const dateInput = Array.from(document.querySelectorAll("input[type='date'], input[name*='birthday' i], input[aria-label*='birthday' i], input[placeholder*='Birthday' i]"))
-                .find((node) => node instanceof HTMLInputElement && isVisible(node));
-              if (dateInput instanceof HTMLInputElement) {
-                dateInput.focus();
-                dateInput.value = dateInput.type === "date" ? isoBirthday : (birthMonth + "/" + birthDay + "/" + birthYear);
-                dispatch(dateInput);
-              }
-              const hiddenBirthday = document.querySelector("input[name='birthday']");
-              if (hiddenBirthday instanceof HTMLInputElement) {
-                hiddenBirthday.value = isoBirthday;
-                dispatch(hiddenBirthday);
-              }
-              return {
-                ok: true,
-                month_value: monthValue || null,
-                day_value: dayValue || null,
-                year_value: yearValue || null,
-                hidden_birthday: hiddenBirthday instanceof HTMLInputElement ? normalize(hiddenBirthday.value) || null : null,
-              };
-            }, payload);
-            await page.waitForTimeout(150).catch(() => {});
+                const selected = node.selectedOptions?.[0];
+                return {
+                  value: String(node.value || ""),
+                  label: String(selected?.label || selected?.textContent || node.value || ""),
+                };
+              }).catch(() => null);
+            };
+            const monthField = await findVisibleSelect([
+              'select[name*="month" i]',
+              'select[aria-label*="month" i]',
+            ], 0);
+            const dayField = await findVisibleSelect([
+              'select[name*="day" i]',
+              'select[aria-label*="day" i]',
+            ], 1);
+            const yearField = await findVisibleSelect([
+              'select[name*="year" i]',
+              'select[aria-label*="year" i]',
+            ], 2);
+            if (!monthField || !dayField || !yearField) {
+              throw new Error("prepare-about-you-selects-not-found");
+            }
+            const monthChoice = await chooseOption(monthField, month, monthTokens);
+            const dayChoice = await chooseOption(dayField, day, dayTokens);
+            const yearChoice = await chooseOption(yearField, year, [year]);
+            if (!monthChoice || !dayChoice || !yearChoice) {
+              throw new Error("prepare-about-you-option-missing");
+            }
+            const monthSet = await setOptionValue(monthField, monthChoice.value);
+            const daySet = await setOptionValue(dayField, dayChoice.value);
+            const yearSet = await setOptionValue(yearField, yearChoice.value);
+            await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
+            await page.waitForTimeout(250).catch(() => {});
+            const monthActual = await readSelected(monthField);
+            const dayActual = await readSelected(dayField);
+            const yearActual = await readSelected(yearField);
             return {
-              ...result,
+              ok: monthSet && daySet && yearSet,
               current_url: page.url(),
+              month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
+              day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
+              year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
             };
   - inspect_prepare_signup_about_you_ready:
       if: "${state.steps.set_prepare_signup_birthday?.action?.ok === true && state.steps.set_prepare_signup_birthday?.action?.skipped !== true}"
       metadata:
-        description: "Inspect the OpenAI about-you form after setting name and birthday during the prepare signup branch."
-        browser:
-          screenshot: true
+        description: "Inspect the prepare about-you form after filling name and birthday."
         mode: headless_ok
         targetRef: primary
+        browser:
+          screenshot: true
       call: afn.driver.browser.exec_script
       with:
         body:
           script: |
-            const fullName = String(args.full_name || "Dev Astronlab").trim();
-            const birthMonth = String(args.birth_month || "1").trim();
-            const birthDay = String(args.birth_day || "24").trim();
-            const birthYear = String(args.birth_year || "1990").trim();
-            const payload = { fullName, birthMonth, birthDay, birthYear };
-            const result = await page.evaluate((payload) => {
-              const fullName = String(payload.fullName || "Dev Astronlab").trim();
-              const birthMonth = String(payload.birthMonth || "1").trim();
-              const birthDay = String(payload.birthDay || "24").trim();
-              const birthYear = String(payload.birthYear || "1990").trim();
-              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
+            const expectedName = String(args.full_name || "Dev Astronlab").trim();
+            const expectedMonth = String(args.birth_month || "1").trim();
+            const expectedDay = String(args.birth_day || "24").trim();
+            const expectedYear = String(args.birth_year || "1990").trim();
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const monthTokens = ({
+              "1": ["1", "01", "jan", "january"],
+              "2": ["2", "02", "feb", "february"],
+              "3": ["3", "03", "mar", "march"],
+              "4": ["4", "04", "apr", "april"],
+              "5": ["5", "05", "may"],
+              "6": ["6", "06", "jun", "june"],
+              "7": ["7", "07", "jul", "july"],
+              "8": ["8", "08", "aug", "august"],
+              "9": ["9", "09", "sep", "sept", "september"],
+              "10": ["10", "oct", "october"],
+              "11": ["11", "nov", "november"],
+              "12": ["12", "dec", "december"],
+            }[expectedMonth] || [expectedMonth]).map((value) => normalize(value).toLowerCase());
+            const dayTokens = [expectedDay, expectedDay.padStart(2, "0")].map((value) => normalize(value));
+            const findVisible = async (selectors) => {
+              for (const selector of selectors) {
+                const locator = page.locator(selector).first();
+                if (!(await locator.count().catch(() => 0))) {
+                  continue;
                 }
-                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden='true']")) {
-                  return false;
+                if (!(await locator.isVisible().catch(() => false))) {
+                  continue;
                 }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
+                return locator;
+              }
+              return null;
+            };
+            const nameField = await findVisible([
+              'input[name="name"]',
+              'input[name*="name" i]',
+              'input[autocomplete="name"]',
+              'input[placeholder*="name" i]',
+            ]);
+            const visibleSelects = [];
+            const selectCount = await page.locator("select").count().catch(() => 0);
+            for (let index = 0; index < selectCount; index += 1) {
+              const locator = page.locator("select").nth(index);
+              if (await locator.isVisible().catch(() => false)) {
+                visibleSelects.push(locator);
+              }
+            }
+            const monthField = await findVisible([
+              'select[name*="month" i]',
+              'select[aria-label*="month" i]',
+            ]) || visibleSelects[0] || null;
+            const dayField = await findVisible([
+              'select[name*="day" i]',
+              'select[aria-label*="day" i]',
+            ]) || visibleSelects[1] || null;
+            const yearField = await findVisible([
+              'select[name*="year" i]',
+              'select[aria-label*="year" i]',
+            ]) || visibleSelects[2] || null;
+            if (!nameField || !monthField || !dayField || !yearField) {
+              throw new Error("prepare-about-you-fields-not-found");
+            }
+            const readSelectValue = async (locator) => {
+              return await locator.evaluate((node) => {
+                if (!(node instanceof HTMLSelectElement)) {
+                  return null;
                 }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const readName = () => {
-                const field = Array.from(document.querySelectorAll("input[name*='name' i], input[autocomplete='name'], input[placeholder*='Full name' i], input[aria-label*='Full name' i]"))
-                  .find((node) => node instanceof HTMLInputElement && isVisible(node));
-                return field instanceof HTMLInputElement ? normalize(field.value) : "";
-              };
-              const selects = Array.from(document.querySelectorAll("select"))
-                .filter((node) => node instanceof HTMLSelectElement && isVisible(node));
-              const readSelect = (node) => node instanceof HTMLSelectElement
-                ? normalize(node.selectedOptions?.[0]?.label || node.value || "")
-                : "";
-              const hiddenBirthday = (() => {
-                const node = document.querySelector("input[name='birthday']");
-                return node instanceof HTMLInputElement ? normalize(node.value) : "";
-              })();
-              const submit = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']"))
-                .filter((node) => isVisible(node))
-                .map((node) => ({
-                  label: normalize(node instanceof HTMLInputElement ? (node.value || node.getAttribute("aria-label") || "") : (node.innerText || node.textContent || node.getAttribute("aria-label") || "")),
-                  disabled: node.hasAttribute("disabled") || node.getAttribute("aria-disabled") === "true",
-                }))
-                .find((node) => /continue|next|finish creating account|submit|verify/i.test(node.label)) || { label: null, disabled: null };
-              const monthValue = readSelect(selects[0]);
-              const dayValue = readSelect(selects[1]);
-              const yearValue = readSelect(selects[2]);
-              const isoBirthday = birthYear + "-" + birthMonth.padStart(2, "0") + "-" + birthDay.padStart(2, "0");
-              const ready = readName() === normalize(fullName)
-                && ((monthValue && dayValue && yearValue) || hiddenBirthday === isoBirthday)
-                && submit.disabled === false;
-              return {
-                ok: true,
-                ready,
-                current_url: location.href,
-                name_value: readName() || null,
-                month_value: monthValue || null,
-                day_value: dayValue || null,
-                year_value: yearValue || null,
-                hidden_birthday: hiddenBirthday || null,
-                submit_text: submit.label,
-                submit_disabled: submit.disabled,
-              };
-            }, payload);
+                const selected = node.selectedOptions?.[0];
+                return {
+                  value: String(node.value || ""),
+                  label: String(selected?.label || selected?.textContent || node.value || ""),
+                };
+              }).catch(() => null);
+            };
+            const nameValue = normalize(await nameField.inputValue().catch(() => ""));
+            const monthActual = await readSelectValue(monthField);
+            const dayActual = await readSelectValue(dayField);
+            const yearActual = await readSelectValue(yearField);
+            const submit = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]')
+              .filter({ hasText: /continue|next|finish creating account|submit|verify/i })
+              .first();
+            const submitDisabled = (await submit.count().catch(() => 0)) > 0 ? await submit.isDisabled().catch(() => null) : null;
+            const result = {
+              ok: nameValue === normalize(expectedName)
+                && monthTokens.includes(normalize(monthActual?.label || monthActual?.value || "").toLowerCase())
+                && dayTokens.includes(normalize(dayActual?.label || dayActual?.value || ""))
+                && normalize(yearActual?.label || yearActual?.value || "") === normalize(expectedYear)
+                && submitDisabled === false,
+              current_url: page.url(),
+              name_value: nameValue || null,
+              month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
+              day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
+              year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
+              submit_disabled: submitDisabled,
+            };
+            if (!result.ok) {
+              throw new Error("prepare-about-you-not-ready:" + JSON.stringify(result));
+            }
             return result;
   - submit_prepare_signup_about_you:
-      if: "${state.steps.inspect_prepare_signup_about_you_ready?.action?.ready === true}"
+      if: "${state.steps.inspect_prepare_signup_about_you_ready?.action?.ok === true && state.steps.inspect_prepare_signup_about_you_ready?.action?.skipped !== true}"
       metadata:
-        templateRef: click_primary_continue
+        templateRef: submit_openai_about_you_form
         description: "Submit the OpenAI about-you form during the prepare signup branch."
         browser:
           screenshot: true
@@ -2828,12 +3107,76 @@ do:
         description: "Classify the prepare flow after submitting the about-you form."
         browser:
           screenshot: true
+  - compute_prepare_flow_result:
+      metadata:
+        description: "Compute the local device-auth prepare result before opening ChatGPT Security."
+      run:
+        script:
+          language: javascript
+          code: |
+            if (state.vars?.reuse_device_auth_session === true) {
+              return {
+                prepare_flow_output: {
+                  reused_device_auth_session: true,
+                  next_action: "complete",
+                  success: true,
+                },
+                prepare_flow_ready: true,
+              };
+            }
+            const candidates = [
+              state.steps?.inspect_prepare_public_chatgpt_entry?.action,
+              state.steps?.classify_prepare_after_signup_about_you?.action,
+              state.steps?.classify_prepare_after_login_verification_retry?.action,
+              state.steps?.classify_prepare_after_login_verification_submit?.action,
+              state.steps?.classify_prepare_after_return_recovery?.action,
+              state.steps?.classify_prepare_login_after_return?.action,
+              state.steps?.classify_prepare_login_verification_ready_after_incorrect_code?.action,
+              state.steps?.classify_prepare_login_verification_ready?.action,
+              state.steps?.classify_prepare_after_timeout_reopen?.action,
+              state.steps?.classify_prepare_after_recovery_timeout_retry?.action,
+              state.steps?.classify_prepare_after_recovery_choice?.action,
+              state.steps?.classify_prepare_after_signup_password_gate?.action,
+              state.steps?.classify_prepare_after_login_password_gate?.action,
+              state.steps?.classify_prepare_after_login_email_retry?.action,
+              state.steps?.classify_prepare_after_login_email?.action,
+              state.steps?.classify_prepare_login_entry?.action,
+            ];
+            const latest = candidates.find((candidate) => candidate && typeof candidate === "object" && candidate.skipped !== true) || {};
+            const stage = String(latest.stage || "");
+            const prepareFlowReady = stage !== "" && (
+              latest.account_ready === true
+              || latest.chatgpt_app_shell === true
+              || latest.success === true
+              || ![
+                "login_email",
+                "login_password",
+                "signup_email",
+                "signup_password",
+                "email_verification",
+                "about_you",
+                "auth_prompt",
+                "unknown",
+                "retryable_timeout",
+                "rate_limit",
+                "session_ended",
+                "security_verification",
+                "invalid_credentials",
+                "existing_account_prompt",
+                "add_phone",
+                "public_chatgpt",
+              ].includes(stage)
+            );
+            return {
+              prepare_flow_output: latest,
+              prepare_flow_ready: prepareFlowReady,
+            };
   - cache_prepare_flow_result:
       metadata:
         description: "Cache the local device-auth prepare result before opening ChatGPT Security."
       set:
-        prepare_flow_output: "${(() => { if (state.vars.reuse_device_auth_session === true) { return { reused_device_auth_session: true, next_action: 'complete', success: true }; } const candidates = [ state.steps.classify_prepare_after_signup_about_you?.action, state.steps.classify_prepare_after_login_verification_retry?.action, state.steps.classify_prepare_after_login_verification_submit?.action, state.steps.classify_prepare_after_return_recovery?.action, state.steps.classify_prepare_login_after_return?.action, state.steps.classify_prepare_login_verification_ready_after_incorrect_code?.action, state.steps.classify_prepare_login_verification_ready?.action, state.steps.classify_prepare_after_timeout_reopen?.action, state.steps.classify_prepare_after_recovery_timeout_retry?.action, state.steps.classify_prepare_after_recovery_choice?.action, state.steps.classify_prepare_after_signup_password_gate?.action, state.steps.classify_prepare_after_login_password_gate?.action, state.steps.classify_prepare_after_login_email_retry?.action, state.steps.classify_prepare_after_login_email?.action, state.steps.classify_prepare_login_entry?.action ]; return candidates.find((candidate) => candidate && typeof candidate === 'object' && candidate.skipped !== true) || {}; })()}"
-        prepare_flow_ready: "${(() => { if (state.vars.reuse_device_auth_session === true) { return true; } const candidates = [ state.steps.classify_prepare_after_signup_about_you?.action, state.steps.classify_prepare_after_login_verification_retry?.action, state.steps.classify_prepare_after_login_verification_submit?.action, state.steps.classify_prepare_after_return_recovery?.action, state.steps.classify_prepare_login_after_return?.action, state.steps.classify_prepare_login_verification_ready_after_incorrect_code?.action, state.steps.classify_prepare_login_verification_ready?.action, state.steps.classify_prepare_after_timeout_reopen?.action, state.steps.classify_prepare_after_recovery_timeout_retry?.action, state.steps.classify_prepare_after_recovery_choice?.action, state.steps.classify_prepare_after_signup_password_gate?.action, state.steps.classify_prepare_after_login_password_gate?.action, state.steps.classify_prepare_after_login_email_retry?.action, state.steps.classify_prepare_after_login_email?.action, state.steps.classify_prepare_login_entry?.action ]; const latest = candidates.find((candidate) => candidate && typeof candidate === 'object' && candidate.skipped !== true) || {}; const stage = String(latest.stage || ''); if (!stage) { return false; } if (latest.account_ready === true || latest.chatgpt_app_shell === true || latest.success === true) { return true; } return !['login_email','login_password','signup_email','signup_password','email_verification','about_you','auth_prompt','unknown','retryable_timeout','rate_limit','session_ended','security_verification','invalid_credentials','existing_account_prompt','add_phone','public_chatgpt'].includes(stage); })()}"
+        prepare_flow_output: "${state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}}"
+        prepare_flow_ready: "${state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_ready === true}"
   - open_chatgpt_shell:
       if: "${false}"
       metadata:
@@ -3177,7 +3520,7 @@ do:
       metadata:
         description: "Cache the current Codex login session metadata for later exit handling."
       set:
-        codex_login: "${(() => { const captured = state.steps.capture_codex_login_url?.action?.value; if (captured && typeof captured === 'object') { return captured; } const started = state.steps.start_codex_login_session?.action?.value; if (started && typeof started === 'object') { return started; } return { auth_url: String(inputs.auth_url || '').trim() || null, device_code: String(inputs.device_code || '').trim() || null, session_dir: String(inputs.codex_session_dir || '').trim() || null, codex_home_path: String(inputs.codex_home_path || '').trim() || null, auth_file_path: String(inputs.codex_auth_file_path || '').trim() || null, pid: (inputs.codex_login_pid ?? null), stdout_path: String(inputs.codex_login_stdout_path || '').trim() || null, stderr_path: String(inputs.codex_login_stderr_path || '').trim() || null, exit_path: String(inputs.codex_login_exit_path || '').trim() || null }; })()}"
+        codex_login: "${state.steps.capture_codex_login_url?.action?.value || state.steps.start_codex_login_session?.action?.value || { auth_url: String(inputs.auth_url || '').trim() || null, device_code: String(inputs.device_code || '').trim() || null, session_dir: String(inputs.codex_session_dir || '').trim() || null, codex_home_path: String(inputs.codex_home_path || '').trim() || null, auth_file_path: String(inputs.codex_auth_file_path || '').trim() || null, pid: (inputs.codex_login_pid ?? null), stdout_path: String(inputs.codex_login_stdout_path || '').trim() || null, stderr_path: String(inputs.codex_login_stderr_path || '').trim() || null, exit_path: String(inputs.codex_login_exit_path || '').trim() || null }}"
   - restore_codex_login_challenge_from_artifacts:
       if: "${(String(state.vars.codex_login?.auth_url || '').trim() === '' || String(state.vars.codex_login?.device_code || '').trim() === '') && (String(state.vars.codex_login?.stdout_path || inputs.codex_login_stdout_path || '').trim() !== '' || String(state.vars.codex_login?.stderr_path || inputs.codex_login_stderr_path || '').trim() !== '')}"
       metadata:
@@ -3337,7 +3680,7 @@ do:
       metadata:
         description: "Cache the effective device-auth login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_device_auth_login_entry_state: "${(() => { const afterLanding = state.steps.classify_device_auth_login_entry_after_auth_landing?.action; if (afterLanding && afterLanding.skipped !== true && (afterLanding.stage || afterLanding.current_url)) { return afterLanding; } const initial = state.steps.classify_device_auth_login_entry?.action; if (initial && initial.skipped !== true && (initial.stage || initial.current_url)) { return initial; } return {}; })()}"
+        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {})}"
   - fill_device_auth_login_email:
       if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true))}"
       metadata:

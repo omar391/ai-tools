@@ -5,7 +5,7 @@ document:
   version: 1.0.7
   summary: "Explicit managed-profile OpenAI account creation and Codex callback login flow for codex-rotate."
   metadata:
-    preferredProfile: dev-1
+    preferredProfile: dev-1-temp
     primaryTarget: primary
     targets:
       - id: primary

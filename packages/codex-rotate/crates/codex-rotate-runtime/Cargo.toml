@@ -1,12 +1,12 @@
 [package]
-name = "codex-rotate-tray-core"
+name = "codex-rotate-runtime"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-codex-rotate-core = { path = "../../../codex-rotate/crates/codex-rotate-core" }
+codex-rotate-core = { path = "../codex-rotate-core" }
 dirs.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
