@@ -24,7 +24,7 @@ use codex_rotate_core::workflow::{
 
 use crate::dev_refresh::{
     current_process_local_cli_build, daemon_socket_is_older_than_binary,
-    local_cli_sources_newer_than_binary, rebuild_local_cli,
+    ensure_tray_process_registered, local_cli_sources_newer_than_binary, rebuild_local_cli,
 };
 use crate::hook::{read_live_account, switch_live_account_to_current_auth};
 use crate::ipc::{
@@ -41,6 +41,7 @@ const DEFAULT_INTERVAL_SECONDS: u64 = 15;
 const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TRAY_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct DaemonState {
@@ -158,6 +159,7 @@ pub fn run_daemon_forever() -> Result<()> {
 
         initialize_runtime(&daemon);
         daemon.publish_state_snapshot();
+        spawn_tray_supervisor_loop();
         spawn_watch_loop(daemon.clone());
 
         for stream in listener.incoming() {
@@ -232,6 +234,20 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
         let interval = next_watch_interval(daemon.snapshot().current_quota_percent);
         daemon.set_next_tick(next_tick_label(interval));
         thread::sleep(interval);
+    });
+}
+
+fn spawn_tray_supervisor_loop() {
+    thread::spawn(move || loop {
+        match ensure_tray_process_registered() {
+            Ok(true) => log_daemon_info("Restored Codex Rotate tray launch agent."),
+            Ok(false) => {}
+            Err(error) => {
+                let message = format!("tray supervision failed: {error}");
+                log_daemon_error(&message);
+            }
+        }
+        thread::sleep(TRAY_SUPERVISOR_INTERVAL);
     });
 }
 

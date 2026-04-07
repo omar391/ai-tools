@@ -170,22 +170,47 @@ pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
     {
         let label = tray_launchd_label();
         let plist_path = write_tray_launch_agent_plist(tray_binary)?;
-        if let Err(error) = launchctl_bootstrap_plist(&plist_path) {
-            clear_tray_service_registration();
-            launchctl_bootstrap_plist(&plist_path).with_context(|| {
-                format!(
-                    "Failed to bootstrap Codex Rotate tray launch agent after reset: {error}"
-                )
-            })?;
-        }
-        launchctl_kickstart_label(&label)
-            .context("Failed to start Codex Rotate tray launch agent.")?;
+        bootstrap_tray_launch_agent_after_reset(
+            &plist_path,
+            "Failed to bootstrap Codex Rotate tray launch agent after reset",
+        )?;
+        kickstart_tray_launch_agent(&label, "Failed to start Codex Rotate tray launch agent.")?;
         return Ok(());
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         spawn_detached_process(tray_binary, &[])
+    }
+}
+
+pub fn ensure_tray_process_registered() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = tray_launch_agent_plist_path()?;
+        if !plist_path.is_file() {
+            return Ok(false);
+        }
+
+        let label = tray_launchd_label();
+        if launchctl_service_is_registered(&label)? {
+            return Ok(false);
+        }
+
+        bootstrap_tray_launch_agent_after_reset(
+            &plist_path,
+            "Failed to restore Codex Rotate tray launch agent after reset",
+        )?;
+        kickstart_tray_launch_agent(
+            &label,
+            "Failed to kickstart restored Codex Rotate tray launch agent.",
+        )?;
+        return Ok(true);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(false)
     }
 }
 
@@ -329,6 +354,36 @@ fn launchctl_kickstart_label(label: &str) -> Result<()> {
         "{}",
         format_launchctl_failure("kickstart", &output, None)
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_service_is_registered(label: &str) -> Result<bool> {
+    let service = launchctl_service_target(label);
+    let output = launchctl_output(["print", &service])?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if launchctl_output_is_absent_service(&output) {
+        return Ok(false);
+    }
+    Err(anyhow!(
+        "{}",
+        format_launchctl_failure("print", &output, None)
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn bootstrap_tray_launch_agent_after_reset(plist_path: &Path, message: &str) -> Result<()> {
+    if let Err(error) = launchctl_bootstrap_plist(plist_path) {
+        clear_tray_service_registration();
+        launchctl_bootstrap_plist(plist_path).with_context(|| format!("{message}: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn kickstart_tray_launch_agent(label: &str, message: &str) -> Result<()> {
+    launchctl_kickstart_label(label).with_context(|| message.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -957,6 +1012,24 @@ mod tests {
             stderr: b"Could not find service \"com.astronlab.codex-rotate.tray\" in domain for user gui: 501\n".to_vec(),
         };
         assert!(launchctl_output_is_absent_service(&output));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_tray_process_registered_skips_when_no_plist_marker_exists() {
+        let _guard = env_mutex().lock().expect("env mutex");
+        let previous_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let fake_home = unique_temp_dir("codex-rotate-tray-supervisor");
+        fs::create_dir_all(&fake_home).expect("create fake home");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &fake_home);
+        }
+
+        let restored = ensure_tray_process_registered().expect("ensure tray registration");
+        assert!(!restored);
+
+        restore_var("CODEX_ROTATE_HOME", previous_home);
+        fs::remove_dir_all(&fake_home).ok();
     }
 
     #[cfg(target_os = "macos")]
