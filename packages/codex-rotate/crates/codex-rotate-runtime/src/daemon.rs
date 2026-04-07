@@ -87,6 +87,14 @@ impl SharedDaemon {
     }
 }
 
+fn managed_codex_port() -> u16 {
+    std::env::var("CODEX_ROTATE_DEBUG_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PORT)
+}
+
 pub fn run_daemon_forever() -> Result<()> {
     migrate_runtime_state()?;
 
@@ -150,8 +158,9 @@ impl Drop for SocketGuard {
 }
 
 fn initialize_runtime(daemon: &SharedDaemon) {
+    let port = managed_codex_port();
     let result = daemon.with_state_mut(|state| {
-        let _ = ensure_debug_codex_instance(None, Some(DEFAULT_PORT), None, None);
+        let _ = ensure_debug_codex_instance(None, Some(port), None, None);
         refresh_live_account_state(state, true)
     });
 
@@ -270,7 +279,7 @@ fn run_invoke_action(state: &mut DaemonState, action: InvokeAction) -> Result<St
                 .unwrap_or_else(|| "watch healthy".to_string()))
         }
         InvokeAction::OpenManaged => {
-            ensure_debug_codex_instance(None, Some(DEFAULT_PORT), None, None)?;
+            ensure_debug_codex_instance(None, Some(managed_codex_port()), None, None)?;
             refresh_live_account_state(state, true)?;
             Ok(state
                 .snapshot
@@ -282,11 +291,12 @@ fn run_invoke_action(state: &mut DaemonState, action: InvokeAction) -> Result<St
 }
 
 fn run_watch_check(state: &mut DaemonState, force_quota_refresh: bool) -> Result<()> {
+    let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
     let auth_changed = refresh_auth_summary(&mut state.snapshot);
 
     let result = run_watch_iteration(WatchIterationOptions {
-        port: Some(DEFAULT_PORT),
+        port: Some(port),
         after_signal_id: None,
         cooldown_ms: None,
         force_quota_refresh: force_quota_refresh || auth_changed,
@@ -326,6 +336,7 @@ fn run_watch_check(state: &mut DaemonState, force_quota_refresh: bool) -> Result
 }
 
 fn run_manual_next(state: &mut DaemonState) -> Result<String> {
+    let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
     let result = rotate_next_internal()?;
     refresh_static_snapshot(state);
@@ -334,7 +345,7 @@ fn run_manual_next(state: &mut DaemonState) -> Result<String> {
         state.snapshot.last_rotation_to_email = Some(summary.email.clone());
     }
     if state.snapshot.capabilities.live_account_sync {
-        if let Ok(live) = switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
+        if let Ok(live) = switch_live_account_to_current_auth(Some(port), false, 15_000) {
             state.snapshot.current_email = Some(live.email);
             state.snapshot.current_plan = Some(live.plan_type);
         }
@@ -353,6 +364,7 @@ fn run_manual_next(state: &mut DaemonState) -> Result<String> {
 }
 
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
+    let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
     let output = cmd_prev()?;
     refresh_static_snapshot(state);
@@ -360,7 +372,7 @@ fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
     state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
     if state.snapshot.capabilities.live_account_sync {
-        if let Ok(live) = switch_live_account_to_current_auth(Some(DEFAULT_PORT), false, 15_000) {
+        if let Ok(live) = switch_live_account_to_current_auth(Some(port), false, 15_000) {
             state.snapshot.current_email = Some(live.email);
             state.snapshot.current_plan = Some(live.plan_type);
         }
@@ -442,8 +454,9 @@ fn refresh_auth_summary(snapshot: &mut StatusSnapshot) -> bool {
 }
 
 fn refresh_live_account_state(state: &mut DaemonState, force_quota_refresh: bool) -> Result<()> {
+    let port = managed_codex_port();
     refresh_static_snapshot(state);
-    let live = read_live_account(Some(DEFAULT_PORT))?;
+    let live = read_live_account(Some(port))?;
     if let Some(account) = live.account {
         state.snapshot.current_email = account.email;
         state.snapshot.current_plan = account.plan_type;
@@ -605,8 +618,8 @@ mod tests {
     fn migrates_legacy_tray_home_into_rotate_home() {
         let _guard = ENV_MUTEX.lock().expect("env mutex");
         let fake_home = unique_temp_dir("codex-rotate-home");
-        let rotate_home = fake_home.join(".codex-rotate");
-        let legacy_home = fake_home.join(".codex-rotate-app");
+        let rotate_home = fake_home.join(".codex-rotate-v2");
+        let legacy_home = fake_home.join(".codex-rotate-v2-app");
         let previous_home = std::env::var_os("HOME");
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
 

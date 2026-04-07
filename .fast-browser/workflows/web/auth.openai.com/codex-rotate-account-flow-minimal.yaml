@@ -5,7 +5,7 @@ document:
   version: 1.0.1
   summary: "Minimal candidate temporarily converged onto the green explicit flow so reductions can be reintroduced from a working baseline."
   metadata:
-    preferredProfile: dev-1
+    preferredProfile: dev-1-temp
     primaryTarget: primary
     targets:
       - id: primary
@@ -1699,6 +1699,49 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the signup state after password-step security handling."
+  - resend_signup_verification_email:
+      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
+      metadata:
+        description: "Request a fresh signup verification email before collecting the OTP from Gmail."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const result = await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const candidates = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']"))
+                .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+              const resend = candidates.find((node) => /resend email/i.test(normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""))));
+              if (!(resend instanceof HTMLElement)) {
+                return { ok: false, reason: "resend-email-button-not-found" };
+              }
+              resend.click();
+              return {
+                ok: true,
+                label: normalize(resend instanceof HTMLInputElement ? resend.value : (resend.innerText || resend.textContent || "")) || null,
+              };
+            }).catch((error) => ({
+              ok: false,
+              reason: error instanceof Error ? error.message : String(error || "resend-email-click-failed"),
+            }));
+            if (!result || result.ok !== true) {
+              throw new Error(String(result && result.reason ? result.reason : "resend-email-click-failed"));
+            }
+            await page.waitForTimeout(1800).catch(() => {});
+            return result;
   - collect_signup_verification_artifact:
       if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
       metadata:

@@ -1,10 +1,10 @@
 {
-  "name": "@ai-tools/codex-rotate",
+  "name": "@ai-tools/codex-rotate-v2",
   "version": "1.0.0",
   "type": "module",
   "private": true,
   "bin": {
-    "codex-rotate": "./index.ts"
+    "codex-rotate-v2": "./index.ts"
   },
   "files": [
     "index.ts",

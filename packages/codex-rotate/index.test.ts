@@ -16,7 +16,7 @@ const WRAPPER_PATH = join(REPO_ROOT, "packages", "codex-rotate", "index.ts");
 describe("npm wrapper", () => {
   test("forwards create --force to the native CLI binary", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
-    const cliStubPath = join(fixtureRoot, "codex-rotate-cli");
+    const cliStubPath = join(fixtureRoot, "codex-rotate-v2");
     const argsCapturePath = join(fixtureRoot, "args.txt");
 
     try {

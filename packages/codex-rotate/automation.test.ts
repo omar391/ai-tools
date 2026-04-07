@@ -45,6 +45,7 @@ import {
   selectPendingBaseEmailHintForProfile,
   selectPendingCredentialForFamily,
   shouldPromptForCodexRotateSecretUnlock,
+  shouldResetFastBrowserDaemonForSocketClose,
   selectStoredBaseEmailHint,
 } from "./automation.ts";
 
@@ -142,7 +143,7 @@ describe("workflow metadata", () => {
     expect(metadata.workflowRef).toBe(
       "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
     );
-    expect(metadata.preferredProfileName).toBe("dev-1");
+    expect(metadata.preferredProfileName).toBe("dev-1-temp");
     expect(metadata.preferredEmail).toBeNull();
   });
 
@@ -209,6 +210,59 @@ describe("credential store normalization", () => {
 
     expect(store.pending).toEqual({});
   });
+
+  test("migrates to v4 and drops stale benchmark families", () => {
+    const store = normalizeCredentialStore({
+      version: 3,
+      families: {
+        "dev-1::bench.devicefix.{n}@astronlab.com": {
+          profile_name: "dev-1",
+          base_email: "bench.devicefix.{n}@astronlab.com",
+          next_suffix: 8,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T00:00:00.000Z",
+          last_created_email: "bench.devicefix.7@astronlab.com",
+        },
+        "dev-1::dev.{n}@astronlab.com": {
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          next_suffix: 35,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T00:00:00.000Z",
+          last_created_email: "dev.34@astronlab.com",
+        },
+      },
+      pending: {
+        "bench.devicefix.8@astronlab.com": {
+          email: "bench.devicefix.8@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "bench.devicefix.{n}@astronlab.com",
+          suffix: 8,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T00:00:00.000Z",
+          started_at: "2026-04-06T00:00:00.000Z",
+        },
+        "dev.35@astronlab.com": {
+          email: "dev.35@astronlab.com",
+          profile_name: "dev-1",
+          base_email: "dev.{n}@astronlab.com",
+          suffix: 35,
+          selector: null,
+          alias: null,
+          created_at: "2026-04-06T00:00:00.000Z",
+          updated_at: "2026-04-06T00:00:00.000Z",
+          started_at: "2026-04-06T00:00:00.000Z",
+        },
+      },
+    } as never);
+
+    expect(store.version).toBe(4);
+    expect(store.default_create_base_email).toBe("dev.{n}@astronlab.com");
+    expect(Object.keys(store.families)).toEqual(["dev-1::dev.{n}@astronlab.com"]);
+    expect(Object.keys(store.pending)).toEqual(["dev.35@astronlab.com"]);
+  });
 });
 
 describe("temporary profile naming", () => {
@@ -223,6 +277,24 @@ describe("temporary profile naming", () => {
       buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:12.000Z"),
     ).not.toBe(
       buildCodexRotateOpenAiTempProfileName("2026-03-22T10:11:13.000Z"),
+    );
+  });
+});
+
+describe("fast-browser daemon recovery", () => {
+  test("detects detached daemon socket-close crashes as retryable runtime resets", () => {
+    expect(
+      shouldResetFastBrowserDaemonForSocketClose(
+        "Error: Daemon closed the socket before sending a response",
+      ),
+    ).toBe(true);
+    expect(
+      shouldResetFastBrowserDaemonForSocketClose(
+        "Timed out waiting for fast-browser daemon response from /tmp/demo.sock",
+      ),
+    ).toBe(false);
+    expect(shouldResetFastBrowserDaemonForSocketClose("other failure")).toBe(
+      false,
     );
   });
 });
@@ -524,7 +596,7 @@ describe("automation bridge transport", () => {
         result?: { preferredProfileName?: string | null };
       };
       expect(response.ok).toBe(true);
-      expect(response.result?.preferredProfileName).toBe("dev-1");
+      expect(response.result?.preferredProfileName).toBe("dev-1-temp");
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -858,6 +930,8 @@ describe("credential store normalization", () => {
       unknown
     >;
     expect("accounts" in serialized).toBe(false);
+    expect(serialized.version).toBe(4);
+    expect(serialized.default_create_base_email).toBe("dev.{n}@astronlab.com");
     expect(serialized.families).toEqual({
       "dev-1::dev.user@gmail.com": {
         profile_name: "dev-1",
@@ -976,10 +1050,14 @@ describe("credential store state-file merge", () => {
       const merged = JSON.parse(readFileSync(ROTATE_STATE_FILE, "utf8")) as {
         active_index?: number;
         accounts?: Array<{ email?: string }>;
+        version?: number;
+        default_create_base_email?: string;
         families?: Record<string, { next_suffix?: number }>;
       };
       expect(merged.active_index).toBe(2);
       expect(merged.accounts?.[0]?.email).toBe("dev.22@astronlab.com");
+      expect(merged.version).toBe(4);
+      expect(merged.default_create_base_email).toBe("dev.{n}@astronlab.com");
       expect(
         merged.families?.["dev-1::dev.{n}@astronlab.com"]?.next_suffix,
       ).toBe(23);
@@ -1018,12 +1096,14 @@ describe("credential store state-file merge", () => {
         active_index?: number;
         accounts?: Array<{ email?: string }>;
         version?: number;
+        default_create_base_email?: string;
         families?: Record<string, unknown>;
         pending?: Record<string, unknown>;
       };
       expect(merged.active_index).toBe(0);
       expect(merged.accounts?.[0]?.email).toBe("dev.23@astronlab.com");
-      expect("version" in merged).toBe(false);
+      expect(merged.version).toBe(4);
+      expect(merged.default_create_base_email).toBe("dev.{n}@astronlab.com");
       expect("families" in merged).toBe(false);
       expect("pending" in merged).toBe(false);
     } finally {

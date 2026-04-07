@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex Rotate Tray",
+  "productName": "Codex Rotate v2 Tray",
   "version": "1.0.0",
-  "identifier": "com.astronlab.codexrotatetray",
+  "identifier": "com.astronlab.codexrotatev2tray",
   "build": {
     "frontendDist": "../app"
   },

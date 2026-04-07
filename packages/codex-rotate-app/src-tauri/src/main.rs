@@ -1,13 +1,8 @@
-use codex_rotate_runtime::ipc::{
-    daemon_is_reachable, invoke, subscribe, InvokeAction, StatusSnapshot,
+use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
+use codex_rotate_tray::{
+    error_snapshot, rendered_snapshot, spawn_subscription_loop, SharedRenderState,
 };
-use std::{
-    path::PathBuf,
-    process::{Command, Stdio},
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::thread;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -205,8 +200,53 @@ fn paint_percent_digits(rgba: &mut [u8], width: u32, height: u32, center: f32, p
     }
 }
 
+fn paint_v2_glyph(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32) {
+    let glyph_height = 26u32;
+    let v_width = 14u32;
+    let digit_width = 16u32;
+    let digit_height = 26u32;
+    let stroke = 3u32;
+    let half_v = v_width as f32 / 2.0;
+
+    for row in 0..glyph_height {
+        let progress = row as f32 / (glyph_height.saturating_sub(1)) as f32;
+        let inset = (progress * (half_v - stroke as f32 / 2.0)).round() as i32;
+        paint_rect(
+            rgba,
+            width,
+            height,
+            x + inset,
+            y + row as i32,
+            stroke,
+            1,
+            255,
+        );
+        paint_rect(
+            rgba,
+            width,
+            height,
+            x + v_width as i32 - stroke as i32 - inset,
+            y + row as i32,
+            stroke,
+            1,
+            255,
+        );
+    }
+
+    paint_segment_digit(
+        rgba,
+        width,
+        height,
+        x + v_width as i32 + 4,
+        y,
+        digit_width,
+        digit_height,
+        '2',
+    );
+}
+
 fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
-    let width = 96u32;
+    let width = 132u32;
     let height = 96u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     let center = 48.0f32;
@@ -258,17 +298,9 @@ fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
         paint_percent_digits(&mut rgba, width, height, center, percent);
     }
 
+    paint_v2_glyph(&mut rgba, width, height, 98, 35);
+
     Image::new_owned(rgba, width, height)
-}
-
-#[derive(Clone, Default)]
-struct SharedRenderState {
-    inner: Arc<Mutex<RenderState>>,
-}
-
-#[derive(Clone, Default)]
-struct RenderState {
-    last_rendered: Option<RenderedSnapshot>,
 }
 
 #[derive(Clone)]
@@ -282,75 +314,6 @@ struct MenuHandles {
     launch_item: MenuItem<tauri::Wry>,
     check_item: MenuItem<tauri::Wry>,
     rotate_item: MenuItem<tauri::Wry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RenderedSnapshot {
-    account_text: String,
-    inventory_text: String,
-    plan_text: String,
-    quota_text: String,
-    status_text: String,
-    rotation_text: String,
-    tooltip_text: String,
-    quota_percent: Option<u8>,
-    launch_enabled: bool,
-    check_enabled: bool,
-    rotate_enabled: bool,
-}
-
-impl SharedRenderState {
-    fn begin_render(&self, rendered: &RenderedSnapshot) -> bool {
-        let mut state = self.inner.lock().expect("render state mutex");
-        if state.last_rendered.as_ref() == Some(rendered) {
-            return false;
-        }
-        state.last_rendered = Some(rendered.clone());
-        true
-    }
-}
-
-fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
-    let rotation_text = match (
-        snapshot.last_rotation_from_email.as_deref(),
-        snapshot.last_rotation_to_email.as_deref(),
-    ) {
-        (Some(from), Some(to)) if from != to => format!("Last rotation: {from} -> {to}"),
-        (_, Some(to)) => format!("Last rotation: {to}"),
-        _ => "Last rotation: none".to_string(),
-    };
-
-    RenderedSnapshot {
-        account_text: format!(
-            "Account: {}",
-            snapshot.current_email.as_deref().unwrap_or("unknown")
-        ),
-        inventory_text: match snapshot.inventory_count {
-            Some(count) => format!("Inventory: {count} account(s)"),
-            None => "Inventory: unknown".to_string(),
-        },
-        plan_text: format!(
-            "Plan: {}",
-            snapshot.current_plan.as_deref().unwrap_or("unknown")
-        ),
-        quota_text: format!(
-            "Quota: {}",
-            snapshot.current_quota.as_deref().unwrap_or("unknown")
-        ),
-        status_text: format!(
-            "Status: {}",
-            snapshot.last_message.as_deref().unwrap_or("starting")
-        ),
-        rotation_text,
-        tooltip_text: match snapshot.current_quota_percent {
-            Some(percent) => format!("Codex Rotate\nQuota: {percent}%\nClick for status"),
-            None => "Codex Rotate\nClick for status".to_string(),
-        },
-        quota_percent: snapshot.current_quota_percent,
-        launch_enabled: snapshot.capabilities.managed_launch,
-        check_enabled: snapshot.capabilities.quota_watch,
-        rotate_enabled: snapshot.capabilities.live_account_sync,
-    }
 }
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
@@ -384,97 +347,9 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 }
 
-fn error_snapshot(message: impl Into<String>) -> StatusSnapshot {
-    StatusSnapshot {
-        last_message: Some(message.into()),
-        ..StatusSnapshot::default()
-    }
-}
-
 fn run_on_main_thread(app: &AppHandle, snapshot: StatusSnapshot) {
     let app_handle = app.clone();
     let _ = app.run_on_main_thread(move || update_snapshot(&app_handle, snapshot));
-}
-
-fn resolve_cli_binary() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("CODEX_ROTATE_CLI_BIN").map(PathBuf::from) {
-        return Ok(path);
-    }
-
-    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Failed to resolve the tray binary directory.".to_string())?;
-    let binary_name = if cfg!(windows) {
-        "codex-rotate-cli.exe"
-    } else {
-        "codex-rotate-cli"
-    };
-    Ok(current_dir.join(binary_name))
-}
-
-fn ensure_daemon_running() -> Result<(), String> {
-    if daemon_is_reachable() {
-        return Ok(());
-    }
-
-    let cli_binary = resolve_cli_binary()?;
-    let _child = Command::new(&cli_binary)
-        .arg("daemon")
-        .arg("run")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Failed to launch {}: {}", cli_binary.display(), error))?;
-
-    for _ in 0..40 {
-        if daemon_is_reachable() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    Err("Timed out waiting for the Codex Rotate daemon to start.".to_string())
-}
-
-fn spawn_subscription_loop(app: AppHandle) {
-    thread::spawn(move || loop {
-        if let Err(error) = ensure_daemon_running() {
-            run_on_main_thread(
-                &app,
-                error_snapshot(format!("daemon start failed: {}", error)),
-            );
-            thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-
-        let mut subscription = match subscribe() {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                run_on_main_thread(
-                    &app,
-                    error_snapshot(format!("daemon subscribe failed: {}", error)),
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        };
-
-        loop {
-            match subscription.recv() {
-                Ok(snapshot) => run_on_main_thread(&app, snapshot),
-                Err(error) => {
-                    run_on_main_thread(
-                        &app,
-                        error_snapshot(format!("daemon disconnected: {}", error)),
-                    );
-                    thread::sleep(Duration::from_secs(1));
-                    break;
-                }
-            }
-        }
-    });
 }
 
 fn spawn_invoke(app: AppHandle, action: InvokeAction) {
@@ -562,48 +437,10 @@ fn main() {
                 })
                 .build(app)?;
 
-            spawn_subscription_loop(app.handle().clone());
+            let app_handle = app.handle().clone();
+            spawn_subscription_loop(move |snapshot| run_on_main_thread(&app_handle, snapshot));
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("failed to run codex rotate tray");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_rendered_snapshot() -> RenderedSnapshot {
-        RenderedSnapshot {
-            account_text: "Account: dev.1@astronlab.com".to_string(),
-            inventory_text: "Inventory: 3 account(s)".to_string(),
-            plan_text: "Plan: free".to_string(),
-            quota_text: "Quota: 5h 80% left".to_string(),
-            status_text: "Status: watch healthy".to_string(),
-            rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com".to_string(),
-            tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
-            quota_percent: Some(80),
-            launch_enabled: true,
-            check_enabled: true,
-            rotate_enabled: true,
-        }
-    }
-
-    #[test]
-    fn render_state_dedups_identical_rendered_snapshots() {
-        let render_state = SharedRenderState::default();
-        let rendered = sample_rendered_snapshot();
-        assert!(render_state.begin_render(&rendered));
-        assert!(!render_state.begin_render(&rendered));
-    }
-
-    #[test]
-    fn render_state_allows_changed_rendered_snapshots() {
-        let render_state = SharedRenderState::default();
-        let rendered = sample_rendered_snapshot();
-        let mut changed = rendered.clone();
-        changed.status_text = "Status: rotated".to_string();
-        assert!(render_state.begin_render(&rendered));
-        assert!(render_state.begin_render(&changed));
-    }
+        .expect("failed to run codex rotate v2 tray");
 }

@@ -96,11 +96,11 @@ type GroupSummary = {
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(MODULE_DIR, "..", "..", "..", "..", "..");
 const ROTATE_HOME = resolve(
-  process.env.CODEX_ROTATE_HOME || join(homedir(), ".codex-rotate"),
+  process.env.CODEX_ROTATE_HOME || join(homedir(), ".codex-rotate-v2"),
 );
 const CODEX_HOME = resolve(process.env.CODEX_HOME || join(homedir(), ".codex"));
 const CLI_BINARY_NAME =
-  process.platform === "win32" ? "codex-rotate-cli.exe" : "codex-rotate-cli";
+  process.platform === "win32" ? "codex-rotate-v2.exe" : "codex-rotate-v2";
 const WORKFLOW_ROOT = join(
   REPO_ROOT,
   ".fast-browser",
@@ -465,7 +465,7 @@ function resolveCliBinary(): string {
   }
 
   throw new Error(
-    `Unable to find the codex-rotate CLI binary. Checked:\n${candidates.map((candidate) => `- ${candidate}`).join("\n")}`,
+    `Unable to find the codex-rotate-v2 CLI binary. Checked:\n${candidates.map((candidate) => `- ${candidate}`).join("\n")}`,
   );
 }
 

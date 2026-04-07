@@ -60,7 +60,7 @@ fn run() -> Result<()> {
         )?,
         Some(other) => {
             return Err(anyhow!(
-                "Unknown command: \"{other}\". Run \"codex-rotate help\" for usage."
+                "Unknown command: \"{other}\". Run \"codex-rotate-v2 help\" for usage."
             ))
         }
     }
@@ -103,12 +103,12 @@ fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("run") | None => {
             if daemon_is_reachable() {
-                return write_output(writer, "Codex Rotate daemon is already running.");
+                return write_output(writer, "Codex Rotate v2 daemon is already running.");
             }
             run_daemon_forever()
         }
         Some(other) => Err(anyhow!(
-            "Unknown daemon command: \"{other}\". Run \"codex-rotate help\" for usage."
+            "Unknown daemon command: \"{other}\". Run \"codex-rotate-v2 help\" for usage."
         )),
     }
 }
@@ -124,11 +124,11 @@ fn write_output(writer: &mut dyn Write, output: &str) -> Result<()> {
 
 fn parse_add_alias(args: &[String]) -> Result<Option<String>> {
     if args.len() > 1 {
-        return Err(anyhow!("Usage: codex-rotate add [alias]"));
+        return Err(anyhow!("Usage: codex-rotate-v2 add [alias]"));
     }
     if let Some(alias) = args.first() {
         if alias.starts_with('-') {
-            return Err(anyhow!("Usage: codex-rotate add [alias]"));
+            return Err(anyhow!("Usage: codex-rotate-v2 add [alias]"));
         }
         let trimmed = alias.trim();
         if trimmed.is_empty() {
@@ -143,7 +143,7 @@ fn parse_add_alias(args: &[String]) -> Result<Option<String>> {
 
 fn parse_remove_selector(args: &[String]) -> Result<&str> {
     if args.len() != 1 || args[0].starts_with('-') {
-        return Err(anyhow!("Usage: codex-rotate remove <selector>"));
+        return Err(anyhow!("Usage: codex-rotate-v2 remove <selector>"));
     }
     Ok(args[0].as_str())
 }
@@ -172,14 +172,14 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
             "--profile" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("Usage: codex-rotate-v2 create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
                 profile_name = Some(value.clone());
                 index += 1;
             }
             "--base-email" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("Usage: codex-rotate-v2 create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
                 base_email = Some(value.clone());
                 index += 1;
             }
@@ -196,7 +196,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
     }
 
     if positionals.len() > 1 {
-        return Err(anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"));
+        return Err(anyhow!("Usage: codex-rotate-v2 create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"));
     }
 
     Ok(CreateCommandOptions {
@@ -253,7 +253,7 @@ fn parse_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
 
     if positionals.len() != 1 {
         return Err(anyhow!(
-            "Usage: codex-rotate relogin <selector> [--allow-email-change] [--manual-login] [--keep-session]"
+            "Usage: codex-rotate-v2 relogin <selector> [--allow-email-change] [--manual-login] [--keep-session]"
         ));
     }
 
@@ -273,10 +273,10 @@ fn parse_relogin_invocation(args: &[String]) -> Result<ReloginInvocation> {
 fn help_text() -> String {
     format!(
         r#"
-{BOLD}codex-rotate{RESET} - Rotate Codex CLI OAuth tokens across multiple ChatGPT accounts.
+{BOLD}codex-rotate-v2{RESET} - Rotate Codex CLI OAuth tokens across multiple ChatGPT accounts.
 
 {BOLD}USAGE{RESET}
-  codex-rotate <command> [args]
+  codex-rotate-v2 <command> [args]
 
 {BOLD}COMMANDS{RESET}
   {CYAN}add{RESET} [alias]      Snapshot current ~/.codex/auth.json into the pool
@@ -474,7 +474,7 @@ mod tests {
             handle.join().expect("daemon probe thread")?;
             assert_eq!(
                 String::from_utf8(output).expect("utf8").trim(),
-                "Codex Rotate daemon is already running."
+                "Codex Rotate v2 daemon is already running."
             );
             Ok(())
         })

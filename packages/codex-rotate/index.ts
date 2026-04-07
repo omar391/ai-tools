@@ -9,8 +9,8 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
 const IS_WINDOWS = process.platform === "win32";
 const CLI_BINARY_NAME = IS_WINDOWS
-  ? "codex-rotate-cli.exe"
-  : "codex-rotate-cli";
+  ? "codex-rotate-v2.exe"
+  : "codex-rotate-v2";
 
 function resolveBinaryCandidates(): string[] {
   return [
@@ -34,7 +34,7 @@ function resolveCliBinary(): string {
   const checked = candidates.map((candidate) => `  - ${candidate}`).join("\n");
   throw new Error(
     [
-      "Unable to find the codex-rotate CLI binary.",
+      "Unable to find the codex-rotate-v2 CLI binary.",
       "Set CODEX_ROTATE_BIN or install a package that ships the native binary.",
       checked ? `Checked:\n${checked}` : "",
     ]
@@ -55,7 +55,7 @@ function main(): never {
   }
   if (result.signal) {
     process.stderr.write(
-      `codex-rotate was interrupted by signal ${result.signal}.\n`,
+      `codex-rotate-v2 was interrupted by signal ${result.signal}.\n`,
     );
     process.exit(1);
   }

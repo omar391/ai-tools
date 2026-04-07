@@ -27,7 +27,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
         .unwrap_or_else(|| home.join(".codex"));
     let rotate_home = std::env::var_os("CODEX_ROTATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex-rotate"));
+        .unwrap_or_else(|| home.join(".codex-rotate-v2"));
     let default_account_flow_file = repo_root
         .join(".fast-browser")
         .join("workflows")

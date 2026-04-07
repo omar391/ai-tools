@@ -4,6 +4,10 @@ version = "1.0.0"
 description = "Codex Rotate Tray"
 edition = "2021"
 
+[[bin]]
+name = "codex-rotate-v2-tray"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.0.1", features = [] }
 

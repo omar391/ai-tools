@@ -5,7 +5,7 @@ document:
   version: 1.0.5
   summary: "Benchmark-selected codex-rotate OpenAI account flow that runs the fastest proven non-device workflow first and falls back to device authorization when needed."
   metadata:
-    preferredProfile: dev-1
+    preferredProfile: dev-1-temp
     primaryTarget: primary
     targets:
       - id: primary

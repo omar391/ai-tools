@@ -295,7 +295,7 @@ pub fn rotate_next_internal() -> Result<NextResult> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     if pool.accounts.is_empty() {
-        return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+        return Err(anyhow!("No accounts in pool. Run: codex-rotate-v2 add"));
     }
 
     let mut dirty = normalize_pool_entries(&mut pool);
@@ -435,11 +435,11 @@ pub fn cmd_prev() -> Result<String> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     if pool.accounts.is_empty() {
-        return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+        return Err(anyhow!("No accounts in pool. Run: codex-rotate-v2 add"));
     }
     if pool.accounts.len() == 1 {
         return Err(anyhow!(
-            "Only 1 account in pool. Add more with: codex-rotate add"
+            "Only 1 account in pool. Add more with: codex-rotate-v2 add"
         ));
     }
 
@@ -480,7 +480,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut dirty = normalize_pool_entries(&mut pool);
     if pool.accounts.is_empty() {
         output.push_line(format!(
-            "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"
+            "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate-v2 add"
         ))?;
         return Ok(());
     }
@@ -589,7 +589,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut live_pool_index = None;
 
     output.push_line(String::new())?;
-    output.push_line(format!("{BOLD}Codex Rotate Status{RESET}"))?;
+    output.push_line(format!("{BOLD}Codex Rotate v2 Status{RESET}"))?;
     output.push_line(String::new())?;
 
     if paths.codex_auth_file.exists() {
@@ -765,7 +765,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
 
 pub fn cmd_remove(selector: &str) -> Result<String> {
     if selector.trim().is_empty() {
-        return Err(anyhow!("Usage: codex-rotate remove <selector>"));
+        return Err(anyhow!("Usage: codex-rotate-v2 remove <selector>"));
     }
     let mut pool = load_pool()?;
     let selection = resolve_account_selector(&pool, selector)?;

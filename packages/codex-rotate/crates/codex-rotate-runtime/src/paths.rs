@@ -27,5 +27,5 @@ pub fn resolve_paths() -> Result<RuntimePaths> {
 
 pub fn legacy_rotate_app_home() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to resolve home directory.")?;
-    Ok(home.join(".codex-rotate-app"))
+    Ok(home.join(".codex-rotate-v2-app"))
 }
