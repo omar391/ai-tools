@@ -343,6 +343,7 @@ dependencies = [
  "codex-rotate-runtime",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

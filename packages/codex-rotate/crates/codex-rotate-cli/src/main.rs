@@ -1,3 +1,5 @@
+mod managed_login;
+
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ use codex_rotate_runtime::dev_refresh::{
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
 };
+use managed_login::run_managed_login;
 
 const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[36m";
@@ -49,6 +52,7 @@ fn run() -> Result<()> {
             write_output(&mut stdout, &help_text())?
         }
         Some("daemon") => run_daemon_command(&mut stdout, &args[1..])?,
+        Some("internal") => run_internal_command(&args[1..])?,
         Some("tray") => run_tray_command(&mut stdout, &args[1..])?,
         Some("add") => write_output(
             &mut stdout,
@@ -177,6 +181,14 @@ fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
         Some(other) => Err(anyhow!(
             "Unknown daemon command: \"{other}\". Run \"codex-rotate help\" for usage."
         )),
+    }
+}
+
+fn run_internal_command(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("managed-login") => run_managed_login(&args[1..]),
+        Some(other) => Err(anyhow!("Unknown internal command: \"{other}\".")),
+        None => Err(anyhow!("Usage: codex-rotate internal <subcommand>")),
     }
 }
 
@@ -847,8 +859,14 @@ mod tests {
             fs::set_permissions(&tray_stub_path, permissions).expect("set tray stub permissions");
 
             let previous_tray_bin = std::env::var_os("CODEX_ROTATE_TRAY_BIN");
+            let previous_launchd_label = std::env::var_os("CODEX_ROTATE_TRAY_LAUNCHD_LABEL");
+            let launchd_label = format!(
+                "com.astronlab.codex-rotate.tray.test.{}",
+                std::process::id()
+            );
             unsafe {
                 std::env::set_var("CODEX_ROTATE_TRAY_BIN", &tray_stub_path);
+                std::env::set_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL", &launchd_label);
             }
 
             let test_result = (|| -> Result<()> {
@@ -888,6 +906,10 @@ mod tests {
             match previous_tray_bin {
                 Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_BIN", value) },
                 None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_BIN") },
+            }
+            match previous_launchd_label {
+                Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL", value) },
+                None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL") },
             }
 
             test_result?;

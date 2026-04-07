@@ -4,7 +4,7 @@ use std::os::raw::c_int;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
@@ -14,6 +14,8 @@ use crate::paths::resolve_paths;
 const FRESHNESS_TOLERANCE: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 pub const MACOS_TRAY_LAUNCHD_LABEL: &str = "com.astronlab.codex-rotate.tray";
+#[cfg(target_os = "macos")]
+const MACOS_TRAY_LAUNCHD_LABEL_ENV: &str = "CODEX_ROTATE_TRAY_LAUNCHD_LABEL";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildProfile {
@@ -166,11 +168,17 @@ pub fn spawn_detached_process(binary: &Path, args: &[&str]) -> Result<()> {
 pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        clear_tray_service_registration();
+        let label = tray_launchd_label();
         let plist_path = write_tray_launch_agent_plist(tray_binary)?;
-        launchctl_bootstrap_plist(&plist_path)
-            .context("Failed to bootstrap Codex Rotate tray launch agent.")?;
-        launchctl_kickstart_label(MACOS_TRAY_LAUNCHD_LABEL)
+        if let Err(error) = launchctl_bootstrap_plist(&plist_path) {
+            clear_tray_service_registration();
+            launchctl_bootstrap_plist(&plist_path).with_context(|| {
+                format!(
+                    "Failed to bootstrap Codex Rotate tray launch agent after reset: {error}"
+                )
+            })?;
+        }
+        launchctl_kickstart_label(&label)
             .context("Failed to start Codex Rotate tray launch agent.")?;
         return Ok(());
     }
@@ -184,10 +192,11 @@ pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
 pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        let label = tray_launchd_label();
         let plist_path = write_tray_launch_agent_plist(tray_binary)?;
         let script = format!(
             "sleep 1; launchctl kickstart -k {service} >/dev/null 2>&1 || (launchctl bootstrap {domain} {plist} >/dev/null 2>&1 && launchctl kickstart -k {service} >/dev/null 2>&1)",
-            service = shell_single_quote_string(&launchctl_service_target(MACOS_TRAY_LAUNCHD_LABEL)),
+            service = shell_single_quote_string(&launchctl_service_target(&label)),
             domain = shell_single_quote_string(&launchctl_user_domain()),
             plist = shell_single_quote(&plist_path),
         );
@@ -209,14 +218,12 @@ pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
 pub fn clear_tray_service_registration() {
     #[cfg(target_os = "macos")]
     {
+        let label = tray_launchd_label();
         if let Ok(plist_path) = tray_launch_agent_plist_path() {
-            let _ = launchctl_bootout_plist(&plist_path);
+            let _ = launchctl_bootout_plist_quiet(&plist_path);
             let _ = fs::remove_file(plist_path);
         }
-        let _ = Command::new("launchctl")
-            .arg("remove")
-            .arg(MACOS_TRAY_LAUNCHD_LABEL)
-            .status();
+        let _ = launchctl_remove_label_quiet(&label);
     }
 }
 
@@ -239,6 +246,7 @@ fn write_tray_launch_agent_plist(tray_binary: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn tray_launch_agent_plist_contents(tray_binary: &Path) -> String {
+    let label = tray_launchd_label();
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -247,7 +255,7 @@ fn tray_launch_agent_plist_contents(tray_binary: &Path) -> String {
   <key>Label</key>
   <string>"#,
     );
-    xml.push_str(&xml_escape(MACOS_TRAY_LAUNCHD_LABEL));
+    xml.push_str(&xml_escape(&label));
     xml.push_str(
         r#"</string>
   <key>ProgramArguments</key>
@@ -300,56 +308,105 @@ fn launch_agent_environment_variables() -> Vec<(String, String)> {
 
 #[cfg(target_os = "macos")]
 fn launchctl_bootstrap_plist(plist_path: &Path) -> Result<()> {
-    let status = Command::new("launchctl")
-        .arg("bootstrap")
-        .arg(launchctl_user_domain())
-        .arg(plist_path)
-        .status()
-        .context("Failed to invoke launchctl bootstrap.")?;
-    if status.success() {
+    let output = launchctl_output(["bootstrap", &launchctl_user_domain(), &plist_path.display().to_string()])?;
+    if output.status.success() {
         return Ok(());
     }
     Err(anyhow!(
-        "launchctl bootstrap exited with status {} for {}.",
-        status,
-        plist_path.display()
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn launchctl_bootout_plist(plist_path: &Path) -> Result<()> {
-    let status = Command::new("launchctl")
-        .arg("bootout")
-        .arg(launchctl_user_domain())
-        .arg(plist_path)
-        .status()
-        .context("Failed to invoke launchctl bootout.")?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "launchctl bootout exited with status {} for {}.",
-        status,
-        plist_path.display()
+        "{}",
+        format_launchctl_failure("bootstrap", &output, Some(plist_path))
     ))
 }
 
 #[cfg(target_os = "macos")]
 fn launchctl_kickstart_label(label: &str) -> Result<()> {
-    let status = Command::new("launchctl")
-        .arg("kickstart")
-        .arg("-k")
-        .arg(launchctl_service_target(label))
-        .status()
-        .context("Failed to invoke launchctl kickstart.")?;
-    if status.success() {
+    let service = launchctl_service_target(label);
+    let output = launchctl_output(["kickstart", "-k", &service])?;
+    if output.status.success() {
         return Ok(());
     }
     Err(anyhow!(
-        "launchctl kickstart exited with status {} for {}.",
-        status,
-        label
+        "{}",
+        format_launchctl_failure("kickstart", &output, None)
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_output<const N: usize>(args: [&str; N]) -> Result<Output> {
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("Failed to invoke launchctl.")
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout_plist_quiet(plist_path: &Path) -> Result<()> {
+    let output = Command::new("launchctl")
+        .arg("bootout")
+        .arg(launchctl_user_domain())
+        .arg(plist_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to invoke launchctl bootout.")?;
+    if output.status.success() || launchctl_output_is_absent_service(&output) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}",
+        format_launchctl_failure("bootout", &output, Some(plist_path))
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_remove_label_quiet(label: &str) -> Result<()> {
+    let output = Command::new("launchctl")
+        .arg("remove")
+        .arg(label)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to invoke launchctl remove.")?;
+    if output.status.success() || launchctl_output_is_absent_service(&output) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}",
+        format_launchctl_failure("remove", &output, None)
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_output_is_absent_service(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    [stderr.as_ref(), stdout.as_ref()].iter().any(|text| {
+        text.contains("Could not find service")
+            || text.contains("No such process")
+            || text.contains("service cannot load in requested session")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn format_launchctl_failure(action: &str, output: &Output, plist_path: Option<&Path>) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match plist_path {
+        Some(path) if !detail.is_empty() => format!(
+            "launchctl {action} exited with status {} for {}: {}",
+            output.status,
+            path.display(),
+            detail
+        ),
+        Some(path) => format!(
+            "launchctl {action} exited with status {} for {}.",
+            output.status,
+            path.display()
+        ),
+        None if !detail.is_empty() => {
+            format!("launchctl {action} exited with status {}: {}", output.status, detail)
+        }
+        None => format!("launchctl {action} exited with status {}.", output.status),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -360,6 +417,15 @@ fn launchctl_user_domain() -> String {
 #[cfg(target_os = "macos")]
 fn launchctl_service_target(label: &str) -> String {
     format!("{}/{}", launchctl_user_domain(), label)
+}
+
+#[cfg(target_os = "macos")]
+fn tray_launchd_label() -> String {
+    std::env::var(MACOS_TRAY_LAUNCHD_LABEL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| MACOS_TRAY_LAUNCHD_LABEL.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -880,6 +946,23 @@ mod tests {
         restore_var("CODEX_ROTATE_HOME", previous_home);
         restore_var("CODEX_ROTATE_DEBUG_PORT", previous_debug_port);
         fs::remove_dir_all(&fake_home).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchctl_absent_service_output_is_treated_as_benign() {
+        let output = Output {
+            status: exit_status_from_code(5),
+            stdout: Vec::new(),
+            stderr: b"Could not find service \"com.astronlab.codex-rotate.tray\" in domain for user gui: 501\n".to_vec(),
+        };
+        assert!(launchctl_output_is_absent_service(&output));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
     }
 
     #[test]

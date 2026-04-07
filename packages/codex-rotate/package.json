@@ -4,14 +4,14 @@
   "type": "module",
   "private": true,
   "bin": {
-    "codex-rotate": "./index.ts"
+    "codex-rotate": "./index.js"
   },
   "files": [
+    "index.js",
     "index.ts",
     "dist",
     "automation.ts",
     "automation-bridge.ts",
-    "codex-login-app-server-helper.mjs",
     "codex-login-managed-browser-opener.mjs"
   ],
   "engines": {

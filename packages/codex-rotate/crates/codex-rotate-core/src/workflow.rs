@@ -268,6 +268,8 @@ struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_file: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workflow_run_stamp: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_signup_recovery: Option<bool>,
@@ -1275,9 +1277,11 @@ fn run_complete_codex_login(
             &fallback_birth_date
         }
     };
+    let workflow_ref = workflow_file.and_then(derive_workflow_ref_from_file_path);
     let options = BridgeLoginOptions {
         codex_bin,
         workflow_file: workflow_file.and_then(|path| path.to_str()),
+        workflow_ref: workflow_ref.as_deref(),
         workflow_run_stamp,
         prefer_signup_recovery,
         full_name: Some(DEFAULT_OPENAI_FULL_NAME),

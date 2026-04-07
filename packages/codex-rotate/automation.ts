@@ -80,10 +80,8 @@ const CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT = resolve(
   MODULE_DIR,
   "codex-login-managed-browser-opener.mjs",
 );
-const CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT = resolve(
-  MODULE_DIR,
-  "codex-login-app-server-helper.mjs",
-);
+const CODEX_ROTATE_CLI_BINARY_NAME =
+  process.platform === "win32" ? "codex-rotate.exe" : "codex-rotate";
 
 const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID =
   "workspace.web.auth-openai-com.codex-rotate-account-flow-main";
@@ -514,7 +512,7 @@ export function cleanupLegacyCodexRotateArtifacts(rootDir = ROTATE_HOME): void {
           LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS,
         ) ||
           (typeof binEntryContents === "string" &&
-            !binEntryContents.includes("codex-login-app-server-helper.mjs")))
+            !binEntryContents.includes("internal managed-login")))
       ) {
         rmSync(binEntryPath, { force: true });
       }
@@ -1081,12 +1079,32 @@ function resolveCodexLoginManagedBrowserOpenerPath(): string {
   return CODEX_LOGIN_MANAGED_BROWSER_OPENER_DEFAULT;
 }
 
-function resolveCodexLoginManagedLoginHelperPath(): string {
-  const override = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN?.trim();
-  if (override) {
-    return override;
+function resolveCodexRotateCliBinaryPath(): string {
+  const candidates = [
+    process.env.CODEX_ROTATE_BIN?.trim(),
+    process.env.CODEX_ROTATE_CLI_BIN?.trim(),
+    join(MODULE_DIR, "bin", CODEX_ROTATE_CLI_BINARY_NAME),
+    join(MODULE_DIR, "dist", "bin", CODEX_ROTATE_CLI_BINARY_NAME),
+    join(REPO_ROOT, "target", "debug", CODEX_ROTATE_CLI_BINARY_NAME),
+    join(REPO_ROOT, "target", "release", CODEX_ROTATE_CLI_BINARY_NAME),
+  ].filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
-  return CODEX_LOGIN_MANAGED_APP_SERVER_HELPER_DEFAULT;
+
+  throw new Error(
+    [
+      "Unable to find the codex-rotate CLI binary for the managed login wrapper.",
+      candidates.length > 0
+        ? `Checked:\n${candidates.map((candidate) => `  - ${candidate}`).join("\n")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  );
 }
 
 function ensureCodexLoginManagedBrowserOpener(): void {
@@ -1099,14 +1117,11 @@ function ensureCodexLoginManagedBrowserOpener(): void {
   chmodSync(openerPath, 0o700);
 }
 
-function ensureCodexLoginManagedLoginHelper(): void {
-  const helperPath = resolveCodexLoginManagedLoginHelperPath();
-  if (!existsSync(helperPath)) {
-    throw new Error(
-      `Managed Codex login helper script not found at ${helperPath}.`,
-    );
+function ensureCodexRotateCliBinary(): void {
+  const cliBinary = resolveCodexRotateCliBinaryPath();
+  if (!existsSync(cliBinary)) {
+    throw new Error(`codex-rotate CLI binary not found at ${cliBinary}.`);
   }
-  chmodSync(helperPath, 0o700);
 }
 
 function shellSingleQuote(value: string): string {
@@ -1119,7 +1134,7 @@ function renderCodexLoginManagedBrowserWrapper(
   shimDir: string,
   nodeBin: string,
   openerPath: string,
-  loginHelperPath: string,
+  rotateCliBin: string,
 ): string {
   return [
     "#!/bin/sh",
@@ -1130,7 +1145,7 @@ function renderCodexLoginManagedBrowserWrapper(
     `export CODEX_ROTATE_REAL_CODEX=${shellSingleQuote(realCodexBin)}`,
     'if [ "$1" = "login" ]; then',
     "  shift",
-    `  exec ${shellSingleQuote(nodeBin)} ${shellSingleQuote(loginHelperPath)} "$@"`,
+    `  exec ${shellSingleQuote(rotateCliBin)} internal managed-login "$@"`,
     "fi",
     `exec ${shellSingleQuote(realCodexBin)} \"$@\"`,
     "",
@@ -1165,7 +1180,6 @@ export function buildCodexLoginManagedBrowserWrapperPath(
   codexBin: string,
 ): string {
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
-  const loginHelperPath = resolveCodexLoginManagedLoginHelperPath();
   const profileToken =
     String(profileName || "default")
       .toLowerCase()
@@ -1173,7 +1187,7 @@ export function buildCodexLoginManagedBrowserWrapperPath(
       .replace(/^-|-$/g, "")
       .slice(0, 32) || "default";
   const hash = createHash("sha256")
-    .update(`${profileName}\n${codexBin}\n${openerPath}\n${loginHelperPath}`)
+    .update(`${profileName}\n${codexBin}\n${openerPath}\nrust-managed-login`)
     .digest("hex")
     .slice(0, 12);
   return join(ROTATE_HOME, "bin", `codex-login-${profileToken}-${hash}`);
@@ -1184,10 +1198,10 @@ export function ensureCodexLoginManagedBrowserWrapper(
   codexBin: string,
 ): string {
   ensureCodexLoginManagedBrowserOpener();
-  ensureCodexLoginManagedLoginHelper();
+  ensureCodexRotateCliBinary();
   mkdirSync(join(ROTATE_HOME, "bin"), { recursive: true });
   const openerPath = resolveCodexLoginManagedBrowserOpenerPath();
-  const loginHelperPath = resolveCodexLoginManagedLoginHelperPath();
+  const rotateCliBin = resolveCodexRotateCliBinaryPath();
   const shimDir = join(ROTATE_HOME, "bin", "codex-login-shims");
   ensureCodexLoginManagedBrowserShims(shimDir, NODE_BINARY, openerPath);
   const wrapperPath = buildCodexLoginManagedBrowserWrapperPath(
@@ -1200,7 +1214,7 @@ export function ensureCodexLoginManagedBrowserWrapper(
     shimDir,
     NODE_BINARY,
     openerPath,
-    loginHelperPath,
+    rotateCliBin,
   );
   const current = existsSync(wrapperPath)
     ? readFileSync(wrapperPath, "utf8")
@@ -1817,7 +1831,7 @@ function deriveWorkflowRefFromRoot(
   return parts.length === 4 ? parts.join(".") : null;
 }
 
-export function deriveWorkflowRefFromFilePath(filePath: string): string | null {
+function deriveWorkflowRefFromFilePath(filePath: string): string | null {
   return (
     deriveWorkflowRefFromRoot(
       filePath,
@@ -1841,6 +1855,7 @@ async function runCodexBrowserLoginWorkflow(
     artifactMode?: "minimal" | "full";
     codexBin?: string;
     workflowFile?: string;
+    workflowRef?: string;
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
     fullName?: string;
@@ -1859,7 +1874,11 @@ async function runCodexBrowserLoginWorkflow(
       ? resolve(options.workflowFile)
       : CODEX_ROTATE_ACCOUNT_FLOW_FILE;
   const workflowRef =
-    deriveWorkflowRefFromFilePath(workflowFile) ??
+    ((typeof options?.workflowRef === "string" &&
+    options.workflowRef.trim().length > 0
+      ? options.workflowRef.trim()
+      : null) ||
+      deriveWorkflowRefFromFilePath(workflowFile)) ??
     DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID;
   return await runFastBrowserDaemonWorkflow(
     workflowRef,
@@ -1923,6 +1942,7 @@ export async function completeCodexLoginViaWorkflow(
   options?: {
     codexBin?: string;
     workflowFile?: string;
+    workflowRef?: string;
     workflowRunStamp?: string;
     preferSignupRecovery?: boolean;
     fullName?: string;
@@ -1994,6 +2014,7 @@ export async function completeCodexLoginViaWorkflow(
             {
               codexBin: options?.codexBin,
               workflowFile: options?.workflowFile,
+              workflowRef: options?.workflowRef,
               codexSession,
               preferSignupRecovery: allowSignupRecovery,
               fullName: options?.fullName,

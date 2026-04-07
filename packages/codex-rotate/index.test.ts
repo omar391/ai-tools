@@ -11,7 +11,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
-const WRAPPER_PATH = join(REPO_ROOT, "packages", "codex-rotate", "index.ts");
+const WRAPPER_PATH = join(REPO_ROOT, "packages", "codex-rotate", "index.js");
+const LEGACY_WRAPPER_PATH = join(
+  REPO_ROOT,
+  "packages",
+  "codex-rotate",
+  "index.ts",
+);
 
 describe("npm wrapper", () => {
   test("forwards create --force to the native CLI binary", () => {
@@ -73,6 +79,38 @@ printf 'tray-wrapper-ok\n'
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("tray-wrapper-ok");
       expect(readFileSync(argsCapturePath, "utf8")).toBe("tray\nstatus\n");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("legacy index.ts shim still forwards to the native CLI binary", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-legacy-"));
+    const cliStubPath = join(fixtureRoot, "codex-rotate");
+    const argsCapturePath = join(fixtureRoot, "args.txt");
+
+    try {
+      writeFileSync(
+        cliStubPath,
+        `#!/bin/sh
+printf '%s\n' "$@" > "${argsCapturePath}"
+printf 'legacy-wrapper-ok\n'
+`,
+      );
+      chmodSync(cliStubPath, 0o755);
+
+      const result = spawnSync("node", [LEGACY_WRAPPER_PATH, "status"], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          CODEX_ROTATE_BIN: cliStubPath,
+        },
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("legacy-wrapper-ok");
+      expect(readFileSync(argsCapturePath, "utf8")).toBe("status\n");
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }

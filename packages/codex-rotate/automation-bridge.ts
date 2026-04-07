@@ -40,6 +40,7 @@ type BridgeRequest =
         options?: {
           codexBin?: string;
           workflowFile?: string;
+          workflowRef?: string;
           workflowRunStamp?: string;
           preferSignupRecovery?: boolean;
           fullName?: string;

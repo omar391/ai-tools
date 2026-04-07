@@ -17,7 +17,7 @@ Codex Rotate is now CLI-owned end to end.
 | CLI daemon runtime  | `packages/codex-rotate/crates/codex-rotate-runtime/src/*.rs`                        | Watch loop, launcher, CDP, logs, live sync, thread recovery, daemon IPC               |
 | Shared engine core  | `packages/codex-rotate/crates/codex-rotate-core/src/*.rs`                           | Auth parsing, quota cache, pool engine, create/relogin orchestration                  |
 | Rust CLI            | `packages/codex-rotate/crates/codex-rotate-cli/src/main.rs`                         | Stable `codex-rotate` command surface and `daemon run`                                |
-| npm wrapper         | `packages/codex-rotate/index.ts`                                                    | Thin Node launcher into the shipped native CLI                                        |
+| npm wrapper         | `packages/codex-rotate/index.js`                                                    | Thin Node launcher into the shipped native CLI                                        |
 | Automation boundary | `packages/codex-rotate/automation.ts`, `packages/codex-rotate/automation-bridge.ts` | `fast-browser`, workflow metadata, Bitwarden secret refs, managed-browser Codex login |
 
 ## Component Diagram
@@ -29,7 +29,7 @@ flowchart LR
   Runtime["CLI Runtime Daemon<br/>codex-rotate-runtime"]
   Engine["Engine Core<br/>pool.rs / workflow.rs / quota.rs"]
   CLI["Rust CLI<br/>codex-rotate-cli"]
-  Wrapper["Node Wrapper<br/>packages/codex-rotate/index.ts"]
+  Wrapper["Node Wrapper<br/>packages/codex-rotate/index.js"]
   Bridge["Automation Bridge<br/>automation-bridge.ts"]
   Auto["Automation Engine<br/>automation.ts + fast-browser"]
   Codex["Codex.app<br/>managed profile"]
@@ -128,8 +128,10 @@ sequenceDiagram
 
 Intentional TS/JS files:
 
-- `packages/codex-rotate/index.ts`
+- `packages/codex-rotate/index.js`
   Packaging wrapper only. It resolves and executes a shipped native CLI binary.
+- `packages/codex-rotate/index.ts`
+  Legacy compatibility shim for existing npm or local links that still target `index.ts`.
 - `packages/codex-rotate/automation-bridge.ts`
   JSON-over-stdio bridge for automation commands.
 - `packages/codex-rotate/automation.ts`

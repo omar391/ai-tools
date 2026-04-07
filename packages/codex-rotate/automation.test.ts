@@ -130,29 +130,15 @@ describe("codex login managed-browser wrapper", () => {
     );
   });
 
-  test("intercepts login through the dedicated managed-login helper", () => {
+  test("intercepts login through the rust managed-login entrypoint", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-wrapper-"));
     const rotateHome = join(fixtureRoot, "rotate-home");
-    const helperLogPath = join(fixtureRoot, "helper-log.json");
-    const helperPath = join(fixtureRoot, "fake-helper.mjs");
+    const cliLogPath = join(fixtureRoot, "cli-log.json");
+    const cliPath = join(fixtureRoot, "fake-codex-rotate.sh");
     const codexMarkerPath = join(fixtureRoot, "codex-invoked.txt");
     const codexPath = join(fixtureRoot, "fake-codex.sh");
     const previousRotateHome = getCodexRotateHome();
 
-    writeFileSync(
-      helperPath,
-      [
-        "#!/usr/bin/env node",
-        'import { writeFileSync } from "node:fs";',
-        "const logPath = process.env.CODEX_ROTATE_TEST_HELPER_LOG;",
-        "writeFileSync(logPath, JSON.stringify({",
-        "  argv: process.argv.slice(2),",
-        "  profile: process.env.FAST_BROWSER_PROFILE || null,",
-        "  realCodex: process.env.CODEX_ROTATE_REAL_CODEX || null,",
-        "}));",
-      ].join("\n"),
-      { encoding: "utf8", mode: 0o700 },
-    );
     writeFileSync(
       codexPath,
       [
@@ -163,14 +149,26 @@ describe("codex login managed-browser wrapper", () => {
       { mode: 0o700 },
     );
 
-    const previousHelper = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
-    const previousLog = process.env.CODEX_ROTATE_TEST_HELPER_LOG;
+    writeFileSync(
+      cliPath,
+      [
+        "#!/bin/sh",
+        'cat <<EOF > "$CODEX_ROTATE_TEST_CLI_LOG"',
+        '{"argv":["$1","$2"],"profile":"$FAST_BROWSER_PROFILE","realCodex":"$CODEX_ROTATE_REAL_CODEX"}',
+        "EOF",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+
+    const previousCli = process.env.CODEX_ROTATE_CLI_BIN;
+    const previousLog = process.env.CODEX_ROTATE_TEST_CLI_LOG;
 
     try {
       mkdirSync(rotateHome, { recursive: true });
       setCodexRotateHomeForTesting(rotateHome);
-      process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
-      process.env.CODEX_ROTATE_TEST_HELPER_LOG = helperLogPath;
+      process.env.CODEX_ROTATE_CLI_BIN = cliPath;
+      process.env.CODEX_ROTATE_TEST_CLI_LOG = cliLogPath;
 
       const wrapperPath = ensureCodexLoginManagedBrowserWrapper(
         "managed-dev-1",
@@ -182,26 +180,26 @@ describe("codex login managed-browser wrapper", () => {
       });
 
       expect(result.status).toBe(0);
-      const logged = JSON.parse(readFileSync(helperLogPath, "utf8")) as {
+      const logged = JSON.parse(readFileSync(cliLogPath, "utf8")) as {
         argv: string[];
         profile: string | null;
         realCodex: string | null;
       };
       expect(logged.profile).toBe("managed-dev-1");
-      expect(logged.argv).toEqual([]);
+      expect(logged.argv).toEqual(["internal", "managed-login"]);
       expect(logged.realCodex).toBe(codexPath);
       expect(existsSync(codexMarkerPath)).toBe(false);
     } finally {
       setCodexRotateHomeForTesting(previousRotateHome);
-      if (previousHelper === undefined) {
-        delete process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+      if (previousCli === undefined) {
+        delete process.env.CODEX_ROTATE_CLI_BIN;
       } else {
-        process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = previousHelper;
+        process.env.CODEX_ROTATE_CLI_BIN = previousCli;
       }
       if (previousLog === undefined) {
-        delete process.env.CODEX_ROTATE_TEST_HELPER_LOG;
+        delete process.env.CODEX_ROTATE_TEST_CLI_LOG;
       } else {
-        process.env.CODEX_ROTATE_TEST_HELPER_LOG = previousLog;
+        process.env.CODEX_ROTATE_TEST_CLI_LOG = previousLog;
       }
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -212,7 +210,7 @@ describe("codex login managed-browser wrapper", () => {
     const rotateHome = join(fixtureRoot, "rotate-home");
     const openerLogPath = join(fixtureRoot, "opener-log.json");
     const openerPath = join(fixtureRoot, "fake-opener.mjs");
-    const helperPath = join(fixtureRoot, "fake-helper.mjs");
+    const cliPath = join(fixtureRoot, "fake-codex-rotate.sh");
     const codexPath = join(fixtureRoot, "fake-codex.sh");
     const previousRotateHome = getCodexRotateHome();
 
@@ -230,7 +228,7 @@ describe("codex login managed-browser wrapper", () => {
       ].join("\n"),
       { encoding: "utf8", mode: 0o700 },
     );
-    writeFileSync(helperPath, ["#!/bin/sh", "exit 0"].join("\n"), {
+    writeFileSync(cliPath, ["#!/bin/sh", "exit 0"].join("\n"), {
       mode: 0o700,
     });
     writeFileSync(
@@ -244,14 +242,14 @@ describe("codex login managed-browser wrapper", () => {
     );
 
     const previousOpener = process.env.CODEX_ROTATE_BROWSER_OPENER_BIN;
-    const previousHelper = process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+    const previousCli = process.env.CODEX_ROTATE_CLI_BIN;
     const previousLog = process.env.CODEX_ROTATE_TEST_OPENER_LOG;
 
     try {
       mkdirSync(rotateHome, { recursive: true });
       setCodexRotateHomeForTesting(rotateHome);
       process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = openerPath;
-      process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = helperPath;
+      process.env.CODEX_ROTATE_CLI_BIN = cliPath;
       process.env.CODEX_ROTATE_TEST_OPENER_LOG = openerLogPath;
 
       const wrapperPath = ensureCodexLoginManagedBrowserWrapper(
@@ -281,10 +279,10 @@ describe("codex login managed-browser wrapper", () => {
       } else {
         process.env.CODEX_ROTATE_BROWSER_OPENER_BIN = previousOpener;
       }
-      if (previousHelper === undefined) {
-        delete process.env.CODEX_ROTATE_LOGIN_HELPER_BIN;
+      if (previousCli === undefined) {
+        delete process.env.CODEX_ROTATE_CLI_BIN;
       } else {
-        process.env.CODEX_ROTATE_LOGIN_HELPER_BIN = previousHelper;
+        process.env.CODEX_ROTATE_CLI_BIN = previousCli;
       }
       if (previousLog === undefined) {
         delete process.env.CODEX_ROTATE_TEST_OPENER_LOG;
@@ -312,69 +310,6 @@ describe("codex login managed-browser wrapper", () => {
     expect(result.stderr).toContain(
       "Managed Codex browser opener refused a non-URL browser launch request.",
     );
-  });
-});
-
-describe("managed login helper", () => {
-  test("starts login through codex app-server and exits on completion", () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-app-server-"));
-    const helperPath = join(
-      import.meta.dir,
-      "codex-login-app-server-helper.mjs",
-    );
-    const fakeCodexPath = join(fixtureRoot, "fake-codex.mjs");
-
-    writeFileSync(
-      fakeCodexPath,
-      [
-        "#!/usr/bin/env node",
-        "import process from 'node:process';",
-        "let buffer = '';",
-        "function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }",
-        "process.stdin.setEncoding('utf8');",
-        "process.stdin.on('data', (chunk) => {",
-        "  buffer += chunk;",
-        "  while (true) {",
-        "    const newlineIndex = buffer.indexOf('\\n');",
-        "    if (newlineIndex === -1) break;",
-        "    const line = buffer.slice(0, newlineIndex).trim();",
-        "    buffer = buffer.slice(newlineIndex + 1);",
-        "    if (!line) continue;",
-        "    const message = JSON.parse(line);",
-        "    if (message.method === 'initialize') {",
-        "      send({ id: message.id, result: { userAgent: 'fake', codexHome: '/tmp', platformFamily: 'unix', platformOs: 'macos' } });",
-        "    } else if (message.method === 'account/login/start') {",
-        "      send({ id: message.id, result: { type: 'chatgpt', loginId: 'login-123', authUrl: 'https://auth.openai.com/oauth/authorize?redirect_uri=' + encodeURIComponent('http://localhost:1455/auth/callback') } });",
-        "      setTimeout(() => send({ jsonrpc: '2.0', method: 'account/login/completed', params: { success: true, loginId: 'login-123', error: null } }), 25);",
-        "    } else if (message.method === 'account/login/cancel') {",
-        "      send({ id: message.id, result: { status: 'canceled' } });",
-        "    }",
-        "  }",
-        "});",
-      ].join("\n"),
-      { encoding: "utf8", mode: 0o700 },
-    );
-
-    try {
-      const result = spawnSync(process.execPath, [helperPath], {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          CODEX_ROTATE_REAL_CODEX: fakeCodexPath,
-        },
-      });
-
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain(
-        "Starting local login server on http://localhost:1455.",
-      );
-      expect(result.stderr).toContain(
-        "https://auth.openai.com/oauth/authorize?",
-      );
-      expect(result.stderr).toContain("Successfully logged in");
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
   });
 });
 
@@ -543,7 +478,7 @@ describe("legacy rotate-home cleanup", () => {
     );
     writeFileSync(
       join(binDir, "codex-login-dev-1-123456789abc"),
-      "#!/bin/sh\nexec '/tmp/codex-login-app-server-helper.mjs' \"$@\"\n",
+      "#!/bin/sh\nexec '/tmp/codex-rotate' internal managed-login \"$@\"\n",
     );
 
     try {
