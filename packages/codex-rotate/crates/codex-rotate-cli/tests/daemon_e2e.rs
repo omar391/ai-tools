@@ -92,7 +92,10 @@ impl DummyCdpServer {
         listener
             .set_nonblocking(true)
             .context("configure dummy cdp listener")?;
-        let port = listener.local_addr().context("dummy cdp local addr")?.port();
+        let port = listener
+            .local_addr()
+            .context("dummy cdp local addr")?
+            .port();
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let handle = thread::spawn(move || loop {
             if shutdown_rx.try_recv().is_ok() {
@@ -153,7 +156,12 @@ struct CommandResult {
     stderr: String,
 }
 
-fn run_cli(args: &[&str], rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Result<CommandResult> {
+fn run_cli(
+    args: &[&str],
+    rotate_home: &Path,
+    codex_home: &Path,
+    debug_port: u16,
+) -> Result<CommandResult> {
     let output = Command::new(cli_binary())
         .args(args)
         .env("CODEX_ROTATE_HOME", rotate_home)
@@ -261,19 +269,42 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     let proxied_status = run_cli(&["status"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_list = run_cli(&["list"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_next = run_cli(&["next"], &rotate_home, &codex_home, dummy_cdp.port)?;
-    let second_daemon = run_cli(&["daemon", "run"], &rotate_home, &codex_home, dummy_cdp.port)?;
+    let second_daemon = run_cli(
+        &["daemon", "run"],
+        &rotate_home,
+        &codex_home,
+        dummy_cdp.port,
+    )?;
 
     assert_eq!(direct_status.code, proxied_status.code);
-    assert_eq!(normalized(&direct_status.stdout), normalized(&proxied_status.stdout));
-    assert_eq!(normalized(&direct_status.stderr), normalized(&proxied_status.stderr));
+    assert_eq!(
+        normalized(&direct_status.stdout),
+        normalized(&proxied_status.stdout)
+    );
+    assert_eq!(
+        normalized(&direct_status.stderr),
+        normalized(&proxied_status.stderr)
+    );
 
     assert_eq!(direct_list.code, proxied_list.code);
-    assert_eq!(normalized(&direct_list.stdout), normalized(&proxied_list.stdout));
-    assert_eq!(normalized(&direct_list.stderr), normalized(&proxied_list.stderr));
+    assert_eq!(
+        normalized(&direct_list.stdout),
+        normalized(&proxied_list.stdout)
+    );
+    assert_eq!(
+        normalized(&direct_list.stderr),
+        normalized(&proxied_list.stderr)
+    );
 
     assert_eq!(direct_next.code, proxied_next.code);
-    assert_eq!(normalized(&direct_next.stdout), normalized(&proxied_next.stdout));
-    assert_eq!(normalized(&direct_next.stderr), normalized(&proxied_next.stderr));
+    assert_eq!(
+        normalized(&direct_next.stdout),
+        normalized(&proxied_next.stdout)
+    );
+    assert_eq!(
+        normalized(&direct_next.stderr),
+        normalized(&proxied_next.stderr)
+    );
 
     assert_eq!(second_daemon.code, 0);
     assert_eq!(

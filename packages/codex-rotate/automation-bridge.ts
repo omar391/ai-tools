@@ -12,7 +12,6 @@ import {
   ensureBitwardenCliAccountSecretRef,
   findBitwardenCliAccountSecretRef,
   inspectManagedProfiles,
-  readWorkflowFileMetadata,
 } from "./automation.ts";
 
 type BridgeRequest =
@@ -20,7 +19,6 @@ type BridgeRequest =
       command: "inspect-managed-profiles";
       payload?: Record<string, never> | null;
     }
-  | { command: "read-workflow-metadata"; payload: { filePath: string } }
   | {
       command: "ensure-account-secret-ref";
       payload: { profileName: string; email: string; password: string };
@@ -86,8 +84,6 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
   switch (request.command) {
     case "inspect-managed-profiles":
       return inspectManagedProfiles();
-    case "read-workflow-metadata":
-      return readWorkflowFileMetadata(request.payload.filePath);
     case "ensure-account-secret-ref":
       return await ensureBitwardenCliAccountSecretRef(
         request.payload.profileName,
@@ -118,10 +114,11 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         },
       )) as CodexRotateAuthFlowSummary;
     default: {
-      const exhaustive: never = request;
-      throw new Error(
-        `Unsupported automation bridge command: ${String(exhaustive)}`,
-      );
+      const label =
+        typeof (request as { command?: unknown }).command === "string"
+          ? (request as { command: string }).command
+          : String(request);
+      throw new Error(`Unsupported automation bridge command: ${label}`);
     }
   }
 }

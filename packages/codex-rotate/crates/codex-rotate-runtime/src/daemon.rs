@@ -2,10 +2,11 @@ use std::fs;
 use std::io::BufReader;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
@@ -19,6 +20,10 @@ use codex_rotate_core::workflow::{
     CreateCommandSource, ReloginOptions,
 };
 
+use crate::dev_refresh::{
+    current_process_local_cli_build, daemon_socket_is_older_than_binary,
+    local_cli_sources_newer_than_binary, rebuild_local_cli,
+};
 use crate::hook::{read_live_account, switch_live_account_to_current_auth};
 use crate::ipc::{
     read_request, write_message, ClientRequest, CreateInvocation, InvokeAction,
@@ -32,6 +37,9 @@ const DEFAULT_PORT: u16 = 9333;
 const DEFAULT_INTERVAL_SECONDS: u64 = 15;
 const LOW_QUOTA_INTERVAL_SECONDS: u64 = 5;
 const CRITICAL_QUOTA_INTERVAL_SECONDS: u64 = 2;
+const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
+const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct DaemonState {
@@ -96,6 +104,9 @@ fn managed_codex_port() -> u16 {
 }
 
 pub fn run_daemon_forever() -> Result<()> {
+    if maybe_refresh_local_daemon_process()? {
+        return Ok(());
+    }
     migrate_runtime_state()?;
 
     #[cfg(unix)]
@@ -104,6 +115,9 @@ pub fn run_daemon_forever() -> Result<()> {
         fs::create_dir_all(&paths.rotate_home)
             .with_context(|| format!("Failed to create {}.", paths.rotate_home.display()))?;
 
+        if takeover_requested() {
+            wait_for_previous_daemon_to_release_socket();
+        }
         if crate::ipc::daemon_is_reachable() {
             return Ok(());
         }
@@ -175,6 +189,11 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
     }
 
     thread::spawn(move || loop {
+        match maybe_refresh_local_daemon_process() {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => {}
+            Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
+        }
         let result = daemon.with_state_mut(|state| run_watch_check(state, false));
         if let Err(error) = result {
             daemon.set_error_message(format!("watch failed: {error}"));
@@ -241,6 +260,52 @@ impl SharedDaemon {
         let result = self.with_state_mut(|state| run_invoke_action(state, action));
         self.broadcast();
         result
+    }
+}
+
+fn maybe_refresh_local_daemon_process() -> Result<bool> {
+    let Some(build) = current_process_local_cli_build() else {
+        return Ok(false);
+    };
+    let daemon_socket = crate::ipc::daemon_socket_path()?;
+    let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)?;
+    if sources_newer_than_binary {
+        rebuild_local_cli(&build)?;
+    }
+    let binary_newer_than_running_socket =
+        daemon_socket_is_older_than_binary(&daemon_socket, &build.cli_binary)?;
+    if !sources_newer_than_binary && !binary_newer_than_running_socket {
+        return Ok(false);
+    }
+
+    Command::new(&build.cli_binary)
+        .arg("daemon")
+        .arg("run")
+        .env(DAEMON_TAKEOVER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to relaunch {} after rebuilding the local daemon.",
+                build.cli_binary.display()
+            )
+        })?;
+    Ok(true)
+}
+
+fn takeover_requested() -> bool {
+    matches!(std::env::var(DAEMON_TAKEOVER_ENV).as_deref(), Ok("1"))
+}
+
+fn wait_for_previous_daemon_to_release_socket() {
+    let deadline = Instant::now() + DAEMON_TAKEOVER_TIMEOUT;
+    while Instant::now() < deadline {
+        if !crate::ipc::daemon_is_reachable() {
+            break;
+        }
+        thread::sleep(DAEMON_TAKEOVER_POLL_INTERVAL);
     }
 }
 

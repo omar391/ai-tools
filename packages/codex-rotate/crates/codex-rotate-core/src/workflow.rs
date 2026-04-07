@@ -193,10 +193,11 @@ struct AdultBirthDate {
     birth_year: u16,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkflowFileMetadata {
+    workflow_ref: Option<String>,
     preferred_profile_name: Option<String>,
+    preferred_email: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -217,10 +218,22 @@ struct ManagedProfilesInspection {
     managed_profiles: ManagedProfilesPayload,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeWorkflowMetadataPayload<'a> {
-    file_path: &'a str,
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemChromeProfileCandidate {
+    directory: String,
+    name: String,
+    emails: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemChromeProfileMatch {
+    directory: String,
+    name: String,
+    emails: Vec<String>,
+    matched_email: String,
+    score: i32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1550,12 +1563,187 @@ fn serialize_stored_credential(record: &StoredCredential) -> Value {
 }
 
 fn read_workflow_file_metadata(file_path: &std::path::Path) -> Result<WorkflowFileMetadata> {
-    let payload = BridgeWorkflowMetadataPayload {
-        file_path: file_path
-            .to_str()
-            .ok_or_else(|| anyhow!("Workflow file path is not valid UTF-8."))?,
-    };
-    run_automation_bridge("read-workflow-metadata", payload)
+    if !file_path.exists() {
+        return Err(anyhow!(
+            "Workflow file was not found at {}.",
+            file_path.display()
+        ));
+    }
+
+    let raw = fs::read_to_string(file_path)
+        .with_context(|| format!("Failed to read workflow file {}.", file_path.display()))?;
+    Ok(WorkflowFileMetadata {
+        workflow_ref: derive_workflow_ref_from_file_path(file_path),
+        ..parse_workflow_file_metadata(&raw)
+    })
+}
+
+fn parse_workflow_file_metadata(raw: &str) -> WorkflowFileMetadata {
+    let mut document_indent = None;
+    let mut metadata_indent = None;
+    let mut metadata_value_indent = None;
+    let mut preferred_profile_name = None;
+    let mut preferred_email = None;
+
+    for line in raw.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed_start.len());
+
+        if let Some(current_metadata_indent) = metadata_indent {
+            if indent <= current_metadata_indent {
+                metadata_indent = None;
+                metadata_value_indent = None;
+            }
+        }
+
+        if let Some(current_metadata_indent) = metadata_indent {
+            if indent > current_metadata_indent {
+                let expected_indent = metadata_value_indent.get_or_insert(indent);
+                if indent != *expected_indent || trimmed_start.starts_with('-') {
+                    continue;
+                }
+                let Some((key, raw_value)) = trimmed_start.split_once(':') else {
+                    continue;
+                };
+                let normalized = normalize_workflow_scalar(raw_value);
+                match key.trim() {
+                    "preferredProfile" => preferred_profile_name = normalized,
+                    "preferredEmail" => preferred_email = normalized,
+                    _ => {}
+                }
+                continue;
+            }
+        }
+
+        if let Some(current_document_indent) = document_indent {
+            if indent <= current_document_indent && trimmed_start != "document:" {
+                document_indent = None;
+            }
+        }
+
+        if let Some(current_document_indent) = document_indent {
+            if indent > current_document_indent && trimmed_start == "metadata:" {
+                metadata_indent = Some(indent);
+                metadata_value_indent = None;
+                continue;
+            }
+        }
+
+        if trimmed_start == "document:" {
+            document_indent = Some(indent);
+            metadata_indent = None;
+            metadata_value_indent = None;
+        }
+    }
+
+    WorkflowFileMetadata {
+        workflow_ref: None,
+        preferred_profile_name,
+        preferred_email,
+    }
+}
+
+fn normalize_workflow_scalar(raw_value: &str) -> Option<String> {
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut comment_index = None;
+    let bytes = trimmed.as_bytes();
+    for index in 0..bytes.len().saturating_sub(1) {
+        if bytes[index].is_ascii_whitespace() && bytes[index + 1] == b'#' {
+            comment_index = Some(index);
+            break;
+        }
+    }
+
+    let without_comment = comment_index
+        .map(|index| &trimmed[..index])
+        .unwrap_or(trimmed)
+        .trim();
+    if without_comment.is_empty() {
+        return None;
+    }
+
+    let mut chars = without_comment.chars();
+    let first = chars.next()?;
+    let last = without_comment.chars().last()?;
+    if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+        let inner = &without_comment[1..without_comment.len().saturating_sub(1)];
+        let normalized = inner.trim();
+        return (!normalized.is_empty()).then(|| normalized.to_string());
+    }
+
+    Some(without_comment.to_string())
+}
+
+fn derive_workflow_ref_from_file_path(file_path: &Path) -> Option<String> {
+    let canonical_path = file_path.canonicalize().ok()?;
+    let paths = resolve_paths().ok()?;
+    let workspace_root = paths.repo_root.join(".fast-browser").join("workflows");
+    derive_workflow_ref_from_root(&canonical_path, &workspace_root, "workspace").or_else(|| {
+        paths.repo_root.parent().and_then(|parent| {
+            let global_root = parent
+                .join("ai-rules")
+                .join("skills")
+                .join("fast-browser")
+                .join("workflows");
+            derive_workflow_ref_from_root(&canonical_path, &global_root, "sys")
+        })
+    })
+}
+
+fn derive_workflow_ref_from_root(
+    file_path: &Path,
+    root_dir: &Path,
+    scope_prefix: &str,
+) -> Option<String> {
+    let relative_path = file_path.strip_prefix(root_dir).ok()?;
+    if relative_path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+        return None;
+    }
+
+    let segments = relative_path
+        .iter()
+        .map(|segment| segment.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    if segments.len() != 3 {
+        return None;
+    }
+
+    let workflow_name = Path::new(segments[2]).file_stem()?.to_str()?;
+    let parts = [
+        Some(scope_prefix.to_string()),
+        slugify_workflow_path_segment(segments[0]),
+        slugify_workflow_path_segment(segments[1]),
+        slugify_workflow_path_segment(workflow_name),
+    ]
+    .into_iter()
+    .collect::<Option<Vec<_>>>()?;
+    (parts.len() == 4).then(|| parts.join("."))
+}
+
+fn slugify_workflow_path_segment(value: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_separator = false;
+
+    for ch in value.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            slug.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let normalized = slug.trim_matches('-').to_string();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn inspect_managed_profiles() -> Result<ManagedProfilesInspection> {
@@ -1971,6 +2159,264 @@ fn get_create_family_hint_priority(base_email: &str, frontier: u32) -> CreateFam
     }
 }
 
+#[cfg(test)]
+fn should_use_default_create_family_hint(base_email: Option<&str>) -> bool {
+    base_email
+        .and_then(|value| parse_email_family(value).ok())
+        .map(|parsed| matches!(parsed.mode, EmailFamilyMode::Template { .. }))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn normalize_gmail_base_email(email: &str) -> Result<String> {
+    normalize_base_email_family(email)
+}
+
+#[cfg(test)]
+fn compute_next_gmail_alias_suffix(
+    base_email: &str,
+    family_next_suffix: u32,
+    known_emails: Vec<String>,
+) -> Result<u32> {
+    compute_next_account_family_suffix(base_email, family_next_suffix, known_emails)
+}
+
+#[cfg(test)]
+fn normalize_email_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim().to_lowercase();
+    let (local, domain) = trimmed.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.starts_with('.') || domain.ends_with('.') {
+        return None;
+    }
+    domain.contains('.').then_some(trimmed)
+}
+
+#[cfg(test)]
+fn extract_supported_gmail_emails(emails: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut supported = Vec::new();
+    for email in emails {
+        let Ok(normalized) = normalize_gmail_base_email(&email) else {
+            continue;
+        };
+        if seen.insert(normalized.clone()) {
+            supported.push(normalized);
+        }
+    }
+    supported
+}
+
+#[cfg(test)]
+fn tokenize_managed_profile_name(profile_name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in profile_name.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(test)]
+fn score_email_for_managed_profile_name(profile_name: &str, email: &str) -> i32 {
+    let Some(normalized_email) = normalize_email_candidate(email) else {
+        return i32::MIN;
+    };
+
+    let local_part = normalized_email
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .split('+')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let compact_local = local_part
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    let local_segments = local_part
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+    let significant_tokens = tokenize_managed_profile_name(profile_name)
+        .into_iter()
+        .filter(|token| {
+            token.len() > 1 || token.chars().all(|character| character.is_ascii_digit())
+        })
+        .collect::<Vec<_>>();
+
+    let mut score = 0;
+    for token in significant_tokens {
+        if local_segments.contains(&token) {
+            score += if token.chars().all(|character| character.is_ascii_digit()) {
+                140
+            } else {
+                120
+            };
+            continue;
+        }
+        if compact_local.starts_with(&token) || compact_local.ends_with(&token) {
+            score += 40;
+            continue;
+        }
+        if compact_local.contains(&token) {
+            score += 25;
+        }
+    }
+
+    let compact_profile = profile_name
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if compact_profile.len() >= 3 {
+        if compact_local.contains(&compact_profile) {
+            score += 80;
+        } else {
+            let reversed = compact_profile.chars().rev().collect::<String>();
+            if compact_local.contains(&reversed) {
+                score += 40;
+            }
+        }
+    }
+
+    score
+}
+
+#[cfg(test)]
+fn select_best_email_for_managed_profile(
+    profile_name: &str,
+    emails: impl IntoIterator<Item = String>,
+    preferred_base_email: Option<&str>,
+) -> Option<String> {
+    let normalized_preferred =
+        preferred_base_email.and_then(|value| normalize_gmail_base_email(value).ok());
+    let mut candidates = extract_supported_gmail_emails(emails)
+        .into_iter()
+        .enumerate()
+        .map(|(index, email)| {
+            let exact_preferred = normalized_preferred
+                .as_ref()
+                .map(|preferred| preferred == &email)
+                .unwrap_or(false);
+            let score = score_email_for_managed_profile_name(profile_name, &email);
+            (index, email, exact_preferred, score)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .reverse()
+            .then_with(|| left.3.cmp(&right.3).reverse())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.into_iter().next().map(|(_, email, _, _)| email)
+}
+
+#[cfg(test)]
+fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) -> Option<String> {
+    let mut candidates = HashMap::<String, (u32, i64, u32)>::new();
+
+    let mut remember = |raw_email: Option<&str>, updated_at: Option<&str>, frontier: u32| {
+        let Some(raw_email) = raw_email else {
+            return;
+        };
+        let Ok(base_email) = normalize_base_email_family(raw_email) else {
+            return;
+        };
+        let entry = candidates.entry(base_email).or_insert((0, 0, 1));
+        entry.0 += 1;
+        entry.1 = entry.1.max(parse_sortable_timestamp(updated_at));
+        entry.2 = entry.2.max(frontier.max(1));
+    };
+
+    for family in store.families.values() {
+        if family.profile_name == profile_name {
+            remember(
+                Some(&family.base_email),
+                Some(family.updated_at.as_str()),
+                family.next_suffix,
+            );
+        }
+    }
+    for pending in store.pending.values() {
+        if pending.stored.profile_name == profile_name {
+            remember(
+                Some(&pending.stored.base_email),
+                pending
+                    .started_at
+                    .as_deref()
+                    .or(Some(pending.stored.updated_at.as_str())),
+                pending.stored.suffix.saturating_add(1),
+            );
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            let left_priority = get_create_family_hint_priority(&left.0, left.1 .2);
+            let right_priority = get_create_family_hint_priority(&right.0, right.1 .2);
+            left_priority
+                .family_rank
+                .cmp(&right_priority.family_rank)
+                .then_with(|| left_priority.frontier.cmp(&right_priority.frontier))
+                .then_with(|| left.1 .0.cmp(&right.1 .0))
+                .then_with(|| left.1 .1.cmp(&right.1 .1))
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(base_email, _)| base_email)
+}
+
+#[cfg(test)]
+fn select_best_system_chrome_profile_match(
+    profile_name: &str,
+    profiles: &[SystemChromeProfileCandidate],
+    preferred_base_email: Option<&str>,
+) -> Option<SystemChromeProfileMatch> {
+    let normalized_preferred =
+        preferred_base_email.and_then(|value| normalize_gmail_base_email(value).ok());
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            let matched_email = select_best_email_for_managed_profile(
+                profile_name,
+                profile.emails.clone(),
+                preferred_base_email,
+            )?;
+            let emails = extract_supported_gmail_emails(profile.emails.clone());
+            let score = if normalized_preferred
+                .as_ref()
+                .map(|preferred| preferred == &matched_email)
+                .unwrap_or(false)
+            {
+                10_000
+            } else {
+                score_email_for_managed_profile_name(profile_name, &matched_email)
+            };
+            Some(SystemChromeProfileMatch {
+                directory: profile.directory.clone(),
+                name: profile.name.clone(),
+                emails,
+                matched_email,
+                score,
+            })
+        })
+        .max_by(|left, right| {
+            left.score
+                .cmp(&right.score)
+                .then_with(|| right.directory.cmp(&left.directory))
+        })
+}
+
 fn resolve_relogin_credential(
     store: &CredentialStore,
     entry: &AccountEntry,
@@ -2223,6 +2669,7 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2261,6 +2708,16 @@ mod tests {
         }
     }
 
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
     #[test]
     fn stored_credentials_used_only_for_non_manual_relogin() {
         let stored = StoredCredential {
@@ -2288,6 +2745,242 @@ mod tests {
                 ..ReloginOptions::default()
             }
         ));
+    }
+
+    #[test]
+    fn read_workflow_file_metadata_reads_preferred_profile_from_main_workflow() {
+        let workflow_file = repo_root()
+            .join(".fast-browser")
+            .join("workflows")
+            .join("web")
+            .join("auth.openai.com")
+            .join("codex-rotate-account-flow-main.yaml");
+
+        let metadata = read_workflow_file_metadata(&workflow_file).expect("workflow metadata");
+
+        assert_eq!(
+            metadata.workflow_ref.as_deref(),
+            Some("workspace.web.auth-openai-com.codex-rotate-account-flow-main")
+        );
+        assert_eq!(metadata.preferred_profile_name.as_deref(), Some("dev-1"));
+        assert_eq!(metadata.preferred_email, None);
+    }
+
+    #[test]
+    fn derive_workflow_ref_from_file_path_handles_alternate_local_workflow() {
+        let workflow_file = repo_root()
+            .join(".fast-browser")
+            .join("workflows")
+            .join("web")
+            .join("auth.openai.com")
+            .join("codex-rotate-account-flow-minimal.yaml");
+
+        assert_eq!(
+            derive_workflow_ref_from_file_path(&workflow_file).as_deref(),
+            Some("workspace.web.auth-openai-com.codex-rotate-account-flow-minimal")
+        );
+    }
+
+    #[test]
+    fn parse_workflow_file_metadata_handles_quotes_and_comments() {
+        let metadata = parse_workflow_file_metadata(
+            r#"
+document:
+  metadata:
+    preferredProfile: "dev-1" # comment
+    preferredEmail: 'dev.41@astronlab.com'
+    targets:
+      - id: primary
+"#,
+        );
+
+        assert_eq!(metadata.preferred_profile_name.as_deref(), Some("dev-1"));
+        assert_eq!(
+            metadata.preferred_email.as_deref(),
+            Some("dev.41@astronlab.com")
+        );
+    }
+
+    #[test]
+    fn normalize_gmail_base_address_before_suffixing() {
+        assert_eq!(
+            normalize_gmail_base_email("Dev.User+17@gmail.com").unwrap(),
+            "dev.user@gmail.com"
+        );
+    }
+
+    #[test]
+    fn compute_next_gmail_alias_suffix_respects_known_emails_and_frontier() {
+        assert_eq!(
+            compute_next_gmail_alias_suffix(
+                "dev.user@gmail.com",
+                1,
+                vec![
+                    "dev.user+1@gmail.com".to_string(),
+                    "dev.user+7@gmail.com".to_string(),
+                    "other@gmail.com".to_string(),
+                ],
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            compute_next_gmail_alias_suffix(
+                "dev.user@gmail.com",
+                5,
+                vec![
+                    "dev.user+1@gmail.com".to_string(),
+                    "dev.user+2@gmail.com".to_string(),
+                ],
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn builds_and_normalizes_templated_families() {
+        assert_eq!(
+            normalize_base_email_family("Dev.{N}@HotspotPrime.com").unwrap(),
+            "dev.{n}@hotspotprime.com"
+        );
+        assert_eq!(
+            build_account_family_email("dev.{N}@hotspotprime.com", 7).unwrap(),
+            "dev.7@hotspotprime.com"
+        );
+        assert_eq!(
+            compute_next_account_family_suffix(
+                "dev.{N}@hotspotprime.com",
+                1,
+                vec![
+                    "dev.1@hotspotprime.com".to_string(),
+                    "dev.4@hotspotprime.com".to_string(),
+                    "other@gmail.com".to_string(),
+                ],
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            compute_next_account_family_suffix(
+                "dev.{N}@astronlab.com",
+                3,
+                vec!["dev.21@astronlab.com".to_string()],
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn create_family_hint_accepts_templates_and_rejects_gmail() {
+        assert!(should_use_default_create_family_hint(Some(
+            "dev.{n}@astronlab.com"
+        )));
+        assert!(should_use_default_create_family_hint(Some(
+            "qa.{n}@astronlab.com"
+        )));
+        assert!(!should_use_default_create_family_hint(Some(
+            "dev.user@gmail.com"
+        )));
+        assert!(!should_use_default_create_family_hint(None));
+    }
+
+    #[test]
+    fn resolve_managed_profile_name_from_candidates_matches_requested_preferred_and_default() {
+        assert_eq!(
+            resolve_managed_profile_name_from_candidates(
+                &["dev-1", "other"],
+                Some("dev-1"),
+                None,
+                None,
+                Some("other"),
+            )
+            .unwrap(),
+            "dev-1"
+        );
+        assert_eq!(
+            resolve_managed_profile_name_from_candidates(
+                &["dev-1", "other"],
+                None,
+                Some("other"),
+                Some("workflow"),
+                Some("dev-1"),
+            )
+            .unwrap(),
+            "other"
+        );
+        assert_eq!(
+            resolve_managed_profile_name_from_candidates(
+                &["dev-1", "other"],
+                None,
+                None,
+                None,
+                Some("other"),
+            )
+            .unwrap(),
+            "other"
+        );
+    }
+
+    #[test]
+    fn resolve_create_base_email_prefers_requested_then_discovered_then_default() {
+        assert_eq!(
+            resolve_create_base_email(Some("other@gmail.com"), Some("dev.user@gmail.com")).unwrap(),
+            "other@gmail.com"
+        );
+        assert_eq!(
+            resolve_create_base_email(None, Some("Dev.User+4@gmail.com")).unwrap(),
+            "dev.user@gmail.com"
+        );
+        assert_eq!(
+            resolve_create_base_email(None, None).unwrap(),
+            "dev.{n}@astronlab.com"
+        );
+    }
+
+    #[test]
+    fn score_email_prefers_exact_profile_token_match() {
+        assert!(
+            score_email_for_managed_profile_name("dev-1", "1.dev.astronlab@gmail.com")
+                > score_email_for_managed_profile_name("dev-1", "dev.2.astronlab@gmail.com")
+        );
+    }
+
+    #[test]
+    fn select_best_email_and_system_chrome_profile_match() {
+        assert_eq!(
+            select_best_email_for_managed_profile(
+                "dev-1",
+                vec![
+                    "other@gmail.com".to_string(),
+                    "1.dev.astronlab@gmail.com".to_string(),
+                ],
+                None,
+            )
+            .as_deref(),
+            Some("1.dev.astronlab@gmail.com")
+        );
+
+        let match_result = select_best_system_chrome_profile_match(
+            "dev-1",
+            &[
+                SystemChromeProfileCandidate {
+                    directory: "Profile 1".to_string(),
+                    name: "Personal".to_string(),
+                    emails: vec!["other@gmail.com".to_string()],
+                },
+                SystemChromeProfileCandidate {
+                    directory: "Profile 2".to_string(),
+                    name: "Dev".to_string(),
+                    emails: vec!["1.dev.astronlab@gmail.com".to_string()],
+                },
+            ],
+            None,
+        )
+        .expect("profile match");
+        assert_eq!(match_result.directory, "Profile 2");
+        assert_eq!(match_result.matched_email, "1.dev.astronlab@gmail.com");
     }
 
     #[test]
@@ -2342,6 +3035,169 @@ mod tests {
 
         assert_eq!(
             select_pending_base_email_hint_for_profile(&store, "dev-1", None).as_deref(),
+            Some("dev.{n}@astronlab.com")
+        );
+    }
+
+    #[test]
+    fn select_pending_credential_for_family_drains_lowest_suffix_first() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "dev.user+1@gmail.com".to_string(),
+            make_pending(
+                "dev.user+1@gmail.com",
+                "dev-1",
+                "dev.user@gmail.com",
+                1,
+                "2026-03-20T00:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "dev.user+3@gmail.com".to_string(),
+            make_pending(
+                "dev.user+3@gmail.com",
+                "dev-1",
+                "dev.user@gmail.com",
+                3,
+                "2026-03-20T03:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            select_pending_credential_for_family(&store, "dev-1", "dev.user@gmail.com", None)
+                .map(|entry| entry.stored.email),
+            Some("dev.user+1@gmail.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_pending_credential_for_family_can_filter_by_alias() {
+        let mut store = CredentialStore::default();
+        let mut left = make_pending(
+            "dev.user+2@gmail.com",
+            "dev-1",
+            "dev.user@gmail.com",
+            2,
+            "2026-03-20T02:00:00.000Z",
+        );
+        left.stored.alias = Some("team-a".to_string());
+        let mut right = make_pending(
+            "dev.user+3@gmail.com",
+            "dev-1",
+            "dev.user@gmail.com",
+            3,
+            "2026-03-20T03:00:00.000Z",
+        );
+        right.stored.alias = Some("team-b".to_string());
+        store.pending.insert(left.stored.email.clone(), left);
+        store.pending.insert(right.stored.email.clone(), right);
+
+        assert_eq!(
+            select_pending_credential_for_family(
+                &store,
+                "dev-1",
+                "dev.user@gmail.com",
+                Some("team-a"),
+            )
+            .map(|entry| entry.stored.email),
+            Some("dev.user+2@gmail.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_pending_base_email_hint_prefers_oldest_family_when_rank_is_equal() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "1.dev.astronlab+1@gmail.com".to_string(),
+            make_pending(
+                "1.dev.astronlab+1@gmail.com",
+                "dev-1",
+                "1.dev.astronlab@gmail.com",
+                1,
+                "2026-03-20T00:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "arjuda.anjum+1@gmail.com".to_string(),
+            make_pending(
+                "arjuda.anjum+1@gmail.com",
+                "dev-1",
+                "arjuda.anjum@gmail.com",
+                1,
+                "2026-03-21T00:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            select_pending_base_email_hint_for_profile(&store, "dev-1", None).as_deref(),
+            Some("1.dev.astronlab@gmail.com")
+        );
+    }
+
+    #[test]
+    fn select_stored_base_email_hint_prefers_common_and_high_frontier_template() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::qa.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "qa.{n}@astronlab.com".to_string(),
+                next_suffix: 300,
+                created_at: "2026-04-06T16:00:00.000Z".to_string(),
+                updated_at: "2026-04-06T16:00:00.000Z".to_string(),
+                last_created_email: Some("qa.299@astronlab.com".to_string()),
+            },
+        );
+        store.pending.insert(
+            "dev.35@astronlab.com".to_string(),
+            make_pending(
+                "dev.35@astronlab.com",
+                "dev-1",
+                "dev.{n}@astronlab.com",
+                35,
+                "2026-04-06T17:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "dev.36@astronlab.com".to_string(),
+            make_pending(
+                "dev.36@astronlab.com",
+                "dev-1",
+                "dev.{n}@astronlab.com",
+                36,
+                "2026-04-06T18:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            select_stored_base_email_hint(&store, "dev-1").as_deref(),
+            Some("dev.{n}@astronlab.com")
+        );
+
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "qa.300@astronlab.com".to_string(),
+            make_pending(
+                "qa.300@astronlab.com",
+                "dev-1",
+                "qa.{n}@astronlab.com",
+                300,
+                "2026-04-06T18:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "dev.35@astronlab.com".to_string(),
+            make_pending(
+                "dev.35@astronlab.com",
+                "dev-1",
+                "dev.{n}@astronlab.com",
+                35,
+                "2026-04-06T17:00:00.000Z",
+            ),
+        );
+
+        assert_eq!(
+            select_stored_base_email_hint(&store, "dev-1").as_deref(),
             Some("dev.{n}@astronlab.com")
         );
     }
@@ -2501,9 +3357,10 @@ mod tests {
                 }
             }
         }));
-        assert_eq!(store.pending.keys().cloned().collect::<Vec<_>>(), vec![
-            "dev.35@astronlab.com".to_string()
-        ]);
+        assert_eq!(
+            store.pending.keys().cloned().collect::<Vec<_>>(),
+            vec!["dev.35@astronlab.com".to_string()]
+        );
     }
 
     #[test]

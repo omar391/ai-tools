@@ -27,7 +27,9 @@ fn build_mutex() -> &'static Mutex<()> {
 }
 
 fn lock_unpoisoned<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -71,7 +73,11 @@ fn built_cli_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .arg("codex-rotate")
         .status()?;
     if !status.success() {
-        return Err(format!("Failed to build codex-rotate via {}.", manifest_path.display()).into());
+        return Err(format!(
+            "Failed to build codex-rotate via {}.",
+            manifest_path.display()
+        )
+        .into());
     }
 
     let path = workspace_root.join("target/debug/codex-rotate");
@@ -85,7 +91,11 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-fn write_cli_wrapper(path: &Path, cli_binary: &Path, pid_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_cli_wrapper(
+    path: &Path,
+    cli_binary: &Path,
+    pid_file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let script = format!(
         "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"daemon\" ] && [ \"${{2-}}\" = \"run\" ]; then\n  {cli} \"$@\" &\n  echo $! > {pid}\n  wait $!\nelse\n  exec {cli} \"$@\"\nfi\n",
         cli = shell_quote(cli_binary),
@@ -137,12 +147,7 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn set(
-        rotate_home: &Path,
-        codex_home: &Path,
-        cli_bin: &Path,
-        debug_port: u16,
-    ) -> Self {
+    fn set(rotate_home: &Path, codex_home: &Path, cli_bin: &Path, debug_port: u16) -> Self {
         let previous = Self {
             home: std::env::var_os("HOME"),
             rotate_home: std::env::var_os("CODEX_ROTATE_HOME"),
@@ -289,7 +294,8 @@ fn tray_shell_launches_real_daemon_binary() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn tray_shell_auto_starts_and_streams_real_daemon_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
+) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock_unpoisoned(env_mutex());
     let sandbox = unique_temp_dir("codex-rotate-tray-ipc");
     let rotate_home = sandbox.join("rotate-home");
@@ -312,14 +318,20 @@ fn tray_shell_auto_starts_and_streams_real_daemon_snapshots() -> Result<(), Box<
     });
 
     let expected_capabilities = RuntimeCapabilities::current();
-    let first =
-        recv_snapshot_with_capabilities(&receiver, &expected_capabilities, Duration::from_secs(20))?;
+    let first = recv_snapshot_with_capabilities(
+        &receiver,
+        &expected_capabilities,
+        Duration::from_secs(20),
+    )?;
     assert_eq!(first.capabilities, RuntimeCapabilities::current());
     wait_for(Duration::from_secs(10), daemon_is_reachable)?;
 
     let _ = invoke(InvokeAction::List)?;
-    let second =
-        recv_snapshot_with_capabilities(&receiver, &expected_capabilities, Duration::from_secs(10))?;
+    let second = recv_snapshot_with_capabilities(
+        &receiver,
+        &expected_capabilities,
+        Duration::from_secs(10),
+    )?;
     assert_eq!(second.capabilities, RuntimeCapabilities::current());
 
     stop.store(true, Ordering::Relaxed);

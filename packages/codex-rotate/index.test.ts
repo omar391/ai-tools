@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
-  existsSync,
   mkdtempSync,
   readFileSync,
   writeFileSync,
@@ -13,20 +12,6 @@ import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 const WRAPPER_PATH = join(REPO_ROOT, "packages", "codex-rotate", "index.ts");
-
-async function waitForCondition(
-  condition: () => boolean,
-  timeoutMs = 5_000,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return condition();
-}
 
 describe("npm wrapper", () => {
   test("forwards create --force to the native CLI binary", () => {
@@ -61,72 +46,34 @@ printf 'wrapper-ok\n'
     }
   });
 
-  test("can launch and stop the tray via wrapper commands", async () => {
-    if (process.platform === "win32") {
-      return;
-    }
-
+  test("forwards tray status to the native CLI binary", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-tray-"));
-    const trayStubPath = join(fixtureRoot, "codex-rotate-tray");
-    const startedPath = join(fixtureRoot, "started.txt");
-    const env = {
-      ...process.env,
-      CODEX_ROTATE_TRAY_BIN: trayStubPath,
-    };
+    const cliStubPath = join(fixtureRoot, "codex-rotate");
+    const argsCapturePath = join(fixtureRoot, "args.txt");
 
     try {
       writeFileSync(
-        trayStubPath,
+        cliStubPath,
         `#!/bin/sh
-trap 'exit 0' TERM INT
-printf 'started\n' > "${startedPath}"
-while true; do
-  sleep 1
-done
+printf '%s\n' "$@" > "${argsCapturePath}"
+printf 'tray-wrapper-ok\n'
 `,
       );
-      chmodSync(trayStubPath, 0o755);
+      chmodSync(cliStubPath, 0o755);
 
-      const openResult = spawnSync("node", [WRAPPER_PATH, "tray", "open"], {
+      const result = spawnSync("node", [WRAPPER_PATH, "tray", "status"], {
         cwd: REPO_ROOT,
-        env,
+        env: {
+          ...process.env,
+          CODEX_ROTATE_BIN: cliStubPath,
+        },
         encoding: "utf8",
       });
-      expect(openResult.status).toBe(0);
-      expect(openResult.stdout).toContain("Started Codex Rotate tray.");
-      expect(await waitForCondition(() => existsSync(startedPath))).toBe(true);
 
-      const statusResult = spawnSync("node", [WRAPPER_PATH, "tray", "status"], {
-        cwd: REPO_ROOT,
-        env,
-        encoding: "utf8",
-      });
-      expect(statusResult.status).toBe(0);
-      expect(statusResult.stdout).toContain("Codex Rotate tray is running.");
-
-      const quitResult = spawnSync("node", [WRAPPER_PATH, "tray", "quit"], {
-        cwd: REPO_ROOT,
-        env,
-        encoding: "utf8",
-      });
-      expect(quitResult.status).toBe(0);
-      expect(quitResult.stdout).toContain("Stopped Codex Rotate tray.");
-
-      const stopped = await waitForCondition(() => {
-        const result = spawnSync("node", [WRAPPER_PATH, "tray", "status"], {
-          cwd: REPO_ROOT,
-          env,
-          encoding: "utf8",
-        });
-        return result.status === 1;
-      });
-      expect(stopped).toBe(true);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("tray-wrapper-ok");
+      expect(readFileSync(argsCapturePath, "utf8")).toBe("tray\nstatus\n");
     } finally {
-      spawnSync("node", [WRAPPER_PATH, "tray", "quit"], {
-        cwd: REPO_ROOT,
-        env,
-        encoding: "utf8",
-      });
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });

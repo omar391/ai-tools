@@ -1,5 +1,11 @@
-use codex_rotate_runtime::ipc::{daemon_is_reachable, subscribe, StatusSnapshot};
-use std::path::PathBuf;
+use codex_rotate_runtime::dev_refresh::{
+    daemon_socket_is_older_than_binary, detect_local_cli_build,
+    local_cli_sources_newer_than_binary, rebuild_local_cli, stop_running_daemons,
+};
+use codex_rotate_runtime::ipc::{
+    daemon_is_reachable, daemon_socket_path, subscribe, StatusSnapshot,
+};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,15 +124,12 @@ pub fn ensure_daemon_running() -> Result<(), String> {
     ensure_daemon_running_with(DAEMON_START_POLL_INTERVAL, DAEMON_START_ATTEMPTS)
 }
 
-fn ensure_daemon_running_with(
-    poll_interval: Duration,
-    max_attempts: usize,
-) -> Result<(), String> {
+fn ensure_daemon_running_with(poll_interval: Duration, max_attempts: usize) -> Result<(), String> {
+    let cli_binary = resolve_cli_binary()?;
+    refresh_local_daemon_if_needed(&cli_binary, poll_interval, max_attempts)?;
     if daemon_is_reachable() {
         return Ok(());
     }
-
-    let cli_binary = resolve_cli_binary()?;
     let _child = Command::new(&cli_binary)
         .arg("daemon")
         .arg("run")
@@ -144,6 +147,49 @@ fn ensure_daemon_running_with(
     }
 
     Err("Timed out waiting for the Codex Rotate daemon to start.".to_string())
+}
+
+fn refresh_local_daemon_if_needed(
+    cli_binary: &Path,
+    poll_interval: Duration,
+    max_attempts: usize,
+) -> Result<(), String> {
+    let Some(build) = detect_local_cli_build(cli_binary) else {
+        return Ok(());
+    };
+    let daemon_socket = daemon_socket_path()
+        .map_err(|error| format!("Failed to resolve daemon socket: {error}"))?;
+    let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)
+        .map_err(|error| format!("Failed to inspect local CLI freshness: {error}"))?;
+    if sources_newer_than_binary {
+        rebuild_local_cli(&build)
+            .map_err(|error| format!("Failed to rebuild local codex-rotate CLI: {error}"))?;
+    }
+    let binary_newer_than_running_daemon =
+        daemon_socket_is_older_than_binary(&daemon_socket, cli_binary)
+            .map_err(|error| format!("Failed to compare daemon freshness: {error}"))?;
+    if !sources_newer_than_binary && !binary_newer_than_running_daemon {
+        return Ok(());
+    }
+
+    if daemon_is_reachable() {
+        stop_running_daemons(cli_binary, &daemon_socket)
+            .map_err(|error| format!("Failed to stop the stale local daemon: {error}"))?;
+        if !wait_for_daemon_state(false, poll_interval, max_attempts) {
+            return Err("Timed out waiting for the stale Codex Rotate daemon to stop.".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_daemon_state(reachable: bool, poll_interval: Duration, max_attempts: usize) -> bool {
+    for _ in 0..max_attempts {
+        if daemon_is_reachable() == reachable {
+            return true;
+        }
+        thread::sleep(poll_interval);
+    }
+    daemon_is_reachable() == reachable
 }
 
 pub fn spawn_subscription_loop<F>(on_snapshot: F)
@@ -176,7 +222,10 @@ where
         let mut subscription = match subscribe() {
             Ok(subscription) => subscription,
             Err(error) => {
-                on_snapshot(error_snapshot(format!("daemon subscribe failed: {}", error)));
+                on_snapshot(error_snapshot(format!(
+                    "daemon subscribe failed: {}",
+                    error
+                )));
                 if sleep_or_stop(&stop, DAEMON_START_RETRY_DELAY) {
                     return;
                 }
@@ -300,5 +349,4 @@ mod tests {
             Some(expected)
         );
     }
-
 }

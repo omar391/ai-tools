@@ -1,5 +1,6 @@
 pub mod cdp;
 pub mod daemon;
+pub mod dev_refresh;
 pub mod hook;
 pub mod ipc;
 pub mod launcher;

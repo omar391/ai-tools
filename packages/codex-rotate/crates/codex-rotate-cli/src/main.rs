@@ -1,6 +1,11 @@
+use std::env;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::pool::{
     cmd_add, cmd_list_stream, cmd_next, cmd_prev, cmd_remove, cmd_status_stream,
 };
@@ -39,6 +44,7 @@ fn run() -> Result<()> {
             write_output(&mut stdout, &help_text())?
         }
         Some("daemon") => run_daemon_command(&mut stdout, &args[1..])?,
+        Some("tray") => run_tray_command(&mut stdout, &args[1..])?,
         Some("add") => write_output(
             &mut stdout,
             &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
@@ -89,7 +95,7 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("remove") | Some("rm") => Some(InvokeAction::Remove {
             selector: parse_remove_selector(args)?.to_string(),
         }),
-        Some("daemon") | None | Some("help") | Some("--help") | Some("-h") => None,
+        Some("daemon") | Some("tray") | None | Some("help") | Some("--help") | Some("-h") => None,
         Some(_) => None,
     };
 
@@ -110,6 +116,257 @@ fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
         Some(other) => Err(anyhow!(
             "Unknown daemon command: \"{other}\". Run \"codex-rotate help\" for usage."
         )),
+    }
+}
+
+fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
+    let command = args.first().map(String::as_str).unwrap_or("open");
+    match command {
+        "open" => write_output(writer, &tray_open_message()?),
+        "status" => {
+            if tray_is_running()? {
+                write_output(writer, "Codex Rotate tray is running.")
+            } else {
+                Err(anyhow!("Codex Rotate tray is not running."))
+            }
+        }
+        "quit" => write_output(writer, &tray_quit_message()?),
+        "restart" => {
+            let _ = tray_quit_message()?;
+            write_output(writer, &tray_open_message()?)
+        }
+        "path" => write_output(writer, &resolve_tray_binary()?.display().to_string()),
+        "help" | "--help" | "-h" => write_output(
+            writer,
+            "Usage: codex-rotate tray [open|status|quit|restart|path]",
+        ),
+        other => Err(anyhow!(
+            "Unknown tray command: \"{other}\". Run \"codex-rotate tray help\" for usage."
+        )),
+    }
+}
+
+fn tray_open_message() -> Result<String> {
+    let tray_binary = resolve_tray_binary()?;
+    if tray_is_running_with_path(&tray_binary)? {
+        return Ok("Codex Rotate tray is already running.".to_string());
+    }
+
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("nohup");
+        command.arg(&tray_binary);
+        command
+    };
+
+    #[cfg(not(unix))]
+    let mut command = Command::new(&tray_binary);
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _child = command
+        .spawn()
+        .with_context(|| format!("Failed to start {}.", tray_binary.display()))?;
+
+    if wait_for_tray_state(&tray_binary, true) {
+        return Ok("Started Codex Rotate tray.".to_string());
+    }
+
+    Err(anyhow!(
+        "Timed out waiting for the Codex Rotate tray to start."
+    ))
+}
+
+fn tray_quit_message() -> Result<String> {
+    let tray_binary = resolve_tray_binary()?;
+    let process_ids = list_running_tray_process_ids(&tray_binary)?;
+    if process_ids.is_empty() {
+        return Ok("Codex Rotate tray is not running.".to_string());
+    }
+
+    for process_id in process_ids {
+        stop_process(process_id)
+            .with_context(|| format!("Failed to stop tray pid {}.", process_id))?;
+    }
+
+    if wait_for_tray_state(&tray_binary, false) {
+        return Ok("Stopped Codex Rotate tray.".to_string());
+    }
+
+    Err(anyhow!(
+        "Timed out waiting for the Codex Rotate tray to stop."
+    ))
+}
+
+fn tray_is_running() -> Result<bool> {
+    let tray_binary = resolve_tray_binary()?;
+    tray_is_running_with_path(&tray_binary)
+}
+
+fn tray_is_running_with_path(tray_binary: &Path) -> Result<bool> {
+    Ok(!list_running_tray_process_ids(tray_binary)?.is_empty())
+}
+
+fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tray_is_running_with_path(tray_binary) {
+            Ok(value) if value == running => return true,
+            _ => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    tray_is_running_with_path(tray_binary).ok() == Some(running)
+}
+
+fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args([
+                "/FO",
+                "CSV",
+                "/NH",
+                "/FI",
+                &format!("IMAGENAME eq {}", tray_binary_name()),
+            ])
+            .output()
+            .context("Failed to query running tray processes.")?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow!(
+                "{}",
+                if detail.is_empty() {
+                    "Failed to query running tray processes.".to_string()
+                } else {
+                    detail
+                }
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("INFO:"))
+            .filter_map(|line| {
+                let columns = line
+                    .split("\",\"")
+                    .map(|value| value.trim_matches('"'))
+                    .collect::<Vec<_>>();
+                columns.get(1).and_then(|value| parse_process_id(value))
+            })
+            .collect::<Vec<_>>());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("ps")
+            .args(["ax", "-o", "pid=,command="])
+            .output()
+            .context("Failed to query running tray processes.")?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow!(
+                "{}",
+                if detail.is_empty() {
+                    "Failed to query running tray processes.".to_string()
+                } else {
+                    detail
+                }
+            ));
+        }
+        let tray_binary = tray_binary.display().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(&tray_binary))
+            .filter_map(|line| line.split_whitespace().next().and_then(parse_process_id))
+            .collect::<Vec<_>>());
+    }
+}
+
+fn stop_process(process_id: u32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .status()
+            .context("Failed to invoke taskkill.")?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(anyhow!("taskkill exited with status {}.", status));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("kill")
+            .args(["-TERM", &process_id.to_string()])
+            .status()
+            .context("Failed to invoke kill.")?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(anyhow!("kill exited with status {}.", status))
+    }
+}
+
+fn parse_process_id(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn resolve_tray_binary() -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env::var_os("CODEX_ROTATE_TRAY_BIN") {
+        candidates.push(PathBuf::from(value));
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(tray_binary_name()));
+        }
+    }
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("..");
+    candidates.push(
+        repo_root
+            .join("target")
+            .join("debug")
+            .join(tray_binary_name()),
+    );
+    candidates.push(
+        repo_root
+            .join("target")
+            .join("release")
+            .join(tray_binary_name()),
+    );
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "Unable to find the codex-rotate tray binary. Set CODEX_ROTATE_TRAY_BIN to override."
+    ))
+}
+
+fn tray_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "codex-rotate-tray.exe"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "codex-rotate-tray"
     }
 }
 
@@ -288,6 +545,7 @@ fn help_text() -> String {
   {CYAN}relogin{RESET} <selector> Repair that account in one step
   {CYAN}remove{RESET} <selector>  Remove that account from the pool
   {CYAN}daemon{RESET} run        Start the background runtime daemon
+  {CYAN}tray{RESET} [subcommand] Manage the Codex Rotate tray app
   {CYAN}help{RESET}             Show this help message
 "#
     )
@@ -299,6 +557,8 @@ mod tests {
     use anyhow::Context;
     use std::fs;
     use std::io::BufReader;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::thread;
@@ -342,6 +602,24 @@ mod tests {
             },
         }
         fs::remove_dir_all(&rotate_home).ok();
+        result
+    }
+
+    fn with_env_var<T>(name: &str, value: &str, test: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let previous = std::env::var_os(name);
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        let result = test();
+        match previous {
+            Some(previous) => unsafe {
+                std::env::set_var(name, previous);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
+        }
         result
     }
 
@@ -436,11 +714,8 @@ mod tests {
 
     #[test]
     fn relogin_parser_rejects_legacy_device_auth_flag() {
-        let error = parse_relogin_options(&[
-            "acct-123".to_string(),
-            "--device-auth".to_string(),
-        ])
-        .expect_err("device auth should fail");
+        let error = parse_relogin_options(&["acct-123".to_string(), "--device-auth".to_string()])
+            .expect_err("device auth should fail");
         assert!(
             error
                 .to_string()
@@ -454,6 +729,70 @@ mod tests {
         let help = help_text();
         assert!(help.contains("daemon"));
         assert!(help.contains("Start the background runtime daemon"));
+        assert!(help.contains("tray"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tray_command_can_launch_report_and_stop_tray_binary() {
+        let fixture_root = unique_temp_dir("codex-rotate-tray-cli");
+        fs::create_dir_all(&fixture_root).expect("fixture root");
+        let tray_stub_path = fixture_root.join("codex-rotate-tray");
+        let started_path = fixture_root.join("started.txt");
+        fs::write(
+            &tray_stub_path,
+            format!(
+                "#!/bin/sh\ntrap 'exit 0' TERM INT\nprintf 'started\\n' > \"{}\"\nwhile true; do\n  sleep 1\ndone\n",
+                started_path.display()
+            ),
+        )
+        .expect("write tray stub");
+        let mut permissions = fs::metadata(&tray_stub_path)
+            .expect("tray stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tray_stub_path, permissions).expect("set tray stub permissions");
+
+        with_env_var(
+            "CODEX_ROTATE_TRAY_BIN",
+            tray_stub_path.to_str().expect("utf8 tray path"),
+            || -> Result<()> {
+                let mut output = Vec::new();
+                run_tray_command(&mut output, &["open".to_string()])?;
+                assert_eq!(
+                    String::from_utf8(output).expect("utf8").trim(),
+                    "Started Codex Rotate tray."
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline && !started_path.exists() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                assert!(started_path.exists(), "tray stub should have started");
+
+                let mut output = Vec::new();
+                run_tray_command(&mut output, &["status".to_string()])?;
+                assert_eq!(
+                    String::from_utf8(output).expect("utf8").trim(),
+                    "Codex Rotate tray is running."
+                );
+
+                let mut output = Vec::new();
+                run_tray_command(&mut output, &["quit".to_string()])?;
+                assert_eq!(
+                    String::from_utf8(output).expect("utf8").trim(),
+                    "Stopped Codex Rotate tray."
+                );
+
+                let error = run_tray_command(&mut Vec::new(), &["status".to_string()])
+                    .expect_err("tray should be stopped");
+                assert!(error.to_string().contains("not running"));
+                Ok(())
+            },
+        )
+        .expect("tray command");
+
+        fs::remove_dir_all(&fixture_root).ok();
     }
 
     #[test]
