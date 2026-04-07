@@ -38,8 +38,6 @@ use crate::watch::{refresh_quota_cache, run_watch_iteration, WatchIterationOptio
 
 const DEFAULT_PORT: u16 = 9333;
 const DEFAULT_INTERVAL_SECONDS: u64 = 15;
-const LOW_QUOTA_INTERVAL_SECONDS: u64 = 5;
-const CRITICAL_QUOTA_INTERVAL_SECONDS: u64 = 2;
 const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -666,12 +664,8 @@ fn set_quota_summary(state: &mut DaemonState, quota: &CachedQuotaState) {
 }
 
 fn next_watch_interval(current_quota_percent: Option<u8>) -> Duration {
-    let seconds = match current_quota_percent {
-        Some(percent) if percent <= 2 => CRITICAL_QUOTA_INTERVAL_SECONDS,
-        Some(percent) if percent <= 20 => LOW_QUOTA_INTERVAL_SECONDS,
-        _ => DEFAULT_INTERVAL_SECONDS,
-    };
-    Duration::from_secs(seconds)
+    let _ = current_quota_percent;
+    Duration::from_secs(DEFAULT_INTERVAL_SECONDS)
 }
 
 fn next_tick_label(interval: Duration) -> String {
@@ -871,5 +865,14 @@ mod tests {
         }
 
         assert!(!result);
+    }
+
+    #[test]
+    fn next_watch_interval_never_drops_below_fifteen_seconds() {
+        assert_eq!(next_watch_interval(None), Duration::from_secs(15));
+        assert_eq!(next_watch_interval(Some(100)), Duration::from_secs(15));
+        assert_eq!(next_watch_interval(Some(20)), Duration::from_secs(15));
+        assert_eq!(next_watch_interval(Some(2)), Duration::from_secs(15));
+        assert_eq!(next_watch_interval(Some(0)), Duration::from_secs(15));
     }
 }
