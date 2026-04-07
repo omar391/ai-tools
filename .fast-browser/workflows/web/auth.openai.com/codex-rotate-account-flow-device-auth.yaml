@@ -323,11 +323,12 @@ use:
             const aboutYou = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(normalizedText)
               || /about-you/i.test(path);
             const resetPasswordPrompt = /reset-password/i.test(currentUrl) || /\breset password\b/i.test(normalizedText);
+            const incorrectCode = /incorrect code|invalid code|code expired|expired code/i.test(normalizedText);
             const existingAccountPrompt = /an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(normalizedText);
             const usernameNotFound = /username_not_found|username not found/i.test(normalizedText);
             const invalidCredentials = /incorrect email address or password|incorrect password|wrong password|invalid email or password/i.test(normalizedText);
             const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
-            const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text)) || (sawOauthConsent && visibleButtons.some((text) => /^continue$/i.test(text)));
+            const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text) || /^continue$/i.test(text));
             const continueButtonVisible = visibleButtons.some((text) => /continue|next|verify|submit|log in|sign in/i.test(text));
             const oneTimeCodeOption = visibleButtons.some((text) => /one-time code|one time code/i.test(text));
             const emailVerification = (!sawOauthConsent && codeInput)
@@ -388,7 +389,7 @@ use:
               stage = "login_email";
             } else if (appShell || securityShell) {
               stage = "app_shell";
-            } else if (publicShell) {
+            } else if (publicShell && !emailInput && !passwordInput && !codeInput) {
               stage = "public_chatgpt";
             } else if (emailInput || passwordInput || codeInput || /welcome back|log in|sign in|check your inbox|enter your password/i.test(normalizedText)) {
               stage = "auth_prompt";
@@ -418,6 +419,7 @@ use:
               retryable_timeout: retryableTimeout,
               rate_limit_exceeded: rateLimitExceeded,
               reset_password_prompt: resetPasswordPrompt,
+              incorrect_code: incorrectCode,
               username_not_found: usernameNotFound,
               invalid_credentials: invalidCredentials,
               existing_account_prompt: existingAccountPrompt,
@@ -440,6 +442,502 @@ use:
           dispatch_events_after_fill: true
           blur_after_fill: true
           settle_ms: 250
+    submit_signup_email_form:
+      metadata:
+        description: "Submit the signup email form and verify that OpenAI advances to a valid next state."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const expectedEmail = String(args.email || "").trim().toLowerCase();
+            const detectStage = async () => {
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                  return await page.evaluate(() => {
+                    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                    const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                      if (!(node instanceof Element)) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    });
+                    const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                    const title = normalize(document.title || "");
+                    const path = location.pathname;
+                    const host = location.hostname;
+                    const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
+                    const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
+                    const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+                    const antiBotGate = /just a moment/i.test(title)
+                      || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
+                      || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
+                    const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);
+                    const sessionEnded = /your session has ended/i.test(bodyText);
+                    const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);
+                    const addPhonePrompt = /add-phone/i.test(path)
+                      || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);
+                    const aboutYou = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)
+                      || /about-you/i.test(path);
+                    const needsEmailVerification = verificationInput
+                      || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
+                      || /email-verification/i.test(path);
+                    const existingAccountPrompt = /an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText);
+                    let stage = "unknown";
+                    if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+                      stage = "callback_complete";
+                    } else if (antiBotGate) {
+                      stage = "security_verification";
+                    } else if (rateLimitExceeded) {
+                      stage = "rate_limit";
+                    } else if (sessionEnded) {
+                      stage = "session_ended";
+                    } else if (retryableTimeout) {
+                      stage = "retryable_timeout";
+                    } else if (addPhonePrompt) {
+                      stage = "add_phone";
+                    } else if (aboutYou) {
+                      stage = "about_you";
+                    } else if (needsEmailVerification) {
+                      stage = "email_verification";
+                    } else if (existingAccountPrompt) {
+                      stage = "existing_account_prompt";
+                    } else if (/\/create-account(?:\/|$)/i.test(path) && passwordInput) {
+                      stage = "signup_password";
+                    } else if (/\/create-account(?:\/|$)/i.test(path) && emailInput) {
+                      stage = "signup_email";
+                    } else if (emailInput || passwordInput || verificationInput) {
+                      stage = "auth_prompt";
+                    }
+                    return {
+                      stage,
+                      current_url: location.href,
+                      headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                    };
+                  });
+                } catch (error) {
+                  const message = String(error?.message || error || "");
+                  if (!/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message) || attempt === 3) {
+                    throw error;
+                  }
+                  await page.waitForLoadState("domcontentloaded").catch(() => {});
+                  await page.waitForTimeout(250).catch(() => {});
+                }
+              }
+              return {
+                stage: "unknown",
+                current_url: page.url(),
+                headline: null,
+              };
+            };
+
+            const fieldSelectors = [
+              'input[type="email"]',
+              'input[name="email"]',
+              'input[autocomplete="email"]',
+              'input[autocomplete="username"]',
+            ];
+            let field = null;
+            for (const selector of fieldSelectors) {
+              const candidate = page.locator(selector).first();
+              if (!(await candidate.count().catch(() => 0))) {
+                continue;
+              }
+              if (!(await candidate.isVisible().catch(() => false))) {
+                continue;
+              }
+              field = candidate;
+              break;
+            }
+            if (!field) {
+              throw new Error("signup-email-field-not-found");
+            }
+            const value = String(await field.inputValue().catch(() => "")).trim().toLowerCase();
+            if (!value || value !== expectedEmail) {
+              throw new Error("signup-email-not-filled:" + (value || "empty"));
+            }
+
+            const allowedStages = new Set([
+              "signup_password",
+              "email_verification",
+              "about_you",
+              "add_phone",
+              "existing_account_prompt",
+              "security_verification",
+              "retryable_timeout",
+              "rate_limit",
+              "session_ended",
+              "callback_complete",
+            ]);
+
+            const clickVisibleContinue = async () => {
+              try {
+                const result = await field.evaluate((input) => {
+                  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                  const isVisible = (node) => {
+                    if (!(node instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") {
+                      return false;
+                    }
+                    const rect = node.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const readLabel = (node) => {
+                    if (!(node instanceof Element)) {
+                      return "";
+                    }
+                    if (node instanceof HTMLInputElement) {
+                      return normalize(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  };
+                  const form = input instanceof Element ? input.closest("form") : null;
+                  const scope = form || document;
+                  const candidates = Array.from(scope.querySelectorAll("button, input[type='submit'], [role='button']"))
+                    .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+                  const preferred = candidates.find((node) => {
+                    const label = readLabel(node);
+                    const isSubmitNode = (node instanceof HTMLButtonElement && node.type === "submit")
+                      || (node instanceof HTMLInputElement && node.type === "submit");
+                    return isSubmitNode && /continue|next|sign up|create account|submit|verify/i.test(label);
+                  }) || candidates.find((node) => /continue|next|sign up|create account|submit|verify/i.test(readLabel(node)));
+                  if (preferred instanceof HTMLElement) {
+                    preferred.click();
+                    return {
+                      ok: true,
+                      strategy: "form-dom-click",
+                      label: readLabel(preferred) || null,
+                    };
+                  }
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                    return {
+                      ok: true,
+                      strategy: "form-request-submit",
+                      label: null,
+                    };
+                  }
+                  return null;
+                });
+                return result;
+              } catch (error) {
+                const message = String(error?.message || error || "");
+                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message)) {
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click-navigation",
+                    label: null,
+                  };
+                }
+                throw error;
+              }
+            };
+
+            const attempts = [
+              async () => clickVisibleContinue(),
+              async () => {
+                await field.press("Enter").catch(() => {});
+                return { strategy: "press-enter", label: null };
+              },
+              async () => {
+                await field.evaluate((input) => {
+                  if (input instanceof HTMLElement) {
+                    input.blur();
+                  }
+                  const form = input instanceof Element ? input.closest("form") : null;
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                  }
+                }).catch(() => {});
+                return { strategy: "request-submit", label: null };
+              },
+            ];
+
+            const waitForTransition = async (sameStage, timeoutMs = 6500) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
+            const transitions = [];
+            for (const attempt of attempts) {
+              const performed = await attempt();
+              if (!performed) {
+                continue;
+              }
+              const after = await waitForTransition("signup_email");
+              transitions.push({ ...performed, ...after });
+              if (allowedStages.has(after.stage) && after.stage !== "signup_email") {
+                return {
+                  ok: true,
+                  strategy: performed.strategy,
+                  next_stage: after.stage,
+                  current_url: after.current_url,
+                  headline: after.headline,
+                  transitions,
+                };
+              }
+            }
+
+            const finalState = await detectStage();
+            throw new Error("signup-email-submit-stuck:" + String(finalState.stage || "unknown") + ":" + String(finalState.current_url || page.url()));
+    submit_login_email_form:
+      metadata:
+        description: "Submit the login email form and verify that OpenAI advances to a valid next state."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const expectedEmail = String(args.email || "").trim().toLowerCase();
+            const detectStage = async () => {
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                  return await page.evaluate(() => {
+                    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                    const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                      if (!(node instanceof Element)) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    });
+                    const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                    const title = normalize(document.title || "");
+                    const path = location.pathname;
+                    const host = location.hostname;
+                    const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
+                    const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
+                    const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+                    const antiBotGate = /just a moment/i.test(title)
+                      || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
+                      || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
+                    const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);
+                    const sessionEnded = /your session has ended/i.test(bodyText);
+                    const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);
+                    const needsEmailVerification = verificationInput
+                      || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
+                      || /email-verification/i.test(path);
+                    let stage = "unknown";
+                    if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+                      stage = "callback_complete";
+                    } else if (antiBotGate) {
+                      stage = "security_verification";
+                    } else if (rateLimitExceeded) {
+                      stage = "rate_limit";
+                    } else if (sessionEnded) {
+                      stage = "session_ended";
+                    } else if (retryableTimeout) {
+                      stage = "retryable_timeout";
+                    } else if (needsEmailVerification) {
+                      stage = "email_verification";
+                    } else if (/\/log-in(?:\/|$)/i.test(path) && passwordInput) {
+                      stage = "login_password";
+                    } else if (/\/log-in(?:\/|$)/i.test(path) && emailInput) {
+                      stage = "login_email";
+                    } else if (emailInput || passwordInput || verificationInput) {
+                      stage = "auth_prompt";
+                    }
+                    return {
+                      stage,
+                      current_url: location.href,
+                      headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                    };
+                  });
+                } catch (error) {
+                  const message = String(error?.message || error || "");
+                  if (!/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message) || attempt === 3) {
+                    throw error;
+                  }
+                  await page.waitForLoadState("domcontentloaded").catch(() => {});
+                  await page.waitForTimeout(250).catch(() => {});
+                }
+              }
+              return {
+                stage: "unknown",
+                current_url: page.url(),
+                headline: null,
+              };
+            };
+
+            const fieldSelectors = [
+              'input[type="email"]',
+              'input[name="email"]',
+              'input[autocomplete="email"]',
+              'input[autocomplete="username"]',
+            ];
+            let field = null;
+            for (const selector of fieldSelectors) {
+              const candidate = page.locator(selector).first();
+              if (!(await candidate.count().catch(() => 0))) {
+                continue;
+              }
+              if (!(await candidate.isVisible().catch(() => false))) {
+                continue;
+              }
+              field = candidate;
+              break;
+            }
+            if (!field) {
+              throw new Error("login-email-field-not-found");
+            }
+            const value = String(await field.inputValue().catch(() => "")).trim().toLowerCase();
+            if (!value || value !== expectedEmail) {
+              throw new Error("login-email-not-filled:" + (value || "empty"));
+            }
+
+            const allowedStages = new Set([
+              "login_password",
+              "email_verification",
+              "security_verification",
+              "retryable_timeout",
+              "rate_limit",
+              "session_ended",
+              "callback_complete",
+            ]);
+
+            const clickVisibleContinue = async () => {
+              try {
+                const result = await field.evaluate((input) => {
+                  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                  const isVisible = (node) => {
+                    if (!(node instanceof Element)) {
+                      return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") {
+                      return false;
+                    }
+                    const rect = node.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  const readLabel = (node) => {
+                    if (!(node instanceof Element)) {
+                      return "";
+                    }
+                    if (node instanceof HTMLInputElement) {
+                      return normalize(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  };
+                  const form = input instanceof Element ? input.closest("form") : null;
+                  const scope = form || document;
+                  const candidates = Array.from(scope.querySelectorAll("button, input[type='submit'], [role='button']"))
+                    .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+                  const preferred = candidates.find((node) => {
+                    const label = readLabel(node);
+                    const isSubmitNode = (node instanceof HTMLButtonElement && node.type === "submit")
+                      || (node instanceof HTMLInputElement && node.type === "submit");
+                    return isSubmitNode && /continue|next|log in|sign in|submit|verify/i.test(label);
+                  }) || candidates.find((node) => /continue|next|log in|sign in|submit|verify/i.test(readLabel(node)));
+                  if (preferred instanceof HTMLElement) {
+                    preferred.click();
+                    return {
+                      ok: true,
+                      strategy: "form-dom-click",
+                      label: readLabel(preferred) || null,
+                    };
+                  }
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                    return {
+                      ok: true,
+                      strategy: "form-request-submit",
+                      label: null,
+                    };
+                  }
+                  return null;
+                });
+                return result;
+              } catch (error) {
+                const message = String(error?.message || error || "");
+                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message)) {
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click-navigation",
+                    label: null,
+                  };
+                }
+                throw error;
+              }
+            };
+
+            const attempts = [
+              async () => clickVisibleContinue(),
+              async () => {
+                await field.press("Enter").catch(() => {});
+                return { strategy: "press-enter", label: null };
+              },
+              async () => {
+                await field.evaluate((input) => {
+                  if (input instanceof HTMLElement) {
+                    input.blur();
+                  }
+                  const form = input instanceof Element ? input.closest("form") : null;
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                  }
+                }).catch(() => {});
+                return { strategy: "request-submit", label: null };
+              },
+            ];
+
+            const waitForTransition = async (sameStage, timeoutMs = 6500) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
+            const transitions = [];
+            for (const attempt of attempts) {
+              const performed = await attempt();
+              if (!performed) {
+                continue;
+              }
+              const after = await waitForTransition("login_email");
+              transitions.push({ ...performed, ...after });
+              if (allowedStages.has(after.stage) && after.stage !== "login_email") {
+                return {
+                  ok: true,
+                  strategy: performed.strategy,
+                  next_stage: after.stage,
+                  current_url: after.current_url,
+                  headline: after.headline,
+                  transitions,
+                };
+              }
+            }
+
+            const finalState = await detectStage();
+            throw new Error("login-email-submit-stuck:" + String(finalState.stage || "unknown") + ":" + String(finalState.current_url || page.url()));
     fill_openai_password_field:
       metadata:
         description: "Fill the OpenAI password field from the runtime-resolved login locator."
@@ -465,10 +963,16 @@ use:
         body:
           script: |
             const fullName = String(args.full_name || "M Omar Faruque").trim();
-            const month = String(args.birth_month || "1").trim();
-            const day = String(args.birth_day || "24").trim();
-            const year = String(args.birth_year || "1990").trim();
-            const monthNames = {
+            const birthday = {
+              month: String(args.birth_month || "1").trim(),
+              day: String(args.birth_day || "24").trim(),
+              year: String(args.birth_year || "1990").trim(),
+            };
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const normalizedMonth = String(Number.parseInt(birthday.month, 10) || 1);
+            const normalizedDay = String(Number.parseInt(birthday.day, 10) || 1);
+            const isoBirthday = birthday.year + "-" + birthday.month.padStart(2, "0") + "-" + birthday.day.padStart(2, "0");
+            const monthAliases = {
               "1": ["1", "01", "jan", "january"],
               "2": ["2", "02", "feb", "february"],
               "3": ["3", "03", "mar", "march"],
@@ -482,105 +986,170 @@ use:
               "11": ["11", "nov", "november"],
               "12": ["12", "dec", "december"],
             };
-            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-            const monthTokens = (monthNames[month] || [month]).map((value) => normalize(value).toLowerCase());
-            const dayTokens = [day, day.padStart(2, "0")].map((value) => normalize(value));
-            const findVisible = async (selectors) => {
+            const monthTokens = (monthAliases[normalizedMonth] || [birthday.month, normalizedMonth]).map((value) => normalize(value).toLowerCase());
+            const dayTokens = [birthday.day, birthday.day.padStart(2, "0"), normalizedDay].map((value) => normalize(value));
+
+            const fillFirst = async (selectors, value) => {
               for (const selector of selectors) {
-                const locator = page.locator(selector).first();
-                if (!(await locator.count().catch(() => 0))) {
+                const field = page.locator(selector).first();
+                if (!(await field.count().catch(() => 0))) {
                   continue;
                 }
-                if (!(await locator.isVisible().catch(() => false))) {
+                if (!(await field.isVisible().catch(() => false))) {
                   continue;
                 }
-                return locator;
+                await field.scrollIntoViewIfNeeded().catch(() => {});
+                await field.fill(value).catch(() => {});
+                let nextValue = await field.inputValue().catch(() => null);
+                if ((typeof nextValue !== "string" || nextValue.length === 0) && typeof value === "string" && value.length > 0) {
+                  await field.click().catch(() => {});
+                  await field.pressSequentially(value, { delay: 20 }).catch(() => {});
+                  nextValue = await field.inputValue().catch(() => null);
+                }
+                if (typeof nextValue === "string" && nextValue.length > 0) {
+                  await field.evaluate((input) => {
+                    if (!(input instanceof HTMLInputElement)) {
+                      return;
+                    }
+                    input.dispatchEvent(new Event("input", { bubbles: true }));
+                    input.dispatchEvent(new Event("change", { bubbles: true }));
+                    input.dispatchEvent(new Event("blur", { bubbles: true }));
+                  }).catch(() => {});
+                  return true;
+                }
               }
-              return null;
+              return false;
             };
-            const readInputValue = async (locator) => {
-              return await locator.inputValue().catch(() => null);
-            };
-            const readSelectValue = async (locator) => {
-              return await locator.evaluate((node) => {
-                if (!(node instanceof HTMLSelectElement)) {
-                  return null;
+
+            const selectFirst = async (selectors, values) => {
+              for (const selector of selectors) {
+                const field = page.locator(selector).first();
+                if (!(await field.count().catch(() => 0))) {
+                  continue;
                 }
-                const selected = node.selectedOptions?.[0];
-                return {
-                  value: String(node.value || ""),
-                  label: String(selected?.label || selected?.textContent || node.value || ""),
-                };
+                if (!(await field.isVisible().catch(() => false))) {
+                  continue;
+                }
+                for (const value of values) {
+                  const selected = await field.selectOption(value).catch(() => []);
+                  if (Array.isArray(selected) && selected.length > 0) {
+                    return true;
+                  }
+                  if (typeof value === "string") {
+                    const labeled = await field.selectOption({ label: value }).catch(() => []);
+                    if (Array.isArray(labeled) && labeled.length > 0) {
+                      return true;
+                    }
+                  }
+                }
+              }
+              return false;
+            };
+
+            const readFieldSummary = async (selector) => {
+              return await page.locator(selector).first().evaluate((node) => {
+                if (node instanceof HTMLSelectElement) {
+                  const selected = node.selectedOptions?.[0];
+                  return {
+                    value: String(node.value || ""),
+                    label: String(selected?.label || selected?.textContent || node.value || ""),
+                  };
+                }
+                if (node instanceof HTMLInputElement) {
+                  return {
+                    value: String(node.value || ""),
+                    label: String(node.value || ""),
+                  };
+                }
+                return null;
               }).catch(() => null);
             };
-            const visibleSelects = [];
-            const selectCount = await page.locator("select").count().catch(() => 0);
-            for (let index = 0; index < selectCount; index += 1) {
-              const locator = page.locator("select").nth(index);
-              if (await locator.isVisible().catch(() => false)) {
-                visibleSelects.push(locator);
-              }
-            }
-            const nameField = await findVisible([
-              'input[name="name"]',
+
+            const nameDone = await fillFirst([
               'input[name*="name" i]',
               'input[autocomplete="name"]',
-              'input[placeholder*="name" i]',
-            ]);
-            const monthField = await findVisible([
-              'select[name*="month" i]',
-              'select[aria-label*="month" i]',
-            ]) || visibleSelects[0] || null;
-            const dayField = await findVisible([
-              'select[name*="day" i]',
-              'select[aria-label*="day" i]',
-            ]) || visibleSelects[1] || null;
-            const yearField = await findVisible([
-              'select[name*="year" i]',
-              'select[aria-label*="year" i]',
-            ]) || visibleSelects[2] || null;
-            if (!nameField || !monthField || !dayField || !yearField) {
-              throw new Error("about-you-fields-not-found");
+              'input[placeholder*="Full name" i]',
+              'input[aria-label*="Full name" i]',
+            ], fullName);
+
+            let monthDone = await selectFirst(
+              ['select[name*="month" i]', 'select[aria-label*="month" i]'],
+              [birthday.month, normalizedMonth, "April", { label: "April" }, "Apr", { label: "Apr" }],
+            );
+            if (!monthDone) {
+              monthDone = await fillFirst(
+                ['input[name*="month" i]', 'input[aria-label*="month" i]', 'input[placeholder*="MM" i]'],
+                birthday.month,
+              );
             }
-            await nameField.scrollIntoViewIfNeeded().catch(() => {});
-            await nameField.click().catch(() => {});
-            await nameField.fill(fullName).catch(() => {});
-            const selectValue = async (locator, targetValue, acceptedTokens = []) => {
-              const options = await locator.evaluate((node) => {
-                if (!(node instanceof HTMLSelectElement)) {
-                  return [];
-                }
-                return Array.from(node.options || []).map((option) => ({
-                  value: String(option.value || ""),
-                  label: String(option.label || option.textContent || ""),
-                }));
-              }).catch(() => []);
-              const normalizedTarget = normalize(targetValue).toLowerCase();
-              const normalizedAccepted = acceptedTokens.map((value) => normalize(value).toLowerCase());
-              const chosen = options.find((option) => {
-                const value = normalize(option.value).toLowerCase();
-                const label = normalize(option.label).toLowerCase();
-                return value === normalizedTarget
-                  || label === normalizedTarget
-                  || normalizedAccepted.includes(value)
-                  || normalizedAccepted.includes(label);
-              });
-              if (!chosen) {
-                throw new Error("about-you-option-not-found:" + String(targetValue));
+
+            let dayDone = await selectFirst(
+              ['select[name*="day" i]', 'select[aria-label*="day" i]'],
+              [birthday.day, normalizedDay, { label: normalizedDay }],
+            );
+            if (!dayDone) {
+              dayDone = await fillFirst(
+                ['input[name*="day" i]', 'input[aria-label*="day" i]', 'input[placeholder*="DD" i]'],
+                birthday.day,
+              );
+            }
+
+            let yearDone = await selectFirst(
+              ['select[name*="year" i]', 'select[aria-label*="year" i]'],
+              [birthday.year, { label: birthday.year }],
+            );
+            if (!yearDone) {
+              yearDone = await fillFirst(
+                ['input[name*="year" i]', 'input[aria-label*="year" i]', 'input[placeholder*="YYYY" i]'],
+                birthday.year,
+              );
+            }
+
+            if (!monthDone || !dayDone || !yearDone) {
+              const birthdaySelects = page.locator("select");
+              const selectCount = await birthdaySelects.count().catch(() => 0);
+              if (selectCount >= 3) {
+                await birthdaySelects.nth(0).selectOption([birthday.month, normalizedMonth]).catch(() => {});
+                await birthdaySelects.nth(1).selectOption([birthday.day, normalizedDay]).catch(() => {});
+                await birthdaySelects.nth(2).selectOption(birthday.year).catch(() => {});
               }
-              await locator.selectOption({ value: chosen.value }).catch(async () => {
-                await locator.selectOption({ label: chosen.label }).catch(() => {});
-              });
-            };
-            await selectValue(monthField, month, monthTokens);
-            await selectValue(dayField, day, dayTokens);
-            await selectValue(yearField, year, [year]);
+            }
+
+            if (!monthDone || !dayDone || !yearDone) {
+              await fillFirst([
+                'input[name*="birthday" i]',
+                'input[aria-label*="birthday" i]',
+                'input[placeholder*="Birthday" i]',
+                'input[type="date"]',
+              ], birthday.month + "/" + birthday.day + "/" + birthday.year);
+              await fillFirst(['input[type="date"]'], isoBirthday);
+            }
+
+            const hiddenBirthdayWritten = await page.evaluate((value) => {
+              const hiddenBirthday = document.querySelector('input[name="birthday"]');
+              if (!(hiddenBirthday instanceof HTMLInputElement)) {
+                return false;
+              }
+              hiddenBirthday.value = value;
+              hiddenBirthday.dispatchEvent(new Event("input", { bubbles: true }));
+              hiddenBirthday.dispatchEvent(new Event("change", { bubbles: true }));
+              return true;
+            }, isoBirthday).catch(() => false);
+
             await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
             await page.waitForTimeout(250).catch(() => {});
-            const nameActual = normalize(await readInputValue(nameField));
-            const monthActual = await readSelectValue(monthField);
-            const dayActual = await readSelectValue(dayField);
-            const yearActual = await readSelectValue(yearField);
+
+            const nameActual = normalize(await page.locator([
+              'input[name*="name" i]',
+              'input[autocomplete="name"]',
+              'input[placeholder*="Full name" i]',
+              'input[aria-label*="Full name" i]',
+            ].join(", ")).first().inputValue().catch(() => ""));
+            const monthActual = await readFieldSummary('select[name*="month" i], select[aria-label*="month" i], input[name*="month" i], input[aria-label*="month" i], input[placeholder*="MM" i]');
+            const dayActual = await readFieldSummary('select[name*="day" i], select[aria-label*="day" i], input[name*="day" i], input[aria-label*="day" i], input[placeholder*="DD" i]');
+            const yearActual = await readFieldSummary('select[name*="year" i], select[aria-label*="year" i], input[name*="year" i], input[aria-label*="year" i], input[placeholder*="YYYY" i]');
+            const hiddenBirthday = await page.locator('input[name="birthday"]').first().inputValue().catch(() => null);
+
             const submit = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]')
               .filter({ hasText: /continue|next|finish creating account|submit|verify/i })
               .first();
@@ -589,23 +1158,32 @@ use:
             const submitText = submitFound
               ? await submit.evaluate((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).catch(() => null)
               : null;
-            const monthMatches = monthTokens.includes(normalize(monthActual?.label || monthActual?.value || "").toLowerCase());
-            const dayMatches = dayTokens.includes(normalize(dayActual?.label || dayActual?.value || ""));
-            const yearMatches = normalize(yearActual?.label || yearActual?.value || "") === normalize(year);
-            const ok = nameActual === normalize(fullName) && monthMatches && dayMatches && yearMatches && submitDisabled === false;
+
+            const monthLabel = normalize(monthActual?.label || monthActual?.value || "").toLowerCase();
+            const dayLabel = normalize(dayActual?.label || dayActual?.value || "");
+            const yearLabel = normalize(yearActual?.label || yearActual?.value || "");
+            const hiddenBirthdayMatches = normalize(hiddenBirthday || "") === isoBirthday;
+            const monthMatches = monthTokens.includes(monthLabel) || hiddenBirthdayMatches;
+            const dayMatches = dayTokens.includes(dayLabel) || hiddenBirthdayMatches;
+            const yearMatches = yearLabel === normalize(birthday.year) || hiddenBirthdayMatches;
+            const ok = nameDone && nameActual === normalize(fullName) && monthMatches && dayMatches && yearMatches && submitDisabled === false;
             if (!ok) {
               throw new Error("about-you-fill-failed:" + JSON.stringify({
+                name_done: nameDone,
                 name_value: nameActual || null,
                 month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
                 day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
                 year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
+                hidden_birthday: normalize(hiddenBirthday || "") || null,
+                hidden_birthday_written: hiddenBirthdayWritten,
                 submit_disabled: submitDisabled,
                 submit_text: normalize(submitText || "") || null,
               }));
             }
             return {
-              ok,
+              ok: true,
               current_url: page.url(),
+              hidden_birthday: hiddenBirthday || null,
             };
     submit_openai_password_form:
       metadata:
@@ -665,8 +1243,8 @@ use:
                   return false;
                 }
                 const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
-                return /continue to codex|continue to openai|authorize|allow|accept/i.test(text)
-                  || (oauthConsentCopy && /^continue$/i.test(text));
+                return oauthConsentCopy && (/continue to codex|continue to openai|authorize|allow|accept/i.test(text)
+                  || /^continue$/i.test(text));
               });
               const needsEmailVerification = (!oauthConsentCopy && verificationInput)
                 || (!oauthConsentCopy && /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText))
@@ -943,6 +1521,15 @@ use:
         body:
           script: |
             const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const emailInputVisible = await page.locator("input[type='email'], input[name='email'], input[autocomplete='email'], input[autocomplete='username']").first().isVisible().catch(() => false);
+            if (emailInputVisible) {
+              return {
+                ok: true,
+                skipped: true,
+                reason: "email-input-already-visible",
+                current_url: page.url(),
+              };
+            }
             const controls = page.locator("button, a, [role='button'], input[type='submit']");
             const count = await controls.count().catch(() => 0);
             for (let index = 0; index < count; index += 1) {
@@ -1003,6 +1590,69 @@ use:
               return { ok: true, current_url: page.url() };
             }
             return { ok: false, error: "retryable-try-again-not-found", current_url: page.url() };
+    click_chatgpt_signup_button:
+      metadata:
+        description: "Click ChatGPT's Sign up entry from the public shell."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const authModal = page.locator("#modal-no-auth-login, [data-testid='modal-no-auth-login'], #modal-no-auth-welcome-back, [data-testid='modal-no-auth-welcome-back']").first();
+            const useModalScope = await authModal.isVisible().catch(() => false);
+            const controls = useModalScope
+              ? authModal.locator("a, button, [role='button'], input[type='submit']")
+              : page.locator("a, button, [role='button'], input[type='submit']");
+            const count = await controls.count().catch(() => 0);
+            for (let index = 0; index < count; index += 1) {
+              const locator = controls.nth(index);
+              if (!(await locator.isVisible().catch(() => false))) {
+                continue;
+              }
+              const payload = await locator.evaluate((node) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                if (!(node instanceof Element)) {
+                  return { label: "", href: "" };
+                }
+                const label = node instanceof HTMLInputElement
+                  ? normalize(node.value || node.getAttribute("aria-label") || node.getAttribute("title") || "")
+                  : normalize(
+                      node.innerText
+                      || node.textContent
+                      || node.getAttribute("aria-label")
+                      || node.getAttribute("title")
+                      || ""
+                    );
+                return {
+                  label,
+                  href: node.getAttribute("href") || "",
+                };
+              }).catch(() => ({ label: "", href: "" }));
+              const label = normalize(payload.label);
+              const href = String(payload.href || "");
+              if (
+                /create-account|sign[_ -]?up/i.test(href)
+                || /^sign up$/i.test(label)
+                || /sign up for free|create account|get started/i.test(label)
+              ) {
+                await locator.scrollIntoViewIfNeeded().catch(() => {});
+                await locator.click({ timeout: 5000 }).catch(() => {});
+                await page.waitForTimeout(1200).catch(() => {});
+                return {
+                  ok: true,
+                  clicked_text: label || null,
+                  clicked_href: href || null,
+                  current_url: page.url(),
+                };
+              }
+            }
+            return {
+              ok: false,
+              error: "sign-up-button-not-found",
+              current_url: page.url(),
+            };
     click_chatgpt_login_button:
       metadata:
         description: "Click ChatGPT's Log in entry from the public shell."
@@ -1455,39 +2105,6 @@ do:
         description: "Detect whether this run is reusing an already-issued device-auth challenge and should skip the fresh ChatGPT preparation branch."
       set:
         reuse_device_auth_session: "${(() => { const authUrl = String(inputs.auth_url || '').trim(); const deviceCode = String(inputs.device_code || '').trim(); return authUrl !== '' && deviceCode !== ''; })()}"
-  - inspect_existing_chatgpt_session:
-      if: "${state.vars.reuse_device_auth_session !== true}"
-      metadata:
-        description: "Detect whether the managed browser is already on an authenticated ChatGPT shell so device-auth can skip the heavy prepare workflow."
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.exec_script
-      with:
-        body:
-          script: |
-            const title = await page.title().catch(() => "");
-            const bodyText = await page.locator("body").innerText().catch(() => "");
-            const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
-            const currentUrl = page.url();
-            const chatGptShell = /chatgpt\.com/i.test(currentUrl);
-            const settingsShell = chatGptShell && /general|notifications|personalization|apps|data controls|security|account/i.test(normalizedText);
-            const securityOpen = chatGptShell && /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText);
-            const composerShell = chatGptShell && /new chat|search chats|chat history|what are you working on|what’s on your mind today|where should we begin/i.test(normalizedText);
-            const sessionExpired = chatGptShell && /your session has expired|please log in again to continue using the app/i.test(normalizedText);
-            const publicShellSignals = chatGptShell && /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started|where should we begin/i.test(normalizedText);
-            const loginCtaVisible = chatGptShell && /(?:^|\b)log in(?:\b|$)|sign up for free|get started/i.test(normalizedText);
-            const accountReady = (securityOpen || composerShell) && !sessionExpired && !loginCtaVisible && !publicShellSignals;
-            return {
-              ok: true,
-              current_url: currentUrl,
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              stage: accountReady ? "app_shell" : (sessionExpired || loginCtaVisible || publicShellSignals ? "public_chatgpt" : "unknown"),
-              account_ready: accountReady,
-              settings_shell: settingsShell,
-              security_open: securityOpen,
-              session_expired: sessionExpired,
-              login_cta_visible: loginCtaVisible,
-            };
   - clear_prepare_device_auth_site_state:
       if: "${state.vars.reuse_device_auth_session !== true}"
       metadata:
@@ -1501,8 +2118,22 @@ do:
       with:
         body:
           url: "https://chatgpt.com/?codex_rotate_public_entry=device_auth_prepare_reset"
+  - force_prepare_chatgpt_logout:
+      if: "${state.vars.reuse_device_auth_session !== true}"
+      metadata:
+        description: "Visit the explicit ChatGPT logout URL before starting the fresh device-auth prepare path."
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "https://chatgpt.com/auth/logout"
+  - wait_after_prepare_chatgpt_logout:
+      if: "${state.steps.force_prepare_chatgpt_logout?.action?.ok === true && state.steps.force_prepare_chatgpt_logout?.action?.skipped !== true}"
+      metadata:
+        description: "Let the explicit ChatGPT logout redirect settle before reopening the public entry."
+      wait:
+        milliseconds: 1200
   - reopen_public_chatgpt_entry_for_prepare:
-      if: "${state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true}"
+      if: "${(state.steps.force_prepare_chatgpt_logout?.action?.ok === true && state.steps.force_prepare_chatgpt_logout?.action?.skipped !== true) || (state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true)}"
       metadata:
         description: "Reopen the public ChatGPT entry after clearing site state so the prepare flow starts from a known public shell."
       call: afn.driver.browser.navigate
@@ -1521,230 +2152,12 @@ do:
         description: "Inspect the public ChatGPT entry before the local device-auth prepare login branch begins."
         mode: headless_ok
         targetRef: primary
-      call: afn.driver.browser.exec_script
-      with:
-        body:
-          script: |
-            const title = await page.title().catch(() => "");
-            const bodyText = await page.locator("body").innerText().catch(() => "");
-            const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
-            const currentUrl = page.url();
-            const chatGptShell = /chatgpt\.com/i.test(currentUrl);
-            const settingsShell = chatGptShell && /general|notifications|personalization|apps|data controls|security|account/i.test(normalizedText);
-            const securityOpen = chatGptShell && /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText);
-            const composerShell = chatGptShell && /new chat|search chats|chat history|what are you working on|what’s on your mind today|where should we begin/i.test(normalizedText);
-            const sessionExpired = chatGptShell && /your session has expired|please log in again to continue using the app/i.test(normalizedText);
-            const publicShellSignals = chatGptShell && /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started|where should we begin/i.test(normalizedText);
-            const loginCtaVisible = chatGptShell && /(?:^|\b)log in(?:\b|$)|sign up for free|get started/i.test(normalizedText);
-            const accountReady = (securityOpen || composerShell) && !sessionExpired && !loginCtaVisible && !publicShellSignals;
-            return {
-              ok: true,
-              current_url: currentUrl,
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              stage: accountReady ? "app_shell" : (sessionExpired || loginCtaVisible || publicShellSignals ? "public_chatgpt" : "unknown"),
-              account_ready: accountReady,
-              settings_shell: settingsShell,
-              security_open: securityOpen,
-              session_expired: sessionExpired,
-              login_cta_visible: loginCtaVisible,
-            };
-  - open_prepare_chatgpt_security_settings_for_logout:
-      if: "${state.vars.reuse_device_auth_session !== true && state.steps.inspect_prepare_public_chatgpt_entry?.action?.account_ready === true}"
-      metadata:
-        description: "Open ChatGPT Security settings so the current managed session can be logged out before the target-account prepare login."
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "https://chatgpt.com/#settings/Security"
-  - wait_for_prepare_chatgpt_settings_shell_for_logout:
-      if: "${state.steps.open_prepare_chatgpt_security_settings_for_logout?.action?.ok === true && state.steps.open_prepare_chatgpt_security_settings_for_logout?.action?.skipped !== true}"
-      metadata:
-        description: "Wait for the ChatGPT settings shell to actually render before attempting the forced logout."
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.exec_script
-      with:
-        body:
-          script: |
-            const ok = await page.waitForFunction(() => {
-              const text = String(document.body ? (document.body.innerText || document.body.textContent || "") : "").replace(/\s+/g, " ").trim();
-              return /general/.test(text.toLowerCase()) && /security/.test(text.toLowerCase()) && /account/.test(text.toLowerCase());
-            }, { timeout: 10000 }).then(() => true).catch(() => false);
-            const title = await page.title().catch(() => "");
-            const bodyText = await page.locator("body").innerText().catch(() => "");
-            const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
-            return {
-              ok,
-              current_url: page.url(),
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              settings_shell: /general|notifications|apps|data controls|security|account/i.test(normalizedText),
-            };
-  - activate_prepare_chatgpt_security_settings_tab_for_logout:
-      if: "${state.steps.wait_for_prepare_chatgpt_settings_shell_for_logout?.action?.ok === true && state.steps.wait_for_prepare_chatgpt_settings_shell_for_logout?.action?.skipped !== true}"
-      metadata:
-        description: "Open the Security section inside ChatGPT settings before clicking the forced logout action."
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.exec_script
-      with:
-        body:
-          script: |
-            const inspectPanel = async () => {
-              const title = await page.title().catch(() => "");
-              const bodyText = await page.locator("body").innerText().catch(() => "");
-              const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
-              return {
-                current_url: page.url(),
-                headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-                settings_shell: /general|notifications|apps|data controls|security|account/i.test(normalizedText),
-                security_open: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices/i.test(normalizedText),
-              };
-            };
-            const clickSecurity = async () => {
-              const deadline = Date.now() + 10000;
-              while (Date.now() < deadline) {
-                const panelBefore = await inspectPanel();
-                if (panelBefore.security_open === true) {
-                  return { ok: true, clicked: false, panel: panelBefore };
-                }
-                const candidates = [
-                  page.getByRole("tab", { name: /^Security$/i }).first(),
-                  page.getByRole("button", { name: /^Security$/i }).first(),
-                  page.getByRole("link", { name: /^Security$/i }).first(),
-                  page.locator("button,a,[role='tab'],[role='button']").filter({ hasText: /Security/i }).first(),
-                  page.getByText(/^Security$/i).first(),
-                ];
-                for (const candidate of candidates) {
-                  if ((await candidate.count().catch(() => 0)) === 0) {
-                    continue;
-                  }
-                  if (!(await candidate.isVisible().catch(() => false))) {
-                    continue;
-                  }
-                  await candidate.scrollIntoViewIfNeeded().catch(() => {});
-                  await candidate.click().catch(() => {});
-                  await page.waitForTimeout(900).catch(() => {});
-                  const panelAfter = await inspectPanel();
-                  if (panelAfter.security_open === true) {
-                    return { ok: true, clicked: true, panel: panelAfter };
-                  }
-                }
-                await page.waitForTimeout(500).catch(() => {});
-              }
-              return { ok: false, clicked: false, panel: await inspectPanel() };
-            };
-            const result = await clickSecurity();
-            const panel = result.panel || await inspectPanel();
-            return {
-              ok: panel.security_open === true,
-              clicked: result.clicked === true,
-              ...panel,
-            };
-  - logout_prepare_current_chatgpt_session:
-      if: "${state.vars.reuse_device_auth_session !== true && state.steps.inspect_prepare_public_chatgpt_entry?.action?.account_ready === true && state.steps.activate_prepare_chatgpt_security_settings_tab_for_logout?.action?.ok === true}"
-      metadata:
-        description: "Log out the current ChatGPT managed session from the Security settings screen so device-auth preparation starts from a clean public auth entry."
-        mode: headless_ok
-        targetRef: primary
         browser:
           screenshot: true
       call: afn.driver.browser.exec_script
       with:
         body:
           script: |
-            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-            const result = await page.evaluate(async () => {
-              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden=\"true\"]")) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const clickVisibleLogout = () => {
-                const direct = Array.from(document.querySelectorAll("button, [role='button'], input[type='submit']"))
-                  .filter((node) => isVisible(node))
-                  .find((node) => normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")) === "Log out");
-                if (direct instanceof HTMLElement) {
-                  direct.click();
-                  return { ok: true, strategy: "security-button", clicked_text: "Log out" };
-                }
-                return null;
-              };
-              const openUserMenu = () => {
-                const menuTrigger = Array.from(document.querySelectorAll("button, [role='button'], a"))
-                  .filter((node) => isVisible(node))
-                  .find((node) => {
-                    const text = normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
-                    const aria = normalize(node.getAttribute("aria-label") || "");
-                    return /m omar faruque|account|profile|user menu|open user menu/i.test(text) || /account|profile|user menu/i.test(aria);
-                  });
-                if (menuTrigger instanceof HTMLElement) {
-                  menuTrigger.click();
-                  return true;
-                }
-                return false;
-              };
-              const clickMenuLogout = () => {
-                const menuLogout = Array.from(document.querySelectorAll("button, [role='button'], a, [role='menuitem']"))
-                  .filter((node) => isVisible(node))
-                  .find((node) => normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "") === "Log out");
-                if (menuLogout instanceof HTMLElement) {
-                  menuLogout.click();
-                  return { ok: true, strategy: "user-menu", clicked_text: "Log out" };
-                }
-                return null;
-              };
-              return clickVisibleLogout() || (openUserMenu() && clickMenuLogout()) || { ok: false, error: "logout-button-not-found" };
-            }).catch((error) => ({
-              ok: false,
-              error: String(error?.message || error || "logout-click-failed"),
-            }));
-            if (result.ok) {
-              await page.waitForTimeout(1800).catch(() => {});
-            }
-            return {
-              ...result,
-              current_url: page.url(),
-              headline: normalize(await page.locator("body").innerText().catch(() => "")).split("\n").map((value) => value.trim()).filter(Boolean)[0] || null,
-            };
-  - reopen_prepare_public_chatgpt_entry_after_logout:
-      if: "${state.steps.logout_prepare_current_chatgpt_session?.action?.ok === true && state.steps.logout_prepare_current_chatgpt_session?.action?.skipped !== true}"
-      metadata:
-        description: "Return to the public ChatGPT landing page after logging out the previous managed session."
-        browser:
-          clearSiteDataForOrigins:
-            - "https://auth.openai.com"
-            - "https://chatgpt.com"
-            - "https://chat.openai.com"
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "https://chatgpt.com/?codex_rotate_public_entry=device_auth_after_logout"
-  - wait_after_prepare_public_chatgpt_entry_after_logout:
-      if: "${state.steps.reopen_prepare_public_chatgpt_entry_after_logout?.action?.ok === true && state.steps.reopen_prepare_public_chatgpt_entry_after_logout?.action?.skipped !== true}"
-      metadata:
-        description: "Let the public ChatGPT entry render after forcing logout of the previous managed session."
-      wait:
-        milliseconds: 1200
-  - inspect_prepare_public_chatgpt_entry_after_logout:
-      if: "${state.steps.reopen_prepare_public_chatgpt_entry_after_logout?.action?.ok === true && state.steps.reopen_prepare_public_chatgpt_entry_after_logout?.action?.skipped !== true}"
-      metadata:
-        description: "Inspect the public ChatGPT entry again after forcing logout of the previous managed session."
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.exec_script
-      with:
-        body:
-          script: |
             const title = await page.title().catch(() => "");
             const bodyText = await page.locator("body").innerText().catch(() => "");
             const normalizedText = String(bodyText || "").replace(/\s+/g, " ").trim();
@@ -1761,8 +2174,8 @@ do:
               ok: true,
               current_url: currentUrl,
               headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              stage: accountReady ? "app_shell" : (sessionExpired || loginCtaVisible || publicShellSignals ? "public_chatgpt" : "unknown"),
-              account_ready: accountReady,
+              stage: sessionExpired || loginCtaVisible || publicShellSignals ? "public_chatgpt" : (accountReady ? "app_shell" : "unknown"),
+              account_ready: false,
               settings_shell: settingsShell,
               security_open: securityOpen,
               session_expired: sessionExpired,
@@ -1771,25 +2184,30 @@ do:
   - cache_effective_prepare_public_entry_state:
       if: "${state.vars.reuse_device_auth_session !== true}"
       metadata:
-        description: "Cache the effective public ChatGPT entry state after any forced logout recovery."
+        description: "Cache the public ChatGPT entry state after resetting site data."
       set:
-        effective_prepare_public_entry_state: "${state.steps.inspect_prepare_public_chatgpt_entry_after_logout?.action || state.steps.inspect_prepare_public_chatgpt_entry?.action || {}}"
+        effective_prepare_public_entry_state: "${state.steps.inspect_prepare_public_chatgpt_entry?.action || {}}"
+  - click_prepare_signup_button:
+      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.account_ready !== true && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
+      metadata:
+        templateRef: click_chatgpt_signup_button
+        description: "Open the ChatGPT signup entry from the public shell during the local device-auth prepare branch."
   - click_prepare_login_button:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.account_ready !== true}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.account_ready !== true && (String(inputs.prefer_signup_recovery ?? 'true') === 'false' || state.steps.click_prepare_signup_button?.action?.ok !== true)}"
       metadata:
         templateRef: click_chatgpt_login_button
         description: "Open the ChatGPT login entry from the public shell during the local device-auth prepare branch."
   - wait_after_prepare_login_button:
-      if: "${state.steps.click_prepare_login_button?.action?.ok === true && state.steps.click_prepare_login_button?.action?.skipped !== true}"
+      if: "${(state.steps.click_prepare_signup_button?.action?.ok === true && state.steps.click_prepare_signup_button?.action?.skipped !== true) || (state.steps.click_prepare_login_button?.action?.ok === true && state.steps.click_prepare_login_button?.action?.skipped !== true)}"
       metadata:
-        description: "Let the ChatGPT login entry settle before choosing the email login provider."
+        description: "Let the ChatGPT auth entry settle before continuing on the visible OpenAI form."
       wait:
         milliseconds: 900
   - choose_prepare_email_login_option:
-      if: "${state.vars.reuse_device_auth_session !== true && state.steps.click_prepare_login_button?.action?.ok === true && !/auth\\.openai\\.com/i.test(String(state.steps.click_prepare_login_button?.action?.current_url || ''))}"
+      if: "${false}"
       metadata:
         templateRef: click_email_login_option
-        description: "Choose ChatGPT's email login provider during the local device-auth prepare branch."
+        description: "Legacy no-op kept for step-id stability; device-auth now uses the visible email form directly instead of choosing a provider."
   - wait_after_prepare_email_login_option:
       if: "${state.steps.choose_prepare_email_login_option?.action?.ok === true && state.steps.choose_prepare_email_login_option?.action?.skipped !== true}"
       metadata:
@@ -1797,15 +2215,17 @@ do:
       wait:
         milliseconds: 900
   - stabilize_prepare_login_surface:
-      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true || /auth\\.openai\\.com|chatgpt\\.com\\/auth\\/login_with/i.test(String(state.vars.effective_prepare_public_entry_state?.current_url || '')))}"
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.click_prepare_signup_button?.action?.ok === true || state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true || /auth\\.openai\\.com|chatgpt\\.com\\/auth\\/login_with/i.test(String(state.vars.effective_prepare_public_entry_state?.current_url || '')))}"
       metadata:
         templateRef: wait_for_openai_surface_ready
         description: "Wait for the local device-auth prepare login surface to render."
   - classify_prepare_login_entry:
-      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.stabilize_prepare_login_surface?.action?.ok === true || state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true)}"
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.stabilize_prepare_login_surface?.action?.ok === true || state.steps.click_prepare_signup_button?.action?.ok === true || state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true)}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the OpenAI login surface during the local device-auth prepare branch."
+        browser:
+          screenshot: true
   - click_prepare_login_button_from_auth_landing:
       if: "${state.steps.classify_prepare_login_entry?.action?.stage === 'public_chatgpt' && /chatgpt\\.com\\/auth\\/login/i.test(String(state.steps.classify_prepare_login_entry?.action?.current_url || '')) && state.steps.classify_prepare_login_entry?.action?.login_cta_visible === true}"
       metadata:
@@ -1818,10 +2238,10 @@ do:
       wait:
         milliseconds: 900
   - choose_prepare_email_login_option_after_auth_landing:
-      if: "${state.steps.click_prepare_login_button_from_auth_landing?.action?.ok === true && !/auth\\.openai\\.com/i.test(String(state.steps.click_prepare_login_button_from_auth_landing?.action?.current_url || ''))}"
+      if: "${false}"
       metadata:
         templateRef: click_email_login_option
-        description: "Choose ChatGPT's email login provider after the auth landing's Log in CTA opens the secondary login shell."
+        description: "Legacy no-op kept for step-id stability; device-auth now uses the visible email form directly instead of choosing a provider."
   - wait_after_prepare_email_login_option_after_auth_landing:
       if: "${state.steps.choose_prepare_email_login_option_after_auth_landing?.action?.ok === true && state.steps.choose_prepare_email_login_option_after_auth_landing?.action?.skipped !== true}"
       metadata:
@@ -1829,7 +2249,7 @@ do:
       wait:
         milliseconds: 900
   - classify_prepare_login_entry_after_auth_landing:
-      if: "${state.steps.click_prepare_login_button_from_auth_landing?.action?.ok === true || state.steps.choose_prepare_email_login_option_after_auth_landing?.action?.ok === true}"
+      if: "${(state.steps.click_prepare_login_button_from_auth_landing?.action?.ok === true && state.steps.click_prepare_login_button_from_auth_landing?.action?.skipped !== true) || (state.steps.choose_prepare_email_login_option_after_auth_landing?.action?.ok === true && state.steps.choose_prepare_email_login_option_after_auth_landing?.action?.skipped !== true)}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Reclassify the prepare login surface after the ChatGPT auth landing's secondary login step."
@@ -1838,33 +2258,40 @@ do:
       metadata:
         description: "Cache the effective prepare login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_prepare_login_entry_state: "${state.steps.classify_prepare_login_entry_after_auth_landing?.action || state.steps.classify_prepare_login_entry?.action || {}}"
+        effective_prepare_login_entry_state: "${(() => { const afterLanding = state.steps.classify_prepare_login_entry_after_auth_landing?.action; if (afterLanding && afterLanding.skipped !== true && (afterLanding.stage || afterLanding.current_url)) { return afterLanding; } const initial = state.steps.classify_prepare_login_entry?.action; if (initial && initial.skipped !== true && (initial.stage || initial.current_url)) { return initial; } return {}; })()}"
   - fill_prepare_login_email:
-      if: "${state.vars.effective_prepare_login_entry_state?.stage === 'login_email'}"
+      if: "${state.vars.effective_prepare_login_entry_state?.stage === 'login_email' || state.vars.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.vars.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_prepare_login_entry_state?.email_input === true)}"
       metadata:
         templateRef: fill_openai_email_field
-        description: "Fill the target email on the local device-auth prepare login branch."
-  - submit_prepare_login_email:
-      if: "${state.vars.effective_prepare_login_entry_state?.stage === 'login_email' && state.steps.fill_prepare_login_email?.action?.ok === true}"
+        description: "Fill the target email on the local device-auth prepare auth branch."
+  - submit_prepare_signup_email:
+      if: "${state.steps.click_prepare_signup_button?.action?.ok === true && state.steps.click_prepare_signup_button?.action?.skipped !== true && state.steps.fill_prepare_login_email?.action?.ok === true && state.steps.fill_prepare_login_email?.action?.skipped !== true}"
       metadata:
-        templateRef: click_primary_continue
-        description: "Submit the email step on the local device-auth prepare login branch."
+        templateRef: submit_signup_email_form
+        description: "Submit the signup email step on the local device-auth prepare branch."
+  - submit_prepare_login_email:
+      if: "${state.steps.click_prepare_signup_button?.action?.ok !== true && (state.vars.effective_prepare_login_entry_state?.stage === 'login_email' || state.vars.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.vars.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_prepare_login_entry_state?.email_input === true)) && state.steps.fill_prepare_login_email?.action?.ok === true && state.steps.fill_prepare_login_email?.action?.skipped !== true}"
+      metadata:
+        templateRef: submit_login_email_form
+        description: "Submit the login email step on the local device-auth prepare branch."
   - wait_after_prepare_login_email_submit:
-      if: "${state.steps.submit_prepare_login_email?.action?.ok === true && state.steps.submit_prepare_login_email?.action?.skipped !== true}"
+      if: "${(state.steps.submit_prepare_signup_email?.action?.ok === true && state.steps.submit_prepare_signup_email?.action?.skipped !== true) || (state.steps.submit_prepare_login_email?.action?.ok === true && state.steps.submit_prepare_login_email?.action?.skipped !== true)}"
       metadata:
         description: "Allow the prepare login email step to settle before choosing one-time-code recovery."
       wait:
         milliseconds: 900
   - classify_prepare_after_login_email:
-      if: "${state.steps.submit_prepare_login_email?.action?.ok === true || state.vars.effective_prepare_login_entry_state?.ok === true}"
+      if: "${state.steps.submit_prepare_signup_email?.action?.ok === true || state.steps.submit_prepare_login_email?.action?.ok === true || state.vars.effective_prepare_login_entry_state?.ok === true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after the email step."
+        browser:
+          screenshot: true
   - retry_prepare_login_email_submit:
-      if: "${state.steps.submit_prepare_login_email?.action?.ok === true && state.steps.submit_prepare_login_email?.action?.skipped !== true && state.steps.classify_prepare_after_login_email?.action?.stage === 'login_email'}"
+      if: "${((state.steps.submit_prepare_signup_email?.action?.ok === true && state.steps.submit_prepare_signup_email?.action?.skipped !== true) || (state.steps.submit_prepare_login_email?.action?.ok === true && state.steps.submit_prepare_login_email?.action?.skipped !== true)) && (state.steps.classify_prepare_after_login_email?.action?.stage === 'login_email' || state.steps.classify_prepare_after_login_email?.action?.stage === 'signup_email' || (state.steps.classify_prepare_after_login_email?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_after_login_email?.action?.email_input === true))}"
       metadata:
         templateRef: click_primary_continue
-        description: "Retry the prepare login email submit when OpenAI leaves the email modal on the same step."
+        description: "Retry the prepare auth email submit when OpenAI leaves the email modal on the same step."
   - wait_after_prepare_login_email_retry:
       if: "${state.steps.retry_prepare_login_email_submit?.action?.ok === true && state.steps.retry_prepare_login_email_submit?.action?.skipped !== true}"
       metadata:
@@ -1902,6 +2329,8 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login state after any password-step handling."
+        browser:
+          screenshot: true
   - wait_for_prepare_signup_password_field:
       if: "${state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'signup_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'signup_password'}"
       metadata:
@@ -2029,7 +2458,7 @@ do:
       metadata:
         description: "Collect the prepare-branch OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:3560ae35fcd099a49ec7ba33d8f6a3e1ebb3aa3a9ec8b6f574d106df2a636f5a
+          digest: sha256:0ebb48a553a2f78bf49df0028267487c7ddd664faf34d4cb9a090fd87422a2bc
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2058,6 +2487,8 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Confirm the OpenAI verification surface after returning from Gmail during local device-auth prepare."
+        browser:
+          screenshot: true
   - refill_prepare_login_email_after_return:
       if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready?.action?.email_input_editable !== false}"
       metadata:
@@ -2071,7 +2502,7 @@ do:
   - submit_prepare_login_email_after_return:
       if: "${state.steps.refill_prepare_login_email_after_return?.action?.ok === true && state.steps.refill_prepare_login_email_after_return?.action?.skipped !== true}"
       metadata:
-        templateRef: click_primary_continue
+        templateRef: submit_login_email_form
         description: "Submit the restored prepare login email step before reopening one-time-code recovery."
   - wait_after_prepare_login_email_after_return:
       if: "${(state.steps.submit_prepare_login_email_after_return?.action?.ok === true && state.steps.submit_prepare_login_email_after_return?.action?.skipped !== true) || (state.steps.continue_prepare_login_email_after_return?.action?.ok === true && state.steps.continue_prepare_login_email_after_return?.action?.skipped !== true)}"
@@ -2122,16 +2553,268 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after submitting the verification OTP."
-  - fill_prepare_signup_about_you:
-      if: "${state.steps.classify_prepare_after_signup_password_gate?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_submit?.action?.follow_up_step === true}"
+  - recollect_prepare_login_verification_artifact_after_incorrect_code:
+      if: "${state.steps.classify_prepare_after_login_verification_submit?.action?.stage === 'email_verification' && state.steps.classify_prepare_after_login_verification_submit?.action?.incorrect_code === true}"
       metadata:
-        templateRef: fill_openai_about_you_form
-        description: "Fill the OpenAI about-you form during the prepare signup branch."
-  - submit_prepare_signup_about_you:
+        description: "Re-collect the prepare-branch OTP from Gmail once when OpenAI rejects the first verification code."
+        ref:
+          digest: sha256:0ebb48a553a2f78bf49df0028267487c7ddd664faf34d4cb9a090fd87422a2bc
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
+  - return_to_prepare_login_verification_page_after_incorrect_code:
+      if: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        description: "Return from Gmail to the prepare verification page after collecting a replacement code."
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_prepare_after_login_verification_submit?.action?.current_url || state.steps.classify_prepare_after_timeout_reopen?.action?.current_url || state.steps.classify_prepare_after_recovery_timeout_retry?.action?.current_url || state.steps.classify_prepare_after_recovery_choice?.action?.current_url || state.steps.classify_prepare_after_login_password_gate?.action?.current_url || state.steps.classify_prepare_after_signup_password_gate?.action?.current_url || state.steps.classify_prepare_after_login_email_retry?.action?.current_url || state.steps.classify_prepare_after_login_email?.action?.current_url || 'https://auth.openai.com/email-verification'}"
+  - stabilize_prepare_login_verification_surface_after_incorrect_code:
+      if: "${state.steps.return_to_prepare_login_verification_page_after_incorrect_code?.action?.ok === true && state.steps.return_to_prepare_login_verification_page_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: "Wait for the prepare verification page to settle after collecting a replacement code."
+  - classify_prepare_login_verification_ready_after_incorrect_code:
+      if: "${state.steps.return_to_prepare_login_verification_page_after_incorrect_code?.action?.ok === true && state.steps.return_to_prepare_login_verification_page_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: "Confirm the prepare verification surface after collecting a replacement code."
+  - fill_prepare_login_verification_code_after_incorrect_code:
+      if: "${state.steps.classify_prepare_login_verification_ready_after_incorrect_code?.action?.stage === 'email_verification'}"
+      metadata:
+        description: "Fill the replacement Gmail OTP into the OpenAI email-verification form during local device-auth prepare."
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]'
+          text: "${String(state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.code || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '').replace(/\\D+/g, '').slice(0, 6)}"
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - submit_prepare_login_verification_code_after_incorrect_code:
+      if: "${state.steps.fill_prepare_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.fill_prepare_login_verification_code_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: "Submit the replacement OpenAI verification OTP during local device-auth prepare."
+  - wait_after_prepare_login_verification_code_retry_submit:
+      if: "${state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        description: "Allow the replacement prepare verification submission to settle before continuing."
+      wait:
+        milliseconds: 900
+  - classify_prepare_after_login_verification_retry:
+      if: "${state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: "Classify the prepare flow after retrying the verification OTP."
+  - fill_prepare_signup_about_you:
+      if: "${state.steps.classify_prepare_after_signup_password_gate?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_submit?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_retry?.action?.follow_up_step === true}"
+      metadata:
+        description: "Set the visible OpenAI full-name field during the prepare signup branch."
+        browser:
+          screenshot: true
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: "input[name*='name' i], input[autocomplete='name'], input[placeholder*='Full name' i], input[aria-label*='Full name' i]"
+          text: "${String(inputs.full_name || 'Dev Astronlab').trim()}"
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - set_prepare_signup_birthday:
       if: "${state.steps.fill_prepare_signup_about_you?.action?.ok === true && state.steps.fill_prepare_signup_about_you?.action?.skipped !== true}"
+      metadata:
+        description: "Set the visible OpenAI birthday controls during the prepare signup branch."
+        browser:
+          screenshot: true
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const birthMonth = String(args.birth_month || "1").trim();
+            const birthDay = String(args.birth_day || "24").trim();
+            const birthYear = String(args.birth_year || "1990").trim();
+            const payload = { birthMonth, birthDay, birthYear };
+            const result = await page.evaluate((payload) => {
+              const birthMonth = String(payload.birthMonth || "1").trim();
+              const birthDay = String(payload.birthDay || "24").trim();
+              const birthYear = String(payload.birthYear || "1990").trim();
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const monthNumber = String(Number.parseInt(birthMonth, 10) || 1);
+              const dayNumber = String(Number.parseInt(birthDay, 10) || 1);
+              const isoBirthday = birthYear + "-" + birthMonth.padStart(2, "0") + "-" + birthDay.padStart(2, "0");
+              const monthTokens = {
+                "1": ["1", "01", "jan", "january"],
+                "2": ["2", "02", "feb", "february"],
+                "3": ["3", "03", "mar", "march"],
+                "4": ["4", "04", "apr", "april"],
+                "5": ["5", "05", "may"],
+                "6": ["6", "06", "jun", "june"],
+                "7": ["7", "07", "jul", "july"],
+                "8": ["8", "08", "aug", "august"],
+                "9": ["9", "09", "sep", "sept", "september"],
+                "10": ["10", "oct", "october"],
+                "11": ["11", "nov", "november"],
+                "12": ["12", "dec", "december"],
+              };
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const dispatch = (node) => {
+                node.dispatchEvent(new Event("input", { bubbles: true }));
+                node.dispatchEvent(new Event("change", { bubbles: true }));
+                node.dispatchEvent(new Event("blur", { bubbles: true }));
+              };
+              const visibleSelects = Array.from(document.querySelectorAll("select"))
+                .filter((node) => node instanceof HTMLSelectElement && isVisible(node));
+              const chooseOption = (node, tokens) => {
+                if (!(node instanceof HTMLSelectElement)) {
+                  return "";
+                }
+                const option = Array.from(node.options).find((candidate) => {
+                  const value = normalize(candidate.value).toLowerCase();
+                  const label = normalize(candidate.label || candidate.textContent || "").toLowerCase();
+                  return tokens.some((token) => token === value || token === label);
+                });
+                if (!option) {
+                  return "";
+                }
+                node.value = option.value;
+                dispatch(node);
+                return normalize(option.label || option.textContent || option.value);
+              };
+              let monthValue = chooseOption(visibleSelects[0], monthTokens[monthNumber] || [birthMonth.toLowerCase(), monthNumber]);
+              let dayValue = chooseOption(visibleSelects[1], [birthDay.toLowerCase(), birthDay.padStart(2, "0").toLowerCase(), dayNumber.toLowerCase()]);
+              let yearValue = chooseOption(visibleSelects[2], [birthYear.toLowerCase()]);
+              const dateInput = Array.from(document.querySelectorAll("input[type='date'], input[name*='birthday' i], input[aria-label*='birthday' i], input[placeholder*='Birthday' i]"))
+                .find((node) => node instanceof HTMLInputElement && isVisible(node));
+              if (dateInput instanceof HTMLInputElement) {
+                dateInput.focus();
+                dateInput.value = dateInput.type === "date" ? isoBirthday : (birthMonth + "/" + birthDay + "/" + birthYear);
+                dispatch(dateInput);
+              }
+              const hiddenBirthday = document.querySelector("input[name='birthday']");
+              if (hiddenBirthday instanceof HTMLInputElement) {
+                hiddenBirthday.value = isoBirthday;
+                dispatch(hiddenBirthday);
+              }
+              return {
+                ok: true,
+                month_value: monthValue || null,
+                day_value: dayValue || null,
+                year_value: yearValue || null,
+                hidden_birthday: hiddenBirthday instanceof HTMLInputElement ? normalize(hiddenBirthday.value) || null : null,
+              };
+            }, payload);
+            await page.waitForTimeout(150).catch(() => {});
+            return {
+              ...result,
+              current_url: page.url(),
+            };
+  - inspect_prepare_signup_about_you_ready:
+      if: "${state.steps.set_prepare_signup_birthday?.action?.ok === true && state.steps.set_prepare_signup_birthday?.action?.skipped !== true}"
+      metadata:
+        description: "Inspect the OpenAI about-you form after setting name and birthday during the prepare signup branch."
+        browser:
+          screenshot: true
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const fullName = String(args.full_name || "Dev Astronlab").trim();
+            const birthMonth = String(args.birth_month || "1").trim();
+            const birthDay = String(args.birth_day || "24").trim();
+            const birthYear = String(args.birth_year || "1990").trim();
+            const payload = { fullName, birthMonth, birthDay, birthYear };
+            const result = await page.evaluate((payload) => {
+              const fullName = String(payload.fullName || "Dev Astronlab").trim();
+              const birthMonth = String(payload.birthMonth || "1").trim();
+              const birthDay = String(payload.birthDay || "24").trim();
+              const birthYear = String(payload.birthYear || "1990").trim();
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden='true']")) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const readName = () => {
+                const field = Array.from(document.querySelectorAll("input[name*='name' i], input[autocomplete='name'], input[placeholder*='Full name' i], input[aria-label*='Full name' i]"))
+                  .find((node) => node instanceof HTMLInputElement && isVisible(node));
+                return field instanceof HTMLInputElement ? normalize(field.value) : "";
+              };
+              const selects = Array.from(document.querySelectorAll("select"))
+                .filter((node) => node instanceof HTMLSelectElement && isVisible(node));
+              const readSelect = (node) => node instanceof HTMLSelectElement
+                ? normalize(node.selectedOptions?.[0]?.label || node.value || "")
+                : "";
+              const hiddenBirthday = (() => {
+                const node = document.querySelector("input[name='birthday']");
+                return node instanceof HTMLInputElement ? normalize(node.value) : "";
+              })();
+              const submit = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']"))
+                .filter((node) => isVisible(node))
+                .map((node) => ({
+                  label: normalize(node instanceof HTMLInputElement ? (node.value || node.getAttribute("aria-label") || "") : (node.innerText || node.textContent || node.getAttribute("aria-label") || "")),
+                  disabled: node.hasAttribute("disabled") || node.getAttribute("aria-disabled") === "true",
+                }))
+                .find((node) => /continue|next|finish creating account|submit|verify/i.test(node.label)) || { label: null, disabled: null };
+              const monthValue = readSelect(selects[0]);
+              const dayValue = readSelect(selects[1]);
+              const yearValue = readSelect(selects[2]);
+              const isoBirthday = birthYear + "-" + birthMonth.padStart(2, "0") + "-" + birthDay.padStart(2, "0");
+              const ready = readName() === normalize(fullName)
+                && ((monthValue && dayValue && yearValue) || hiddenBirthday === isoBirthday)
+                && submit.disabled === false;
+              return {
+                ok: true,
+                ready,
+                current_url: location.href,
+                name_value: readName() || null,
+                month_value: monthValue || null,
+                day_value: dayValue || null,
+                year_value: yearValue || null,
+                hidden_birthday: hiddenBirthday || null,
+                submit_text: submit.label,
+                submit_disabled: submit.disabled,
+              };
+            }, payload);
+            return result;
+  - submit_prepare_signup_about_you:
+      if: "${state.steps.inspect_prepare_signup_about_you_ready?.action?.ready === true}"
       metadata:
         templateRef: click_primary_continue
         description: "Submit the OpenAI about-you form during the prepare signup branch."
+        browser:
+          screenshot: true
   - wait_after_prepare_signup_about_you_submit:
       if: "${state.steps.submit_prepare_signup_about_you?.action?.ok === true && state.steps.submit_prepare_signup_about_you?.action?.skipped !== true}"
       metadata:
@@ -2143,12 +2826,14 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after submitting the about-you form."
+        browser:
+          screenshot: true
   - cache_prepare_flow_result:
       metadata:
         description: "Cache the local device-auth prepare result before opening ChatGPT Security."
       set:
-        prepare_flow_output: "${state.vars.reuse_device_auth_session === true ? { reused_device_auth_session: true, next_action: 'complete', success: true } : (state.steps.classify_prepare_after_signup_about_you?.action || state.steps.classify_prepare_after_login_verification_submit?.action || state.steps.classify_prepare_after_return_recovery?.action || state.steps.classify_prepare_login_after_return?.action || state.steps.classify_prepare_login_verification_ready?.action || state.steps.classify_prepare_after_timeout_reopen?.action || state.steps.classify_prepare_after_recovery_timeout_retry?.action || state.steps.classify_prepare_after_recovery_choice?.action || state.steps.classify_prepare_after_signup_password_gate?.action || state.steps.classify_prepare_after_login_password_gate?.action || state.steps.classify_prepare_after_login_email_retry?.action || state.steps.classify_prepare_after_login_email?.action || state.steps.classify_prepare_login_entry?.action || {})}"
-        prepare_flow_ready: "${(() => { if (state.vars.reuse_device_auth_session === true) { return true; } const latest = state.steps.classify_prepare_after_signup_about_you?.action || state.steps.classify_prepare_after_login_verification_submit?.action || state.steps.classify_prepare_after_return_recovery?.action || state.steps.classify_prepare_login_after_return?.action || state.steps.classify_prepare_login_verification_ready?.action || state.steps.classify_prepare_after_timeout_reopen?.action || state.steps.classify_prepare_after_recovery_timeout_retry?.action || state.steps.classify_prepare_after_recovery_choice?.action || state.steps.classify_prepare_after_signup_password_gate?.action || state.steps.classify_prepare_after_login_password_gate?.action || state.steps.classify_prepare_after_login_email_retry?.action || state.steps.classify_prepare_after_login_email?.action || state.steps.classify_prepare_login_entry?.action || {}; const stage = String(latest.stage || ''); if (!stage) { return false; } if (latest.account_ready === true || latest.chatgpt_app_shell === true || latest.success === true) { return true; } return !['login_email','login_password','signup_email','signup_password','email_verification','about_you','auth_prompt','unknown','retryable_timeout','rate_limit','session_ended','security_verification','invalid_credentials','existing_account_prompt','add_phone','public_chatgpt'].includes(stage); })()}"
+        prepare_flow_output: "${(() => { if (state.vars.reuse_device_auth_session === true) { return { reused_device_auth_session: true, next_action: 'complete', success: true }; } const candidates = [ state.steps.classify_prepare_after_signup_about_you?.action, state.steps.classify_prepare_after_login_verification_retry?.action, state.steps.classify_prepare_after_login_verification_submit?.action, state.steps.classify_prepare_after_return_recovery?.action, state.steps.classify_prepare_login_after_return?.action, state.steps.classify_prepare_login_verification_ready_after_incorrect_code?.action, state.steps.classify_prepare_login_verification_ready?.action, state.steps.classify_prepare_after_timeout_reopen?.action, state.steps.classify_prepare_after_recovery_timeout_retry?.action, state.steps.classify_prepare_after_recovery_choice?.action, state.steps.classify_prepare_after_signup_password_gate?.action, state.steps.classify_prepare_after_login_password_gate?.action, state.steps.classify_prepare_after_login_email_retry?.action, state.steps.classify_prepare_after_login_email?.action, state.steps.classify_prepare_login_entry?.action ]; return candidates.find((candidate) => candidate && typeof candidate === 'object' && candidate.skipped !== true) || {}; })()}"
+        prepare_flow_ready: "${(() => { if (state.vars.reuse_device_auth_session === true) { return true; } const candidates = [ state.steps.classify_prepare_after_signup_about_you?.action, state.steps.classify_prepare_after_login_verification_retry?.action, state.steps.classify_prepare_after_login_verification_submit?.action, state.steps.classify_prepare_after_return_recovery?.action, state.steps.classify_prepare_login_after_return?.action, state.steps.classify_prepare_login_verification_ready_after_incorrect_code?.action, state.steps.classify_prepare_login_verification_ready?.action, state.steps.classify_prepare_after_timeout_reopen?.action, state.steps.classify_prepare_after_recovery_timeout_retry?.action, state.steps.classify_prepare_after_recovery_choice?.action, state.steps.classify_prepare_after_signup_password_gate?.action, state.steps.classify_prepare_after_login_password_gate?.action, state.steps.classify_prepare_after_login_email_retry?.action, state.steps.classify_prepare_after_login_email?.action, state.steps.classify_prepare_login_entry?.action ]; const latest = candidates.find((candidate) => candidate && typeof candidate === 'object' && candidate.skipped !== true) || {}; const stage = String(latest.stage || ''); if (!stage) { return false; } if (latest.account_ready === true || latest.chatgpt_app_shell === true || latest.success === true) { return true; } return !['login_email','login_password','signup_email','signup_password','email_verification','about_you','auth_prompt','unknown','retryable_timeout','rate_limit','session_ended','security_verification','invalid_credentials','existing_account_prompt','add_phone','public_chatgpt'].includes(stage); })()}"
   - open_chatgpt_shell:
       if: "${false}"
       metadata:
@@ -2588,7 +3273,7 @@ do:
             const stateMismatch = /state mismatch/i.test(title) || /state mismatch/i.test(normalizedText);
             const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
             const deviceAuthDisabled = /enable device code authorization for codex in chatgpt security settings/i.test(normalizedText);
-            const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text)) || (sawOauthConsent && visibleButtons.some((text) => /^continue$/i.test(text)));
+            const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text) || /^continue$/i.test(text));
             const success = /you can close this window|successfully logged in|signed in|device authorized|authorization complete/i.test(normalizedText) || /close this window/i.test(title);
             const chatGptHost = /(?:^|\.)chatgpt\.com$/i.test(host);
             const appShell = chatGptHost && !/^\/auth\//i.test(path) && /\bnew chat\b|\bsearch chats\b|\bimages\b|\bapps\b|\bprojects\b|\bdeep research\b|\bcodex\b|what['’]s on your mind today\?|ask anything/i.test(normalizedText);
@@ -2632,10 +3317,10 @@ do:
       wait:
         milliseconds: 900
   - choose_device_auth_email_login_option_after_auth_landing:
-      if: "${state.steps.click_device_auth_login_button_from_auth_landing?.action?.ok === true && !/auth\\.openai\\.com/i.test(String(state.steps.click_device_auth_login_button_from_auth_landing?.action?.current_url || ''))}"
+      if: "${false}"
       metadata:
         templateRef: click_email_login_option
-        description: "Choose ChatGPT's email login provider after the device-auth auth landing opens the secondary login shell."
+        description: "Legacy no-op kept for step-id stability; device-auth now uses the visible email form directly instead of choosing a provider."
   - wait_after_device_auth_email_login_option_after_auth_landing:
       if: "${state.steps.choose_device_auth_email_login_option_after_auth_landing?.action?.ok === true && state.steps.choose_device_auth_email_login_option_after_auth_landing?.action?.skipped !== true}"
       metadata:
@@ -2643,7 +3328,7 @@ do:
       wait:
         milliseconds: 900
   - classify_device_auth_login_entry_after_auth_landing:
-      if: "${state.steps.click_device_auth_login_button_from_auth_landing?.action?.ok === true || state.steps.choose_device_auth_email_login_option_after_auth_landing?.action?.ok === true}"
+      if: "${(state.steps.click_device_auth_login_button_from_auth_landing?.action?.ok === true && state.steps.click_device_auth_login_button_from_auth_landing?.action?.skipped !== true) || (state.steps.choose_device_auth_email_login_option_after_auth_landing?.action?.ok === true && state.steps.choose_device_auth_email_login_option_after_auth_landing?.action?.skipped !== true)}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Reclassify the device-auth login surface after the ChatGPT auth landing's secondary login step."
@@ -2652,106 +3337,106 @@ do:
       metadata:
         description: "Cache the effective device-auth login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_device_auth_login_entry_state: "${state.steps.classify_device_auth_login_entry_after_auth_landing?.action || state.steps.classify_device_auth_login_entry?.action || {}}"
+        effective_device_auth_login_entry_state: "${(() => { const afterLanding = state.steps.classify_device_auth_login_entry_after_auth_landing?.action; if (afterLanding && afterLanding.skipped !== true && (afterLanding.stage || afterLanding.current_url)) { return afterLanding; } const initial = state.steps.classify_device_auth_login_entry?.action; if (initial && initial.skipped !== true && (initial.stage || initial.current_url)) { return initial; } return {}; })()}"
   - fill_device_auth_login_email:
-      if: "${state.vars.effective_device_auth_login_entry_state?.stage === 'login_email'}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true))}"
       metadata:
         templateRef: fill_openai_email_field
         description: "Fill the account email on the device-auth login entry."
   - submit_device_auth_login_email:
-      if: "${state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' && state.steps.fill_device_auth_login_email?.action?.ok === true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true)) && state.steps.fill_device_auth_login_email?.action?.ok === true && state.steps.fill_device_auth_login_email?.action?.skipped !== true}"
       metadata:
-        templateRef: click_primary_continue
+        templateRef: submit_login_email_form
         description: "Submit the device-auth login email step."
   - wait_after_device_auth_login_email_submit:
-      if: "${state.steps.submit_device_auth_login_email?.action?.ok === true && state.steps.submit_device_auth_login_email?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.submit_device_auth_login_email?.action?.ok === true && state.steps.submit_device_auth_login_email?.action?.skipped !== true}"
       metadata:
         description: "Allow the device-auth login email step to settle before choosing the recovery branch."
       wait:
         milliseconds: 900
   - classify_device_auth_after_login_email:
-      if: "${state.steps.submit_device_auth_login_email?.action?.ok === true || state.vars.effective_device_auth_login_entry_state?.ok === true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && ((state.steps.submit_device_auth_login_email?.action?.ok === true && state.steps.submit_device_auth_login_email?.action?.skipped !== true) || state.vars.effective_device_auth_login_entry_state?.ok === true)}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after the email step."
   - retry_device_auth_login_email_submit:
-      if: "${state.steps.submit_device_auth_login_email?.action?.ok === true && state.steps.submit_device_auth_login_email?.action?.skipped !== true && state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_email'}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.submit_device_auth_login_email?.action?.ok === true && state.steps.submit_device_auth_login_email?.action?.skipped !== true && (state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_email' || (state.steps.classify_device_auth_after_login_email?.action?.stage === 'auth_prompt' && state.steps.classify_device_auth_after_login_email?.action?.email_input === true))}"
       metadata:
         templateRef: click_primary_continue
         description: "Retry the device-auth login email submit when OpenAI remains on the email step."
   - wait_after_device_auth_login_email_retry:
-      if: "${state.steps.retry_device_auth_login_email_submit?.action?.ok === true && state.steps.retry_device_auth_login_email_submit?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.retry_device_auth_login_email_submit?.action?.ok === true && state.steps.retry_device_auth_login_email_submit?.action?.skipped !== true}"
       metadata:
         description: "Allow the retried device-auth login email submit to settle before classifying the next page."
       wait:
         milliseconds: 1500
   - classify_device_auth_after_login_email_retry:
-      if: "${state.steps.retry_device_auth_login_email_submit?.action?.ok === true && state.steps.retry_device_auth_login_email_submit?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.retry_device_auth_login_email_submit?.action?.ok === true && state.steps.retry_device_auth_login_email_submit?.action?.skipped !== true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after retrying the email submit."
   - fill_device_auth_login_password:
-      if: "${(state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.classify_device_auth_after_login_email_retry?.action?.one_time_code_option !== true && state.steps.classify_device_auth_after_login_email?.action?.one_time_code_option !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.classify_device_auth_after_login_email_retry?.action?.one_time_code_option !== true && state.steps.classify_device_auth_after_login_email?.action?.one_time_code_option !== true}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the stored password on the device-auth login branch before falling back to recovery."
   - submit_device_auth_login_password:
-      if: "${(state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the stored password on the device-auth login branch."
   - wait_after_device_auth_login_password_submit:
-      if: "${state.steps.submit_device_auth_login_password?.action?.ok === true && state.steps.submit_device_auth_login_password?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.submit_device_auth_login_password?.action?.ok === true && state.steps.submit_device_auth_login_password?.action?.skipped !== true}"
       metadata:
         description: "Allow the device-auth login password submission to settle before classifying the next page."
       wait:
         milliseconds: 900
   - classify_device_auth_after_login_password:
-      if: "${(state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login surface after submitting the stored password."
   - classify_device_auth_after_login_password_gate:
-      if: "${(state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login state after any password-step handling."
   - choose_device_auth_one_time_code_recovery:
-      if: "${(state.steps.classify_device_auth_after_login_email_retry?.action?.one_time_code_option === true || state.steps.classify_device_auth_after_login_email?.action?.one_time_code_option === true) || (((((state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') || ((state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'auth_prompt' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'auth_prompt') && (state.steps.classify_device_auth_after_login_email_retry?.action?.password_input === true || state.steps.classify_device_auth_after_login_email?.action?.password_input === true))) && inputs.account_login_locator == null) || state.steps.classify_device_auth_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_device_auth_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_device_auth_after_login_password_gate?.action?.username_not_found === true))}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && ((state.steps.classify_device_auth_after_login_email_retry?.action?.one_time_code_option === true || state.steps.classify_device_auth_after_login_email?.action?.one_time_code_option === true) || (((((state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') || ((state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'auth_prompt' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'auth_prompt') && (state.steps.classify_device_auth_after_login_email_retry?.action?.password_input === true || state.steps.classify_device_auth_after_login_email?.action?.password_input === true))) && inputs.account_login_locator == null) || state.steps.classify_device_auth_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_device_auth_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_device_auth_after_login_password_gate?.action?.username_not_found === true))}"
       metadata:
         templateRef: click_one_time_code_button
         description: "Switch the device-auth login branch to one-time-code recovery instead of using the stored password."
   - classify_device_auth_after_recovery_choice:
-      if: "${state.steps.choose_device_auth_one_time_code_recovery?.action?.ok === true && state.steps.choose_device_auth_one_time_code_recovery?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.choose_device_auth_one_time_code_recovery?.action?.ok === true && state.steps.choose_device_auth_one_time_code_recovery?.action?.skipped !== true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after selecting the one-time-code branch."
   - recover_device_auth_login_recovery_timeout:
-      if: "${state.steps.classify_device_auth_after_recovery_choice?.action?.retryable_timeout === true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.classify_device_auth_after_recovery_choice?.action?.retryable_timeout === true}"
       metadata:
         templateRef: click_retryable_try_again
         description: "Retry the one-time-code branch when OpenAI renders its retryable timeout shell."
   - classify_device_auth_after_recovery_timeout_retry:
-      if: "${state.steps.recover_device_auth_login_recovery_timeout?.action?.ok === true && state.steps.recover_device_auth_login_recovery_timeout?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.recover_device_auth_login_recovery_timeout?.action?.ok === true && state.steps.recover_device_auth_login_recovery_timeout?.action?.skipped !== true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after retrying the one-time-code branch."
   - reopen_device_auth_one_time_code_after_timeout:
-      if: "${state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.stage === 'login_password' || (state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.stage === 'auth_prompt' && state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.password_input === true)}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.stage === 'login_password' || (state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.stage === 'auth_prompt' && state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.password_input === true))}"
       metadata:
         templateRef: click_one_time_code_button
         description: "Reopen the one-time-code recovery branch when a retryable timeout returns the device-auth flow to the password prompt."
   - classify_device_auth_after_timeout_reopen:
-      if: "${state.steps.reopen_device_auth_one_time_code_after_timeout?.action?.ok === true && state.steps.reopen_device_auth_one_time_code_after_timeout?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.reopen_device_auth_one_time_code_after_timeout?.action?.ok === true && state.steps.reopen_device_auth_one_time_code_after_timeout?.action?.skipped !== true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after reopening the one-time-code branch."
   - collect_device_auth_login_verification_artifact:
-      if: "${state.steps.classify_device_auth_after_login_email?.action?.email_verification === true || state.steps.classify_device_auth_after_login_email_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_login_password_gate?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_choice?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_timeout_reopen?.action?.email_verification === true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email?.action?.email_verification === true || state.steps.classify_device_auth_after_login_email_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_login_password_gate?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_choice?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_timeout_reopen?.action?.email_verification === true)}"
       metadata:
         description: "Collect the device-auth login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:3560ae35fcd099a49ec7ba33d8f6a3e1ebb3aa3a9ec8b6f574d106df2a636f5a
+          digest: sha256:0ebb48a553a2f78bf49df0028267487c7ddd664faf34d4cb9a090fd87422a2bc
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2761,7 +3446,7 @@ do:
           message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
           link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
   - return_to_device_auth_login_verification_page:
-      if: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && state.steps.collect_device_auth_login_verification_artifact?.action?.ok === true && state.steps.collect_device_auth_login_verification_artifact?.action?.skipped !== true}"
       metadata:
         description: "Return from Gmail to the active OpenAI email-verification page in the device-auth login branch."
         mode: headless_ok
@@ -2793,7 +3478,7 @@ do:
   - submit_device_auth_login_email_after_return:
       if: "${state.steps.refill_device_auth_login_email_after_return?.action?.ok === true && state.steps.refill_device_auth_login_email_after_return?.action?.skipped !== true}"
       metadata:
-        templateRef: click_primary_continue
+        templateRef: submit_login_email_form
         description: "Submit the restored device-auth login email step before reopening one-time-code recovery."
   - wait_after_device_auth_login_email_after_return:
       if: "${(state.steps.submit_device_auth_login_email_after_return?.action?.ok === true && state.steps.submit_device_auth_login_email_after_return?.action?.skipped !== true) || (state.steps.continue_device_auth_login_email_after_return?.action?.ok === true && state.steps.continue_device_auth_login_email_after_return?.action?.skipped !== true)}"
@@ -2886,7 +3571,7 @@ do:
               const deviceCodePrompt = verificationInput && !emailVerification && /device code|one-time code|authorization code|enter (?:the |your )?(?:\d+-character )?code|code displayed in your terminal/i.test(surfaceText);
               const stateMismatch = /state mismatch/i.test(title) || /state mismatch/i.test(normalizedText);
               const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
-              const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text)) || (sawOauthConsent && visibleButtons.some((text) => /^continue$/i.test(text)));
+              const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text) || /^continue$/i.test(text));
               const success = /you can close this window|successfully logged in|signed in|device authorized|authorization complete/i.test(normalizedText) || /close this window/i.test(title);
               const authPrompt = emailInput || passwordInput || /welcome back|log in|enter your password/i.test(normalizedText);
               const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(normalizedText) || /oops, an error occurred|operation timed out/i.test(title);
@@ -2985,7 +3670,7 @@ do:
               const deviceCodePrompt = verificationInput && !emailVerification && /device code|one-time code|authorization code|enter (?:the |your )?(?:\d+-character )?code|code displayed in your terminal/i.test(surfaceText);
               const stateMismatch = /state mismatch/i.test(title) || /state mismatch/i.test(normalizedText);
               const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
-              const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text)) || (sawOauthConsent && visibleButtons.some((text) => /^continue$/i.test(text)));
+              const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text) || /^continue$/i.test(text));
               const success = /you can close this window|successfully logged in|signed in|device authorized|authorization complete/i.test(normalizedText) || /close this window/i.test(title);
               const authPrompt = emailInput || passwordInput || /welcome back|log in|enter your password/i.test(normalizedText);
               const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(normalizedText) || /oops, an error occurred|operation timed out/i.test(title);
@@ -3134,7 +3819,7 @@ do:
             const visibleButtons = await page.evaluate(() => Array.from(document.querySelectorAll("button,a,[role=\"button\"],input[type=\"submit\"]")).map((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 16)).catch(() => []);
             const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
             const deviceAuthDisabled = /enable device code authorization for codex in chatgpt security settings/i.test(normalizedText);
-            const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text)) || (sawOauthConsent && visibleButtons.some((text) => /^continue$/i.test(text)));
+            const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept/i.test(text) || /^continue$/i.test(text));
             const success = /you can close this window|successfully logged in|signed in|device authorized|authorization complete/i.test(normalizedText) || /close this window/i.test(title);
             const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(normalizedText) || /oops, an error occurred|operation timed out/i.test(title);
             const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(normalizedText);
@@ -3155,7 +3840,7 @@ do:
         templateRef: click_oauth_consent_continue
         description: "Approve the final Codex device-authorization consent step."
   - inspect_device_authorization_final:
-      if: "${state.steps.submit_device_authorization_consent?.action?.ok === true || state.steps.inspect_device_authorization_after_code?.action?.success === true || state.steps.inspect_device_authorization_surface?.action?.success === true}"
+      if: "${(state.steps.submit_device_authorization_consent?.action?.ok === true && state.steps.submit_device_authorization_consent?.action?.skipped !== true) || state.steps.inspect_device_authorization_after_code?.action?.success === true || state.steps.inspect_device_authorization_surface?.action?.success === true}"
       metadata:
         description: "Inspect the final surface after any device-authorization consent action."
         mode: headless_ok
@@ -3173,7 +3858,8 @@ do:
               const verificationInput = await page.locator("input[name*=\"code\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[placeholder*=\"code\" i], input[inputmode=\"numeric\"]").count().catch(() => 0) > 0;
               const surfaceText = String(title || "") + "\n" + normalizedText;
               const deviceCodePrompt = verificationInput && /device code|one-time code|authorization code|enter (?:the |your )?(?:\d+-character )?code|code displayed in your terminal/i.test(surfaceText);
-              const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept|continue/i.test(text));
+            const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
+            const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept|continue/i.test(text));
               return {
                 ok: true,
                 current_url: page.url(),
@@ -3302,7 +3988,7 @@ do:
         templateRef: click_primary_continue
         description: "Submit the device code from the post-consent callback page."
   - inspect_device_authorization_after_callback_code:
-      if: "${state.steps.submit_callback_device_authorization_code?.action?.ok === true}"
+      if: "${state.steps.submit_callback_device_authorization_code?.action?.ok === true && state.steps.submit_callback_device_authorization_code?.action?.skipped !== true}"
       metadata:
         description: "Inspect the device-authorization callback page after submitting the device code."
         mode: headless_ok
@@ -3320,7 +4006,8 @@ do:
               const verificationInput = await page.locator("input[name*=\"code\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[placeholder*=\"code\" i], input[inputmode=\"numeric\"]").count().catch(() => 0) > 0;
               const surfaceText = String(title || "") + "\n" + normalizedText;
               const deviceCodePrompt = verificationInput && /device code|one-time code|authorization code|enter (?:the |your )?(?:\d+-character )?code|code displayed in your terminal/i.test(surfaceText);
-              const oauthContinueVisible = visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept|continue/i.test(text));
+              const sawOauthConsent = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|link your account/i.test(normalizedText) || /sign in to codex/i.test(title);
+              const oauthContinueVisible = sawOauthConsent && visibleButtons.some((text) => /continue to codex|continue to openai|authorize|allow|accept|continue/i.test(text));
               return {
                 ok: true,
                 current_url: page.url(),
@@ -3344,7 +4031,7 @@ do:
 
             return surface;
   - wait_for_codex_login_exit:
-      if: "${(state.vars.codex_login?.exit_path || inputs.codex_login_exit_path) && state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true && state.vars.device_authorization_surface?.device_auth_disabled !== true && (state.steps.inspect_device_authorization_final?.action?.device_code_prompt !== true || state.steps.submit_callback_device_authorization_code?.action?.ok === true)}"
+      if: "${(state.vars.codex_login?.exit_path || inputs.codex_login_exit_path) && (state.steps.open_device_authorization_entry?.action?.ok === true && state.steps.open_device_authorization_entry?.action?.skipped !== true) && state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true && state.vars.device_authorization_surface?.device_auth_disabled !== true && (state.steps.inspect_device_authorization_final?.action?.device_code_prompt !== true || (state.steps.submit_callback_device_authorization_code?.action?.ok === true && state.steps.submit_callback_device_authorization_code?.action?.skipped !== true))}"
       metadata:
         description: "Wait for the detached codex device-auth process to exit after browser authorization completes."
       run:
@@ -3388,7 +4075,7 @@ do:
               stderr_tail: tail(stderrPath) || null,
             };
   - finalize_device_auth_tail_summary:
-      if: "${state.vars.prepare_flow_ready === true}"
+      if: "${state.vars.prepare_flow_ready === true && String(state.vars.codex_login?.auth_url || '').trim() !== ''}"
       metadata:
         description: "Build the final device-authorization outcome from the browser surface and detached Codex session."
       run:
@@ -3535,8 +4222,12 @@ do:
           code: |
             const prepare =
               state.vars.prepare_flow_output || {};
+            const tailAction =
+              state.steps.finalize_device_auth_tail_summary?.action || null;
             const tail =
-              state.steps.finalize_device_auth_tail_summary?.action?.value || null;
+              tailAction && tailAction.skipped !== true
+                ? (tailAction.value || null)
+                : null;
             const prepareComplete =
               state.vars.prepare_flow_ready === true
               || prepare.account_ready === true
