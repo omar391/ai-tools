@@ -320,6 +320,8 @@ fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
 }
 
 fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
+    let tray_binaries = tray_binary_candidates(tray_binary);
+
     #[cfg(windows)]
     {
         let output = Command::new("tasklist")
@@ -375,7 +377,6 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
                 }
             ));
         }
-        let tray_binary = tray_binary.display().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Ok(stdout
             .lines()
@@ -385,11 +386,34 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
                 let _pid = parts.next();
                 let first = parts.next();
                 let second = parts.next();
-                command_tokens_match_binary(first, second, &tray_binary)
+                tray_binaries.iter().any(|tray_binary| {
+                    command_tokens_match_binary(first, second, tray_binary)
+                })
             })
             .filter_map(|line| line.split_whitespace().next().and_then(parse_process_id))
             .collect::<Vec<_>>());
     }
+}
+
+fn tray_binary_candidates(tray_binary: &Path) -> Vec<String> {
+    let mut binaries = vec![tray_binary.display().to_string()];
+    let Some(build) = detect_local_tray_build(tray_binary) else {
+        return binaries;
+    };
+
+    let Some(binary_name) = tray_binary.file_name() else {
+        return binaries;
+    };
+    for candidate in [
+        build.repo_root.join("target").join("debug").join(binary_name),
+        build.repo_root.join("target").join("release").join(binary_name),
+    ] {
+        let candidate = candidate.display().to_string();
+        if !binaries.contains(&candidate) {
+            binaries.push(candidate);
+        }
+    }
+    binaries
 }
 
 fn command_tokens_match_binary(first: Option<&str>, second: Option<&str>, binary: &str) -> bool {

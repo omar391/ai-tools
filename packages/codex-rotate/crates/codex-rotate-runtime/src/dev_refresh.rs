@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::raw::c_int;
 #[cfg(unix)]
@@ -16,6 +16,7 @@ const FRESHNESS_TOLERANCE: Duration = Duration::from_secs(1);
 pub const MACOS_TRAY_LAUNCHD_LABEL: &str = "com.astronlab.codex-rotate.tray";
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_LAUNCHD_LABEL_ENV: &str = "CODEX_ROTATE_TRAY_LAUNCHD_LABEL";
+const LOCAL_REFRESH_DISABLE_ENV: &str = "CODEX_ROTATE_DISABLE_LOCAL_REFRESH";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildProfile {
@@ -135,6 +136,40 @@ pub fn stop_running_daemons(cli_binary: &Path, daemon_socket: &Path) -> Result<(
     Ok(())
 }
 
+pub fn stop_other_local_daemons(
+    build: &LocalCliBuild,
+    daemon_socket: &Path,
+    keep_pid: u32,
+) -> Result<()> {
+    let Some(binary_name) = build.cli_binary.file_name() else {
+        return Ok(());
+    };
+    let debug_binary = build
+        .repo_root
+        .join("target")
+        .join("debug")
+        .join(binary_name);
+    let release_binary = build
+        .repo_root
+        .join("target")
+        .join("release")
+        .join(binary_name);
+
+    let mut pids = daemon_pids_from_lsof(daemon_socket).unwrap_or_default();
+    for binary in [&debug_binary, &release_binary] {
+        for pid in daemon_pids_from_ps(binary)? {
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+    }
+
+    for pid in pids.into_iter().filter(|pid| *pid != keep_pid) {
+        stop_process(pid).with_context(|| format!("Failed to stop daemon pid {}.", pid))?;
+    }
+    Ok(())
+}
+
 pub fn stop_running_trays(tray_binary: &Path) -> Result<()> {
     for pid in tray_pids_from_ps(tray_binary)? {
         stop_process(pid).with_context(|| format!("Failed to stop tray pid {}.", pid))?;
@@ -145,22 +180,7 @@ pub fn stop_running_trays(tray_binary: &Path) -> Result<()> {
 pub fn spawn_detached_process(binary: &Path, args: &[&str]) -> Result<()> {
     let mut command = Command::new(binary);
     command.args(args);
-    #[cfg(unix)]
-    {
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    spawn_detached_command(&mut command)
         .with_context(|| format!("Failed to start {}.", binary.display()))?;
     Ok(())
 }
@@ -214,17 +234,67 @@ pub fn ensure_tray_process_registered() -> Result<bool> {
     }
 }
 
+pub fn maybe_start_background_release_cli_build(build: &LocalCliBuild) -> Result<bool> {
+    if local_refresh_disabled() {
+        return Ok(false);
+    }
+    if build.profile != BuildProfile::Debug {
+        return Ok(false);
+    }
+    maybe_start_background_release_build(
+        &build.repo_root.join("Cargo.toml"),
+        "codex-rotate-cli",
+        &build.cli_binary,
+        tracked_cli_source_paths(&build.repo_root),
+    )
+}
+
+pub fn maybe_start_background_release_tray_build(build: &LocalTrayBuild) -> Result<bool> {
+    if local_refresh_disabled() {
+        return Ok(false);
+    }
+    if build.profile != BuildProfile::Debug {
+        return Ok(false);
+    }
+    maybe_start_background_release_build(
+        &build
+            .repo_root
+            .join("packages")
+            .join("codex-rotate-app")
+            .join("src-tauri")
+            .join("Cargo.toml"),
+        "codex-rotate-tray",
+        &build.tray_binary,
+        tracked_tray_source_paths(&build.repo_root),
+    )
+}
+
+pub fn preferred_release_cli_binary(build: &LocalCliBuild) -> Result<Option<PathBuf>> {
+    if local_refresh_disabled() {
+        return Ok(None);
+    }
+    if build.profile != BuildProfile::Debug {
+        return Ok(None);
+    }
+    preferred_release_binary(&build.cli_binary, tracked_cli_source_paths(&build.repo_root))
+}
+
+pub fn preferred_release_tray_binary(build: &LocalTrayBuild) -> Result<Option<PathBuf>> {
+    if local_refresh_disabled() {
+        return Ok(None);
+    }
+    if build.profile != BuildProfile::Debug {
+        return Ok(None);
+    }
+    preferred_release_binary(&build.tray_binary, tracked_tray_source_paths(&build.repo_root))
+}
+
 pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let label = tray_launchd_label();
         let plist_path = write_tray_launch_agent_plist(tray_binary)?;
-        let script = format!(
-            "sleep 1; launchctl kickstart -k {service} >/dev/null 2>&1 || (launchctl bootstrap {domain} {plist} >/dev/null 2>&1 && launchctl kickstart -k {service} >/dev/null 2>&1)",
-            service = shell_single_quote_string(&launchctl_service_target(&label)),
-            domain = shell_single_quote_string(&launchctl_user_domain()),
-            plist = shell_single_quote(&plist_path),
-        );
+        let script = build_tray_launch_agent_reset_script(&plist_path, &label);
         return spawn_detached_process(Path::new("/bin/sh"), &["-c", script.as_str()]);
     }
 
@@ -374,11 +444,23 @@ fn launchctl_service_is_registered(label: &str) -> Result<bool> {
 
 #[cfg(target_os = "macos")]
 fn bootstrap_tray_launch_agent_after_reset(plist_path: &Path, message: &str) -> Result<()> {
-    if let Err(error) = launchctl_bootstrap_plist(plist_path) {
-        clear_tray_service_registration();
-        launchctl_bootstrap_plist(plist_path).with_context(|| format!("{message}: {error}"))?;
+    let label = tray_launchd_label();
+    launchctl_bootout_plist_quiet(plist_path).ok();
+    launchctl_remove_label_quiet(&label).ok();
+    let mut last_error = None;
+    for _ in 0..5 {
+        match launchctl_bootstrap_plist(plist_path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(250));
+                launchctl_bootout_plist_quiet(plist_path).ok();
+                launchctl_remove_label_quiet(&label).ok();
+            }
+        }
     }
-    Ok(())
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to bootstrap tray launch agent.")))
+        .with_context(|| message.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -515,6 +597,29 @@ fn shell_single_quote_string(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn build_tray_launch_agent_reset_script(plist_path: &Path, label: &str) -> String {
+    format!(
+        "sleep 1; \
+launchctl bootout {domain} {plist} >/dev/null 2>&1 || true; \
+launchctl remove {label} >/dev/null 2>&1 || true; \
+i=0; \
+while [ $i -lt 5 ]; do \
+  launchctl bootstrap {domain} {plist} >/dev/null 2>&1 && \
+  launchctl kickstart -k {service} >/dev/null 2>&1 && exit 0; \
+  i=$((i + 1)); \
+  sleep 1; \
+  launchctl bootout {domain} {plist} >/dev/null 2>&1 || true; \
+  launchctl remove {label} >/dev/null 2>&1 || true; \
+done; \
+exit 1",
+        domain = shell_single_quote_string(&launchctl_user_domain()),
+        plist = shell_single_quote(plist_path),
+        label = shell_single_quote_string(label),
+        service = shell_single_quote_string(&launchctl_service_target(label)),
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -567,6 +672,14 @@ fn tracked_cli_source_paths(repo_root: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn local_refresh_disabled() -> bool {
+    std::env::var(LOCAL_REFRESH_DISABLE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn tracked_tray_source_paths(repo_root: &Path) -> Vec<PathBuf> {
     vec![
         repo_root.join("Cargo.toml"),
@@ -606,6 +719,19 @@ fn tracked_tray_source_paths(repo_root: &Path) -> Vec<PathBuf> {
             .join("src-tauri")
             .join("src"),
     ]
+}
+
+fn release_binary_path(current_binary: &Path) -> PathBuf {
+    current_binary
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new(""))
+        .join("release")
+        .join(
+            current_binary
+                .file_name()
+                .unwrap_or_default(),
+        )
 }
 
 fn detect_local_build(
@@ -703,6 +829,47 @@ fn rebuild_local_binary(
     ))
 }
 
+fn maybe_start_background_release_build(
+    manifest_path: &Path,
+    package_name: &str,
+    current_binary: &Path,
+    tracked_paths: Vec<PathBuf>,
+) -> Result<bool> {
+    let release_binary = release_binary_path(current_binary);
+    if binary_is_current(&release_binary, tracked_paths)? {
+        clear_stale_release_build_lock(package_name)?;
+        return Ok(false);
+    }
+
+    let Some(lock_path) = try_acquire_release_build_lock(package_name)? else {
+        return Ok(false);
+    };
+
+    let cargo_binary = resolve_cargo_binary();
+    let mut command = Command::new(&cargo_binary);
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .arg("-p")
+        .arg(package_name)
+        .arg("--release");
+    let pid = spawn_detached_command(&mut command).with_context(|| {
+        format!(
+            "Failed to invoke {} build --release for {}.",
+            cargo_binary.display(),
+            package_name
+        )
+    })?;
+    fs::write(&lock_path, pid.to_string()).with_context(|| {
+        format!(
+            "Failed to record background release build pid in {}.",
+            lock_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
 fn resolve_cargo_binary() -> PathBuf {
     let candidates = [
         std::env::var_os("CODEX_ROTATE_CARGO_BIN").map(PathBuf::from),
@@ -719,6 +886,123 @@ fn resolve_cargo_binary() -> PathBuf {
         }
     }
     PathBuf::from("cargo")
+}
+
+fn binary_is_current(binary: &Path, tracked_paths: Vec<PathBuf>) -> Result<bool> {
+    if !binary.is_file() {
+        return Ok(false);
+    }
+    let modified = file_modified_at(binary)?;
+    Ok(!source_paths_newer_than_binary(modified, tracked_paths)?)
+}
+
+fn preferred_release_binary(
+    current_binary: &Path,
+    tracked_paths: Vec<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let release_binary = release_binary_path(current_binary);
+    if current_binary == release_binary {
+        return Ok(None);
+    }
+    if binary_is_current(&release_binary, tracked_paths)? {
+        return Ok(Some(release_binary));
+    }
+    Ok(None)
+}
+
+fn release_build_lock_path(package_name: &str) -> Result<PathBuf> {
+    let paths = resolve_paths()?;
+    Ok(paths.rotate_home.join(format!(
+        ".release-build-{}.pid",
+        package_name.replace(|ch: char| !ch.is_ascii_alphanumeric(), "-")
+    )))
+}
+
+fn try_acquire_release_build_lock(package_name: &str) -> Result<Option<PathBuf>> {
+    let lock_path = release_build_lock_path(package_name)?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+
+    loop {
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(Some(lock_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if release_build_lock_is_stale(&lock_path)? {
+                    fs::remove_file(&lock_path).ok();
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to create {}.", lock_path.display()))
+            }
+        }
+    }
+}
+
+fn clear_stale_release_build_lock(package_name: &str) -> Result<()> {
+    let lock_path = release_build_lock_path(package_name)?;
+    if lock_path.exists() && release_build_lock_is_stale(&lock_path)? {
+        fs::remove_file(&lock_path).ok();
+    }
+    Ok(())
+}
+
+fn release_build_lock_is_stale(lock_path: &Path) -> Result<bool> {
+    let pid = fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
+    match pid {
+        Some(pid) => Ok(!process_is_running(pid)),
+        None => Ok(true),
+    }
+}
+
+fn process_is_running(process_id: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &process_id.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", process_id), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&process_id.to_string()))
+            .unwrap_or(false)
+    }
+}
+
+fn spawn_detached_command(command: &mut Command) -> Result<u32> {
+    #[cfg(unix)]
+    {
+        unsafe {
+            command.pre_exec(|| {
+                if setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(child.id())
 }
 
 fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {

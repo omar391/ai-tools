@@ -26,6 +26,9 @@ pub fn resolve_paths() -> Result<RuntimePaths> {
 }
 
 pub fn legacy_rotate_app_home() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Failed to resolve home directory.")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .context("Failed to resolve home directory.")?;
     Ok(home.join(".codex-rotate-app"))
 }

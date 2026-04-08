@@ -24,9 +24,11 @@ use codex_rotate_core::workflow::{
 
 use crate::dev_refresh::{
     current_process_local_cli_build, daemon_socket_is_older_than_binary,
-    ensure_tray_process_registered, local_cli_sources_newer_than_binary, rebuild_local_cli,
+    ensure_tray_process_registered, local_cli_sources_newer_than_binary,
+    maybe_start_background_release_cli_build, preferred_release_cli_binary, rebuild_local_cli,
+    stop_other_local_daemons,
 };
-use crate::hook::{read_live_account, switch_live_account_to_current_auth};
+use crate::hook::{read_live_account, read_live_account_if_running, switch_live_account_to_current_auth};
 use crate::ipc::{
     read_request, write_message, ClientRequest, CreateInvocation, InvokeAction,
     RuntimeCapabilities, ServerMessage, StatusSnapshot,
@@ -154,6 +156,13 @@ pub fn run_daemon_forever() -> Result<()> {
             "Daemon listening on {}.",
             paths.daemon_socket.display()
         ));
+        if let Some(build) = current_process_local_cli_build() {
+            if let Err(error) =
+                stop_other_local_daemons(&build, &paths.daemon_socket, std::process::id())
+            {
+                log_daemon_error(format!("Failed to stop stale daemons: {error:#}"));
+            }
+        }
         let _socket_guard = SocketGuard(paths.daemon_socket.clone());
         let daemon = SharedDaemon::new();
 
@@ -199,10 +208,8 @@ impl Drop for SocketGuard {
 }
 
 fn initialize_runtime(daemon: &SharedDaemon) {
-    let port = managed_codex_port();
     let result = daemon.with_state_mut(|state| {
-        let _ = ensure_debug_codex_instance(None, Some(port), None, None);
-        refresh_live_account_state(state, true)
+        refresh_live_account_state(state, true, false)
     });
 
     if let Err(error) = result {
@@ -360,6 +367,30 @@ fn maybe_refresh_local_daemon_process() -> Result<bool> {
         ));
         rebuild_local_cli(&build)?;
     }
+    if maybe_start_background_release_cli_build(&build)? {
+        log_daemon_info("Queued background release build for codex-rotate.");
+    }
+    if let Some(release_binary) = preferred_release_cli_binary(&build)? {
+        log_daemon_info(format!(
+            "Promoting daemon to release binary {}.",
+            release_binary.display()
+        ));
+        Command::new(&release_binary)
+            .arg("daemon")
+            .arg("run")
+            .env(DAEMON_TAKEOVER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to relaunch {} after preparing the release daemon.",
+                    release_binary.display()
+                )
+            })?;
+        return Ok(true);
+    }
     let binary_newer_than_running_socket =
         daemon_socket_is_older_than_binary(&daemon_socket, &build.cli_binary)?;
     if !sources_newer_than_binary && !binary_newer_than_running_socket {
@@ -455,7 +486,7 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
         }),
         InvokeAction::OpenManaged => daemon.with_state_mut(|state| {
             ensure_debug_codex_instance(None, Some(managed_codex_port()), None, None)?;
-            refresh_live_account_state(state, true)?;
+            refresh_live_account_state(state, true, true)?;
             Ok(state
                 .snapshot
                 .last_message
@@ -649,17 +680,33 @@ fn refresh_auth_summary(snapshot: &mut StatusSnapshot) -> bool {
     snapshot.current_email != previous_email || snapshot.current_plan != previous_plan
 }
 
-fn refresh_live_account_state(state: &mut DaemonState, force_quota_refresh: bool) -> Result<()> {
+fn refresh_live_account_state(
+    state: &mut DaemonState,
+    force_quota_refresh: bool,
+    launch_if_needed: bool,
+) -> Result<()> {
     let port = managed_codex_port();
     refresh_static_snapshot(state);
-    let live = read_live_account(Some(port))?;
-    if let Some(account) = live.account {
-        state.snapshot.current_email = account.email;
-        state.snapshot.current_plan = account.plan_type;
+    let live = if launch_if_needed {
+        Some(read_live_account(Some(port))?)
+    } else {
+        read_live_account_if_running(Some(port))?
+    };
+    if let Some(live) = live {
+        if let Some(account) = live.account {
+            state.snapshot.current_email = account.email;
+            state.snapshot.current_plan = account.plan_type;
+        }
     }
     refresh_quota_state(state, force_quota_refresh);
     if state.snapshot.last_message.is_none() {
-        state.snapshot.last_message = Some("launcher ready".to_string());
+        state.snapshot.last_message = Some(
+            if launch_if_needed {
+                "launcher ready".to_string()
+            } else {
+                "watch healthy".to_string()
+            },
+        );
     }
     Ok(())
 }

@@ -144,6 +144,8 @@ struct EnvGuard {
     codex_home: Option<OsString>,
     cli_bin: Option<OsString>,
     debug_port: Option<OsString>,
+    disable_managed_launch: Option<OsString>,
+    disable_local_refresh: Option<OsString>,
 }
 
 impl EnvGuard {
@@ -154,6 +156,8 @@ impl EnvGuard {
             codex_home: std::env::var_os("CODEX_HOME"),
             cli_bin: std::env::var_os("CODEX_ROTATE_CLI_BIN"),
             debug_port: std::env::var_os("CODEX_ROTATE_DEBUG_PORT"),
+            disable_managed_launch: std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH"),
+            disable_local_refresh: std::env::var_os("CODEX_ROTATE_DISABLE_LOCAL_REFRESH"),
         };
         let fake_home = rotate_home
             .parent()
@@ -165,6 +169,8 @@ impl EnvGuard {
             std::env::set_var("CODEX_HOME", codex_home);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", cli_bin);
             std::env::set_var("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
+            std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
+            std::env::set_var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH", "1");
         }
         previous
     }
@@ -177,6 +183,14 @@ impl Drop for EnvGuard {
         restore_var("CODEX_HOME", self.codex_home.take());
         restore_var("CODEX_ROTATE_CLI_BIN", self.cli_bin.take());
         restore_var("CODEX_ROTATE_DEBUG_PORT", self.debug_port.take());
+        restore_var(
+            "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
+            self.disable_managed_launch.take(),
+        );
+        restore_var(
+            "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
+            self.disable_local_refresh.take(),
+        );
     }
 }
 

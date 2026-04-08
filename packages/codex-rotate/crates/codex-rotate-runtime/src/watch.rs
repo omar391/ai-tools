@@ -19,7 +19,7 @@ use codex_rotate_core::workflow::{
 use serde::{Deserialize, Serialize};
 
 use crate::hook::{
-    live_account_matches_summary, read_live_account, switch_live_account_to_current_auth,
+    live_account_matches_summary, read_live_account_if_running, switch_live_account_to_current_auth,
     AccountReadResult, LiveSwitchResult,
 };
 use crate::logs::{
@@ -133,11 +133,15 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         previous_state.quota.as_ref(),
         options.force_quota_refresh,
     )?;
-    let live_account = ensure_live_account_matches_current_auth(
-        port,
-        &current_summary,
-        read_live_account(Some(port))?,
-    )?;
+    let live_account = match read_live_account_if_running(Some(port))? {
+        Some(live_account) => {
+            ensure_live_account_matches_current_auth(port, &current_summary, live_account)?
+        }
+        None => AccountReadResult {
+            account: None,
+            requires_openai_auth: None,
+        },
+    };
 
     let mut rotated = false;
     let mut rotation = None;

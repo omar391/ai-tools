@@ -8,7 +8,7 @@ use codex_rotate_core::auth::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::cdp::{invalidate_local_codex_connection, with_local_codex_connection};
+use crate::cdp::{invalidate_local_codex_connection, is_cdp_ready, with_local_codex_connection};
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::resolve_paths;
 
@@ -39,6 +39,17 @@ pub struct LiveSwitchResult {
 
 pub fn read_live_account(port: Option<u16>) -> Result<AccountReadResult> {
     send_mcp_request(port.unwrap_or(9333), "account/read", json!({}))
+}
+
+pub fn read_live_account_if_running(port: Option<u16>) -> Result<Option<AccountReadResult>> {
+    let port = port.unwrap_or(9333);
+    if !is_cdp_ready(port) {
+        return Ok(None);
+    }
+    match send_mcp_request_once(port, "account/read", &json!({})) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
 }
 
 pub fn switch_live_account_to_current_auth(

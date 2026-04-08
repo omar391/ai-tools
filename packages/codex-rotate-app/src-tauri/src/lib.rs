@@ -1,7 +1,8 @@
 use codex_rotate_runtime::dev_refresh::{
     current_process_local_tray_build, daemon_socket_is_older_than_binary, detect_local_cli_build,
     local_cli_sources_newer_than_binary, local_tray_sources_newer_than_binary, rebuild_local_cli,
-    rebuild_local_tray, schedule_tray_relaunch_process, spawn_detached_process,
+    rebuild_local_tray, maybe_start_background_release_tray_build,
+    preferred_release_tray_binary, schedule_tray_relaunch_process, spawn_detached_process,
     stop_running_daemons,
 };
 use codex_rotate_runtime::ipc::{
@@ -177,6 +178,13 @@ fn refresh_local_daemon_if_needed(
     poll_interval: Duration,
     max_attempts: usize,
 ) -> Result<(), String> {
+    if std::env::var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     let Some(build) = detect_local_cli_build(cli_binary) else {
         return Ok(());
     };
@@ -216,21 +224,46 @@ fn wait_for_daemon_state(reachable: bool, poll_interval: Duration, max_attempts:
 }
 
 pub fn maybe_refresh_current_tray() -> Result<bool, String> {
+    if std::env::var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
     let Some(build) = current_process_local_tray_build() else {
         return Ok(false);
     };
     let sources_newer_than_binary = local_tray_sources_newer_than_binary(&build)
         .map_err(|error| format!("Failed to inspect local tray freshness: {error}"))?;
+    if sources_newer_than_binary {
+        log_tray_info(format!(
+            "Local tray sources changed. Rebuilding {}.",
+            build.tray_binary.display()
+        ));
+        rebuild_local_tray(&build)
+            .map_err(|error| format!("Failed to rebuild local codex-rotate tray: {error}"))?;
+    }
+    if maybe_start_background_release_tray_build(&build)
+        .map_err(|error| format!("Failed to queue background release tray build: {error}"))?
+    {
+        log_tray_info("Queued background release build for codex-rotate-tray.");
+    }
+    if let Some(release_binary) = preferred_release_tray_binary(&build)
+        .map_err(|error| format!("Failed to inspect release tray freshness: {error}"))?
+    {
+        log_tray_info(format!(
+            "Promoting tray to release binary {}.",
+            release_binary.display()
+        ));
+        schedule_tray_relaunch(&release_binary)
+            .map_err(|error| format!("Failed to relaunch local tray: {error}"))?;
+        return Ok(true);
+    }
     if !sources_newer_than_binary {
         return Ok(false);
     }
 
-    log_tray_info(format!(
-        "Local tray sources changed. Rebuilding {}.",
-        build.tray_binary.display()
-    ));
-    rebuild_local_tray(&build)
-        .map_err(|error| format!("Failed to rebuild local codex-rotate tray: {error}"))?;
     log_tray_info("Scheduling tray relaunch after rebuild.");
     schedule_tray_relaunch(&build.tray_binary)
         .map_err(|error| format!("Failed to relaunch local tray: {error}"))?;

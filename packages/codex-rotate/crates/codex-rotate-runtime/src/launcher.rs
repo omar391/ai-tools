@@ -23,6 +23,12 @@ pub fn ensure_debug_codex_instance(
         return Ok(());
     }
 
+    if managed_launch_disabled() {
+        return Err(anyhow!(
+            "Managed Codex launch is disabled by CODEX_ROTATE_DISABLE_MANAGED_LAUNCH."
+        ));
+    }
+
     std::fs::create_dir_all(&paths.rotate_home)
         .with_context(|| format!("Failed to create {}.", paths.rotate_home.display()))?;
     std::fs::create_dir_all(profile_dir)
@@ -67,6 +73,14 @@ pub fn ensure_debug_codex_instance(
         "Codex did not expose a remote debugging target on port {}.",
         port
     ))
+}
+
+fn managed_launch_disabled() -> bool {
+    std::env::var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 trait IfEmptyThen {
