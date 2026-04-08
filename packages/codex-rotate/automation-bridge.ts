@@ -9,9 +9,8 @@ import type {
 import {
   completeCodexLoginViaWorkflow,
   deleteBitwardenCliAccountSecretRef,
-  ensureBitwardenCliAccountSecretRef,
-  findBitwardenCliAccountSecretRef,
   inspectManagedProfiles,
+  prepareBitwardenCliAccountSecretRef,
 } from "./automation.ts";
 
 type BridgeRequest =
@@ -20,12 +19,8 @@ type BridgeRequest =
       payload?: Record<string, never> | null;
     }
   | {
-      command: "ensure-account-secret-ref";
+      command: "prepare-account-secret-ref";
       payload: { profileName: string; email: string; password: string };
-    }
-  | {
-      command: "find-account-secret-ref";
-      payload: { profileName: string; email: string };
     }
   | {
       command: "delete-account-secret-ref";
@@ -37,6 +32,8 @@ type BridgeRequest =
         profileName: string;
         email: string;
         accountLoginLocator?: CodexRotateSecretLocator | null;
+        accountLoginEnvVarName?: string | null;
+        accountLoginEnvVarValue?: string | null;
         options?: {
           codexBin?: string;
           workflowFile?: string;
@@ -50,6 +47,7 @@ type BridgeRequest =
           maxAttempts?: number;
           maxReplayPasses?: number;
           retryDelaysMs?: number[];
+          skipLocatorPreflight?: boolean;
         };
       };
     };
@@ -81,20 +79,45 @@ function respond(response: BridgeResponse): never {
   process.exit(response.ok ? 0 : 1);
 }
 
+async function withTemporaryEnvVar<T>(
+  name: string | null,
+  value: string | null,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const normalizedName = typeof name === "string" ? name.trim() : "";
+  if (!normalizedName) {
+    return await operation();
+  }
+  const hadPrevious = Object.prototype.hasOwnProperty.call(
+    process.env,
+    normalizedName,
+  );
+  const previousValue = process.env[normalizedName];
+  if (typeof value === "string") {
+    process.env[normalizedName] = value;
+  } else {
+    delete process.env[normalizedName];
+  }
+  try {
+    return await operation();
+  } finally {
+    if (hadPrevious && previousValue !== undefined) {
+      process.env[normalizedName] = previousValue;
+    } else {
+      delete process.env[normalizedName];
+    }
+  }
+}
+
 async function handleRequest(request: BridgeRequest): Promise<unknown> {
   switch (request.command) {
     case "inspect-managed-profiles":
       return inspectManagedProfiles();
-    case "ensure-account-secret-ref":
-      return await ensureBitwardenCliAccountSecretRef(
+    case "prepare-account-secret-ref":
+      return await prepareBitwardenCliAccountSecretRef(
         request.payload.profileName,
         request.payload.email,
         request.payload.password,
-      );
-    case "find-account-secret-ref":
-      return await findBitwardenCliAccountSecretRef(
-        request.payload.profileName,
-        request.payload.email,
       );
     case "delete-account-secret-ref":
       return await deleteBitwardenCliAccountSecretRef(
@@ -102,18 +125,23 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.email,
       );
     case "complete-codex-login":
-      return (await completeCodexLoginViaWorkflow(
-        request.payload.profileName,
-        request.payload.email,
-        request.payload.accountLoginLocator ?? null,
-        {
-          ...request.payload.options,
-          onNote: (message) => {
-            process.stderr.write(`[codex-rotate] ${message}\n`);
-          },
-          restoreState: null,
-        },
-      )) as CodexRotateAuthFlowSummary;
+      return await withTemporaryEnvVar(
+        request.payload.accountLoginEnvVarName ?? null,
+        request.payload.accountLoginEnvVarValue ?? null,
+        async () =>
+          (await completeCodexLoginViaWorkflow(
+            request.payload.profileName,
+            request.payload.email,
+            request.payload.accountLoginLocator ?? null,
+            {
+              ...request.payload.options,
+              onNote: (message) => {
+                process.stderr.write(`[codex-rotate] ${message}\n`);
+              },
+              restoreState: null,
+            },
+          )) as CodexRotateAuthFlowSummary,
+      );
     default: {
       const label =
         typeof (request as { command?: unknown }).command === "string"

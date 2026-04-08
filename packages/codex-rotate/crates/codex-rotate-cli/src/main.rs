@@ -4,8 +4,10 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -128,10 +130,13 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
 
     Ok(match action {
         Some(action) => {
-            if command_streams_progress(command) {
-                spawn_daemon_progress_printer();
+            let progress_printer = command_streams_progress(command)
+                .then(DaemonProgressPrinter::spawn);
+            let result = invoke(action);
+            if let Some(printer) = progress_printer {
+                printer.stop();
             }
-            Some(invoke(action)?)
+            Some(result?)
         }
         None => None,
     })
@@ -141,21 +146,69 @@ fn cli_progress_callback() -> Option<Arc<dyn Fn(String) + Send + Sync>> {
     Some(Arc::new(|message| eprintln!("{message}")))
 }
 
-fn spawn_daemon_progress_printer() {
-    thread::spawn(|| {
+struct DaemonProgressPrinter {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DaemonProgressPrinter {
+    fn spawn() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = stop.clone();
+        let handle = thread::spawn(move || {
         let Ok(mut subscription) = subscribe() else {
             return;
         };
         if subscription.recv().is_err() {
             return;
         }
-        while let Ok(snapshot) = subscription.recv() {
+        let mut last_printed = None::<String>;
+        while !stop_signal.load(Ordering::Relaxed) {
+            let Ok(snapshot) = subscription.recv_timeout(Duration::from_millis(200)) else {
+                break;
+            };
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
             let Some(message) = snapshot.last_message else {
                 continue;
             };
+            if !should_print_daemon_progress_message(&message) {
+                continue;
+            }
+            if last_printed.as_deref() == Some(message.as_str()) {
+                continue;
+            }
+            last_printed = Some(message.clone());
             eprintln!("{message}");
         }
-    });
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn should_print_daemon_progress_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed.starts_with("[fast-browser]")
+        || trimmed.starts_with("Creating ")
+        || trimmed.starts_with("Preparing ")
+        || trimmed.starts_with("Starting managed login")
+        || trimmed.starts_with("Found a stored ")
+        || trimmed.starts_with("Using a freshly generated ")
+        || trimmed.starts_with("Completing Codex login")
+        || trimmed.starts_with("OpenAI verification is not ready")
+        || trimmed.starts_with("Retrying Codex login")
+        || trimmed.starts_with("Saving password secret")
 }
 
 fn command_streams_progress(command: Option<&str>) -> bool {
@@ -858,6 +911,20 @@ mod tests {
         assert!(help.contains("daemon"));
         assert!(help.contains("Start the background runtime daemon"));
         assert!(help.contains("tray"));
+    }
+
+    #[test]
+    fn daemon_progress_filter_only_prints_real_progress_lines() {
+        assert!(should_print_daemon_progress_message(
+            "[fast-browser] 2026-04-08T00:00:00Z step: ..."
+        ));
+        assert!(should_print_daemon_progress_message(
+            "Starting managed login for dev.43@astronlab.com."
+        ));
+        assert!(!should_print_daemon_progress_message("watch healthy"));
+        assert!(!should_print_daemon_progress_message(
+            "\u{1b}[32mROTATE\u{1b}[0m dev.44 -> dev.45"
+        ));
     }
 
     #[cfg(unix)]

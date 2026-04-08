@@ -272,6 +272,7 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     let direct_status = run_cli(&["status"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let direct_list = run_cli(&["list"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let direct_next = run_cli(&["next"], &rotate_home, &codex_home, dummy_cdp.port)?;
+    let direct_prev = run_cli(&["prev"], &rotate_home, &codex_home, dummy_cdp.port)?;
 
     let mut daemon = spawn_daemon(&rotate_home, &codex_home, dummy_cdp.port)?;
     wait_for_socket(&mut daemon, Duration::from_secs(10))?;
@@ -283,6 +284,7 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     let proxied_status = run_cli(&["status"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_list = run_cli(&["list"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_next = run_cli(&["next"], &rotate_home, &codex_home, dummy_cdp.port)?;
+    let proxied_prev = run_cli(&["prev"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let second_daemon = run_cli(
         &["daemon", "run"],
         &rotate_home,
@@ -320,6 +322,16 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
         "expected proxied stderr to end with direct stderr.\ndirect:\n{}\n\nproxied:\n{}",
         normalized(&direct_next.stderr),
         normalized(&proxied_next.stderr),
+    );
+
+    assert_eq!(direct_prev.code, proxied_prev.code);
+    assert_eq!(
+        normalized(&direct_prev.stdout),
+        normalized(&proxied_prev.stdout)
+    );
+    assert_eq!(
+        normalized(&direct_prev.stderr),
+        normalized(&proxied_prev.stderr)
     );
 
     assert_eq!(second_daemon.code, 0);

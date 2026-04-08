@@ -17,6 +17,7 @@ pub const MACOS_TRAY_LAUNCHD_LABEL: &str = "com.astronlab.codex-rotate.tray";
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_LAUNCHD_LABEL_ENV: &str = "CODEX_ROTATE_TRAY_LAUNCHD_LABEL";
 const LOCAL_REFRESH_DISABLE_ENV: &str = "CODEX_ROTATE_DISABLE_LOCAL_REFRESH";
+pub const INSTANCE_HOME_ENV: &str = "CODEX_ROTATE_INSTANCE_HOME";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildProfile {
@@ -123,8 +124,9 @@ pub fn rebuild_local_tray(build: &LocalTrayBuild) -> Result<()> {
 }
 
 pub fn stop_running_daemons(cli_binary: &Path, daemon_socket: &Path) -> Result<()> {
+    let instance_home = std::env::var(INSTANCE_HOME_ENV).ok();
     let mut pids = daemon_pids_from_lsof(daemon_socket).unwrap_or_default();
-    for pid in daemon_pids_from_ps(cli_binary)? {
+    for pid in daemon_pids_from_ps(cli_binary, instance_home.as_deref())? {
         if !pids.contains(&pid) {
             pids.push(pid);
         }
@@ -140,6 +142,7 @@ pub fn stop_other_local_daemons(
     build: &LocalCliBuild,
     daemon_socket: &Path,
     keep_pid: u32,
+    instance_home: Option<&str>,
 ) -> Result<()> {
     let Some(binary_name) = build.cli_binary.file_name() else {
         return Ok(());
@@ -157,7 +160,7 @@ pub fn stop_other_local_daemons(
 
     let mut pids = daemon_pids_from_lsof(daemon_socket).unwrap_or_default();
     for binary in [&debug_binary, &release_binary] {
-        for pid in daemon_pids_from_ps(binary)? {
+        for pid in daemon_pids_from_ps(binary, instance_home)? {
             if !pids.contains(&pid) {
                 pids.push(pid);
             }
@@ -672,7 +675,7 @@ fn tracked_cli_source_paths(repo_root: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn local_refresh_disabled() -> bool {
+pub fn local_refresh_disabled() -> bool {
     std::env::var(LOCAL_REFRESH_DISABLE_ENV)
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
@@ -1070,9 +1073,12 @@ fn daemon_pids_from_lsof(daemon_socket: &Path) -> Result<Vec<u32>> {
         .collect::<Vec<_>>())
 }
 
-fn daemon_pids_from_ps(cli_binary: &Path) -> Result<Vec<u32>> {
+fn daemon_pids_from_ps(cli_binary: &Path, instance_home: Option<&str>) -> Result<Vec<u32>> {
     let cli_binary = cli_binary.display().to_string();
     process_ids_from_ps("running daemon processes", move |line| {
+        if !matches_instance_home_marker(line, instance_home) {
+            return false;
+        }
         let mut parts = line.split_whitespace();
         let _pid = parts.next();
         let first = parts.next();
@@ -1133,7 +1139,7 @@ where
     F: Fn(&str) -> bool,
 {
     let output = Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
+        .args(["axeww", "-o", "pid=,command="])
         .output()
         .with_context(|| format!("Failed to query {label}."))?;
     if !output.status.success() {
@@ -1151,6 +1157,14 @@ where
         .filter(|line| predicate(line))
         .filter_map(|line| line.split_whitespace().next().and_then(parse_process_id))
         .collect::<Vec<_>>())
+}
+
+fn matches_instance_home_marker(line: &str, instance_home: Option<&str>) -> bool {
+    let Some(instance_home) = instance_home else {
+        return true;
+    };
+    let marker = format!("{INSTANCE_HOME_ENV}={instance_home}");
+    line.contains(&marker)
 }
 
 fn stop_process(process_id: u32) -> Result<()> {
@@ -1262,6 +1276,22 @@ mod tests {
         assert_eq!(detected.profile, BuildProfile::Debug);
 
         fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn instance_home_marker_filters_other_homes() {
+        let home = "/tmp/codex-home-a";
+        let matching = format!(
+            "123 /Volumes/demo/target/debug/codex-rotate daemon run {}={}",
+            INSTANCE_HOME_ENV, home
+        );
+        let other = format!(
+            "123 /Volumes/demo/target/debug/codex-rotate daemon run {}={}",
+            INSTANCE_HOME_ENV, "/tmp/codex-home-b"
+        );
+        assert!(matches_instance_home_marker(&matching, Some(home)));
+        assert!(!matches_instance_home_marker(&other, Some(home)));
+        assert!(matches_instance_home_marker(&other, None));
     }
 
     #[cfg(target_os = "macos")]

@@ -38,6 +38,7 @@ const DEFAULT_OPENAI_BIRTH_MONTH: u8 = 1;
 const DEFAULT_OPENAI_BIRTH_DAY: u8 = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR: u16 = 1990;
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
+const CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR: &str = "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD";
 const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -167,6 +168,9 @@ enum CodexRotateSecretLocator {
         uris: Vec<String>,
         field_path: String,
     },
+    EnvVar {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,13 +252,6 @@ struct BridgeEnsureSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BridgeFindSecretPayload<'a> {
-    profile_name: &'a str,
-    email: &'a str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BridgeDeleteSecretPayload<'a> {
     profile_name: &'a str,
     email: &'a str,
@@ -271,6 +268,8 @@ struct BridgeLoginOptions<'a> {
     workflow_ref: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_run_stamp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_locator_preflight: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_signup_recovery: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,6 +289,10 @@ struct BridgeCompleteLoginPayload<'a> {
     email: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     account_login_locator: Option<&'a CodexRotateSecretLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_login_env_var_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_login_env_var_value: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<BridgeLoginOptions<'a>>,
 }
@@ -451,6 +454,9 @@ pub fn cmd_relogin_with_progress(
                 &updated_stored.profile_name,
                 &updated_stored.email,
                 Some(&account_login_locator),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -904,32 +910,18 @@ fn execute_create_flow_attempt(
         }
         return Ok(result);
     }
-    let account_login_locator = build_openai_account_login_locator(&created_email);
+    let mut generated_password: Option<String> = None;
+    let mut account_login_locator = build_openai_account_login_locator(&created_email);
+    let mut skip_locator_preflight = false;
     if !reusing_pending {
         report_progress(
             progress.as_ref(),
-            format!("Preparing password secret for {}.", created_email),
+            format!("Preparing password for {}.", created_email),
         );
-        let existing_secret_ref: Option<CodexRotateSecretRef> = run_automation_bridge(
-            "find-account-secret-ref",
-            BridgeFindSecretPayload {
-                profile_name: &profile_name,
-                email: &created_email,
-            },
-        )
-        .map_err(CreateFlowAttemptFailure::Fatal)?;
-        if existing_secret_ref.is_none() {
-            let generated_password = generate_password(18);
-            let _: CodexRotateSecretRef = run_automation_bridge(
-                "ensure-account-secret-ref",
-                BridgeEnsureSecretPayload {
-                    profile_name: &profile_name,
-                    email: &created_email,
-                    password: &generated_password,
-                },
-            )
-            .map_err(CreateFlowAttemptFailure::Fatal)?;
-        }
+        generated_password = Some(generate_password(18));
+        account_login_locator =
+            build_openai_account_password_env_var_locator(CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR);
+        skip_locator_preflight = true;
     }
     let pending = PendingCredential {
         stored: StoredCredential {
@@ -970,6 +962,11 @@ fn execute_create_flow_attempt(
         Some(workflow_file.as_path()),
         Some(codex_bin().as_str()),
         Some(started_at.as_str()),
+        generated_password
+            .as_ref()
+            .map(|_| CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR),
+        generated_password.as_deref(),
+        Some(skip_locator_preflight),
         Some(true),
         Some(&birth_date),
         progress.clone(),
@@ -1015,6 +1012,22 @@ fn execute_create_flow_attempt(
         }
         fatal(save_credential_store(&store))?;
         return Err(CreateFlowAttemptFailure::Fatal(error));
+    }
+
+    if let Some(generated_password) = generated_password.as_deref() {
+        report_progress(
+            progress.as_ref(),
+            format!("Saving password secret for {}.", created_email),
+        );
+        let _: CodexRotateSecretRef = run_automation_bridge(
+            "prepare-account-secret-ref",
+            BridgeEnsureSecretPayload {
+                profile_name: &profile_name,
+                email: &created_email,
+                password: generated_password,
+            },
+        )
+        .map_err(CreateFlowAttemptFailure::Fatal)?;
     }
 
     report_progress(
@@ -1265,6 +1278,9 @@ fn run_complete_codex_login(
     workflow_file: Option<&Path>,
     codex_bin: Option<&str>,
     workflow_run_stamp: Option<&str>,
+    account_login_env_var_name: Option<&str>,
+    account_login_env_var_value: Option<&str>,
+    skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
     birth_date: Option<&AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
@@ -1283,6 +1299,7 @@ fn run_complete_codex_login(
         workflow_file: workflow_file.and_then(|path| path.to_str()),
         workflow_ref: workflow_ref.as_deref(),
         workflow_run_stamp,
+        skip_locator_preflight,
         prefer_signup_recovery,
         full_name: Some(DEFAULT_OPENAI_FULL_NAME),
         birth_month: Some(birth_date.birth_month),
@@ -1295,6 +1312,8 @@ fn run_complete_codex_login(
             profile_name,
             email,
             account_login_locator,
+            account_login_env_var_name,
+            account_login_env_var_value,
             options: Some(options),
         },
         progress,
@@ -1311,6 +1330,12 @@ fn build_openai_account_login_locator(email: &str) -> CodexRotateSecretLocator {
             "https://chatgpt.com".to_string(),
         ],
         field_path: "/password".to_string(),
+    }
+}
+
+fn build_openai_account_password_env_var_locator(name: &str) -> CodexRotateSecretLocator {
+    CodexRotateSecretLocator::EnvVar {
+        name: name.trim().to_string(),
     }
 }
 
@@ -3604,6 +3629,23 @@ document:
                         "https://chatgpt.com".to_string()
                     ]
                 );
+            }
+            CodexRotateSecretLocator::EnvVar { .. } => {
+                panic!("expected login lookup locator")
+            }
+        }
+    }
+
+    #[test]
+    fn builds_openai_password_env_var_locator() {
+        let locator =
+            build_openai_account_password_env_var_locator("CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD");
+        match locator {
+            CodexRotateSecretLocator::EnvVar { name } => {
+                assert_eq!(name, "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD");
+            }
+            CodexRotateSecretLocator::LoginLookup { .. } => {
+                panic!("expected env var locator")
             }
         }
     }

@@ -2,7 +2,9 @@ use std::fs;
 use std::io::BufReader;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,9 +26,9 @@ use codex_rotate_core::workflow::{
 
 use crate::dev_refresh::{
     current_process_local_cli_build, daemon_socket_is_older_than_binary,
-    ensure_tray_process_registered, local_cli_sources_newer_than_binary,
+    ensure_tray_process_registered, local_cli_sources_newer_than_binary, local_refresh_disabled,
     maybe_start_background_release_cli_build, preferred_release_cli_binary, rebuild_local_cli,
-    stop_other_local_daemons,
+    stop_other_local_daemons, INSTANCE_HOME_ENV,
 };
 use crate::hook::{read_live_account, read_live_account_if_running, switch_live_account_to_current_auth};
 use crate::ipc::{
@@ -68,6 +70,7 @@ struct SharedDaemon {
     state: Arc<Mutex<DaemonState>>,
     snapshot_cache: Arc<Mutex<StatusSnapshot>>,
     subscribers: Arc<Mutex<Vec<Sender<StatusSnapshot>>>>,
+    in_flight_invocations: Arc<AtomicUsize>,
 }
 
 impl SharedDaemon {
@@ -78,6 +81,7 @@ impl SharedDaemon {
             state: Arc::new(Mutex::new(state)),
             snapshot_cache: Arc::new(Mutex::new(snapshot)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            in_flight_invocations: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -124,7 +128,7 @@ fn managed_codex_port() -> u16 {
 }
 
 pub fn run_daemon_forever() -> Result<()> {
-    if maybe_refresh_local_daemon_process()? {
+    if maybe_refresh_local_daemon_process(None)? {
         return Ok(());
     }
     migrate_runtime_state()?;
@@ -132,6 +136,9 @@ pub fn run_daemon_forever() -> Result<()> {
     #[cfg(unix)]
     {
         let paths = resolve_paths()?;
+        unsafe {
+            std::env::set_var(INSTANCE_HOME_ENV, &paths.rotate_home);
+        }
         fs::create_dir_all(&paths.rotate_home)
             .with_context(|| format!("Failed to create {}.", paths.rotate_home.display()))?;
 
@@ -157,8 +164,14 @@ pub fn run_daemon_forever() -> Result<()> {
             paths.daemon_socket.display()
         ));
         if let Some(build) = current_process_local_cli_build() {
+            let instance_home = paths.rotate_home.to_string_lossy().into_owned();
             if let Err(error) =
-                stop_other_local_daemons(&build, &paths.daemon_socket, std::process::id())
+                stop_other_local_daemons(
+                    &build,
+                    &paths.daemon_socket,
+                    std::process::id(),
+                    Some(instance_home.as_str()),
+                )
             {
                 log_daemon_error(format!("Failed to stop stale daemons: {error:#}"));
             }
@@ -176,7 +189,9 @@ pub fn run_daemon_forever() -> Result<()> {
             match stream {
                 Ok(stream) => {
                     thread::spawn(move || {
-                        let _ = handle_client(daemon, stream);
+                        if let Err(error) = handle_client(daemon, stream) {
+                            log_daemon_error(format!("client handler failed: {error:#}"));
+                        }
                     });
                 }
                 Err(error) => {
@@ -224,7 +239,7 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
 
     thread::spawn(move || loop {
         daemon.clear_next_tick();
-        match maybe_refresh_local_daemon_process() {
+        match maybe_refresh_local_daemon_process(Some(&daemon)) {
             Ok(true) => std::process::exit(0),
             Ok(false) => {}
             Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
@@ -276,18 +291,34 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
         ClientRequest::Invoke { action } => {
             let mut writer = stream;
             let action_name = format!("{action:?}");
-            let response = match daemon.handle_invoke(action) {
-                Ok(output) => ServerMessage::Result {
+            let response = match panic::catch_unwind(AssertUnwindSafe(|| daemon.handle_invoke(action)))
+            {
+                Ok(Ok(output)) => ServerMessage::Result {
                     ok: true,
                     output: Some(output),
                     error: None,
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     log_daemon_error(format!("invoke {action_name} failed: {error:#}"));
                     ServerMessage::Result {
                         ok: false,
                         output: None,
                         error: Some(error.to_string()),
+                    }
+                }
+                Err(payload) => {
+                    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                        (*message).to_string()
+                    } else if let Some(message) = payload.downcast_ref::<String>() {
+                        message.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    log_daemon_error(format!("invoke {action_name} panicked: {detail}"));
+                    ServerMessage::Result {
+                        ok: false,
+                        output: None,
+                        error: Some(format!("Daemon invoke panicked: {detail}")),
                     }
                 }
             };
@@ -345,19 +376,48 @@ impl SharedDaemon {
     }
 
     fn handle_invoke(&self, action: InvokeAction) -> Result<String> {
+        let _guard = InvocationGuard::new(self.in_flight_invocations.clone());
         let result = run_invoke_action(self, action);
         self.publish_state_snapshot();
         result
     }
+
+    fn has_in_flight_invocations(&self) -> bool {
+        self.in_flight_invocations.load(Ordering::SeqCst) > 0
+    }
 }
 
-fn maybe_refresh_local_daemon_process() -> Result<bool> {
+struct InvocationGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InvocationGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<bool> {
+    if local_refresh_disabled() {
+        return Ok(false);
+    }
     if takeover_requested() {
+        return Ok(false);
+    }
+    if daemon.is_some_and(SharedDaemon::has_in_flight_invocations) {
         return Ok(false);
     }
     let Some(build) = current_process_local_cli_build() else {
         return Ok(false);
     };
+    let instance_home = resolve_paths()?.rotate_home;
     let daemon_socket = crate::ipc::daemon_socket_path()?;
     let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)?;
     if sources_newer_than_binary {
@@ -379,6 +439,7 @@ fn maybe_refresh_local_daemon_process() -> Result<bool> {
             .arg("daemon")
             .arg("run")
             .env(DAEMON_TAKEOVER_ENV, "1")
+            .env(INSTANCE_HOME_ENV, &instance_home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -405,6 +466,7 @@ fn maybe_refresh_local_daemon_process() -> Result<bool> {
         .arg("daemon")
         .arg("run")
         .env(DAEMON_TAKEOVER_ENV, "1")
+        .env(INSTANCE_HOME_ENV, &instance_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -916,7 +978,7 @@ mod tests {
             std::env::set_var(DAEMON_TAKEOVER_ENV, "1");
         }
 
-        let result = maybe_refresh_local_daemon_process().expect("refresh result");
+        let result = maybe_refresh_local_daemon_process(None).expect("refresh result");
 
         match previous_takeover {
             Some(value) => unsafe {
@@ -926,6 +988,17 @@ mod tests {
                 std::env::remove_var(DAEMON_TAKEOVER_ENV);
             },
         }
+
+        assert!(!result);
+    }
+
+    #[test]
+    fn skips_local_daemon_refresh_while_invoke_is_active() {
+        let daemon = SharedDaemon::new();
+        let _guard = InvocationGuard::new(daemon.in_flight_invocations.clone());
+
+        let result =
+            maybe_refresh_local_daemon_process(Some(&daemon)).expect("refresh result");
 
         assert!(!result);
     }

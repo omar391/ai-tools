@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,23 @@ impl SnapshotSubscription {
             ))
         }
     }
+
+    #[cfg(unix)]
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<StatusSnapshot>> {
+        self.reader
+            .get_mut()
+            .set_read_timeout(Some(timeout))
+            .context("Failed to configure daemon subscription timeout.")?;
+        match read_message(&mut self.reader) {
+            Ok(ServerMessage::Snapshot { snapshot }) => Ok(Some(snapshot)),
+            Ok(ServerMessage::Result { error, .. }) => Err(anyhow!(
+                "{}",
+                error.unwrap_or_else(|| "Daemon returned an unexpected response.".to_string())
+            )),
+            Err(error) if is_timeout_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub fn subscribe() -> Result<SnapshotSubscription> {
@@ -243,4 +261,17 @@ pub fn read_message(reader: &mut BufReader<LocalStream>) -> Result<ServerMessage
         return Err(anyhow!("Daemon closed the connection."));
     }
     serde_json::from_str(line.trim()).context("Failed to decode daemon response.")
+}
+
+#[cfg(unix)]
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|value| value.downcast_ref::<std::io::Error>())
+        .any(|value| {
+            matches!(
+                value.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        })
 }

@@ -587,11 +587,10 @@ async function resolveOptionalCodexRotateSecretLocator(
   });
 }
 
-export async function ensureBitwardenCliAccountSecretRef(
+function normalizeBitwardenCliAccountSecretIdentity(
   profileName: string,
   email: string,
-  password: string,
-): Promise<CodexRotateSecretRef> {
+): { profileName: string; email: string } {
   const normalizedProfileName = String(profileName || "").trim();
   const normalizedEmail = String(email || "")
     .trim()
@@ -604,46 +603,130 @@ export async function ensureBitwardenCliAccountSecretRef(
   if (!normalizedEmail) {
     throw new Error("Bitwarden account secrets require a non-empty email.");
   }
+  return {
+    profileName: normalizedProfileName,
+    email: normalizedEmail,
+  };
+}
+
+async function withReadyBitwardenSecretBroker<T>(
+  profileName: string,
+  promptIfLocked: boolean,
+  operation: (daemon: {
+    ensureDaemonSecretStoreReadyInteractive: (options: {
+      profileName: string;
+      store: "bitwarden-cli";
+      promptIfLocked: boolean;
+    }) => Promise<unknown>;
+    findDaemonLoginSecretRef: (options: {
+      profileName: string;
+      store: "bitwarden-cli";
+      username: string;
+      uris: string[];
+    }) => Promise<{
+      ok?: boolean;
+      ref?: unknown;
+      error?: { message?: string };
+    }>;
+    ensureDaemonLoginSecretRef: (options: {
+      profileName: string;
+      store: "bitwarden-cli";
+      name: string;
+      username: string;
+      password: string;
+      notes: string;
+      uris: string[];
+    }) => Promise<{
+      ok?: boolean;
+      ref?: unknown;
+      error?: { message?: string };
+    }>;
+  }) => Promise<T>,
+): Promise<T> {
+  return await withBitwardenSecretBrokerRecovery(async () => {
+    const daemon = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
+    await daemon.ensureDaemonSecretStoreReadyInteractive({
+      profileName,
+      store: "bitwarden-cli",
+      promptIfLocked,
+    });
+    return await operation(daemon);
+  });
+}
+
+export async function prepareBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+  password: string,
+): Promise<CodexRotateSecretRef> {
+  const normalized = normalizeBitwardenCliAccountSecretIdentity(
+    profileName,
+    email,
+  );
   const normalizedPassword = String(password || "");
   if (!normalizedPassword) {
     throw new Error(
-      `Bitwarden account secret for ${normalizedEmail} requires a non-empty password.`,
+      `Bitwarden account secret for ${normalized.email} requires a non-empty password.`,
     );
   }
 
-  return await withBitwardenSecretBrokerRecovery(async () => {
-    const {
-      ensureDaemonLoginSecretRef,
-      ensureDaemonSecretStoreReadyInteractive,
-    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-    await ensureDaemonSecretStoreReadyInteractive({
-      profileName: normalizedProfileName,
-      store: "bitwarden-cli",
-      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
-    });
-    const response = await ensureDaemonLoginSecretRef({
-      profileName: normalizedProfileName,
-      store: "bitwarden-cli",
-      name: buildCodexRotateAccountSecretName(normalizedEmail),
-      username: normalizedEmail,
-      password: normalizedPassword,
-      notes: `Managed by codex-rotate for ${normalizedEmail}.`,
-      uris: OPENAI_ACCOUNT_SECRET_URIS,
-    });
-    if (!response?.ok) {
-      throw new Error(
-        response?.error?.message ||
-          `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalizedEmail}.`,
-      );
-    }
-    const ref = normalizeCodexRotateSecretRef(response?.ref);
-    if (!ref) {
-      throw new Error(
-        `Fast-browser Bitwarden adapter did not return a secret ref for ${normalizedEmail}.`,
-      );
-    }
-    return ref;
-  });
+  return await withReadyBitwardenSecretBroker(
+    normalized.profileName,
+    shouldPromptForCodexRotateSecretUnlock(),
+    async (daemon) => {
+      const existing = await daemon.findDaemonLoginSecretRef({
+        profileName: normalized.profileName,
+        store: "bitwarden-cli",
+        username: normalized.email,
+        uris: OPENAI_ACCOUNT_SECRET_URIS,
+      });
+      if (!existing?.ok) {
+        throw new Error(
+          existing?.error?.message ||
+            `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
+        );
+      }
+      const existingRef = normalizeCodexRotateSecretRef(existing?.ref);
+      if (existingRef) {
+        return existingRef;
+      }
+
+      const created = await daemon.ensureDaemonLoginSecretRef({
+        profileName: normalized.profileName,
+        store: "bitwarden-cli",
+        name: buildCodexRotateAccountSecretName(normalized.email),
+        username: normalized.email,
+        password: normalizedPassword,
+        notes: `Managed by codex-rotate for ${normalized.email}.`,
+        uris: OPENAI_ACCOUNT_SECRET_URIS,
+      });
+      if (!created?.ok) {
+        throw new Error(
+          created?.error?.message ||
+            `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalized.email}.`,
+        );
+      }
+      const createdRef = normalizeCodexRotateSecretRef(created?.ref);
+      if (!createdRef) {
+        throw new Error(
+          `Fast-browser Bitwarden adapter did not return a secret ref for ${normalized.email}.`,
+        );
+      }
+      return createdRef;
+    },
+  );
+}
+
+export async function ensureBitwardenCliAccountSecretRef(
+  profileName: string,
+  email: string,
+  password: string,
+): Promise<CodexRotateSecretRef> {
+  return await prepareBitwardenCliAccountSecretRef(
+    profileName,
+    email,
+    password,
+  );
 }
 
 async function findBitwardenCliAccountSecretRefWithOptions(
@@ -651,45 +734,30 @@ async function findBitwardenCliAccountSecretRefWithOptions(
   email: string,
   promptIfLocked: boolean,
 ): Promise<CodexRotateSecretRef | null> {
-  const normalizedProfileName = String(profileName || "").trim();
-  const normalizedEmail = String(email || "")
-    .trim()
-    .toLowerCase();
-  if (!normalizedProfileName) {
-    throw new Error(
-      "Bitwarden account secret lookup requires a managed profile name.",
-    );
-  }
-  if (!normalizedEmail) {
-    throw new Error(
-      "Bitwarden account secret lookup requires a non-empty email.",
-    );
-  }
+  const normalized = normalizeBitwardenCliAccountSecretIdentity(
+    profileName,
+    email,
+  );
 
-  return await withBitwardenSecretBrokerRecovery(async () => {
-    const {
-      ensureDaemonSecretStoreReadyInteractive,
-      findDaemonLoginSecretRef,
-    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-    await ensureDaemonSecretStoreReadyInteractive({
-      profileName: normalizedProfileName,
-      store: "bitwarden-cli",
-      promptIfLocked,
-    });
-    const response = await findDaemonLoginSecretRef({
-      profileName: normalizedProfileName,
-      store: "bitwarden-cli",
-      username: normalizedEmail,
-      uris: OPENAI_ACCOUNT_SECRET_URIS,
-    });
-    if (!response?.ok) {
-      throw new Error(
-        response?.error?.message ||
-          `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalizedEmail}.`,
-      );
-    }
-    return normalizeCodexRotateSecretRef(response?.ref);
-  });
+  return await withReadyBitwardenSecretBroker(
+    normalized.profileName,
+    promptIfLocked,
+    async (daemon) => {
+      const response = await daemon.findDaemonLoginSecretRef({
+        profileName: normalized.profileName,
+        store: "bitwarden-cli",
+        username: normalized.email,
+        uris: OPENAI_ACCOUNT_SECRET_URIS,
+      });
+      if (!response?.ok) {
+        throw new Error(
+          response?.error?.message ||
+            `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
+        );
+      }
+      return normalizeCodexRotateSecretRef(response?.ref);
+    },
+  );
 }
 
 export async function findBitwardenCliAccountSecretRef(
@@ -707,68 +775,61 @@ export async function deleteBitwardenCliAccountSecretRef(
   profileName: string,
   email: string,
 ): Promise<boolean> {
-  const normalizedProfileName = String(profileName || "").trim();
-  const normalizedEmail = String(email || "")
-    .trim()
-    .toLowerCase();
-  if (!normalizedProfileName) {
-    throw new Error(
-      "Bitwarden account secret deletion requires a managed profile name.",
-    );
-  }
-  if (!normalizedEmail) {
-    throw new Error(
-      "Bitwarden account secret deletion requires a non-empty email.",
-    );
-  }
+  const normalized = normalizeBitwardenCliAccountSecretIdentity(
+    profileName,
+    email,
+  );
 
-  return await withBitwardenSecretBrokerRecovery(async () => {
-    const { ensureDaemonSecretStoreReadyInteractive } = await import(
-      FAST_BROWSER_DAEMON_CLIENT_MODULE
-    );
-    await ensureDaemonSecretStoreReadyInteractive({
-      profileName: normalizedProfileName,
-      store: "bitwarden-cli",
-      promptIfLocked: false,
-    });
+  return await withReadyBitwardenSecretBroker(
+    normalized.profileName,
+    false,
+    async (daemon) => {
+      const response = await daemon.findDaemonLoginSecretRef({
+        profileName: normalized.profileName,
+        store: "bitwarden-cli",
+        username: normalized.email,
+        uris: OPENAI_ACCOUNT_SECRET_URIS,
+      });
+      if (!response?.ok) {
+        throw new Error(
+          response?.error?.message ||
+            `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
+        );
+      }
+      const ref = normalizeCodexRotateSecretRef(response?.ref);
+      if (!ref) {
+        return false;
+      }
 
-    const ref = await findBitwardenCliAccountSecretRefWithOptions(
-      normalizedProfileName,
-      normalizedEmail,
-      false,
-    );
-    if (!ref) {
-      return false;
-    }
-
-    const { buildBitwardenCliEnv } = await import(
-      FAST_BROWSER_BITWARDEN_SESSION_MODULE
-    );
-    const result = spawnSync(
-      BITWARDEN_BINARY,
-      ["delete", "item", ref.object_id],
-      {
-        cwd: resolveStableWorkingDirectory(),
-        env: buildBitwardenCliEnv(process.env),
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 60_000,
-      },
-    );
-    if (result.error) {
-      throw result.error;
-    }
-    if ((result.status ?? 1) !== 0) {
-      const detail = [result.stderr, result.stdout]
-        .map((value) => String(value || "").trim())
-        .find((value) => value.length > 0);
-      throw new Error(
-        detail ||
-          `Bitwarden CLI failed while deleting the vault item for ${normalizedEmail}.`,
+      const { buildBitwardenCliEnv } = await import(
+        FAST_BROWSER_BITWARDEN_SESSION_MODULE
       );
-    }
-    return true;
-  });
+      const result = spawnSync(
+        BITWARDEN_BINARY,
+        ["delete", "item", ref.object_id],
+        {
+          cwd: resolveStableWorkingDirectory(),
+          env: buildBitwardenCliEnv(process.env),
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 60_000,
+        },
+      );
+      if (result.error) {
+        throw result.error;
+      }
+      if ((result.status ?? 1) !== 0) {
+        const detail = [result.stderr, result.stdout]
+          .map((value) => String(value || "").trim())
+          .find((value) => value.length > 0);
+        throw new Error(
+          detail ||
+            `Bitwarden CLI failed while deleting the vault item for ${normalized.email}.`,
+        );
+      }
+      return true;
+    },
+  );
 }
 
 async function sleep(milliseconds: number): Promise<void> {
@@ -1952,15 +2013,18 @@ export async function completeCodexLoginViaWorkflow(
     maxAttempts?: number;
     maxReplayPasses?: number;
     retryDelaysMs?: readonly number[];
+    skipLocatorPreflight?: boolean;
     onNote?: ((message: string) => void) | null;
     restoreState?: (() => void) | null;
   },
 ): Promise<CodexRotateAuthFlowSummary> {
   const workflowAccountLoginLocator =
-    await resolveOptionalCodexRotateSecretLocator(
-      profileName,
-      accountLoginLocator,
-    );
+    options?.skipLocatorPreflight === true
+      ? accountLoginLocator
+      : await resolveOptionalCodexRotateSecretLocator(
+          profileName,
+          accountLoginLocator,
+        );
 
   const maxAttempts = Math.max(1, Number(options?.maxAttempts ?? 6));
   const maxReplayPasses = Math.max(1, Number(options?.maxReplayPasses ?? 5));
@@ -1981,9 +2045,15 @@ export async function completeCodexLoginViaWorkflow(
 
   try {
     if (workflowAccountLoginLocator) {
-      note?.(
-        `Found a stored OpenAI login secret for ${email}; attempting password login first.`,
-      );
+      if (workflowAccountLoginLocator.kind === "env_var") {
+        note?.(
+          `Using a freshly generated OpenAI password for ${email}; attempting password login first.`,
+        );
+      } else {
+        note?.(
+          `Found a stored OpenAI login secret for ${email}; attempting password login first.`,
+        );
+      }
     } else {
       note?.(
         `No stored OpenAI login secret was found for ${email}; using one-time-code recovery.`,
