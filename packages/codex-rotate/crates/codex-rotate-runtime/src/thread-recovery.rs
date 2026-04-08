@@ -16,11 +16,22 @@ use crate::runtime_log::log_daemon_error;
 
 const DEFAULT_PORT: u16 = 9333;
 const MAX_RECOVERY_SCAN_EVENTS: usize = 32;
-const CONTINUE_INPUT: &str = "continue";
+const CONTINUE_INPUT: &str = "continue with skipped msgs";
 const MCP_RESPONSE_TIMEOUT_MS: u64 = 8_000;
 const HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT: u8 = 10;
 const OTEL_METADATA_LOOKUP_WINDOW: i64 = 2_000;
 const THREAD_RESUME_SETTLE_MS: u64 = 1_000;
+const QUOTA_EXHAUSTION_ERROR_MESSAGE: &str = "You've hit your usage limit.";
+const MODEL_CAPACITY_ERROR_MESSAGE: &str = "Selected model is at capacity. Please try a different model.";
+const MODEL_CAPACITY_RETRY_DELAY_SECS: i64 = 30;
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadRecoveryKind {
+    #[default]
+    QuotaExhausted,
+    ModelCapacity,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +39,8 @@ pub struct ThreadRecoveryEvent {
     pub source_log_id: i64,
     pub source_ts: i64,
     pub thread_id: String,
+    #[serde(default)]
+    pub kind: ThreadRecoveryKind,
     pub exhausted_turn_id: Option<String>,
     pub exhausted_email: Option<String>,
     pub exhausted_account_id: Option<String>,
@@ -58,7 +71,7 @@ pub struct RecoveryIterationOptions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct OtelQuotaMetadata {
+struct OtelFailureMetadata {
     exhausted_email: Option<String>,
     exhausted_account_id: Option<String>,
 }
@@ -96,10 +109,10 @@ struct RecoveryProcessingResult {
     pending_events: Vec<ThreadRecoveryEvent>,
 }
 
-pub fn read_latest_quota_exhaustion_log_id() -> Result<Option<i64>> {
+pub fn read_latest_recoverable_turn_failure_log_id() -> Result<Option<i64>> {
     let paths = resolve_paths()?;
     let connection = open_logs_connection(&paths.codex_logs_db_file)?;
-    read_latest_quota_exhaustion_log_id_from_connection(&connection)
+    read_latest_recoverable_turn_failure_log_id_from_connection(&connection)
 }
 
 pub fn run_thread_recovery_iteration(
@@ -110,7 +123,7 @@ pub fn run_thread_recovery_iteration(
     let connection = open_logs_connection(&paths.codex_logs_db_file)?;
 
     if options.last_log_id.is_none() && !options.pending {
-        let last_log_id = read_latest_quota_exhaustion_log_id_from_connection(&connection)?;
+        let last_log_id = read_latest_recoverable_turn_failure_log_id_from_connection(&connection)?;
         return Ok(RecoveryIterationResult {
             last_log_id,
             pending: false,
@@ -121,8 +134,11 @@ pub fn run_thread_recovery_iteration(
         });
     }
 
-    let detected_events =
-        scan_quota_exhaustion_events(&connection, options.last_log_id, MAX_RECOVERY_SCAN_EVENTS)?;
+    let detected_events = scan_recoverable_turn_failure_events(
+        &connection,
+        options.last_log_id,
+        MAX_RECOVERY_SCAN_EVENTS,
+    )?;
     let candidate_events = merge_thread_recovery_events(&options.pending_events, detected_events);
     if candidate_events.is_empty() {
         return Ok(RecoveryIterationResult {
@@ -148,7 +164,7 @@ pub fn run_thread_recovery_iteration(
         options.current_primary_quota_left_percent,
     );
     let processing = process_thread_recovery_events(&candidate_events, |event| {
-        resolve_quota_exhaustion_event(
+        resolve_recoverable_turn_failure_event(
             &connection,
             port,
             event,
@@ -172,7 +188,7 @@ pub fn run_thread_recovery_iteration(
     })
 }
 
-fn resolve_quota_exhaustion_event(
+fn resolve_recoverable_turn_failure_event(
     connection: &Connection,
     port: u16,
     event: &ThreadRecoveryEvent,
@@ -187,12 +203,12 @@ fn resolve_quota_exhaustion_event(
         Ok(summary) => summary,
         Err(error) if is_terminal_thread_recovery_error(&error) => {
             log_daemon_error(format!(
-                "dropping exhausted thread {} after terminal thread/read failure: {error:#}",
-                event.thread_id
+                "dropping recoverable thread {} after terminal thread/read failure: {error:#}",
+                event.thread_id,
             ));
             eprintln!(
-                "codex-rotate: dropping exhausted thread {} after terminal thread/read failure: {error:#}",
-                event.thread_id
+                "codex-rotate: dropping recoverable thread {} after terminal thread/read failure: {error:#}",
+                event.thread_id,
             );
             return Ok(RecoveryResolution::Dropped);
         }
@@ -216,12 +232,21 @@ fn resolve_quota_exhaustion_event(
         return Ok(RecoveryResolution::Blocked);
     }
 
-    if same_live_account(current_live_email, event.exhausted_email.as_deref()) {
-        return Ok(RecoveryResolution::Blocked);
-    }
+    match event.kind {
+        ThreadRecoveryKind::QuotaExhausted => {
+            if same_live_account(current_live_email, event.exhausted_email.as_deref()) {
+                return Ok(RecoveryResolution::Blocked);
+            }
 
-    if event.exhausted_email.is_none() && !can_continue_without_email {
-        return Ok(RecoveryResolution::Blocked);
+            if event.exhausted_email.is_none() && !can_continue_without_email {
+                return Ok(RecoveryResolution::Blocked);
+            }
+        }
+        ThreadRecoveryKind::ModelCapacity => {
+            if !model_capacity_retry_due(event) {
+                return Ok(RecoveryResolution::Blocked);
+            }
+        }
     }
 
     let cwd = match thread_summary {
@@ -230,12 +255,12 @@ fn resolve_quota_exhaustion_event(
             Ok(cwd) => cwd,
             Err(error) if is_terminal_thread_recovery_error(&error) => {
                 log_daemon_error(format!(
-                    "dropping exhausted thread {} after terminal resume failure: {error:#}",
-                    event.thread_id
+                    "dropping recoverable thread {} after terminal resume failure: {error:#}",
+                    event.thread_id,
                 ));
                 eprintln!(
-                    "codex-rotate: dropping exhausted thread {} after terminal resume failure: {error:#}",
-                    event.thread_id
+                    "codex-rotate: dropping recoverable thread {} after terminal resume failure: {error:#}",
+                    event.thread_id,
                 );
                 return Ok(RecoveryResolution::Dropped);
             }
@@ -271,23 +296,25 @@ fn resolve_quota_exhaustion_event(
         Ok(()) => Ok(RecoveryResolution::Continued),
         Err(error) if is_terminal_thread_recovery_error(&error) => {
             log_daemon_error(format!(
-                "dropping exhausted thread {} after terminal continue failure: {error:#}",
-                event.thread_id
+                "dropping recoverable thread {} after terminal continue failure: {error:#}",
+                event.thread_id,
             ));
             eprintln!(
-                "codex-rotate: dropping exhausted thread {} after terminal continue failure: {error:#}",
-                event.thread_id
+                "codex-rotate: dropping recoverable thread {} after terminal continue failure: {error:#}",
+                event.thread_id,
             );
             Ok(RecoveryResolution::Dropped)
         }
         Err(error) => {
             log_daemon_error(format!(
-                "failed to continue thread {} after quota recovery: {error:#}",
-                event.thread_id
+                "failed to continue thread {} after {} recovery: {error:#}",
+                event.thread_id,
+                event.kind.label(),
             ));
             eprintln!(
-                "codex-rotate: failed to continue thread {} after quota recovery: {error:#}",
-                event.thread_id
+                "codex-rotate: failed to continue thread {} after {} recovery: {error:#}",
+                event.thread_id,
+                event.kind.label(),
             );
             Ok(RecoveryResolution::Blocked)
         }
@@ -329,7 +356,7 @@ limit 20
     Ok(false)
 }
 
-fn scan_quota_exhaustion_events(
+fn scan_recoverable_turn_failure_events(
     connection: &Connection,
     after_log_id: Option<i64>,
     limit: usize,
@@ -340,7 +367,10 @@ select id, ts, feedback_log_body
 from logs
 where id > ?1
   and target = 'codex_core::codex'
-  and feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+  and (
+    feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+    or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+  )
 order by id asc
 limit ?2
         "#,
@@ -358,14 +388,16 @@ limit ?2
     let mut events = Vec::new();
     for row in rows {
         let (id, ts, body) = row?;
-        if let Some(event) = parse_codex_core_quota_exhaustion_event(connection, id, ts, &body)? {
+        if let Some(event) =
+            parse_codex_core_recoverable_turn_failure_event(connection, id, ts, &body)?
+        {
             events.push(event);
         }
     }
     Ok(events)
 }
 
-fn read_latest_quota_exhaustion_log_id_from_connection(
+fn read_latest_recoverable_turn_failure_log_id_from_connection(
     connection: &Connection,
 ) -> Result<Option<i64>> {
     let mut statement = connection.prepare(
@@ -373,7 +405,10 @@ fn read_latest_quota_exhaustion_log_id_from_connection(
 select id
 from logs
 where target = 'codex_core::codex'
-  and feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+  and (
+    feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+    or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+  )
 order by id desc
 limit 1
         "#,
@@ -387,7 +422,7 @@ limit 1
     }
 }
 
-fn parse_codex_core_quota_exhaustion_event(
+fn parse_codex_core_recoverable_turn_failure_event(
     connection: &Connection,
     source_log_id: i64,
     source_ts: i64,
@@ -402,9 +437,12 @@ fn parse_codex_core_quota_exhaustion_event(
     let Some(message) = message else {
         return Ok(None);
     };
+    let Some(kind) = parse_thread_recovery_kind(&message) else {
+        return Ok(None);
+    };
     let exhausted_turn_id = extract_token_field(body, "turn.id=");
     let metadata = match exhausted_turn_id.as_deref() {
-        Some(turn_id) => find_otel_quota_metadata_for_turn(connection, source_log_id, turn_id)?,
+        Some(turn_id) => find_otel_failure_metadata_for_turn(connection, source_log_id, turn_id)?,
         None => None,
     }
     .unwrap_or_default();
@@ -413,6 +451,7 @@ fn parse_codex_core_quota_exhaustion_event(
         source_log_id,
         source_ts,
         thread_id,
+        kind,
         exhausted_turn_id,
         exhausted_email: metadata.exhausted_email,
         exhausted_account_id: metadata.exhausted_account_id,
@@ -420,11 +459,11 @@ fn parse_codex_core_quota_exhaustion_event(
     }))
 }
 
-fn find_otel_quota_metadata_for_turn(
+fn find_otel_failure_metadata_for_turn(
     connection: &Connection,
     source_log_id: i64,
     turn_id: &str,
-) -> Result<Option<OtelQuotaMetadata>> {
+) -> Result<Option<OtelFailureMetadata>> {
     let min_id = source_log_id.saturating_sub(OTEL_METADATA_LOOKUP_WINDOW);
     let max_id = source_log_id.saturating_add(OTEL_METADATA_LOOKUP_WINDOW);
     let turn_marker = format!("turn.id={turn_id}");
@@ -435,7 +474,10 @@ from logs
 where id between ?1 and ?2
   and target = 'codex_otel.log_only'
   and feedback_log_body like '%event.kind=response.completed%'
-  and feedback_log_body like '%error.message=You''ve hit your usage limit.%'
+  and (
+    feedback_log_body like '%error.message=You''ve hit your usage limit.%'
+    or feedback_log_body like '%error.message=Selected model is at capacity. Please try a different model.%'
+  )
   and feedback_log_body like '%' || ?3 || '%'
 order by abs(id - ?4) asc
 limit 1
@@ -446,19 +488,32 @@ limit 1
         return Ok(None);
     };
     let body: String = row.get(0)?;
-    Ok(parse_otel_quota_metadata(&body))
+    Ok(parse_otel_failure_metadata(&body))
 }
 
-fn parse_otel_quota_metadata(body: &str) -> Option<OtelQuotaMetadata> {
-    if !body.contains("event.kind=response.completed")
-        || !body.contains("error.message=You've hit your usage limit.")
-    {
+fn parse_otel_failure_metadata(body: &str) -> Option<OtelFailureMetadata> {
+    if !body.contains("event.kind=response.completed") || !contains_recoverable_error_message(body) {
         return None;
     }
-    Some(OtelQuotaMetadata {
+    Some(OtelFailureMetadata {
         exhausted_email: extract_quoted_field(body, "user.email=\""),
         exhausted_account_id: extract_quoted_field(body, "user.account_id=\""),
     })
+}
+
+fn parse_thread_recovery_kind(message: &str) -> Option<ThreadRecoveryKind> {
+    if message.contains(QUOTA_EXHAUSTION_ERROR_MESSAGE) {
+        Some(ThreadRecoveryKind::QuotaExhausted)
+    } else if message.contains(MODEL_CAPACITY_ERROR_MESSAGE) {
+        Some(ThreadRecoveryKind::ModelCapacity)
+    } else {
+        None
+    }
+}
+
+fn contains_recoverable_error_message(body: &str) -> bool {
+    body.contains(&format!("error.message={QUOTA_EXHAUSTION_ERROR_MESSAGE}"))
+        || body.contains(&format!("error.message={MODEL_CAPACITY_ERROR_MESSAGE}"))
 }
 
 fn extract_token_field(body: &str, marker: &str) -> Option<String> {
@@ -514,6 +569,11 @@ fn can_continue_without_email(
             && current_primary_quota_left_percent
                 .map(|percent| percent > HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT)
                 .unwrap_or(false))
+}
+
+fn model_capacity_retry_due(event: &ThreadRecoveryEvent) -> bool {
+    matches!(event.kind, ThreadRecoveryKind::ModelCapacity)
+        && Utc::now().timestamp() >= event.source_ts.saturating_add(MODEL_CAPACITY_RETRY_DELAY_SECS)
 }
 
 fn merge_thread_recovery_events(
@@ -573,6 +633,15 @@ fn is_terminal_thread_recovery_error(error: &anyhow::Error) -> bool {
         || message.contains("no thread found")
         || message.contains("unknown thread")
         || message.contains("does not exist")
+}
+
+impl ThreadRecoveryKind {
+    fn label(self) -> &'static str {
+        match self {
+            ThreadRecoveryKind::QuotaExhausted => "quota exhaustion",
+            ThreadRecoveryKind::ModelCapacity => "model capacity",
+        }
+    }
 }
 
 fn read_thread_summary(port: u16, thread_id: &str) -> Result<Option<ThreadSummary>> {
@@ -760,7 +829,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn parses_otel_quota_metadata() {
+    fn parses_otel_failure_metadata() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
         connection
@@ -790,7 +859,7 @@ insert into logs (id, ts, target, feedback_log_body) values
                 |row| row.get(0),
             )
             .unwrap();
-        let metadata = parse_otel_quota_metadata(&body).unwrap();
+        let metadata = parse_otel_failure_metadata(&body).unwrap();
         assert_eq!(
             metadata.exhausted_email.as_deref(),
             Some("user@example.com")
@@ -828,7 +897,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             )
             .unwrap();
 
-        let event = parse_codex_core_quota_exhaustion_event(
+        let event = parse_codex_core_recoverable_turn_failure_event(
             &connection,
             10,
             1775445612,
@@ -838,6 +907,7 @@ insert into logs (id, ts, target, feedback_log_body) values
         .unwrap();
 
         assert_eq!(event.thread_id, "local-thread");
+        assert_eq!(event.kind, ThreadRecoveryKind::QuotaExhausted);
         assert_eq!(event.exhausted_turn_id.as_deref(), Some("turn-123"));
         assert_eq!(event.exhausted_email.as_deref(), Some("user@example.com"));
         assert_eq!(event.exhausted_account_id.as_deref(), Some("acct-123"));
@@ -867,14 +937,50 @@ insert into logs (id, ts, target, feedback_log_body) values
             )
             .unwrap();
 
-        let events = scan_quota_exhaustion_events(&connection, None, 50).unwrap();
+        let events = scan_recoverable_turn_failure_events(&connection, None, 50).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].thread_id, "thread-456");
+        assert_eq!(events[0].kind, ThreadRecoveryKind::QuotaExhausted);
         assert_eq!(events[0].exhausted_turn_id.as_deref(), Some("turn-456"));
         assert!(events[0].exhausted_email.is_none());
         assert!(events[0]
             .message
             .starts_with("You've hit your usage limit."));
+    }
+
+    #[test]
+    fn parses_model_capacity_event_from_codex_core_log() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text
+);
+insert into logs (id, ts, target, feedback_log_body) values
+  (
+    10,
+    1775636941,
+    'codex_core::codex',
+    'session_loop{thread_id=thread-789}:submission_dispatch{otel.name="op.dispatch.user_input"}:turn{otel.name="session_task.turn" thread.id=thread-789 turn.id=turn-789 model=gpt-5.4}:run_turn: Turn error: Selected model is at capacity. Please try a different model.'
+  );
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_recoverable_turn_failure_events(&connection, None, 50).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread_id, "thread-789");
+        assert_eq!(events[0].kind, ThreadRecoveryKind::ModelCapacity);
+        assert_eq!(events[0].exhausted_turn_id.as_deref(), Some("turn-789"));
+        assert_eq!(
+            events[0].message,
+            "Selected model is at capacity. Please try a different model."
+        );
     }
 
     #[test]
@@ -911,6 +1017,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             source_log_id: 10,
             source_ts: 1775445612,
             thread_id: "thread-123".to_string(),
+            kind: ThreadRecoveryKind::QuotaExhausted,
             exhausted_turn_id: Some("turn-old".to_string()),
             exhausted_email: None,
             exhausted_account_id: None,
@@ -933,7 +1040,7 @@ insert into logs (id, ts, target, feedback_log_body) values
     }
 
     #[test]
-    fn reads_latest_quota_exhaustion_log_id() {
+    fn reads_latest_recoverable_turn_failure_log_id() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
         connection
@@ -950,14 +1057,15 @@ insert into logs (id, ts, target, feedback_log_body) values
   (11, 1001, 'codex_otel.trace_safe', 'event.kind=response.completed error.message=You''ve hit your usage limit. conversation.id=thread-a'),
   (12, 1002, 'codex_otel.log_only', 'event.kind=response.completed error.message=You''ve hit your usage limit. conversation.id=thread-b'),
   (13, 1003, 'codex_core::codex', 'session_loop{thread_id=thread-c}:turn{thread.id=thread-c turn.id=turn-c}:run_turn: Turn error: You''ve hit your usage limit. Upgrade to Plus to continue using Codex.'),
-  (14, 1004, 'log', 'error.message=You''ve hit your usage limit. not authoritative');
+  (14, 1004, 'log', 'error.message=You''ve hit your usage limit. not authoritative'),
+  (15, 1005, 'codex_core::codex', 'session_loop{thread_id=thread-d}:turn{thread.id=thread-d turn.id=turn-d}:run_turn: Turn error: Selected model is at capacity. Please try a different model.');
                 "#,
             )
             .unwrap();
 
         assert_eq!(
-            read_latest_quota_exhaustion_log_id_from_connection(&connection).unwrap(),
-            Some(13)
+            read_latest_recoverable_turn_failure_log_id_from_connection(&connection).unwrap(),
+            Some(15)
         );
     }
 
@@ -979,12 +1087,38 @@ insert into logs (id, ts, target, feedback_log_body) values
     }
 
     #[test]
+    fn model_capacity_retry_due_requires_delay_window() {
+        let event = ThreadRecoveryEvent {
+            source_log_id: 10,
+            source_ts: Utc::now()
+                .timestamp()
+                .saturating_sub(MODEL_CAPACITY_RETRY_DELAY_SECS - 5),
+            thread_id: "thread-capacity".to_string(),
+            kind: ThreadRecoveryKind::ModelCapacity,
+            exhausted_turn_id: Some("turn-capacity".to_string()),
+            exhausted_email: None,
+            exhausted_account_id: None,
+            message: MODEL_CAPACITY_ERROR_MESSAGE.to_string(),
+        };
+        assert!(!model_capacity_retry_due(&event));
+
+        let ready = ThreadRecoveryEvent {
+            source_ts: Utc::now()
+                .timestamp()
+                .saturating_sub(MODEL_CAPACITY_RETRY_DELAY_SECS + 1),
+            ..event
+        };
+        assert!(model_capacity_retry_due(&ready));
+    }
+
+    #[test]
     fn merge_thread_recovery_events_keeps_latest_event_per_thread() {
         let merged = merge_thread_recovery_events(
             &[ThreadRecoveryEvent {
                 source_log_id: 10,
                 source_ts: 10,
                 thread_id: "thread-a".to_string(),
+                kind: ThreadRecoveryKind::QuotaExhausted,
                 exhausted_turn_id: Some("turn-1".to_string()),
                 exhausted_email: Some("a@example.com".to_string()),
                 exhausted_account_id: None,
@@ -995,6 +1129,7 @@ insert into logs (id, ts, target, feedback_log_body) values
                     source_log_id: 11,
                     source_ts: 11,
                     thread_id: "thread-b".to_string(),
+                    kind: ThreadRecoveryKind::QuotaExhausted,
                     exhausted_turn_id: Some("turn-2".to_string()),
                     exhausted_email: Some("b@example.com".to_string()),
                     exhausted_account_id: None,
@@ -1004,6 +1139,7 @@ insert into logs (id, ts, target, feedback_log_body) values
                     source_log_id: 12,
                     source_ts: 12,
                     thread_id: "thread-a".to_string(),
+                    kind: ThreadRecoveryKind::QuotaExhausted,
                     exhausted_turn_id: Some("turn-3".to_string()),
                     exhausted_email: Some("a@example.com".to_string()),
                     exhausted_account_id: None,
@@ -1026,6 +1162,7 @@ insert into logs (id, ts, target, feedback_log_body) values
                 source_log_id: 10,
                 source_ts: 10,
                 thread_id: "thread-a".to_string(),
+                kind: ThreadRecoveryKind::QuotaExhausted,
                 exhausted_turn_id: Some("turn-a".to_string()),
                 exhausted_email: None,
                 exhausted_account_id: None,
@@ -1035,6 +1172,7 @@ insert into logs (id, ts, target, feedback_log_body) values
                 source_log_id: 11,
                 source_ts: 11,
                 thread_id: "thread-b".to_string(),
+                kind: ThreadRecoveryKind::QuotaExhausted,
                 exhausted_turn_id: Some("turn-b".to_string()),
                 exhausted_email: None,
                 exhausted_account_id: None,

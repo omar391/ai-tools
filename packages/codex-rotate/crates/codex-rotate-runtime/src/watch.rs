@@ -28,12 +28,13 @@ use crate::logs::{
 use crate::paths::resolve_paths;
 use crate::runtime_log::log_daemon_error;
 use crate::thread_recovery::{
-    read_latest_quota_exhaustion_log_id, run_thread_recovery_iteration, RecoveryIterationOptions,
-    ThreadRecoveryEvent,
+    read_latest_recoverable_turn_failure_log_id, run_thread_recovery_iteration,
+    RecoveryIterationOptions, ThreadRecoveryEvent,
 };
 
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 20;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
+const THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS: i64 = 2_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
@@ -47,6 +48,7 @@ pub struct WatchState {
     pub last_thread_recovery_log_id: Option<i64>,
     pub thread_recovery_pending: bool,
     pub thread_recovery_pending_events: Vec<ThreadRecoveryEvent>,
+    pub thread_recovery_backfill_complete: bool,
     pub quota: Option<CachedQuotaState>,
 }
 
@@ -192,17 +194,18 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
     let mut thread_recovery_log_id = previous_state.last_thread_recovery_log_id;
-    let mut latest_quota_exhaustion_log_id = None;
+    let mut latest_recoverable_turn_failure_log_id = None;
     if !previous_state.thread_recovery_pending && !usage_limit_signal_seen && !rotated {
-        latest_quota_exhaustion_log_id = read_latest_quota_exhaustion_log_id()?;
+        latest_recoverable_turn_failure_log_id = read_latest_recoverable_turn_failure_log_id()?;
         if thread_recovery_log_id.is_none() {
-            thread_recovery_log_id = latest_quota_exhaustion_log_id;
+            thread_recovery_log_id = latest_recoverable_turn_failure_log_id;
         }
     }
-    let quota_exhaustion_log_advanced = latest_quota_exhaustion_log_id
+    let recoverable_turn_failure_log_advanced = latest_recoverable_turn_failure_log_id
         .zip(thread_recovery_log_id)
         .map(|(latest, current)| latest > current)
         .unwrap_or(false);
+    let bootstrap_thread_recovery = !previous_state.thread_recovery_backfill_complete;
 
     let mut next_state = WatchState {
         last_signal_id: decision.last_signal_id,
@@ -235,14 +238,22 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         last_thread_recovery_log_id: thread_recovery_log_id,
         thread_recovery_pending: previous_state.thread_recovery_pending,
         thread_recovery_pending_events: previous_state.thread_recovery_pending_events.clone(),
+        thread_recovery_backfill_complete: previous_state.thread_recovery_backfill_complete,
         quota: quota_cache,
     };
     if should_run_thread_recovery(
         &previous_state,
         usage_limit_signal_seen,
         rotated,
-        quota_exhaustion_log_advanced,
+        recoverable_turn_failure_log_advanced,
     ) {
+        let recovery_last_log_id = if bootstrap_thread_recovery {
+            next_state
+                .last_thread_recovery_log_id
+                .map(|id| id.saturating_sub(THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS))
+        } else {
+            next_state.last_thread_recovery_log_id
+        };
         match run_thread_recovery_iteration(RecoveryIterationOptions {
             port: Some(port),
             current_live_email: live
@@ -255,7 +266,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 .as_ref()
                 .and_then(|quota| quota.primary_quota_left_percent),
             rotated,
-            last_log_id: next_state.last_thread_recovery_log_id,
+            last_log_id: recovery_last_log_id,
             pending: next_state.thread_recovery_pending,
             pending_events: next_state.thread_recovery_pending_events.clone(),
         }) {
@@ -263,6 +274,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 next_state.last_thread_recovery_log_id = recovery.last_log_id;
                 next_state.thread_recovery_pending = recovery.pending;
                 next_state.thread_recovery_pending_events = recovery.pending_events;
+                next_state.thread_recovery_backfill_complete = true;
             }
             Err(error) => {
                 log_daemon_error(format!("thread recovery iteration failed: {error:#}"));
@@ -634,12 +646,13 @@ fn should_run_thread_recovery(
     previous: &WatchState,
     usage_limit_signal_seen: bool,
     rotated: bool,
-    quota_exhaustion_log_advanced: bool,
+    recoverable_turn_failure_log_advanced: bool,
 ) -> bool {
-    usage_limit_signal_seen
+    !previous.thread_recovery_backfill_complete
+        || usage_limit_signal_seen
         || rotated
         || previous.thread_recovery_pending
-        || quota_exhaustion_log_advanced
+        || recoverable_turn_failure_log_advanced
 }
 
 fn write_file_atomically(path: &Path, raw: &str) -> Result<()> {
@@ -965,9 +978,22 @@ mod tests {
     }
 
     #[test]
-    fn thread_recovery_runs_when_quota_exhaustion_log_advances() {
+    fn thread_recovery_runs_for_bootstrap_backfill() {
         assert!(should_run_thread_recovery(
             &WatchState::default(),
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn thread_recovery_runs_when_recoverable_turn_failure_log_advances() {
+        assert!(should_run_thread_recovery(
+            &WatchState {
+                thread_recovery_backfill_complete: true,
+                ..WatchState::default()
+            },
             false,
             false,
             true
@@ -977,7 +1003,10 @@ mod tests {
     #[test]
     fn thread_recovery_stays_idle_without_signal_rotation_pending_or_new_log() {
         assert!(!should_run_thread_recovery(
-            &WatchState::default(),
+            &WatchState {
+                thread_recovery_backfill_complete: true,
+                ..WatchState::default()
+            },
             false,
             false,
             false
