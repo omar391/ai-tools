@@ -555,18 +555,18 @@ pub fn cmd_relogin_with_progress(
                 }
             }
 
-            run_complete_codex_login(
-                &updated_stored.profile_name,
-                &updated_stored.email,
-                Some(&account_login_locator),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                progress.clone(),
-            )
+            run_complete_codex_login(CompleteCodexLoginArgs {
+                profile_name: &updated_stored.profile_name,
+                email: &updated_stored.email,
+                account_login_locator: Some(&account_login_locator),
+                workflow_ref: None,
+                codex_bin: None,
+                workflow_run_stamp: None,
+                skip_locator_preflight: None,
+                prefer_signup_recovery: None,
+                birth_date: None,
+                progress: progress.clone(),
+            })
         })();
         if let Err(error) = login_result {
             restore_active_auth(previous_auth.as_ref())?;
@@ -954,14 +954,14 @@ fn execute_create_flow_attempt(
             .cloned()
             .ok_or_else(|| anyhow!("Current Codex auth disappeared before create could finish."))
             .map_err(CreateFlowAttemptFailure::Fatal)?;
-        let result = finalize_created_account(
-            &mut store,
-            family.as_ref(),
-            &family_key,
-            &profile_name,
-            &base_email,
+        let result = finalize_created_account(FinalizeCreatedAccountArgs {
+            store: &mut store,
+            family: family.as_ref(),
+            family_key: &family_key,
+            profile_name: &profile_name,
+            base_email: &base_email,
             suffix,
-            &PendingCredential {
+            pending: &PendingCredential {
                 stored: StoredCredential {
                     email: created_email.clone(),
                     profile_name: profile_name.clone(),
@@ -985,11 +985,11 @@ fn execute_create_flow_attempt(
                     .or_else(|| Some(started_at.clone())),
             },
             options,
-            &auth,
-            started_at.as_str(),
-            previous_auth.as_ref(),
-            progress.clone(),
-        );
+            auth: &auth,
+            started_at: started_at.as_str(),
+            previous_auth: previous_auth.as_ref(),
+            progress: progress.clone(),
+        });
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -1065,18 +1065,18 @@ fn execute_create_flow_attempt(
         progress.as_ref(),
         format!("Starting managed login for {}.", created_email),
     );
-    let login_result = run_complete_codex_login(
-        &profile_name,
-        &created_email,
-        Some(&account_login_locator),
-        workflow_metadata.workflow_ref.as_deref(),
-        Some(codex_bin().as_str()),
-        Some(started_at.as_str()),
-        Some(skip_locator_preflight),
-        Some(true),
-        Some(&birth_date),
-        progress.clone(),
-    );
+    let login_result = run_complete_codex_login(CompleteCodexLoginArgs {
+        profile_name: &profile_name,
+        email: &created_email,
+        account_login_locator: Some(&account_login_locator),
+        workflow_ref: workflow_metadata.workflow_ref.as_deref(),
+        codex_bin: Some(codex_bin().as_str()),
+        workflow_run_stamp: Some(started_at.as_str()),
+        skip_locator_preflight: Some(skip_locator_preflight),
+        prefer_signup_recovery: Some(true),
+        birth_date: Some(&birth_date),
+        progress: progress.clone(),
+    });
     if let Err(error) = login_result {
         fatal(restore_active_auth(previous_auth.as_ref()))?;
         if should_retry_create_until_usable(options) {
@@ -1124,20 +1124,20 @@ fn execute_create_flow_attempt(
         progress.as_ref(),
         format!("Managed login finished for {}. Finalizing.", created_email),
     );
-    let result = finalize_created_account(
-        &mut store,
-        family.as_ref(),
-        &family_key,
-        &profile_name,
-        &base_email,
+    let result = finalize_created_account(FinalizeCreatedAccountArgs {
+        store: &mut store,
+        family: family.as_ref(),
+        family_key: &family_key,
+        profile_name: &profile_name,
+        base_email: &base_email,
         suffix,
-        &pending,
+        pending: &pending,
         options,
-        &auth,
-        started_at.as_str(),
-        previous_auth.as_ref(),
-        progress.clone(),
-    );
+        auth: &auth,
+        started_at: started_at.as_str(),
+        previous_auth: previous_auth.as_ref(),
+        progress: progress.clone(),
+    });
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -1169,20 +1169,36 @@ fn auth_matches_target_email(auth: &CodexAuth, target_email: &str) -> bool {
     normalize_email_key(&summarize_codex_auth(auth).email) == normalize_email_key(target_email)
 }
 
-fn finalize_created_account(
-    store: &mut CredentialStore,
-    family: Option<&CredentialFamily>,
-    family_key: &str,
-    profile_name: &str,
-    base_email: &str,
+struct FinalizeCreatedAccountArgs<'a> {
+    store: &'a mut CredentialStore,
+    family: Option<&'a CredentialFamily>,
+    family_key: &'a str,
+    profile_name: &'a str,
+    base_email: &'a str,
     suffix: u32,
-    pending: &PendingCredential,
-    options: &CreateCommandOptions,
-    auth: &CodexAuth,
-    started_at: &str,
-    previous_auth: Option<&CodexAuth>,
+    pending: &'a PendingCredential,
+    options: &'a CreateCommandOptions,
+    auth: &'a CodexAuth,
+    started_at: &'a str,
+    previous_auth: Option<&'a CodexAuth>,
     progress: Option<AutomationProgressCallback>,
-) -> Result<CreateCommandResult> {
+}
+
+fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<CreateCommandResult> {
+    let FinalizeCreatedAccountArgs {
+        store,
+        family,
+        family_key,
+        profile_name,
+        base_email,
+        suffix,
+        pending,
+        options,
+        auth,
+        started_at,
+        previous_auth,
+        progress,
+    } = args;
     let created_email = pending.stored.email.clone();
     report_progress(
         progress.as_ref(),
@@ -1361,18 +1377,32 @@ fn restore_active_auth(previous_auth: Option<&CodexAuth>) -> Result<()> {
     Ok(())
 }
 
-fn run_complete_codex_login(
-    profile_name: &str,
-    email: &str,
-    account_login_locator: Option<&CodexRotateSecretLocator>,
-    workflow_ref: Option<&str>,
-    codex_bin: Option<&str>,
-    workflow_run_stamp: Option<&str>,
+struct CompleteCodexLoginArgs<'a> {
+    profile_name: &'a str,
+    email: &'a str,
+    account_login_locator: Option<&'a CodexRotateSecretLocator>,
+    workflow_ref: Option<&'a str>,
+    codex_bin: Option<&'a str>,
+    workflow_run_stamp: Option<&'a str>,
     skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
-    birth_date: Option<&AdultBirthDate>,
+    birth_date: Option<&'a AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
-) -> Result<()> {
+}
+
+fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
+    let CompleteCodexLoginArgs {
+        profile_name,
+        email,
+        account_login_locator,
+        workflow_ref,
+        codex_bin,
+        workflow_run_stamp,
+        skip_locator_preflight,
+        prefer_signup_recovery,
+        birth_date,
+        progress,
+    } = args;
     let workflow_defaults = resolve_login_workflow_defaults(workflow_ref)?;
     let fallback_birth_date;
     let birth_date = match birth_date {
@@ -2625,10 +2655,7 @@ fn resolve_managed_profile_name_from_candidates(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if available_names
-            .iter()
-            .any(|value| *value == requested_profile_name)
-        {
+        if available_names.contains(&requested_profile_name) {
             return Ok(requested_profile_name.to_string());
         }
         return Err(anyhow!(
@@ -2641,10 +2668,7 @@ fn resolve_managed_profile_name_from_candidates(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if available_names
-            .iter()
-            .any(|value| *value == preferred_profile_name)
-        {
+        if available_names.contains(&preferred_profile_name) {
             return Ok(preferred_profile_name.to_string());
         }
         let suffix = preferred_profile_source
@@ -2661,10 +2685,7 @@ fn resolve_managed_profile_name_from_candidates(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if available_names
-            .iter()
-            .any(|value| *value == default_profile_name)
-        {
+        if available_names.contains(&default_profile_name) {
             return Ok(default_profile_name.to_string());
         }
     }

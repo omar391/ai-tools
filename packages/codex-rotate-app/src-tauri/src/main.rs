@@ -82,6 +82,44 @@ fn paint_dot(rgba: &mut [u8], width: u32, height: u32, center_x: f32, center_y: 
     }
 }
 
+fn paint_arc(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    center_x: f32,
+    center_y: f32,
+    inner_radius: f32,
+    outer_radius: f32,
+    start_degrees: f32,
+    sweep_degrees: f32,
+    alpha: u8,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = center_y - (y as f32 + 0.5);
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = ring_coverage(distance, inner_radius, outer_radius);
+            if coverage <= 0.0 {
+                continue;
+            }
+
+            let mut angle = dy.atan2(dx).to_degrees();
+            if angle < 0.0 {
+                angle += 360.0;
+            }
+            if ccw_distance_degrees(start_degrees, angle) > sweep_degrees {
+                continue;
+            }
+
+            let blended_alpha = (coverage * alpha as f32).round() as u8;
+            if blended_alpha > 0 {
+                paint_alpha(rgba, width, x, y, blended_alpha);
+            }
+        }
+    }
+}
+
 fn seven_segment_mask(digit: char) -> Option<u8> {
     match digit {
         '0' => Some(0b0111111),
@@ -206,23 +244,16 @@ fn paint_percent_digits(rgba: &mut [u8], width: u32, height: u32, center: f32, p
 }
 
 fn paint_activity_badge(rgba: &mut [u8], width: u32, height: u32) {
-    let center_x = width as i32 - 18;
-    let center_y = 16i32;
+    let center_x = width as f32 - 18.0;
+    let center_y = 19.0f32;
 
-    paint_rect(rgba, width, height, center_x - 1, center_y - 7, 2, 14, 255);
-    paint_rect(rgba, width, height, center_x - 7, center_y - 1, 14, 2, 255);
-    paint_dot(
-        rgba,
-        width,
-        height,
-        center_x as f32 + 0.5,
-        center_y as f32 + 0.5,
-        2.5,
+    paint_arc(
+        rgba, width, height, center_x, center_y, 8.5, 11.5, 298.0, 250.0, 255,
     );
-
-    for (dx, dy) in [(-5, -5), (5, -5), (-5, 5), (5, 5)] {
-        paint_rect(rgba, width, height, center_x + dx, center_y + dy, 2, 2, 220);
-    }
+    paint_arc(
+        rgba, width, height, center_x, center_y, 5.0, 7.0, 320.0, 220.0, 200,
+    );
+    paint_dot(rgba, width, height, center_x, center_y, 3.75);
 }
 
 fn build_tray_icon_rgba(
