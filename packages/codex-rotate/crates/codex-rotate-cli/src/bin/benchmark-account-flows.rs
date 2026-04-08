@@ -381,6 +381,7 @@ fn benchmark_candidate(
     let run_label = format!("{}-{}", candidate.id, iso_now());
     let command = vec![
         cli_binary.to_path_buf(),
+        PathBuf::from("internal"),
         PathBuf::from("create"),
         PathBuf::from("--force"),
         PathBuf::from("--restore-auth"),

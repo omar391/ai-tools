@@ -66,29 +66,29 @@ fn run() -> Result<()> {
             &mut stdout,
             &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
         )?,
-        Some("create") | Some("new") => {
+        Some("create") => {
             write_output(
                 &mut stdout,
                 &cmd_create_with_progress(
-                    parse_create_options(&args[1..])?,
+                    parse_public_create_options(&args[1..])?,
                     cli_progress_callback(),
                 )?,
             )?
         }
-        Some("next") | Some("n") => {
+        Some("next") => {
             write_output(&mut stdout, &cmd_next_with_progress(cli_progress_callback())?)?
         }
-        Some("prev") | Some("p") => write_output(&mut stdout, &cmd_prev()?)?,
-        Some("list") | Some("ls") => cmd_list_stream(&mut stdout)?,
-        Some("status") | Some("s") => cmd_status_stream(&mut stdout)?,
-        Some("relogin") | Some("reauth") => {
-            let (selector, options) = parse_relogin_options(&args[1..])?;
+        Some("prev") => write_output(&mut stdout, &cmd_prev()?)?,
+        Some("list") => cmd_list_stream(&mut stdout)?,
+        Some("status") => cmd_status_stream(&mut stdout)?,
+        Some("relogin") => {
+            let (selector, options) = parse_public_relogin_options(&args[1..])?;
             write_output(
                 &mut stdout,
                 &cmd_relogin_with_progress(&selector, options, cli_progress_callback())?,
             )?
         }
-        Some("remove") | Some("rm") => write_output(
+        Some("remove") => write_output(
             &mut stdout,
             &cmd_remove(parse_remove_selector(&args[1..])?)?,
         )?,
@@ -110,21 +110,19 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("add") => Some(InvokeAction::Add {
             alias: parse_add_alias(args)?,
         }),
-        Some("create") | Some("new") => Some(InvokeAction::Create {
-            options: parse_create_invocation(args)?,
+        Some("create") => Some(InvokeAction::Create {
+            options: parse_public_create_invocation(args)?,
         }),
-        Some("next") | Some("n") => Some(InvokeAction::Next),
-        Some("prev") | Some("p") => Some(InvokeAction::Prev),
-        Some("relogin") | Some("reauth") => Some(InvokeAction::Relogin {
-            options: parse_relogin_invocation(args)?,
+        Some("next") => Some(InvokeAction::Next),
+        Some("prev") => Some(InvokeAction::Prev),
+        Some("relogin") => Some(InvokeAction::Relogin {
+            options: parse_public_relogin_invocation(args)?,
         }),
-        Some("remove") | Some("rm") => Some(InvokeAction::Remove {
+        Some("remove") => Some(InvokeAction::Remove {
             selector: parse_remove_selector(args)?.to_string(),
         }),
         Some("list")
-        | Some("ls")
         | Some("status")
-        | Some("s")
         | Some("daemon")
         | Some("tray")
         | None
@@ -211,25 +209,21 @@ fn snapshot_contains_progress(snapshot: &StatusSnapshot) -> bool {
 fn command_streams_progress(command: Option<&str>) -> bool {
     matches!(
         command,
-        Some("create")
-            | Some("new")
-            | Some("next")
-            | Some("n")
-            | Some("relogin")
-            | Some("reauth")
+        Some("create") | Some("next") | Some("relogin")
     )
 }
 
 fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("run") | None => {
+        None => {
             if daemon_is_reachable() {
                 return write_output(writer, "Codex Rotate daemon is already running.");
             }
             run_daemon_forever()
         }
+        Some("help") | Some("--help") | Some("-h") => write_output(writer, "Usage: codex-rotate daemon"),
         Some(other) => Err(anyhow!(
-            "Unknown daemon command: \"{other}\". Run \"codex-rotate help\" for usage."
+            "Unknown daemon command: \"{other}\". Usage: codex-rotate daemon"
         )),
     }
 }
@@ -238,6 +232,20 @@ fn run_internal_command(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("managed-login") => run_managed_login(&args[1..]),
         Some("managed-browser-wrapper") => run_managed_browser_wrapper(&args[1..]),
+        Some("create") => {
+            let output = cmd_create_with_progress(
+                parse_internal_create_options(&args[1..])?,
+                cli_progress_callback(),
+            )?;
+            println!("{output}");
+            Ok(())
+        }
+        Some("relogin") => {
+            let (selector, options) = parse_internal_relogin_options(&args[1..])?;
+            let output = cmd_relogin_with_progress(&selector, options, cli_progress_callback())?;
+            println!("{output}");
+            Ok(())
+        }
         Some(other) => Err(anyhow!("Unknown internal command: \"{other}\".")),
         None => Err(anyhow!("Usage: codex-rotate internal <subcommand>")),
     }
@@ -264,10 +272,9 @@ fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
             let _ = tray_quit_message()?;
             write_output(writer, &tray_open_message()?)
         }
-        "path" => write_output(writer, &resolve_tray_binary()?.display().to_string()),
         "help" | "--help" | "-h" => write_output(
             writer,
-            "Usage: codex-rotate tray [open|status|quit|restart|path]",
+            "Usage: codex-rotate tray [open|status|quit|restart]",
         ),
         other => Err(anyhow!(
             "Unknown tray command: \"{other}\". Run \"codex-rotate tray help\" for usage."
@@ -637,7 +644,7 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
-fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
+fn parse_create_options(args: &[String], allow_internal_flags: bool) -> Result<CreateCommandOptions> {
     let mut positionals = Vec::new();
     let mut profile_name = None;
     let mut base_email = None;
@@ -653,22 +660,28 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
                 force = true;
             }
             "--ignore-current" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown create option: \"{arg}\""));
+                }
                 ignore_current = true;
             }
-            "--restore-auth" | "--restore-previous-auth" => {
+            "--restore-auth" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown create option: \"{arg}\""));
+                }
                 restore_previous_auth_after_create = true;
             }
             "--profile" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("{}", create_usage(allow_internal_flags)))?;
                 profile_name = Some(value.clone());
                 index += 1;
             }
             "--base-email" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"))?;
+                    .ok_or_else(|| anyhow!("{}", create_usage(allow_internal_flags)))?;
                 base_email = Some(value.clone());
                 index += 1;
             }
@@ -685,7 +698,7 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
     }
 
     if positionals.len() > 1 {
-        return Err(anyhow!("Usage: codex-rotate create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"));
+        return Err(anyhow!("{}", create_usage(allow_internal_flags)));
     }
 
     Ok(CreateCommandOptions {
@@ -705,8 +718,24 @@ fn parse_create_options(args: &[String]) -> Result<CreateCommandOptions> {
     })
 }
 
-fn parse_create_invocation(args: &[String]) -> Result<CreateInvocation> {
-    let options = parse_create_options(args)?;
+fn create_usage(allow_internal_flags: bool) -> &'static str {
+    if allow_internal_flags {
+        "Usage: codex-rotate internal create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"
+    } else {
+        "Usage: codex-rotate create [alias] [--force] [--profile <managed-name>] [--base-email <email-family>]"
+    }
+}
+
+fn parse_public_create_options(args: &[String]) -> Result<CreateCommandOptions> {
+    parse_create_options(args, false)
+}
+
+fn parse_internal_create_options(args: &[String]) -> Result<CreateCommandOptions> {
+    parse_create_options(args, true)
+}
+
+fn parse_public_create_invocation(args: &[String]) -> Result<CreateInvocation> {
+    let options = parse_public_create_options(args)?;
     Ok(CreateInvocation {
         alias: options.alias,
         profile_name: options.profile_name,
@@ -718,39 +747,66 @@ fn parse_create_invocation(args: &[String]) -> Result<CreateInvocation> {
     })
 }
 
-fn parse_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
+fn parse_relogin_options(
+    args: &[String],
+    allow_internal_flags: bool,
+) -> Result<(String, ReloginOptions)> {
     let mut positionals = Vec::new();
     let mut options = ReloginOptions::default();
 
     for arg in args {
         match arg.as_str() {
-            "--allow-email-change" => options.allow_email_change = true,
-            "--device-auth" => {
-                return Err(anyhow!(
-                    "--device-auth is no longer supported. Use the managed-browser default flow or pass --manual-login if you need to repair it interactively."
-                ));
+            "--allow-email-change" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown relogin option: \"{arg}\""));
+                }
+                options.allow_email_change = true;
             }
-            "--manual-login" | "--browser-login" | "--no-device-auth" => {
+            "--manual-login" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown relogin option: \"{arg}\""));
+                }
                 options.manual_login = true;
             }
-            "--logout-first" => options.logout_first = true,
-            "--keep-session" | "--no-logout-first" => options.logout_first = false,
+            "--logout-first" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown relogin option: \"{arg}\""));
+                }
+                options.logout_first = true;
+            }
+            "--keep-session" => {
+                if !allow_internal_flags {
+                    return Err(anyhow!("Unknown relogin option: \"{arg}\""));
+                }
+                options.logout_first = false;
+            }
             _ if arg.starts_with('-') => return Err(anyhow!("Unknown relogin option: \"{arg}\"")),
             _ => positionals.push(arg.clone()),
         }
     }
 
     if positionals.len() != 1 {
-        return Err(anyhow!(
-            "Usage: codex-rotate relogin <selector> [--allow-email-change] [--manual-login] [--keep-session]"
-        ));
+        if allow_internal_flags {
+            return Err(anyhow!(
+                "Usage: codex-rotate internal relogin <selector> [--allow-email-change] [--manual-login] [--logout-first|--keep-session]"
+            ));
+        }
+        return Err(anyhow!("Usage: codex-rotate relogin <selector>"));
     }
 
     Ok((positionals[0].clone(), options))
 }
 
-fn parse_relogin_invocation(args: &[String]) -> Result<ReloginInvocation> {
-    let (selector, options) = parse_relogin_options(args)?;
+fn parse_public_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
+    parse_relogin_options(args, false)
+}
+
+fn parse_internal_relogin_options(args: &[String]) -> Result<(String, ReloginOptions)> {
+    parse_relogin_options(args, true)
+}
+
+fn parse_public_relogin_invocation(args: &[String]) -> Result<ReloginInvocation> {
+    let (selector, options) = parse_public_relogin_options(args)?;
     Ok(ReloginInvocation {
         selector,
         allow_email_change: options.allow_email_change,
@@ -772,11 +828,11 @@ fn help_text() -> String {
   {CYAN}create{RESET} [alias]   Reuse a healthy account, or create a new one when needed
   {CYAN}next{RESET}             Swap to the next account with usable quota
   {CYAN}prev{RESET}             Swap to the previous account
-  {CYAN}list{RESET}             Show all accounts with live quota info
+  {CYAN}list{RESET}             Show all accounts with cached quota info
   {CYAN}status{RESET}           Show the current active account info and quota
   {CYAN}relogin{RESET} <selector> Repair that account in one step
   {CYAN}remove{RESET} <selector>  Remove that account from the pool
-  {CYAN}daemon{RESET} run        Start the background runtime daemon
+  {CYAN}daemon{RESET}           Start the background runtime daemon
   {CYAN}tray{RESET} [subcommand] Manage the Codex Rotate tray app
   {CYAN}help{RESET}             Show this help message
 "#
@@ -904,7 +960,7 @@ mod tests {
 
     #[test]
     fn create_parser_preserves_flags_and_alias() {
-        let options = parse_create_options(&[
+        let options = parse_internal_create_options(&[
             "bench".to_string(),
             "--force".to_string(),
             "--ignore-current".to_string(),
@@ -927,8 +983,18 @@ mod tests {
     }
 
     #[test]
-    fn relogin_parser_supports_current_flags() {
-        let (selector, options) = parse_relogin_options(&[
+    fn public_create_parser_rejects_internal_flags() {
+        let error = parse_public_create_options(&[
+            "--ignore-current".to_string(),
+            "--restore-auth".to_string(),
+        ])
+        .expect_err("public create should reject internal flags");
+        assert!(error.to_string().contains("Unknown create option"));
+    }
+
+    #[test]
+    fn internal_relogin_parser_supports_current_flags() {
+        let (selector, options) = parse_internal_relogin_options(&[
             "acct-123".to_string(),
             "--allow-email-change".to_string(),
             "--manual-login".to_string(),
@@ -943,15 +1009,13 @@ mod tests {
     }
 
     #[test]
-    fn relogin_parser_rejects_legacy_device_auth_flag() {
-        let error = parse_relogin_options(&["acct-123".to_string(), "--device-auth".to_string()])
-            .expect_err("device auth should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("--device-auth is no longer supported"),
-            "{error}"
-        );
+    fn public_relogin_parser_rejects_internal_flags() {
+        let error = parse_public_relogin_options(&[
+            "acct-123".to_string(),
+            "--manual-login".to_string(),
+        ])
+        .expect_err("public relogin should reject internal flags");
+        assert!(error.to_string().contains("Unknown relogin option"));
     }
 
     #[test]
@@ -1077,7 +1141,7 @@ mod tests {
         with_rotate_home(|| {
             let handle = spawn_reachable_daemon();
             let mut output = Vec::new();
-            run_daemon_command(&mut output, &["run".to_string()])?;
+            run_daemon_command(&mut output, &[])?;
             handle.join().expect("daemon probe thread")?;
             assert_eq!(
                 String::from_utf8(output).expect("utf8").trim(),
@@ -1104,8 +1168,6 @@ mod tests {
                 vec![
                     "bench".to_string(),
                     "--force".to_string(),
-                    "--ignore-current".to_string(),
-                    "--restore-auth".to_string(),
                     "--profile".to_string(),
                     "dev-1".to_string(),
                     "--base-email".to_string(),
@@ -1117,21 +1179,6 @@ mod tests {
                         profile_name: Some("dev-1".to_string()),
                         base_email: Some("dev.{n}@astronlab.com".to_string()),
                         force: true,
-                        ignore_current: true,
-                        restore_previous_auth_after_create: true,
-                        require_usable_quota: false,
-                    },
-                },
-            ),
-            (
-                Some("new"),
-                Vec::new(),
-                InvokeAction::Create {
-                    options: CreateInvocation {
-                        alias: None,
-                        profile_name: None,
-                        base_email: None,
-                        force: false,
                         ignore_current: false,
                         restore_previous_auth_after_create: false,
                         require_usable_quota: false,
@@ -1139,47 +1186,21 @@ mod tests {
                 },
             ),
             (Some("next"), Vec::new(), InvokeAction::Next),
-            (Some("n"), Vec::new(), InvokeAction::Next),
             (Some("prev"), Vec::new(), InvokeAction::Prev),
-            (Some("p"), Vec::new(), InvokeAction::Prev),
             (
                 Some("relogin"),
-                vec![
-                    "acct-123".to_string(),
-                    "--allow-email-change".to_string(),
-                    "--manual-login".to_string(),
-                    "--logout-first".to_string(),
-                ],
-                InvokeAction::Relogin {
-                    options: ReloginInvocation {
-                        selector: "acct-123".to_string(),
-                        allow_email_change: true,
-                        logout_first: true,
-                        manual_login: true,
-                    },
-                },
-            ),
-            (
-                Some("reauth"),
-                vec!["acct-123".to_string(), "--keep-session".to_string()],
+                vec!["acct-123".to_string()],
                 InvokeAction::Relogin {
                     options: ReloginInvocation {
                         selector: "acct-123".to_string(),
                         allow_email_change: false,
-                        logout_first: false,
+                        logout_first: true,
                         manual_login: false,
                     },
                 },
             ),
             (
                 Some("remove"),
-                vec!["acct-123".to_string()],
-                InvokeAction::Remove {
-                    selector: "acct-123".to_string(),
-                },
-            ),
-            (
-                Some("rm"),
                 vec!["acct-123".to_string()],
                 InvokeAction::Remove {
                     selector: "acct-123".to_string(),

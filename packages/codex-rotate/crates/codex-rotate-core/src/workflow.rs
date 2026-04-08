@@ -11,6 +11,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use serde_yaml::Value as YamlValue;
 
 use crate::auth::{
     extract_account_id_from_auth, load_codex_auth, summarize_codex_auth, write_codex_auth,
@@ -34,13 +35,7 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
-const DEFAULT_OPENAI_FULL_NAME: &str = "Dev Astronlab";
-const DEFAULT_OPENAI_BIRTH_MONTH: u8 = 1;
-const DEFAULT_OPENAI_BIRTH_DAY: u8 = 24;
-const DEFAULT_OPENAI_BIRTH_YEAR: u16 = 1990;
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
-const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID: &str =
-    "workspace.web.auth-openai-com.codex-rotate-account-flow-main";
 const CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR: &str = "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD";
 const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
@@ -272,7 +267,7 @@ impl Default for CredentialStore {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AdultBirthDate {
     birth_month: u8,
     birth_day: u8,
@@ -284,6 +279,27 @@ struct WorkflowFileMetadata {
     workflow_ref: Option<String>,
     preferred_profile_name: Option<String>,
     preferred_email: Option<String>,
+    default_full_name: Option<String>,
+    default_birth_month: Option<u8>,
+    default_birth_day: Option<u8>,
+    default_birth_year: Option<u16>,
+}
+
+impl WorkflowFileMetadata {
+    fn default_birth_date(&self) -> Option<AdultBirthDate> {
+        Some(AdultBirthDate {
+            birth_month: self.default_birth_month?,
+            birth_day: self.default_birth_day?,
+            birth_year: self.default_birth_year?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoginWorkflowDefaults {
+    workflow_ref: String,
+    full_name: String,
+    birth_date: AdultBirthDate,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -860,6 +876,7 @@ fn execute_create_flow_attempt(
     let workflow_file = resolve_account_flow_file_for_create(&paths, options);
     let workflow_file_display = workflow_file.display().to_string();
     let workflow_metadata = fatal(read_workflow_file_metadata(&workflow_file))?;
+    let login_workflow_defaults = fatal(resolve_login_workflow_defaults(None))?;
     let profile_name = fatal(resolve_managed_profile_name(
         options.profile_name.as_deref(),
         workflow_metadata.preferred_profile_name.as_deref(),
@@ -915,7 +932,11 @@ fn execute_create_flow_attempt(
         },
         started_at: Some(started_at.clone()),
     });
-    let birth_date = resolve_credential_birth_date(Some(&existing_pending.stored), Utc::now());
+    let birth_date = resolve_credential_birth_date(
+        Some(&existing_pending.stored),
+        workflow_metadata.default_birth_date().as_ref(),
+    )
+    .unwrap_or_else(|| login_workflow_defaults.birth_date.clone());
     report_progress(
         progress.as_ref(),
         if reusing_pending {
@@ -1382,15 +1403,16 @@ fn run_complete_codex_login(
     birth_date: Option<&AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
 ) -> Result<()> {
+    let workflow_defaults = resolve_login_workflow_defaults(workflow_ref)?;
     let fallback_birth_date;
     let birth_date = match birth_date {
         Some(value) => value,
         None => {
-            fallback_birth_date = default_openai_birth_date();
+            fallback_birth_date = workflow_defaults.birth_date.clone();
             &fallback_birth_date
         }
     };
-    let workflow_ref = resolve_login_workflow_ref(workflow_ref);
+    let workflow_ref = workflow_defaults.workflow_ref;
     let wrapped_codex_bin =
         ensure_managed_browser_wrapper(profile_name, codex_bin.unwrap_or(DEFAULT_CODEX_BIN))?;
     let wrapped_codex_bin = wrapped_codex_bin.to_string_lossy().into_owned();
@@ -1435,7 +1457,7 @@ fn run_complete_codex_login(
                     workflow_run_stamp: login_workflow_run_stamp.as_deref(),
                     skip_locator_preflight,
                     prefer_signup_recovery: Some(allow_signup_recovery),
-                    full_name: Some(DEFAULT_OPENAI_FULL_NAME),
+                    full_name: Some(workflow_defaults.full_name.as_str()),
                     birth_month: Some(birth_date.birth_month),
                     birth_day: Some(birth_date.birth_day),
                     birth_year: Some(birth_date.birth_year),
@@ -1693,12 +1715,41 @@ fn run_complete_codex_login(
     result
 }
 
-fn resolve_login_workflow_ref(workflow_ref: Option<&str>) -> String {
-    workflow_ref
+fn resolve_login_workflow_defaults(workflow_ref: Option<&str>) -> Result<LoginWorkflowDefaults> {
+    let paths = resolve_paths()?;
+    let workflow_metadata = read_workflow_file_metadata(&paths.account_flow_file)?;
+    let workflow_ref = workflow_ref
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID.to_string())
+        .or_else(|| workflow_metadata.workflow_ref.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not resolve a codex-rotate workflow ref from {}.",
+                paths.account_flow_file.display()
+            )
+        })?;
+    let full_name = workflow_metadata
+        .default_full_name
+        .clone()
+        .ok_or_else(|| {
+            anyhow!(
+                "Workflow {} is missing input.schema.document.properties.full_name.default.",
+                paths.account_flow_file.display()
+            )
+        })?;
+    let birth_date = workflow_metadata.default_birth_date().ok_or_else(|| {
+        anyhow!(
+            "Workflow {} is missing one or more birth-date defaults.",
+            paths.account_flow_file.display()
+        )
+    })?;
+
+    Ok(LoginWorkflowDefaults {
+        workflow_ref,
+        full_name,
+        birth_date,
+    })
 }
 
 fn read_string_value(record: &Map<String, Value>, field: &str) -> Option<String> {
@@ -2417,107 +2468,78 @@ fn read_workflow_file_metadata(file_path: &std::path::Path) -> Result<WorkflowFi
 }
 
 fn parse_workflow_file_metadata(raw: &str) -> WorkflowFileMetadata {
-    let mut document_indent = None;
-    let mut metadata_indent = None;
-    let mut metadata_value_indent = None;
-    let mut preferred_profile_name = None;
-    let mut preferred_email = None;
-
-    for line in raw.lines() {
-        let trimmed_start = line.trim_start();
-        if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
-            continue;
-        }
-
-        let indent = line.len().saturating_sub(trimmed_start.len());
-
-        if let Some(current_metadata_indent) = metadata_indent {
-            if indent <= current_metadata_indent {
-                metadata_indent = None;
-                metadata_value_indent = None;
-            }
-        }
-
-        if let Some(current_metadata_indent) = metadata_indent {
-            if indent > current_metadata_indent {
-                let expected_indent = metadata_value_indent.get_or_insert(indent);
-                if indent != *expected_indent || trimmed_start.starts_with('-') {
-                    continue;
-                }
-                let Some((key, raw_value)) = trimmed_start.split_once(':') else {
-                    continue;
-                };
-                let normalized = normalize_workflow_scalar(raw_value);
-                match key.trim() {
-                    "preferredProfile" => preferred_profile_name = normalized,
-                    "preferredEmail" => preferred_email = normalized,
-                    _ => {}
-                }
-                continue;
-            }
-        }
-
-        if let Some(current_document_indent) = document_indent {
-            if indent <= current_document_indent && trimmed_start != "document:" {
-                document_indent = None;
-            }
-        }
-
-        if let Some(current_document_indent) = document_indent {
-            if indent > current_document_indent && trimmed_start == "metadata:" {
-                metadata_indent = Some(indent);
-                metadata_value_indent = None;
-                continue;
-            }
-        }
-
-        if trimmed_start == "document:" {
-            document_indent = Some(indent);
-            metadata_indent = None;
-            metadata_value_indent = None;
-        }
-    }
+    let parsed = serde_yaml::from_str::<YamlValue>(raw).ok();
+    let root = parsed.as_ref();
+    let document = root
+        .as_ref()
+        .and_then(|value| yaml_mapping_get(value, "document"));
+    let metadata = document.and_then(|value| yaml_mapping_get(value, "metadata"));
 
     WorkflowFileMetadata {
         workflow_ref: None,
-        preferred_profile_name,
-        preferred_email,
+        preferred_profile_name: metadata
+            .and_then(|value| yaml_mapping_get(value, "preferredProfile"))
+            .and_then(read_yaml_string),
+        preferred_email: metadata
+            .and_then(|value| yaml_mapping_get(value, "preferredEmail"))
+            .and_then(read_yaml_string),
+        default_full_name: read_workflow_input_property(root, "full_name")
+            .and_then(|value| yaml_mapping_get(value, "default"))
+            .and_then(read_yaml_string),
+        default_birth_month: read_workflow_input_property(root, "birth_month")
+            .and_then(|value| yaml_mapping_get(value, "default"))
+            .and_then(read_yaml_u8),
+        default_birth_day: read_workflow_input_property(root, "birth_day")
+            .and_then(|value| yaml_mapping_get(value, "default"))
+            .and_then(read_yaml_u8),
+        default_birth_year: read_workflow_input_property(root, "birth_year")
+            .and_then(|value| yaml_mapping_get(value, "default"))
+            .and_then(read_yaml_u16),
     }
 }
 
-fn normalize_workflow_scalar(raw_value: &str) -> Option<String> {
-    let trimmed = raw_value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
+fn yaml_mapping_get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
+    value
+        .as_mapping()?
+        .get(YamlValue::String(key.to_string()))
+}
 
-    let mut comment_index = None;
-    let bytes = trimmed.as_bytes();
-    for index in 0..bytes.len().saturating_sub(1) {
-        if bytes[index].is_ascii_whitespace() && bytes[index + 1] == b'#' {
-            comment_index = Some(index);
-            break;
+fn read_workflow_input_property<'a>(root: Option<&'a YamlValue>, field: &str) -> Option<&'a YamlValue> {
+    let properties = root
+        .and_then(|value| yaml_mapping_get(value, "input"))
+        .and_then(|value| yaml_mapping_get(value, "schema"))
+        .and_then(|value| yaml_mapping_get(value, "document"))
+        .and_then(|value| yaml_mapping_get(value, "properties"))?;
+    yaml_mapping_get(properties, field)
+}
+
+fn read_yaml_string(value: &YamlValue) -> Option<String> {
+    match value {
+        YamlValue::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
+        YamlValue::Number(value) => Some(value.to_string()),
+        _ => None,
     }
+}
 
-    let without_comment = comment_index
-        .map(|index| &trimmed[..index])
-        .unwrap_or(trimmed)
-        .trim();
-    if without_comment.is_empty() {
-        return None;
+fn read_yaml_u8(value: &YamlValue) -> Option<u8> {
+    match value {
+        YamlValue::Number(value) => value.as_u64().and_then(|value| u8::try_from(value).ok()),
+        YamlValue::String(value) => value.trim().parse::<u8>().ok(),
+        _ => None,
     }
+}
 
-    let mut chars = without_comment.chars();
-    let first = chars.next()?;
-    let last = without_comment.chars().last()?;
-    if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-        let inner = &without_comment[1..without_comment.len().saturating_sub(1)];
-        let normalized = inner.trim();
-        return (!normalized.is_empty()).then(|| normalized.to_string());
+fn read_yaml_u16(value: &YamlValue) -> Option<u16> {
+    match value {
+        YamlValue::Number(value) => value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok()),
+        YamlValue::String(value) => value.trim().parse::<u16>().ok(),
+        _ => None,
     }
-
-    Some(without_comment.to_string())
 }
 
 fn derive_workflow_ref_from_file_path(file_path: &Path) -> Option<String> {
@@ -3515,18 +3537,24 @@ fn fisher_yates_shuffle(chars: &mut [char]) {
 }
 
 fn resolve_credential_birth_date(
-    _credential: Option<&StoredCredential>,
-    _now: DateTime<Utc>,
-) -> AdultBirthDate {
-    default_openai_birth_date()
-}
-
-fn default_openai_birth_date() -> AdultBirthDate {
-    AdultBirthDate {
-        birth_month: DEFAULT_OPENAI_BIRTH_MONTH,
-        birth_day: DEFAULT_OPENAI_BIRTH_DAY,
-        birth_year: DEFAULT_OPENAI_BIRTH_YEAR,
+    credential: Option<&StoredCredential>,
+    fallback_birth_date: Option<&AdultBirthDate>,
+) -> Option<AdultBirthDate> {
+    if let Some(credential) = credential {
+        if let (Some(birth_month), Some(birth_day), Some(birth_year)) = (
+            credential.birth_month,
+            credential.birth_day,
+            credential.birth_year,
+        ) {
+            return Some(AdultBirthDate {
+                birth_month,
+                birth_day,
+                birth_year,
+            });
+        }
     }
+
+    fallback_birth_date.cloned()
 }
 
 fn now_iso() -> String {
@@ -3632,6 +3660,10 @@ mod tests {
         );
         assert_eq!(metadata.preferred_profile_name.as_deref(), Some("dev-1"));
         assert_eq!(metadata.preferred_email, None);
+        assert_eq!(metadata.default_full_name.as_deref(), Some("Dev Astronlab"));
+        assert_eq!(metadata.default_birth_month, Some(1));
+        assert_eq!(metadata.default_birth_day, Some(24));
+        assert_eq!(metadata.default_birth_year, Some(1990));
     }
 
     #[test]
@@ -3659,6 +3691,18 @@ document:
     preferredEmail: 'dev.41@astronlab.com'
     targets:
       - id: primary
+input:
+  schema:
+    document:
+      properties:
+        full_name:
+          default: "Dev Astronlab"
+        birth_month:
+          default: 1
+        birth_day:
+          default: 24
+        birth_year:
+          default: 1990
 "#,
         );
 
@@ -3667,25 +3711,46 @@ document:
             metadata.preferred_email.as_deref(),
             Some("dev.41@astronlab.com")
         );
+        assert_eq!(metadata.default_full_name.as_deref(), Some("Dev Astronlab"));
+        assert_eq!(metadata.default_birth_month, Some(1));
+        assert_eq!(metadata.default_birth_day, Some(24));
+        assert_eq!(metadata.default_birth_year, Some(1990));
     }
 
     #[test]
-    fn resolve_login_workflow_ref_uses_explicit_value() {
+    fn resolve_login_workflow_defaults_uses_explicit_value() {
+        let defaults =
+            resolve_login_workflow_defaults(Some("workspace.web.auth-openai-com.custom-flow"))
+                .expect("login workflow defaults");
+
         assert_eq!(
-            resolve_login_workflow_ref(Some("workspace.web.auth-openai-com.custom-flow")),
+            defaults.workflow_ref,
             "workspace.web.auth-openai-com.custom-flow"
         );
+        assert_eq!(defaults.full_name, "Dev Astronlab");
+        assert_eq!(
+            defaults.birth_date,
+            AdultBirthDate {
+                birth_month: 1,
+                birth_day: 24,
+                birth_year: 1990,
+            }
+        );
     }
 
     #[test]
-    fn resolve_login_workflow_ref_falls_back_to_default_for_missing_or_blank_values() {
+    fn resolve_login_workflow_defaults_falls_back_to_default_for_missing_or_blank_values() {
+        let defaults = resolve_login_workflow_defaults(None).expect("login workflow defaults");
         assert_eq!(
-            resolve_login_workflow_ref(None),
-            DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID
+            defaults.workflow_ref,
+            "workspace.web.auth-openai-com.codex-rotate-account-flow-main"
         );
+        assert_eq!(defaults.full_name, "Dev Astronlab");
         assert_eq!(
-            resolve_login_workflow_ref(Some("   ")),
-            DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID
+            resolve_login_workflow_defaults(Some("   "))
+                .expect("login workflow defaults")
+                .workflow_ref,
+            "workspace.web.auth-openai-com.codex-rotate-account-flow-main"
         );
     }
 
@@ -3998,8 +4063,17 @@ document:
     }
 
     #[test]
-    fn uses_fixed_default_birth_date() {
-        let value = default_openai_birth_date();
+    fn reads_default_birth_date_from_workflow_metadata() {
+        let metadata = read_workflow_file_metadata(
+            &repo_root()
+                .join(".fast-browser")
+                .join("workflows")
+                .join("web")
+                .join("auth.openai.com")
+                .join("codex-rotate-account-flow-main.yaml"),
+        )
+        .expect("workflow metadata");
+        let value = metadata.default_birth_date().expect("default birth date");
         assert_eq!(value.birth_month, 1);
         assert_eq!(value.birth_day, 24);
         assert_eq!(value.birth_year, 1990);
@@ -4368,9 +4442,6 @@ document:
 
     #[test]
     fn reuses_existing_birth_date() {
-        let now = DateTime::parse_from_rfc3339("2026-04-02T00:00:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
         let value = resolve_credential_birth_date(
             Some(&StoredCredential {
                 email: "dev.user+1@gmail.com".to_string(),
@@ -4385,11 +4456,16 @@ document:
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T00:00:00.000Z".to_string(),
             }),
-            now,
-        );
-        assert_eq!(value.birth_month, 1);
-        assert_eq!(value.birth_day, 24);
-        assert_eq!(value.birth_year, 1990);
+            Some(&AdultBirthDate {
+                birth_month: 1,
+                birth_day: 24,
+                birth_year: 1990,
+            }),
+        )
+        .expect("birth date");
+        assert_eq!(value.birth_month, 7);
+        assert_eq!(value.birth_day, 14);
+        assert_eq!(value.birth_year, 1994);
     }
 
     #[test]

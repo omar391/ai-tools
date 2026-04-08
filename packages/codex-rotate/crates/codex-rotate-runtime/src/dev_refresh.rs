@@ -1143,7 +1143,7 @@ fn daemon_pids_from_ps(cli_binary: &Path, instance_home: Option<&str>) -> Result
         command_tokens_match_binary(first, second, &cli_binary)
             && matches!(
                 command_args_after_binary(first, second, third, fourth),
-                [Some("daemon"), Some("run")]
+                [Some("daemon"), None]
             )
     })
 }
@@ -1337,11 +1337,11 @@ mod tests {
     fn instance_home_marker_filters_other_homes() {
         let home = "/tmp/codex-home-a";
         let matching = format!(
-            "123 /Volumes/demo/target/debug/codex-rotate daemon run {}={}",
+            "123 /Volumes/demo/target/debug/codex-rotate daemon {}={}",
             INSTANCE_HOME_ENV, home
         );
         let other = format!(
-            "123 /Volumes/demo/target/debug/codex-rotate daemon run {}={}",
+            "123 /Volumes/demo/target/debug/codex-rotate daemon {}={}",
             INSTANCE_HOME_ENV, "/tmp/codex-home-b"
         );
         assert!(matches_instance_home_marker(&matching, Some(home)));

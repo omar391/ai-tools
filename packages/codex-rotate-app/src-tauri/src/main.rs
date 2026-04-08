@@ -205,7 +205,14 @@ fn paint_percent_digits(rgba: &mut [u8], width: u32, height: u32, center: f32, p
     }
 }
 
-fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
+fn paint_activity_badge(rgba: &mut [u8], width: u32, height: u32) {
+    let center_x = width as f32 - 17.0;
+    let center_y = 17.0f32;
+    paint_dot(rgba, width, height, center_x, center_y, 8.5);
+    paint_dot(rgba, width, height, center_x, center_y, 4.5);
+}
+
+fn build_tray_icon_rgba(quota_percent: Option<u8>, show_activity_badge: bool) -> (Vec<u8>, u32, u32) {
     let width = 96u32;
     let height = 96u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
@@ -258,6 +265,15 @@ fn build_tray_icon(quota_percent: Option<u8>) -> Image<'static> {
         paint_percent_digits(&mut rgba, width, height, center, percent);
     }
 
+    if show_activity_badge {
+        paint_activity_badge(&mut rgba, width, height);
+    }
+
+    (rgba, width, height)
+}
+
+fn build_tray_icon(quota_percent: Option<u8>, show_activity_badge: bool) -> Image<'static> {
+    let (rgba, width, height) = build_tray_icon_rgba(quota_percent, show_activity_badge);
     Image::new_owned(rgba, width, height)
 }
 
@@ -299,7 +315,10 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
     }
 
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_icon(Some(build_tray_icon(rendered.quota_percent)));
+        let _ = tray.set_icon(Some(build_tray_icon(
+            rendered.quota_percent,
+            rendered.show_activity_badge,
+        )));
         let _ = tray.set_title(Option::<String>::None);
         let _ = tray.set_tooltip(Some(rendered.tooltip_text));
     }
@@ -381,7 +400,7 @@ fn main() {
             )?;
 
             TrayIconBuilder::with_id("main")
-                .icon(build_tray_icon(None))
+                .icon(build_tray_icon(None, false))
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -434,4 +453,17 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run codex rotate tray");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_icon_activity_badge_changes_pixels() {
+        let (idle, _, _) = build_tray_icon_rgba(Some(42), false);
+        let (busy, _, _) = build_tray_icon_rgba(Some(42), true);
+
+        assert_ne!(idle, busy);
+    }
 }

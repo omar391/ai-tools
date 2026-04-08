@@ -193,7 +193,6 @@ fn run_cli(
 fn spawn_daemon(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Result<Child> {
     Command::new(cli_binary())
         .arg("daemon")
-        .arg("run")
         .env("CODEX_ROTATE_HOME", rotate_home)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string())
@@ -285,12 +284,7 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     let proxied_list = run_cli(&["list"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_next = run_cli(&["next"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let proxied_prev = run_cli(&["prev"], &rotate_home, &codex_home, dummy_cdp.port)?;
-    let second_daemon = run_cli(
-        &["daemon", "run"],
-        &rotate_home,
-        &codex_home,
-        dummy_cdp.port,
-    )?;
+    let second_daemon = run_cli(&["daemon"], &rotate_home, &codex_home, dummy_cdp.port)?;
 
     assert_eq!(direct_status.code, proxied_status.code);
     assert_eq!(

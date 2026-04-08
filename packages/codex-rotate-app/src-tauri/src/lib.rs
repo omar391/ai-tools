@@ -7,7 +7,7 @@ use codex_rotate_runtime::dev_refresh::{
     stop_running_daemons,
 };
 use codex_rotate_runtime::ipc::{
-    daemon_is_reachable, daemon_socket_path, subscribe, StatusSnapshot,
+    daemon_is_reachable, daemon_socket_path, subscribe, SnapshotMessageKind, StatusSnapshot,
 };
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,7 @@ pub struct RenderedSnapshot {
     pub rotation_text: String,
     pub tooltip_text: String,
     pub quota_percent: Option<u8>,
+    pub show_activity_badge: bool,
     pub launch_enabled: bool,
     pub check_enabled: bool,
     pub rotate_enabled: bool,
@@ -108,6 +109,7 @@ pub fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
             None => "Codex Rotate\nClick for status".to_string(),
         },
         quota_percent: snapshot.current_quota_percent,
+        show_activity_badge: snapshot.last_message_kind == Some(SnapshotMessageKind::Progress),
         launch_enabled: snapshot.capabilities.managed_launch,
         check_enabled: snapshot.capabilities.quota_watch,
         rotate_enabled: snapshot.capabilities.live_account_sync,
@@ -161,7 +163,7 @@ fn ensure_daemon_running_with(
         "Launching Codex Rotate daemon via {}.",
         cli_binary.display()
     ));
-    spawn_detached_process(cli_binary, &["daemon", "run"])
+    spawn_detached_process(cli_binary, &["daemon"])
         .map_err(|error| format!("Failed to launch {}: {}", cli_binary.display(), error))?;
 
     for _ in 0..max_attempts {
@@ -396,6 +398,7 @@ mod tests {
             rotation_text: "Last rotation: dev.0@astronlab.com -> dev.1@astronlab.com".to_string(),
             tooltip_text: "Codex Rotate\nQuota: 80%\nClick for status".to_string(),
             quota_percent: Some(80),
+            show_activity_badge: false,
             launch_enabled: true,
             check_enabled: true,
             rotate_enabled: true,
@@ -447,6 +450,19 @@ mod tests {
         let rendered = rendered_snapshot(&snapshot);
 
         assert_eq!(rendered.inventory_text, "Inventory: 2/3 account(s)");
+    }
+
+    #[test]
+    fn rendered_snapshot_marks_progress_as_activity_badge() {
+        let snapshot = StatusSnapshot {
+            last_message: Some("Creating dev.48@astronlab.com.".to_string()),
+            last_message_kind: Some(SnapshotMessageKind::Progress),
+            ..StatusSnapshot::default()
+        };
+
+        let rendered = rendered_snapshot(&snapshot);
+
+        assert!(rendered.show_activity_badge);
     }
 
     #[test]

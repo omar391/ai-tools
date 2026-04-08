@@ -16,7 +16,7 @@ Codex Rotate is now CLI-owned end to end.
 | Tray shell          | `packages/codex-rotate-app/src-tauri/src/main.rs`                                   | Menu, icon, daemon bootstrap, IPC subscription, user actions                          |
 | CLI daemon runtime  | `packages/codex-rotate/crates/codex-rotate-runtime/src/*.rs`                        | Watch loop, launcher, CDP, logs, live sync, thread recovery, daemon IPC               |
 | Shared engine core  | `packages/codex-rotate/crates/codex-rotate-core/src/*.rs`                           | Auth parsing, quota cache, pool engine, create/relogin orchestration                  |
-| Rust CLI            | `packages/codex-rotate/crates/codex-rotate-cli/src/main.rs`                         | Stable `codex-rotate` command surface and `daemon run`                                |
+| Rust CLI            | `packages/codex-rotate/crates/codex-rotate-cli/src/main.rs`                         | Stable `codex-rotate` command surface and daemon entrypoint                           |
 | npm wrapper         | `packages/codex-rotate/index.js`                                                    | Thin Node launcher into the shipped native CLI                                        |
 | Automation boundary | `packages/codex-rotate/automation.ts`, `packages/codex-rotate/automation-bridge.ts` | `fast-browser`, workflow metadata, Bitwarden secret refs, managed-browser Codex login |
 

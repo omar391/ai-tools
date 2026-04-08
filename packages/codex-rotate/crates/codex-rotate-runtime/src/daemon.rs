@@ -441,7 +441,6 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
         ));
         Command::new(&release_binary)
             .arg("daemon")
-            .arg("run")
             .env(DAEMON_TAKEOVER_ENV, "1")
             .env(INSTANCE_HOME_ENV, &instance_home)
             .stdin(Stdio::null())
@@ -468,7 +467,6 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
 
     Command::new(&build.cli_binary)
         .arg("daemon")
-        .arg("run")
         .env(DAEMON_TAKEOVER_ENV, "1")
         .env(INSTANCE_HOME_ENV, &instance_home)
         .stdin(Stdio::null())

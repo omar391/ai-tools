@@ -48,9 +48,6 @@ const FAST_BROWSER_BITWARDEN_SESSION_MODULE = pathToFileURL(
     "bitwarden-session.mjs",
   ),
 ).href;
-const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID =
-  "workspace.web.auth-openai-com.codex-rotate-account-flow-main";
-
 const CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE: "minimal" | "full" =
   process.env.CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE === "full"
     ? "full"
@@ -59,10 +56,6 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
-const DEFAULT_OPENAI_FULL_NAME = "Dev Astronlab";
-const DEFAULT_OPENAI_BIRTH_MONTH = 1;
-const DEFAULT_OPENAI_BIRTH_DAY = 24;
-const DEFAULT_OPENAI_BIRTH_YEAR = 1990;
 const BITWARDEN_BINARY = process.env.CODEX_ROTATE_BW_BIN?.trim() || "bw";
 const FAST_BROWSER_PLAYWRIGHT_MODULE = resolvePlaywrightModulePath();
 const FAST_BROWSER_NODE_PATH = dirname(FAST_BROWSER_PLAYWRIGHT_MODULE);
@@ -1087,6 +1080,27 @@ function shouldResetFastBrowserSecretBrokerForBrokenCwd(
   return FAST_BROWSER_SECRET_BROKEN_CWD_PATTERN.test(text);
 }
 
+function requireWorkflowInputString(
+  value: string | null | undefined,
+  field: string,
+): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) {
+    throw new Error(`Automation bridge requires a non-empty ${field}.`);
+  }
+  return normalized;
+}
+
+function requireWorkflowInputInteger(
+  value: number | null | undefined,
+  field: string,
+): number {
+  if (!Number.isInteger(value)) {
+    throw new Error(`Automation bridge requires an integer ${field}.`);
+  }
+  return Number(value);
+}
+
 async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
@@ -1105,11 +1119,20 @@ async function runCodexBrowserLoginWorkflow(
   },
 ): Promise<FastBrowserRunResult> {
   const codexBin = String(options?.codexBin || "codex").trim() || "codex";
-  const workflowRef =
-    (typeof options?.workflowRef === "string" &&
-    options.workflowRef.trim().length > 0
-      ? options.workflowRef.trim()
-      : null) ?? DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID;
+  const workflowRef = requireWorkflowInputString(
+    options?.workflowRef,
+    "workflowRef",
+  );
+  const fullName = requireWorkflowInputString(options?.fullName, "fullName");
+  const birthMonth = requireWorkflowInputInteger(
+    options?.birthMonth,
+    "birthMonth",
+  );
+  const birthDay = requireWorkflowInputInteger(options?.birthDay, "birthDay");
+  const birthYear = requireWorkflowInputInteger(
+    options?.birthYear,
+    "birthYear",
+  );
   return await runFastBrowserDaemonWorkflow(
     workflowRef,
     {
@@ -1148,12 +1171,12 @@ async function runCodexBrowserLoginWorkflow(
       ...(accountLoginLocator
         ? { account_login_locator: accountLoginLocator }
         : {}),
-      full_name: String(options?.fullName ?? DEFAULT_OPENAI_FULL_NAME).trim(),
+      full_name: fullName,
       prefer_signup_recovery:
         options?.preferSignupRecovery === true ? "true" : "false",
-      birth_month: String(options?.birthMonth ?? DEFAULT_OPENAI_BIRTH_MONTH),
-      birth_day: String(options?.birthDay ?? DEFAULT_OPENAI_BIRTH_DAY),
-      birth_year: String(options?.birthYear ?? DEFAULT_OPENAI_BIRTH_YEAR),
+      birth_month: String(birthMonth),
+      birth_day: String(birthDay),
+      birth_year: String(birthYear),
     },
     profileName,
     {
