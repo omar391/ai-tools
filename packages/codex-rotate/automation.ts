@@ -217,6 +217,9 @@ export interface FastBrowserRunResult {
   status?: string;
   state?: FastBrowserState;
   output?: Record<string, unknown> | null;
+  error?: {
+    message?: string | null;
+  } | null;
   pause?: FastBrowserPause | null;
   finalUrl?: string | null;
   observability?: {
@@ -864,12 +867,14 @@ function parseFastBrowserJson<T>(
   return parseJson<T>(stdout, `${actionLabel} returned invalid JSON.`);
 }
 
-function buildFastBrowserWorkflowError(
+export function buildFastBrowserWorkflowError(
   workflowRef: string,
   response: FastBrowserDaemonRunResponse | null | undefined,
 ): Error {
   const error = new Error(
-    response?.error?.message || `fast-browser workflow ${workflowRef} failed.`,
+    response?.result?.error?.message ||
+      response?.error?.message ||
+      `fast-browser workflow ${workflowRef} failed.`,
   );
   if (response?.result && typeof response.result === "object") {
     (

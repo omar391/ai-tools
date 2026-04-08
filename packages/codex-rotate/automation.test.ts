@@ -1,17 +1,23 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { shouldPromptForCodexRotateSecretUnlock } from "./automation.ts";
+import {
+  buildFastBrowserWorkflowError,
+  shouldPromptForCodexRotateSecretUnlock,
+} from "./automation.ts";
+
+setDefaultTimeout(15_000);
 
 describe("fast-browser daemon recovery", () => {
   test("automation module still imports when the original cwd is deleted", () => {
     const automationModuleUrl = new URL("./automation.ts", import.meta.url)
       .href;
     const result = spawnSync(
-      process.execPath,
+      "node",
       [
         "--experimental-strip-types",
         "--input-type=module",
@@ -100,6 +106,110 @@ describe("automation bridge transport", () => {
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fast-browser workflow failures", () => {
+  test("surfaces nested daemon workflow errors instead of a generic callback failure", () => {
+    const error = buildFastBrowserWorkflowError(
+      "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
+      {
+        ok: false,
+        result: {
+          ok: false,
+          status: "failed",
+          error: {
+            message:
+              "Workflow validation failed for codex-rotate-account-flow-main.yaml",
+          },
+        },
+      },
+    );
+
+    expect(error.message).toContain("Workflow validation failed");
+    expect(error.message).not.toContain("fast-browser workflow");
+  });
+});
+
+describe("active auth workflows", () => {
+  test("validate against current fast-browser digest pins", async () => {
+    const repoRoot = join(import.meta.dir, "..", "..");
+    const workflowsModulePath = join(
+      import.meta.dir,
+      "..",
+      "..",
+      "..",
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "workflows.mjs",
+    );
+    expect(existsSync(workflowsModulePath)).toBe(true);
+    const workflowPaths = [
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-main.yaml",
+      ),
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-minimal.yaml",
+      ),
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-device-auth.yaml",
+      ),
+    ];
+
+    const result = spawnSync(
+      "node",
+      [
+        "--input-type=module",
+        "-e",
+        `
+import { pathToFileURL } from "node:url";
+const { loadWorkflowRecord, validateWorkflowRecord } = await import(${JSON.stringify(
+          pathToFileURL(workflowsModulePath).href,
+        )});
+for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
+  const record = await loadWorkflowRecord(workflowPath, "project");
+  await validateWorkflowRecord(record);
+  console.log("ok\\t" + workflowPath);
+}
+`,
+      ],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_OPTIONS: undefined,
+        },
+      },
+    );
+
+    if (result.status !== 0) {
+      throw new Error(
+        `workflow validation failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+    }
+    expect(result.stdout).toContain("codex-rotate-account-flow-main.yaml");
+    expect(result.stdout).toContain("codex-rotate-account-flow-minimal.yaml");
+    expect(result.stdout).toContain(
+      "codex-rotate-account-flow-device-auth.yaml",
+    );
   });
 });
 

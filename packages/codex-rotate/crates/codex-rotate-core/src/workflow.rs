@@ -2218,7 +2218,6 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
         .into_iter()
         .filter(|(email, record)| {
             !inventory_emails.contains(email)
-                && !pending_is_superseded_by_inventory(record, &inventory_emails)
                 && !should_drop_non_dev_pending_credential(&record.stored.base_email)
         })
         .collect::<HashMap<_, _>>();
@@ -2281,19 +2280,6 @@ fn collect_inventory_emails_from_state(raw: &Value) -> HashSet<String> {
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default()
-}
-
-fn pending_is_superseded_by_inventory(
-    pending: &PendingCredential,
-    inventory_emails: &HashSet<String>,
-) -> bool {
-    inventory_emails
-        .iter()
-        .filter_map(|email| extract_account_family_suffix(email, &pending.stored.base_email).ok())
-        .flatten()
-        .max()
-        .map(|suffix| suffix > pending.stored.suffix)
-        .unwrap_or(false)
 }
 
 fn normalize_stored_credential_map(raw: Option<&Value>) -> HashMap<String, StoredCredential> {
@@ -4502,7 +4488,7 @@ input:
     }
 
     #[test]
-    fn drops_pending_entries_superseded_by_newer_inventory_suffixes() {
+    fn keeps_pending_entries_for_missing_lower_suffixes() {
         let store = normalize_credential_store(json!({
             "accounts": [
                 {
@@ -4522,7 +4508,7 @@ input:
                 }
             }
         }));
-        assert!(store.pending.is_empty());
+        assert!(store.pending.contains_key("dev.1@astronlab.com"));
     }
 
     #[test]
