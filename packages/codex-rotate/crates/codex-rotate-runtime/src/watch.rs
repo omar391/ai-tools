@@ -111,6 +111,11 @@ pub fn read_watch_state() -> Result<WatchState> {
 
 pub fn write_watch_state(state: &WatchState) -> Result<()> {
     let paths = resolve_paths()?;
+    if let Some(parent) = paths.watch_state_file.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create {}.", parent.display())
+        })?;
+    }
     let raw = serde_json::to_string_pretty(state)?;
     write_file_atomically(&paths.watch_state_file, &raw)
 }

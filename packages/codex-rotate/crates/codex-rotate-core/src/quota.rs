@@ -259,17 +259,55 @@ pub fn quota_cache_ttl(
     }
 }
 
+pub fn quota_next_refresh_at(
+    usage: Option<&UsageResponse>,
+    error: Option<&str>,
+    fetched_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    if error.is_some() {
+        return fetched_at + chrono::Duration::seconds(15);
+    }
+
+    let Some(usage) = usage else {
+        return fetched_at + chrono::Duration::seconds(15);
+    };
+
+    if has_usable_quota(usage) {
+        return fetched_at + quota_refresh_interval_from_usage(usage);
+    }
+
+    if let Some(primary_window) = usage
+        .rate_limit
+        .as_ref()
+        .and_then(|limits| limits.primary_window.as_ref())
+    {
+        if get_quota_left(Some(primary_window))
+            .map(|value| value <= 0.0)
+            .unwrap_or(false)
+            && primary_window.reset_after_seconds >= 0
+        {
+            return fetched_at + chrono::Duration::seconds(primary_window.reset_after_seconds);
+        }
+    }
+
+    fetched_at + chrono::Duration::seconds(15)
+}
+
 pub fn build_cached_quota_state(
     account_id: &str,
     assessment: Option<&QuotaAssessment>,
     error: Option<&str>,
     fetched_at: DateTime<Utc>,
 ) -> CachedQuotaState {
-    let ttl = quota_cache_ttl(assessment, error);
     CachedQuotaState {
         account_id: account_id.to_string(),
         fetched_at: fetched_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        next_refresh_at: (fetched_at + ttl).to_rfc3339_opts(SecondsFormat::Millis, true),
+        next_refresh_at: quota_next_refresh_at(
+            assessment.map(|value| &value.usage),
+            error,
+            fetched_at,
+        )
+        .to_rfc3339_opts(SecondsFormat::Millis, true),
         summary: assessment
             .map(|value| value.summary.clone())
             .unwrap_or_else(|| "quota unavailable".to_string()),
@@ -301,6 +339,22 @@ pub fn quota_cache_is_stale(
         return true;
     };
     now >= next_refresh_at.with_timezone(&Utc)
+}
+
+fn quota_refresh_interval_from_usage(usage: &UsageResponse) -> chrono::Duration {
+    match get_quota_left(
+        usage
+            .rate_limit
+            .as_ref()
+            .and_then(|limits| limits.primary_window.as_ref()),
+    )
+    .map(|value| value.round() as u8)
+    .unwrap_or(0)
+    {
+        value if value > 20 => chrono::Duration::seconds(60),
+        value if value > 10 => chrono::Duration::seconds(30),
+        _ => chrono::Duration::seconds(15),
+    }
 }
 
 fn format_usage_window(window: Option<&UsageWindow>, fallback_label: &str) -> Option<String> {
@@ -553,5 +607,23 @@ mod tests {
             ..fresh
         };
         assert!(quota_cache_is_stale(Some(&expired), "acct-123", now));
+    }
+
+    #[test]
+    fn build_cached_quota_state_waits_until_reset_for_exhausted_primary_window() {
+        let fetched_at = DateTime::parse_from_rfc3339("2026-04-03T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let assessment = QuotaAssessment {
+            usage: make_usage(100.0),
+            usable: false,
+            summary: "5h 0% left, resets in 1h".to_string(),
+            blocker: Some("5h quota exhausted, resets in 1h".to_string()),
+            primary_quota_left_percent: Some(0.0),
+        };
+
+        let cache = build_cached_quota_state("acct-123", Some(&assessment), None, fetched_at);
+
+        assert_eq!(cache.next_refresh_at, "2026-04-03T14:00:00.000Z");
     }
 }

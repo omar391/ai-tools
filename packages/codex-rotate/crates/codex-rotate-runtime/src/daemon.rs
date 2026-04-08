@@ -39,10 +39,14 @@ use crate::ipc::{
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
-use crate::watch::{refresh_quota_cache, run_watch_iteration, WatchIterationOptions, WatchState};
+use crate::watch::{
+    read_watch_state, refresh_quota_cache, run_watch_iteration, WatchIterationOptions, WatchState,
+};
 
 const DEFAULT_PORT: u16 = 9333;
-const DEFAULT_INTERVAL_SECONDS: u64 = 15;
+const RISKY_INTERVAL_SECONDS: u64 = 15;
+const HEALTHY_INTERVAL_SECONDS: u64 = 30;
+const LOW_QUOTA_WATCH_THRESHOLD_PERCENT: u8 = 20;
 const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -222,7 +226,10 @@ impl Drop for SocketGuard {
 }
 
 fn initialize_runtime(daemon: &SharedDaemon) {
-    let result = daemon.with_state_mut(|state| refresh_live_account_state(state, true, false));
+    let result = daemon.with_state_mut(|state| {
+        hydrate_quota_cache_from_watch_state(state);
+        refresh_live_account_state(state, false, false)
+    });
 
     if let Err(error) = result {
         daemon.set_error_message(format!("startup failed: {error}"));
@@ -551,7 +558,7 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
         }),
         InvokeAction::OpenManaged => daemon.with_state_mut(|state| {
             ensure_debug_codex_instance(None, Some(managed_codex_port()), None, None)?;
-            refresh_live_account_state(state, true, true)?;
+            refresh_live_account_state(state, false, true)?;
             Ok(state
                 .snapshot
                 .last_message
@@ -642,7 +649,7 @@ fn run_manual_next(
             state.snapshot.current_plan = Some(live.plan_type);
         }
     }
-    refresh_quota_state(state, true);
+    refresh_quota_state(state, false);
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
     let output = match result {
         NextResult::Rotated { message, .. }
@@ -673,7 +680,7 @@ fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
             state.snapshot.current_plan = Some(live.plan_type);
         }
     }
-    refresh_quota_state(state, true);
+    refresh_quota_state(state, false);
     set_snapshot_message(
         &mut state.snapshot,
         SnapshotMessageKind::Status,
@@ -701,7 +708,7 @@ fn run_manual_create(
         progress,
     )?;
     refresh_static_snapshot(state);
-    refresh_quota_state(state, true);
+    refresh_quota_state(state, false);
     state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
     set_snapshot_message(
         &mut state.snapshot,
@@ -726,7 +733,7 @@ fn run_manual_relogin(
         progress,
     )?;
     refresh_static_snapshot(state);
-    refresh_quota_state(state, true);
+    refresh_quota_state(state, false);
     set_snapshot_message(
         &mut state.snapshot,
         SnapshotMessageKind::Status,
@@ -746,6 +753,19 @@ fn next_result_summary(result: &NextResult) -> Option<codex_rotate_core::auth::A
 fn refresh_static_snapshot(state: &mut DaemonState) {
     refresh_inventory_count(&mut state.snapshot);
     refresh_auth_summary(&mut state.snapshot);
+}
+
+fn hydrate_quota_cache_from_watch_state(state: &mut DaemonState) {
+    if state.quota_cache.is_some() {
+        return;
+    }
+    let Ok(watch_state) = read_watch_state() else {
+        return;
+    };
+    let Some(quota) = watch_state.quota.as_ref() else {
+        return;
+    };
+    set_quota_summary(state, quota);
 }
 
 fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
@@ -840,8 +860,11 @@ fn set_snapshot_message(
 }
 
 fn next_watch_interval(current_quota_percent: Option<u8>) -> Duration {
-    let _ = current_quota_percent;
-    Duration::from_secs(DEFAULT_INTERVAL_SECONDS)
+    let seconds = match current_quota_percent {
+        Some(percent) if percent > LOW_QUOTA_WATCH_THRESHOLD_PERCENT => HEALTHY_INTERVAL_SECONDS,
+        _ => RISKY_INTERVAL_SECONDS,
+    };
+    Duration::from_secs(seconds)
 }
 
 fn next_tick_label(interval: Duration) -> String {
@@ -978,7 +1001,12 @@ pub fn read_watch_state_file() -> Result<WatchState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_rotate_core::auth::{write_codex_auth, AuthTokens, CodexAuth};
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -990,6 +1018,60 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
+
+    fn make_test_auth(account_id: &str) -> CodexAuth {
+        CodexAuth {
+            auth_mode: "chatgpt".to_string(),
+            openai_api_key: None,
+            tokens: AuthTokens {
+                id_token: "id-token".to_string(),
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                account_id: account_id.to_string(),
+            },
+            last_refresh: "2026-04-08T00:00:00.000Z".to_string(),
+        }
+    }
+
+    fn spawn_quota_server(response_body: String) -> (String, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("quota listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking quota listener");
+        let address = listener.local_addr().expect("quota listener addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let request_count_thread = request_count.clone();
+        let stop_thread = stop.clone();
+        std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        request_count_thread.fetch_add(1, Ordering::SeqCst);
+                        let mut buffer = [0_u8; 1024];
+                        let _ = stream.read(&mut buffer);
+                        let body = response_body.as_bytes();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            response_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (
+            format!("http://127.0.0.1:{}/wham/usage", address.port()),
+            request_count,
+            stop,
+        )
     }
 
     #[test]
@@ -1071,11 +1153,138 @@ mod tests {
     }
 
     #[test]
-    fn next_watch_interval_never_drops_below_fifteen_seconds() {
+    fn next_watch_interval_adapts_between_healthy_and_risky_states() {
         assert_eq!(next_watch_interval(None), Duration::from_secs(15));
-        assert_eq!(next_watch_interval(Some(100)), Duration::from_secs(15));
+        assert_eq!(next_watch_interval(Some(100)), Duration::from_secs(30));
+        assert_eq!(next_watch_interval(Some(21)), Duration::from_secs(30));
         assert_eq!(next_watch_interval(Some(20)), Duration::from_secs(15));
         assert_eq!(next_watch_interval(Some(2)), Duration::from_secs(15));
         assert_eq!(next_watch_interval(Some(0)), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn initialize_runtime_reuses_fresh_watch_quota_cache_without_probe() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_wham = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        let body = r#"{"user_id":"user-1","account_id":"acct-123","email":"dev.audit@astronlab.com","plan_type":"free","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":40.0,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1775185200},"secondary_window":{"used_percent":0.0,"limit_window_seconds":604800,"reset_after_seconds":86400,"reset_at":1775271600}},"code_review_rate_limit":null,"additional_rate_limits":null,"credits":null,"promo":null}"#.to_string();
+        let (wham_url, request_count, stop_server) = spawn_quota_server(body);
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &wham_url);
+        }
+
+        write_codex_auth(&codex_home.join("auth.json"), &make_test_auth("acct-123"))
+            .expect("write auth");
+        crate::watch::write_watch_state(&crate::watch::WatchState {
+            quota: Some(CachedQuotaState {
+                account_id: "acct-123".to_string(),
+                fetched_at: "2026-04-08T08:00:00.000Z".to_string(),
+                next_refresh_at: "2099-04-08T08:30:00.000Z".to_string(),
+                summary: "5h 60% left".to_string(),
+                usable: true,
+                blocker: None,
+                primary_quota_left_percent: Some(60),
+                error: None,
+            }),
+            ..crate::watch::WatchState::default()
+        })
+        .expect("write watch state");
+
+        let daemon = SharedDaemon::new();
+        initialize_runtime(&daemon);
+
+        stop_server.store(true, Ordering::Relaxed);
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match previous_wham {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value)
+            },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE") },
+        }
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        let cached_summary = daemon
+            .with_state_mut(|state| Ok(state.snapshot.current_quota.clone()))
+            .expect("read daemon state");
+        assert_eq!(cached_summary.as_deref(), Some("5h 60% left"));
+    }
+
+    #[test]
+    fn refresh_quota_state_skips_probe_when_in_memory_cache_is_fresh() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_wham = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        let body = r#"{"user_id":"user-1","account_id":"acct-123","email":"dev.audit@astronlab.com","plan_type":"free","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":40.0,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1775185200},"secondary_window":{"used_percent":0.0,"limit_window_seconds":604800,"reset_after_seconds":86400,"reset_at":1775271600}},"code_review_rate_limit":null,"additional_rate_limits":null,"credits":null,"promo":null}"#.to_string();
+        let (wham_url, request_count, stop_server) = spawn_quota_server(body);
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &wham_url);
+        }
+
+        write_codex_auth(&codex_home.join("auth.json"), &make_test_auth("acct-123"))
+            .expect("write auth");
+
+        let mut state = DaemonState::new();
+        state.quota_cache = Some(CachedQuotaState {
+            account_id: "acct-123".to_string(),
+            fetched_at: "2026-04-08T08:00:00.000Z".to_string(),
+            next_refresh_at: "2099-04-08T08:30:00.000Z".to_string(),
+            summary: "5h 60% left".to_string(),
+            usable: true,
+            blocker: None,
+            primary_quota_left_percent: Some(60),
+            error: None,
+        });
+
+        refresh_quota_state(&mut state, false);
+
+        stop_server.store(true, Ordering::Relaxed);
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match previous_wham {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value)
+            },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE") },
+        }
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.snapshot.current_quota.as_deref(), Some("5h 60% left"));
     }
 }

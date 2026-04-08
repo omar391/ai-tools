@@ -16,8 +16,8 @@ use crate::auth::{
 };
 use crate::paths::resolve_paths;
 use crate::quota::{
-    describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota, UsageCredits,
-    UsageResponse, UsageWindow,
+    describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota,
+    quota_next_refresh_at, UsageCredits, UsageResponse, UsageWindow,
 };
 use crate::state::{load_rotate_state_json, write_rotate_state_json};
 use crate::workflow::{
@@ -521,8 +521,9 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         }
         return Ok(());
     }
-
-    dirty |= refresh_stale_list_quota_entries(&mut pool, &paths.codex_auth_file)?;
+    let refresh_order =
+        build_list_quota_refresh_order(&pool, Utc::now(), LIST_STALE_QUOTA_REFRESH_LIMIT);
+    let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
 
     let mut usable_count = 0;
     let mut exhausted_count = 0;
@@ -560,6 +561,11 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         if let Some(alias) = alias {
             output.push_line(format!("    {DIM}alias{RESET}  {}", alias))?;
         }
+        if refresh_indices.contains(&index) {
+            let inspection =
+                inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
+            dirty |= inspection.updated;
+        }
         let quota_line = format_cached_quota_line(&pool.accounts[index]);
         match pool.accounts[index].last_quota_usable {
             Some(true) => usable_count += 1,
@@ -591,21 +597,6 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     }
     output.push_line(String::new())?;
     Ok(())
-}
-
-fn refresh_stale_list_quota_entries(pool: &mut Pool, auth_path: &Path) -> Result<bool> {
-    let refresh_order =
-        build_list_quota_refresh_order(pool, Utc::now(), LIST_STALE_QUOTA_REFRESH_LIMIT);
-    let mut dirty = false;
-    for index in refresh_order {
-        let inspection = inspect_account(
-            &mut pool.accounts[index],
-            auth_path,
-            index == pool.active_index,
-        )?;
-        dirty |= inspection.updated;
-    }
-    Ok(dirty)
 }
 
 fn format_cached_quota_line(entry: &AccountEntry) -> String {
@@ -739,47 +730,6 @@ fn parse_compact_duration(value: &str) -> Option<Duration> {
         };
     }
     Some(Duration::seconds(seconds))
-}
-
-fn compute_quota_next_refresh_at(
-    inspection: &AccountInspection,
-    checked_at: DateTime<Utc>,
-) -> DateTime<Utc> {
-    if let Some(usage) = inspection.usage.as_ref() {
-        if has_usable_quota(usage) {
-            return checked_at + cached_quota_refresh_interval_from_usage(usage);
-        }
-        if let Some(primary_window) = usage
-            .rate_limit
-            .as_ref()
-            .and_then(|limits| limits.primary_window.as_ref())
-        {
-            if get_quota_left(Some(primary_window))
-                .map(|value| value <= 0.0)
-                .unwrap_or(false)
-                && primary_window.reset_after_seconds >= 0
-            {
-                return checked_at + Duration::seconds(primary_window.reset_after_seconds);
-            }
-        }
-    }
-    checked_at + Duration::seconds(15)
-}
-
-fn cached_quota_refresh_interval_from_usage(usage: &UsageResponse) -> Duration {
-    match get_quota_left(
-        usage
-            .rate_limit
-            .as_ref()
-            .and_then(|limits| limits.primary_window.as_ref()),
-    )
-    .map(|value| value.round() as u8)
-    .unwrap_or(0)
-    {
-        value if value > 20 => Duration::seconds(60),
-        value if value > 10 => Duration::seconds(30),
-        _ => Duration::seconds(15),
-    }
 }
 
 pub fn cmd_status() -> Result<String> {
@@ -1427,8 +1377,12 @@ fn apply_quota_inspection_to_account(
         )
         .map(|value| value.round() as u8)
     });
-    let next_refresh_at = compute_quota_next_refresh_at(inspection, checked_at_value)
-        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let next_refresh_at = quota_next_refresh_at(
+        inspection.usage.as_ref(),
+        inspection.error.as_deref(),
+        checked_at_value,
+    )
+    .to_rfc3339_opts(SecondsFormat::Millis, true);
     let next_blocker = inspection
         .usage
         .as_ref()
@@ -1916,6 +1870,7 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
     use std::time::{Duration as StdDuration, Instant};
 
@@ -1959,6 +1914,13 @@ mod tests {
     }
 
     fn spawn_usage_server(body: String) -> (String, thread::JoinHandle<()>) {
+        spawn_usage_server_with_delay(body, StdDuration::from_millis(0))
+    }
+
+    fn spawn_usage_server_with_delay(
+        body: String,
+        response_delay: StdDuration,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind usage server");
         listener
             .set_nonblocking(true)
@@ -1971,6 +1933,9 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let mut buffer = [0_u8; 4096];
                         let _ = stream.read(&mut buffer);
+                        if !response_delay.is_zero() {
+                            thread::sleep(response_delay);
+                        }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                             body.len(),
@@ -1993,6 +1958,32 @@ mod tests {
             }
         });
         (format!("http://{address}/usage"), handle)
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.buffer.lock().expect("writer mutex").clone())
+                .expect("utf8 output")
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("writer mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {
@@ -2276,6 +2267,95 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("list should refresh stale cached quota");
+    }
+
+    #[test]
+    fn cmd_list_stream_emits_account_lines_before_slow_quota_refresh_finishes() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut stale = stored_entry(Some(true), Some("2026-04-07T12:00:00.000Z"));
+            stale.email = "dev.61@astronlab.com".to_string();
+            stale.account_id = "acct-61".to_string();
+            stale.label = "dev.61@astronlab.com_free".to_string();
+            stale.auth = make_auth("dev.61@astronlab.com", "acct-61", "free");
+            stale.auth.tokens.account_id = "acct-61".to_string();
+            stale.last_quota_summary = Some("5h 99% left".to_string());
+            stale.last_quota_primary_left_percent = Some(99);
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![stale],
+            })?;
+
+            let (usage_url, handle) = spawn_usage_server_with_delay(
+                json!({
+                    "user_id": "user-61",
+                    "account_id": "acct-61",
+                    "email": "dev.61@astronlab.com",
+                    "plan_type": "free",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 80.0,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 3600,
+                            "reset_at": 0
+                        },
+                        "secondary_window": null
+                    },
+                    "code_review_rate_limit": null,
+                    "additional_rate_limits": null,
+                    "credits": null,
+                    "promo": null
+                })
+                .to_string(),
+                StdDuration::from_millis(400),
+            );
+            unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &usage_url);
+            }
+
+            let writer = SharedWriter::default();
+            let probe_writer = writer.clone();
+            let join = thread::spawn(move || {
+                let mut writer = writer;
+                cmd_list_stream(&mut writer)
+            });
+
+            thread::sleep(StdDuration::from_millis(100));
+            let partial = probe_writer.snapshot();
+            assert!(partial.contains("Codex OAuth Account Pool"));
+            assert!(partial.contains("dev.61@astronlab.com"));
+            assert!(!partial.contains("    \u{1b}[2mquota"));
+
+            join.join()
+                .expect("list stream thread")
+                .expect("list stream");
+            handle.join().expect("usage server should finish");
+
+            let final_output = probe_writer.snapshot();
+            assert!(final_output.contains("5h 20% left"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list stream should emit header before slow refresh completes");
     }
 
     #[test]
