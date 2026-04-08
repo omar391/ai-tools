@@ -340,6 +340,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codex-rotate-core",
+ "codex-rotate-refresh",
  "codex-rotate-runtime",
  "serde",
  "serde_json",
@@ -363,12 +364,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-rotate-refresh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "codex-rotate-core",
+ "dirs",
+ "tempfile",
+]
+
+[[package]]
 name = "codex-rotate-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "codex-rotate-core",
+ "codex-rotate-refresh",
  "dirs",
  "reqwest 0.12.28",
  "rusqlite",
@@ -383,6 +395,7 @@ name = "codex-rotate-tray"
 version = "1.0.0"
 dependencies = [
  "codex-rotate-core",
+ "codex-rotate-refresh",
  "codex-rotate-runtime",
  "serde",
  "serde_json",

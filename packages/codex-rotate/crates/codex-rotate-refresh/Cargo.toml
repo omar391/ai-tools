@@ -1,0 +1,12 @@
+[package]
+name = "codex-rotate-refresh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+codex-rotate-core = { path = "../codex-rotate-core" }
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

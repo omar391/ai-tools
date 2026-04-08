@@ -3,7 +3,6 @@ mod managed_login;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,15 +18,13 @@ use codex_rotate_core::workflow::{
     cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions, CreateCommandSource,
     ReloginOptions,
 };
-use codex_rotate_runtime::daemon::run_daemon_forever;
 #[cfg(not(target_os = "macos"))]
-use codex_rotate_runtime::dev_refresh::stop_running_trays;
-#[cfg(target_os = "macos")]
-use codex_rotate_runtime::dev_refresh::tray_service_pid;
-use codex_rotate_runtime::dev_refresh::{
-    clear_tray_service_registration, detect_local_tray_build, launch_tray_process,
-    local_tray_sources_newer_than_binary, rebuild_local_tray,
+use codex_rotate_refresh::stop_running_trays;
+use codex_rotate_refresh::{
+    clear_tray_service_registration, detect_local_build, launch_tray_process, rebuild_local_binary,
+    preferred_release_binary, sources_newer_than_binary, tray_service_pid, TargetKind,
 };
+use codex_rotate_runtime::daemon::run_daemon_forever;
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
     SnapshotMessageKind, StatusSnapshot,
@@ -299,6 +296,7 @@ fn tray_open_message() -> Result<String> {
     launch_tray_binary(&tray_binary)?;
 
     if wait_for_tray_state(&tray_binary, true) {
+        wait_for_stable_tray_after_open(&tray_binary)?;
         return Ok("Started Codex Rotate tray.".to_string());
     }
 
@@ -365,15 +363,15 @@ fn tray_is_running_with_path(tray_binary: &Path) -> Result<bool> {
 }
 
 fn refresh_local_tray_if_needed(tray_binary: &Path) -> Result<()> {
-    let Some(build) = detect_local_tray_build(tray_binary) else {
+    let Some(build) = detect_local_build(tray_binary, TargetKind::Tray) else {
         return Ok(());
     };
-    let sources_newer_than_binary = local_tray_sources_newer_than_binary(&build)?;
+    let sources_newer_than_binary = sources_newer_than_binary(&build)?;
     if !sources_newer_than_binary {
         return Ok(());
     }
 
-    rebuild_local_tray(&build)?;
+    rebuild_local_binary(&build)?;
     if tray_is_running_with_path(tray_binary)? {
         #[cfg(target_os = "macos")]
         clear_tray_service_registration();
@@ -392,6 +390,32 @@ fn launch_tray_binary(tray_binary: &Path) -> Result<()> {
     launch_tray_process(tray_binary)
 }
 
+#[cfg(target_os = "macos")]
+fn wait_for_stable_tray_after_open(tray_binary: &Path) -> Result<()> {
+    let Some(build) = detect_local_build(tray_binary, TargetKind::Tray) else {
+        return Ok(());
+    };
+    let Some(release_binary) = preferred_release_binary(&build)? else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if tray_service_matches_binary(&release_binary)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(anyhow!(
+        "Timed out waiting for Codex Rotate tray to settle on {}.",
+        release_binary.display()
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait_for_stable_tray_after_open(_tray_binary: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -401,6 +425,25 @@ fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
         }
     }
     tray_is_running_with_path(tray_binary).ok() == Some(running)
+}
+
+#[cfg(target_os = "macos")]
+fn tray_service_matches_binary(expected_binary: &Path) -> Result<bool> {
+    let Some(process_id) = tray_service_pid()? else {
+        return Ok(false);
+    };
+    let output = Command::new("ps")
+        .args(["-p", &process_id.to_string(), "-o", "command="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    Ok(command_matches_binary(&command, expected_binary))
+}
+
+fn command_matches_binary(command: &str, binary: &Path) -> bool {
+    command.split_whitespace().next().map(Path::new) == Some(binary)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -483,7 +526,7 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
 #[cfg(not(target_os = "macos"))]
 fn tray_binary_candidates(tray_binary: &Path) -> Vec<String> {
     let mut binaries = vec![tray_binary.display().to_string()];
-    let Some(build) = detect_local_tray_build(tray_binary) else {
+    let Some(build) = detect_local_build(tray_binary, TargetKind::Tray) else {
         return binaries;
     };
 
@@ -1047,6 +1090,17 @@ mod tests {
         let mut missing_text = StatusSnapshot::default();
         missing_text.last_message_kind = Some(SnapshotMessageKind::Progress);
         assert!(!snapshot_contains_progress(&missing_text));
+    }
+
+    #[test]
+    fn command_matches_binary_uses_first_token_only() {
+        let binary = Path::new("/tmp/codex-rotate-tray");
+        assert!(command_matches_binary("/tmp/codex-rotate-tray\n", binary));
+        assert!(command_matches_binary(
+            "/tmp/codex-rotate-tray --flag ignored",
+            binary
+        ));
+        assert!(!command_matches_binary("/tmp/other-tray", binary));
     }
 
     #[cfg(unix)]

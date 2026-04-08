@@ -1,9 +1,8 @@
-use codex_rotate_runtime::dev_refresh::{
-    current_process_local_tray_build, daemon_socket_is_older_than_binary, detect_local_cli_build,
-    local_cli_sources_newer_than_binary, local_refresh_disabled,
-    local_tray_sources_newer_than_binary, maybe_start_background_release_tray_build,
-    preferred_release_tray_binary, rebuild_local_cli, rebuild_local_tray,
-    schedule_tray_relaunch_process, spawn_detached_process, stop_running_daemons,
+use codex_rotate_refresh::{
+    current_process_local_build, daemon_socket_is_older_than_binary, detect_local_build,
+    local_refresh_disabled, maybe_start_background_release_build, preferred_release_binary,
+    rebuild_local_binary, schedule_tray_relaunch_process, sources_newer_than_binary,
+    spawn_detached_process, stop_running_daemons, TargetKind,
 };
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, subscribe, SnapshotMessageKind, StatusSnapshot,
@@ -148,7 +147,7 @@ pub fn resolve_cli_binary() -> Result<PathBuf, String> {
 
 pub fn ensure_daemon_running() -> Result<(), String> {
     let cli_binary = resolve_cli_binary()?;
-    let max_attempts = if detect_local_cli_build(&cli_binary).is_some() {
+    let max_attempts = if detect_local_build(&cli_binary, TargetKind::Cli).is_some() {
         LOCAL_BUILD_DAEMON_START_ATTEMPTS
     } else {
         DAEMON_START_ATTEMPTS
@@ -190,15 +189,15 @@ fn refresh_local_daemon_if_needed(
     if local_refresh_disabled() {
         return Ok(());
     }
-    let Some(build) = detect_local_cli_build(cli_binary) else {
+    let Some(build) = detect_local_build(cli_binary, TargetKind::Cli) else {
         return Ok(());
     };
     let daemon_socket = daemon_socket_path()
         .map_err(|error| format!("Failed to resolve daemon socket: {error}"))?;
-    let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)
+    let sources_newer_than_binary = sources_newer_than_binary(&build)
         .map_err(|error| format!("Failed to inspect local CLI freshness: {error}"))?;
     if sources_newer_than_binary {
-        rebuild_local_cli(&build)
+        rebuild_local_binary(&build)
             .map_err(|error| format!("Failed to rebuild local codex-rotate CLI: {error}"))?;
     }
     let binary_newer_than_running_daemon =
@@ -232,25 +231,25 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
     if local_refresh_disabled() {
         return Ok(false);
     }
-    let Some(build) = current_process_local_tray_build() else {
+    let Some(build) = current_process_local_build(TargetKind::Tray) else {
         return Ok(false);
     };
-    let sources_newer_than_binary = local_tray_sources_newer_than_binary(&build)
+    let sources_newer_than_binary = sources_newer_than_binary(&build)
         .map_err(|error| format!("Failed to inspect local tray freshness: {error}"))?;
     if sources_newer_than_binary {
         log_tray_info(format!(
             "Local tray sources changed. Rebuilding {}.",
-            build.tray_binary.display()
+            build.binary_path.display()
         ));
-        rebuild_local_tray(&build)
+        rebuild_local_binary(&build)
             .map_err(|error| format!("Failed to rebuild local codex-rotate tray: {error}"))?;
     }
-    if maybe_start_background_release_tray_build(&build)
+    if maybe_start_background_release_build(&build)
         .map_err(|error| format!("Failed to queue background release tray build: {error}"))?
     {
         log_tray_info("Queued background release build for codex-rotate-tray.");
     }
-    if let Some(release_binary) = preferred_release_tray_binary(&build)
+    if let Some(release_binary) = preferred_release_binary(&build)
         .map_err(|error| format!("Failed to inspect release tray freshness: {error}"))?
     {
         log_tray_info(format!(
@@ -266,7 +265,7 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
     }
 
     log_tray_info("Scheduling tray relaunch after rebuild.");
-    schedule_tray_relaunch(&build.tray_binary)
+    schedule_tray_relaunch(&build.binary_path)
         .map_err(|error| format!("Failed to relaunch local tray: {error}"))?;
     Ok(true)
 }

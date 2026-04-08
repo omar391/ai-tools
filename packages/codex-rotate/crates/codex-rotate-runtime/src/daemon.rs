@@ -10,25 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use chrono::{Duration as ChronoDuration, Local, Utc};
-use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
-use codex_rotate_core::pool::{
-    cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
-    rotate_next_internal_with_progress, NextResult,
-};
-use codex_rotate_core::quota::CachedQuotaState;
-use codex_rotate_core::workflow::{
-    cmd_create_with_progress, cmd_relogin_with_progress, migrate_legacy_credential_store_if_needed,
-    CreateCommandOptions, CreateCommandSource, ReloginOptions,
-};
-
-use crate::dev_refresh::{
-    current_process_local_cli_build, daemon_socket_is_older_than_binary,
-    ensure_tray_process_registered, local_cli_sources_newer_than_binary, local_refresh_disabled,
-    maybe_start_background_release_cli_build, preferred_release_cli_binary, rebuild_local_cli,
-    stop_other_local_daemons, INSTANCE_HOME_ENV,
-};
 use crate::hook::{
     read_live_account, read_live_account_if_running, switch_live_account_to_current_auth,
 };
@@ -41,6 +22,24 @@ use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
     read_watch_state, refresh_quota_cache, run_watch_iteration, WatchIterationOptions, WatchState,
+};
+use anyhow::{Context, Result};
+use chrono::{Duration as ChronoDuration, Local, Utc};
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
+use codex_rotate_core::pool::{
+    cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
+    rotate_next_internal_with_progress, NextResult,
+};
+use codex_rotate_core::quota::CachedQuotaState;
+use codex_rotate_core::workflow::{
+    cmd_create_with_progress, cmd_relogin_with_progress, migrate_legacy_credential_store_if_needed,
+    CreateCommandOptions, CreateCommandSource, ReloginOptions,
+};
+use codex_rotate_refresh::{
+    current_process_local_build, daemon_socket_is_older_than_binary,
+    ensure_tray_process_registered, local_refresh_disabled, maybe_start_background_release_build,
+    preferred_release_binary, rebuild_local_binary, sources_newer_than_binary,
+    stop_other_local_daemons, TargetKind, INSTANCE_HOME_ENV,
 };
 
 const DEFAULT_PORT: u16 = 9333;
@@ -168,7 +167,7 @@ pub fn run_daemon_forever() -> Result<()> {
             "Daemon listening on {}.",
             paths.daemon_socket.display()
         ));
-        if let Some(build) = current_process_local_cli_build() {
+        if let Some(build) = current_process_local_build(TargetKind::Cli) {
             let instance_home = paths.rotate_home.to_string_lossy().into_owned();
             if let Err(error) = stop_other_local_daemons(
                 &build,
@@ -418,23 +417,23 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
     if daemon.is_some_and(SharedDaemon::has_in_flight_invocations) {
         return Ok(false);
     }
-    let Some(build) = current_process_local_cli_build() else {
+    let Some(build) = current_process_local_build(TargetKind::Cli) else {
         return Ok(false);
     };
     let instance_home = resolve_paths()?.rotate_home;
     let daemon_socket = crate::ipc::daemon_socket_path()?;
-    let sources_newer_than_binary = local_cli_sources_newer_than_binary(&build)?;
+    let sources_newer_than_binary = sources_newer_than_binary(&build)?;
     if sources_newer_than_binary {
         log_daemon_info(format!(
             "Local CLI/runtime sources changed. Rebuilding {}.",
-            build.cli_binary.display()
+            build.binary_path.display()
         ));
-        rebuild_local_cli(&build)?;
+        rebuild_local_binary(&build)?;
     }
-    if maybe_start_background_release_cli_build(&build)? {
+    if maybe_start_background_release_build(&build)? {
         log_daemon_info("Queued background release build for codex-rotate.");
     }
-    if let Some(release_binary) = preferred_release_cli_binary(&build)? {
+    if let Some(release_binary) = preferred_release_binary(&build)? {
         log_daemon_info(format!(
             "Promoting daemon to release binary {}.",
             release_binary.display()
@@ -456,16 +455,16 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
         return Ok(true);
     }
     let binary_newer_than_running_socket =
-        daemon_socket_is_older_than_binary(&daemon_socket, &build.cli_binary)?;
+        daemon_socket_is_older_than_binary(&daemon_socket, &build.binary_path)?;
     if !sources_newer_than_binary && !binary_newer_than_running_socket {
         return Ok(false);
     }
     log_daemon_info(format!(
         "Refreshing daemon with rebuilt binary {}.",
-        build.cli_binary.display()
+        build.binary_path.display()
     ));
 
-    Command::new(&build.cli_binary)
+    Command::new(&build.binary_path)
         .arg("daemon")
         .env(DAEMON_TAKEOVER_ENV, "1")
         .env(INSTANCE_HOME_ENV, &instance_home)
@@ -476,7 +475,7 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
         .with_context(|| {
             format!(
                 "Failed to relaunch {} after rebuilding the local daemon.",
-                build.cli_binary.display()
+                build.binary_path.display()
             )
         })?;
     Ok(true)

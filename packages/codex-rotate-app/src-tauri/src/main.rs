@@ -1,4 +1,4 @@
-use codex_rotate_runtime::dev_refresh::clear_tray_service_registration;
+use codex_rotate_refresh::clear_tray_service_registration;
 use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
 use codex_rotate_tray::{
