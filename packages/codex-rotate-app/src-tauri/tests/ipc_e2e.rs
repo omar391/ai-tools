@@ -97,7 +97,7 @@ fn write_cli_wrapper(
     pid_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"daemon\" ] && [ \"${{2-}}\" = \"run\" ]; then\n  {cli} \"$@\" &\n  echo $! > {pid}\n  wait $!\nelse\n  exec {cli} \"$@\"\nfi\n",
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"daemon\" ]; then\n  echo $$ > {pid}\nfi\nexec {cli} \"$@\"\n",
         cli = shell_quote(cli_binary),
         pid = shell_quote(pid_file),
     );
@@ -270,15 +270,20 @@ impl Drop for DummyCdpServer {
     }
 }
 
-fn kill_daemon_from_pid_file(pid_file: &Path) {
+fn kill_daemon_from_pid_file(pid_file: &Path) -> bool {
     let Ok(raw_pid) = fs::read_to_string(pid_file) else {
-        return;
+        return false;
     };
     let pid = raw_pid.trim();
     if pid.is_empty() {
-        return;
+        return false;
     }
-    let _ = Command::new("kill").arg("-TERM").arg(pid).status();
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(pid)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[test]
@@ -301,8 +306,10 @@ fn tray_shell_launches_real_daemon_binary() -> Result<(), Box<dyn std::error::Er
     ensure_daemon_running()?;
     wait_for(Duration::from_secs(10), daemon_is_reachable)?;
     assert!(rotate_home.join("daemon.sock").exists());
+    wait_for(Duration::from_secs(5), || pid_file.exists())?;
 
-    kill_daemon_from_pid_file(&pid_file);
+    assert!(kill_daemon_from_pid_file(&pid_file));
+    wait_for(Duration::from_secs(10), || !daemon_is_reachable())?;
     fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
@@ -339,6 +346,7 @@ fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
     )?;
     assert_eq!(first.capabilities, RuntimeCapabilities::current());
     wait_for(Duration::from_secs(10), daemon_is_reachable)?;
+    wait_for(Duration::from_secs(5), || pid_file.exists())?;
 
     let _ = invoke(InvokeAction::List)?;
     let second = recv_snapshot_with_capabilities(
@@ -352,7 +360,8 @@ fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
     let _ = invoke(InvokeAction::Status);
     handle.join().expect("join tray subscription loop");
 
-    kill_daemon_from_pid_file(&pid_file);
+    assert!(kill_daemon_from_pid_file(&pid_file));
+    wait_for(Duration::from_secs(10), || !daemon_is_reachable())?;
     fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
