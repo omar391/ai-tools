@@ -1,7 +1,8 @@
 use codex_rotate_runtime::dev_refresh::{
     current_process_local_tray_build, daemon_socket_is_older_than_binary, detect_local_cli_build,
-    local_cli_sources_newer_than_binary, local_tray_sources_newer_than_binary, rebuild_local_cli,
-    rebuild_local_tray, maybe_start_background_release_tray_build,
+    local_cli_sources_newer_than_binary, local_refresh_disabled,
+    local_tray_sources_newer_than_binary, rebuild_local_cli, rebuild_local_tray,
+    maybe_start_background_release_tray_build,
     preferred_release_tray_binary, schedule_tray_relaunch_process, spawn_detached_process,
     stop_running_daemons,
 };
@@ -178,11 +179,7 @@ fn refresh_local_daemon_if_needed(
     poll_interval: Duration,
     max_attempts: usize,
 ) -> Result<(), String> {
-    if std::env::var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH")
-        .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-    {
+    if local_refresh_disabled() {
         return Ok(());
     }
     let Some(build) = detect_local_cli_build(cli_binary) else {
@@ -224,11 +221,7 @@ fn wait_for_daemon_state(reachable: bool, poll_interval: Duration, max_attempts:
 }
 
 pub fn maybe_refresh_current_tray() -> Result<bool, String> {
-    if std::env::var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH")
-        .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-    {
+    if local_refresh_disabled() {
         return Ok(false);
     }
     let Some(build) = current_process_local_tray_build() else {

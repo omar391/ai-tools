@@ -12,7 +12,7 @@
     "dist",
     "automation.ts",
     "automation-bridge.ts",
-    "codex-login-managed-browser-opener.mjs"
+    "codex-login-managed-browser-opener.ts"
   ],
   "engines": {
     "node": ">=22.6.0"

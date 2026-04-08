@@ -2,22 +2,18 @@
 
 import { readFileSync } from "node:fs";
 import type {
-  CodexRotateAuthFlowSummary,
   CodexRotateSecretLocator,
+  CodexRotateAuthFlowSession,
   CodexRotateSecretRef,
 } from "./automation.ts";
 import {
-  completeCodexLoginViaWorkflow,
+  completeCodexLoginViaWorkflowAttempt,
   deleteBitwardenCliAccountSecretRef,
-  inspectManagedProfiles,
   prepareBitwardenCliAccountSecretRef,
+  resetManagedProfileRuntime,
 } from "./automation.ts";
 
 type BridgeRequest =
-  | {
-      command: "inspect-managed-profiles";
-      payload?: Record<string, never> | null;
-    }
   | {
       command: "prepare-account-secret-ref";
       payload: { profileName: string; email: string; password: string };
@@ -27,7 +23,11 @@ type BridgeRequest =
       payload: { profileName: string; email: string };
     }
   | {
-      command: "complete-codex-login";
+      command: "reset-managed-runtime";
+      payload: { profileName: string; socketPath?: string | null };
+    }
+  | {
+      command: "complete-codex-login-attempt";
       payload: {
         profileName: string;
         email: string;
@@ -36,7 +36,6 @@ type BridgeRequest =
         accountLoginEnvVarValue?: string | null;
         options?: {
           codexBin?: string;
-          workflowFile?: string;
           workflowRef?: string;
           workflowRunStamp?: string;
           preferSignupRecovery?: boolean;
@@ -44,10 +43,8 @@ type BridgeRequest =
           birthMonth?: number;
           birthDay?: number;
           birthYear?: number;
-          maxAttempts?: number;
-          maxReplayPasses?: number;
-          retryDelaysMs?: number[];
           skipLocatorPreflight?: boolean;
+          codexSession?: CodexRotateAuthFlowSession | null;
         };
       };
     };
@@ -111,8 +108,6 @@ async function withTemporaryEnvVar<T>(
 
 async function handleRequest(request: BridgeRequest): Promise<unknown> {
   switch (request.command) {
-    case "inspect-managed-profiles":
-      return inspectManagedProfiles();
     case "prepare-account-secret-ref":
       return await prepareBitwardenCliAccountSecretRef(
         request.payload.profileName,
@@ -124,23 +119,25 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.profileName,
         request.payload.email,
       );
-    case "complete-codex-login":
+    case "reset-managed-runtime":
+      await resetManagedProfileRuntime(
+        request.payload.profileName,
+        request.payload.socketPath ?? null,
+      );
+      return { ok: true };
+    case "complete-codex-login-attempt":
       return await withTemporaryEnvVar(
         request.payload.accountLoginEnvVarName ?? null,
         request.payload.accountLoginEnvVarValue ?? null,
         async () =>
-          (await completeCodexLoginViaWorkflow(
+          (await completeCodexLoginViaWorkflowAttempt(
             request.payload.profileName,
             request.payload.email,
             request.payload.accountLoginLocator ?? null,
             {
               ...request.payload.options,
-              onNote: (message) => {
-                process.stderr.write(`[codex-rotate] ${message}\n`);
-              },
-              restoreState: null,
             },
-          )) as CodexRotateAuthFlowSummary,
+          )) as unknown,
       );
     default: {
       const label =

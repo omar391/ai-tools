@@ -3,6 +3,7 @@ mod managed_login;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use codex_rotate_core::pool::{
     cmd_add, cmd_list_stream, cmd_next_with_progress, cmd_prev, cmd_remove, cmd_status_stream,
 };
@@ -21,12 +22,17 @@ use codex_rotate_core::workflow::{
 use codex_rotate_runtime::daemon::run_daemon_forever;
 use codex_rotate_runtime::dev_refresh::{
     clear_tray_service_registration, detect_local_tray_build, launch_tray_process,
-    local_tray_sources_newer_than_binary, rebuild_local_tray, stop_running_trays,
+    local_tray_sources_newer_than_binary, rebuild_local_tray,
 };
+#[cfg(target_os = "macos")]
+use codex_rotate_runtime::dev_refresh::tray_service_pid;
+#[cfg(not(target_os = "macos"))]
+use codex_rotate_runtime::dev_refresh::stop_running_trays;
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
+    SnapshotMessageKind, StatusSnapshot,
 };
-use managed_login::run_managed_login;
+use managed_login::{run_managed_browser_wrapper, run_managed_login};
 
 const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[36m";
@@ -170,12 +176,12 @@ impl DaemonProgressPrinter {
             let Some(snapshot) = snapshot else {
                 continue;
             };
+            if !snapshot_contains_progress(&snapshot) {
+                continue;
+            }
             let Some(message) = snapshot.last_message else {
                 continue;
             };
-            if !should_print_daemon_progress_message(&message) {
-                continue;
-            }
             if last_printed.as_deref() == Some(message.as_str()) {
                 continue;
             }
@@ -197,18 +203,9 @@ impl DaemonProgressPrinter {
     }
 }
 
-fn should_print_daemon_progress_message(message: &str) -> bool {
-    let trimmed = message.trim();
-    trimmed.starts_with("[fast-browser]")
-        || trimmed.starts_with("Creating ")
-        || trimmed.starts_with("Preparing ")
-        || trimmed.starts_with("Starting managed login")
-        || trimmed.starts_with("Found a stored ")
-        || trimmed.starts_with("Using a freshly generated ")
-        || trimmed.starts_with("Completing Codex login")
-        || trimmed.starts_with("OpenAI verification is not ready")
-        || trimmed.starts_with("Retrying Codex login")
-        || trimmed.starts_with("Saving password secret")
+fn snapshot_contains_progress(snapshot: &StatusSnapshot) -> bool {
+    snapshot.last_message_kind == Some(SnapshotMessageKind::Progress)
+        && snapshot.last_message.is_some()
 }
 
 fn command_streams_progress(command: Option<&str>) -> bool {
@@ -240,6 +237,7 @@ fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
 fn run_internal_command(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("managed-login") => run_managed_login(&args[1..]),
+        Some("managed-browser-wrapper") => run_managed_browser_wrapper(&args[1..]),
         Some(other) => Err(anyhow!("Unknown internal command: \"{other}\".")),
         None => Err(anyhow!("Usage: codex-rotate internal <subcommand>")),
     }
@@ -284,8 +282,9 @@ fn tray_open_message() -> Result<String> {
         if daemon_is_reachable() {
             return Ok("Codex Rotate tray is already running.".to_string());
         }
-        stop_running_trays(&tray_binary)?;
         clear_tray_service_registration();
+        #[cfg(not(target_os = "macos"))]
+        stop_running_trays(&tray_binary)?;
         if !wait_for_tray_state(&tray_binary, false) {
             return Err(anyhow!(
                 "Timed out waiting for the unhealthy Codex Rotate tray to stop."
@@ -306,6 +305,23 @@ fn tray_open_message() -> Result<String> {
 
 fn tray_quit_message() -> Result<String> {
     let tray_binary = resolve_tray_binary()?;
+    #[cfg(target_os = "macos")]
+    {
+        if !tray_is_running_with_path(&tray_binary)? {
+            clear_tray_service_registration();
+            return Ok("Codex Rotate tray is not running.".to_string());
+        }
+        clear_tray_service_registration();
+        if wait_for_tray_state(&tray_binary, false) {
+            return Ok("Stopped Codex Rotate tray.".to_string());
+        }
+        return Err(anyhow!(
+            "Timed out waiting for the Codex Rotate tray to stop."
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
     let process_ids = list_running_tray_process_ids(&tray_binary)?;
     if process_ids.is_empty() {
         clear_tray_service_registration();
@@ -325,6 +341,7 @@ fn tray_quit_message() -> Result<String> {
     Err(anyhow!(
         "Timed out waiting for the Codex Rotate tray to stop."
     ))
+    }
 }
 
 fn tray_is_running() -> Result<bool> {
@@ -333,6 +350,13 @@ fn tray_is_running() -> Result<bool> {
 }
 
 fn tray_is_running_with_path(tray_binary: &Path) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tray_binary;
+        return Ok(tray_service_pid()?.is_some());
+    }
+
+    #[cfg(not(target_os = "macos"))]
     Ok(!list_running_tray_process_ids(tray_binary)?.is_empty())
 }
 
@@ -347,6 +371,9 @@ fn refresh_local_tray_if_needed(tray_binary: &Path) -> Result<()> {
 
     rebuild_local_tray(&build)?;
     if tray_is_running_with_path(tray_binary)? {
+        #[cfg(target_os = "macos")]
+        clear_tray_service_registration();
+        #[cfg(not(target_os = "macos"))]
         stop_running_trays(tray_binary)?;
         if !wait_for_tray_state(tray_binary, false) {
             return Err(anyhow!(
@@ -372,6 +399,7 @@ fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
     tray_is_running_with_path(tray_binary).ok() == Some(running)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
     let tray_binaries = tray_binary_candidates(tray_binary);
 
@@ -448,6 +476,7 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn tray_binary_candidates(tray_binary: &Path) -> Vec<String> {
     let mut binaries = vec![tray_binary.display().to_string()];
     let Some(build) = detect_local_tray_build(tray_binary) else {
@@ -469,10 +498,12 @@ fn tray_binary_candidates(tray_binary: &Path) -> Vec<String> {
     binaries
 }
 
+#[cfg(not(target_os = "macos"))]
 fn command_tokens_match_binary(first: Option<&str>, second: Option<&str>, binary: &str) -> bool {
     first == Some(binary) || (shell_like_command(first) && second == Some(binary))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn shell_like_command(command: Option<&str>) -> bool {
     let Some(command) = command else {
         return false;
@@ -486,6 +517,7 @@ fn shell_like_command(command: Option<&str>) -> bool {
     matches!(name, "sh" | "bash" | "zsh" | "dash")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn stop_process(process_id: u32) -> Result<()> {
     #[cfg(windows)]
     {
@@ -512,6 +544,7 @@ fn stop_process(process_id: u32) -> Result<()> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_process_id(raw: &str) -> Option<u32> {
     raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
 }
@@ -782,7 +815,7 @@ mod tests {
     }
 
     fn with_rotate_home<T>(test: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let rotate_home = unique_temp_dir("codex-rotate-cli-tests");
         fs::create_dir_all(&rotate_home).expect("create rotate home");
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
@@ -813,20 +846,36 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
         let response_output = response_output.to_string();
         thread::spawn(move || -> Result<ClientRequest> {
-            let (_probe_stream, _) = listener.accept().context("accept probe")?;
-            let (mut stream, _) = listener.accept().context("accept request")?;
-            let mut reader = BufReader::new(stream.try_clone()?);
-            let request = read_request(&mut reader)?;
-            write_message(
-                &mut stream,
-                &ServerMessage::Result {
-                    ok: true,
-                    output: Some(response_output),
-                    error: None,
-                },
-            )?;
-            fs::remove_file(&socket_path).ok();
-            Ok(request)
+            loop {
+                let (mut stream, _) = listener.accept().context("accept request")?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let request = match read_request(&mut reader) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                match request {
+                    ClientRequest::Subscribe => {
+                        write_message(
+                            &mut stream,
+                            &ServerMessage::Snapshot {
+                                snapshot: StatusSnapshot::default(),
+                            },
+                        )?;
+                    }
+                    ClientRequest::Invoke { .. } => {
+                        write_message(
+                            &mut stream,
+                            &ServerMessage::Result {
+                                ok: true,
+                                output: Some(response_output),
+                                error: None,
+                            },
+                        )?;
+                        fs::remove_file(&socket_path).ok();
+                        return Ok(request);
+                    }
+                }
+            }
         })
     }
 
@@ -914,17 +963,20 @@ mod tests {
     }
 
     #[test]
-    fn daemon_progress_filter_only_prints_real_progress_lines() {
-        assert!(should_print_daemon_progress_message(
-            "[fast-browser] 2026-04-08T00:00:00Z step: ..."
-        ));
-        assert!(should_print_daemon_progress_message(
-            "Starting managed login for dev.43@astronlab.com."
-        ));
-        assert!(!should_print_daemon_progress_message("watch healthy"));
-        assert!(!should_print_daemon_progress_message(
-            "\u{1b}[32mROTATE\u{1b}[0m dev.44 -> dev.45"
-        ));
+    fn daemon_progress_stream_uses_explicit_message_kind() {
+        let mut progress = StatusSnapshot::default();
+        progress.last_message = Some("[fast-browser] 2026-04-08T00:00:00Z step: ...".to_string());
+        progress.last_message_kind = Some(SnapshotMessageKind::Progress);
+        assert!(snapshot_contains_progress(&progress));
+
+        let mut status = StatusSnapshot::default();
+        status.last_message = Some("watch healthy".to_string());
+        status.last_message_kind = Some(SnapshotMessageKind::Status);
+        assert!(!snapshot_contains_progress(&status));
+
+        let mut missing_text = StatusSnapshot::default();
+        missing_text.last_message_kind = Some(SnapshotMessageKind::Progress);
+        assert!(!snapshot_contains_progress(&missing_text));
     }
 
     #[cfg(unix)]

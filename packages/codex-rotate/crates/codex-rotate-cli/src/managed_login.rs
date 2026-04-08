@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
+use codex_rotate_core::managed_browser::ensure_managed_browser_wrapper;
 use serde_json::{json, Value};
 
 const CLIENT_NAME: &str = "codex-rotate-managed-login";
@@ -59,6 +60,26 @@ pub fn run_managed_login(args: &[String]) -> Result<()> {
     completion?;
     close_result?;
     eprintln!("Successfully logged in");
+    Ok(())
+}
+
+pub fn run_managed_browser_wrapper(args: &[String]) -> Result<()> {
+    let profile_name = args
+        .first()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("Usage: codex-rotate internal managed-browser-wrapper <profile> <codex-bin>")
+        })?;
+    let codex_bin = args
+        .get(1)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("Usage: codex-rotate internal managed-browser-wrapper <profile> <codex-bin>")
+        })?;
+    let wrapper_path = ensure_managed_browser_wrapper(profile_name, codex_bin)?;
+    println!("{}", wrapper_path.display());
     Ok(())
 }
 

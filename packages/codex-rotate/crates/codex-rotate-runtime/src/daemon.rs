@@ -33,7 +33,7 @@ use crate::dev_refresh::{
 use crate::hook::{read_live_account, read_live_account_if_running, switch_live_account_to_current_auth};
 use crate::ipc::{
     read_request, write_message, ClientRequest, CreateInvocation, InvokeAction,
-    RuntimeCapabilities, ServerMessage, StatusSnapshot,
+    RuntimeCapabilities, ServerMessage, SnapshotMessageKind, StatusSnapshot,
 };
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
@@ -334,7 +334,11 @@ impl SharedDaemon {
         log_daemon_error(&message);
         let snapshot = {
             let mut state = self.state.lock().expect("daemon state mutex");
-            state.snapshot.last_message = Some(message);
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Error,
+                message,
+            );
             state.snapshot.next_tick_at = None;
             state.snapshot.clone()
         };
@@ -344,7 +348,7 @@ impl SharedDaemon {
     fn set_progress_message(&self, message: String) {
         log_daemon_info(&message);
         let mut snapshot = self.snapshot();
-        snapshot.last_message = Some(message);
+        set_snapshot_message(&mut snapshot, SnapshotMessageKind::Progress, message);
         snapshot.next_tick_at = None;
         self.publish_snapshot(snapshot);
     }
@@ -507,7 +511,11 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
         InvokeAction::Add { alias } => daemon.with_state_mut(|state| {
             let output = cmd_add(alias.as_deref())?;
             refresh_static_snapshot(state);
-            state.snapshot.last_message = Some(first_line(&output));
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Status,
+                first_line(&output),
+            );
             Ok(output)
         }),
         InvokeAction::Next => {
@@ -532,7 +540,11 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
         InvokeAction::Remove { selector } => daemon.with_state_mut(|state| {
             let output = cmd_remove(&selector)?;
             refresh_static_snapshot(state);
-            state.snapshot.last_message = Some(first_line(&output));
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Status,
+                first_line(&output),
+            );
             Ok(output)
         }),
         InvokeAction::Refresh => daemon.with_state_mut(|state| {
@@ -593,18 +605,30 @@ fn run_watch_check(
             state.snapshot.last_rotation_to_email = Some(rotation.email.clone());
         }
         state.snapshot.last_rotation_reason = result.decision.reason.clone();
-        state.snapshot.last_message = Some(format!(
-            "rotated: {}",
-            result
-                .decision
-                .reason
-                .clone()
-                .unwrap_or_else(|| "quota exhausted".to_string())
-        ));
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            format!(
+                "rotated: {}",
+                result
+                    .decision
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "quota exhausted".to_string())
+            ),
+        );
     } else if let Some(error) = result.decision.assessment_error.as_deref() {
-        state.snapshot.last_message = Some(format!("quota probe failed: {}", error));
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Error,
+            format!("quota probe failed: {}", error),
+        );
     } else {
-        state.snapshot.last_message = Some("watch healthy".to_string());
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            "watch healthy",
+        );
     }
     Ok(())
 }
@@ -636,7 +660,11 @@ fn run_manual_next(
             output: message, ..
         } => message,
     };
-    state.snapshot.last_message = Some(first_line(&output));
+    set_snapshot_message(
+        &mut state.snapshot,
+        SnapshotMessageKind::Status,
+        first_line(&output),
+    );
     Ok(output)
 }
 
@@ -655,7 +683,11 @@ fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
         }
     }
     refresh_quota_state(state, true);
-    state.snapshot.last_message = Some(first_line(&output));
+    set_snapshot_message(
+        &mut state.snapshot,
+        SnapshotMessageKind::Status,
+        first_line(&output),
+    );
     Ok(output)
 }
 
@@ -677,7 +709,11 @@ fn run_manual_create(
     refresh_static_snapshot(state);
     refresh_quota_state(state, true);
     state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
-    state.snapshot.last_message = Some(first_line(&output));
+    set_snapshot_message(
+        &mut state.snapshot,
+        SnapshotMessageKind::Status,
+        first_line(&output),
+    );
     Ok(output)
 }
 
@@ -697,7 +733,11 @@ fn run_manual_relogin(
     )?;
     refresh_static_snapshot(state);
     refresh_quota_state(state, true);
-    state.snapshot.last_message = Some(first_line(&output));
+    set_snapshot_message(
+        &mut state.snapshot,
+        SnapshotMessageKind::Status,
+        first_line(&output),
+    );
     Ok(output)
 }
 
@@ -762,7 +802,9 @@ fn refresh_live_account_state(
     }
     refresh_quota_state(state, force_quota_refresh);
     if state.snapshot.last_message.is_none() {
-        state.snapshot.last_message = Some(
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
             if launch_if_needed {
                 "launcher ready".to_string()
             } else {
@@ -777,7 +819,11 @@ fn refresh_quota_state(state: &mut DaemonState, force_refresh: bool) {
     match refresh_quota_cache(force_refresh, state.quota_cache.as_ref()) {
         Ok(quota) => set_quota_summary(state, &quota),
         Err(error) => {
-            state.snapshot.last_message = Some(format!("quota refresh failed: {}", error));
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Error,
+                format!("quota refresh failed: {}", error),
+            );
         }
     }
 }
@@ -786,6 +832,15 @@ fn set_quota_summary(state: &mut DaemonState, quota: &CachedQuotaState) {
     state.snapshot.current_quota = Some(quota.summary.clone());
     state.snapshot.current_quota_percent = quota.primary_quota_left_percent;
     state.quota_cache = Some(quota.clone());
+}
+
+fn set_snapshot_message(
+    snapshot: &mut StatusSnapshot,
+    kind: SnapshotMessageKind,
+    message: impl Into<String>,
+) {
+    snapshot.last_message = Some(message.into());
+    snapshot.last_message_kind = Some(kind);
 }
 
 fn next_watch_interval(current_quota_percent: Option<u8>) -> Duration {
@@ -859,16 +914,26 @@ fn move_if_missing(from: &std::path::Path, to: &std::path::Path, is_file: bool) 
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}.", parent.display()))?;
     }
-    fs::rename(from, to).or_else(|_| {
+    if let Err(rename_error) = fs::rename(from, to) {
+        if to.exists() && !from.exists() {
+            return Ok(());
+        }
         if is_file {
-            fs::copy(from, to).with_context(|| format!("Failed to copy {}.", from.display()))?;
+            fs::copy(from, to).with_context(|| {
+                format!(
+                    "Failed to copy {} after rename fallback ({rename_error}).",
+                    from.display()
+                )
+            })?;
             fs::remove_file(from).with_context(|| format!("Failed to remove {}.", from.display()))
         } else {
             copy_dir_recursive(from, to)?;
             fs::remove_dir_all(from)
                 .with_context(|| format!("Failed to remove {}.", from.display()))
         }
-    })
+    } else {
+        Ok(())
+    }
 }
 
 fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
@@ -926,7 +991,7 @@ mod tests {
 
     #[test]
     fn migrates_legacy_tray_home_into_rotate_home() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fake_home = unique_temp_dir("codex-rotate-home");
         let rotate_home = fake_home.join(".codex-rotate");
         let legacy_home = fake_home.join(".codex-rotate-app");
@@ -971,7 +1036,7 @@ mod tests {
 
     #[test]
     fn takeover_child_skips_local_daemon_refresh() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let previous_takeover = std::env::var_os(DAEMON_TAKEOVER_ENV);
 
         unsafe {

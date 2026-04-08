@@ -19,6 +19,7 @@ use crate::auth::{
 use crate::bridge::{
     run_automation_bridge, run_automation_bridge_with_progress, AutomationProgressCallback,
 };
+use crate::managed_browser::ensure_managed_browser_wrapper;
 use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::pool::{
     cmd_add, find_next_usable_account, format_account_summary_for_display, inspect_account,
@@ -38,10 +39,21 @@ const DEFAULT_OPENAI_BIRTH_MONTH: u8 = 1;
 const DEFAULT_OPENAI_BIRTH_DAY: u8 = 24;
 const DEFAULT_OPENAI_BIRTH_YEAR: u16 = 1990;
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
+const DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID: &str =
+    "workspace.web.auth-openai-com.codex-rotate-account-flow-main";
 const CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR: &str = "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD";
 const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS: usize = 6;
+const DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES: usize = 5;
+const DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS: &[u64] = &[15_000, 30_000, 60_000, 120_000, 240_000];
+const DEFAULT_CODEX_LOGIN_VERIFICATION_RETRY_DELAYS_MS: &[u64] =
+    &[5_000, 10_000, 20_000, 30_000, 60_000];
+const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS: &[u64] =
+    &[8_000, 15_000, 30_000, 60_000, 120_000];
+const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS: &[u64] =
+    &[30_000, 60_000, 120_000, 240_000, 300_000];
 const AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT: &str =
     "Automatic account creation stopped retrying because a reusable account is now available.";
 
@@ -173,6 +185,74 @@ enum CodexRotateSecretLocator {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct CodexRotateAuthFlowSession {
+    auth_url: Option<String>,
+    callback_url: Option<String>,
+    callback_port: Option<u16>,
+    device_code: Option<String>,
+    session_dir: Option<String>,
+    codex_home_path: Option<String>,
+    auth_file_path: Option<String>,
+    pid: Option<u32>,
+    stdout_path: Option<String>,
+    stderr_path: Option<String>,
+    exit_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct CodexRotateAuthFlowSummary {
+    stage: Option<String>,
+    current_url: Option<String>,
+    headline: Option<String>,
+    callback_complete: Option<bool>,
+    success: Option<bool>,
+    account_ready: Option<bool>,
+    needs_email_verification: Option<bool>,
+    follow_up_step: Option<bool>,
+    add_phone_prompt: Option<bool>,
+    retryable_timeout: Option<bool>,
+    session_ended: Option<bool>,
+    existing_account_prompt: Option<bool>,
+    username_not_found: Option<bool>,
+    invalid_credentials: Option<bool>,
+    rate_limit_exceeded: Option<bool>,
+    anti_bot_gate: Option<bool>,
+    auth_prompt: Option<bool>,
+    consent_blocked: Option<bool>,
+    consent_error: Option<String>,
+    next_action: Option<String>,
+    replay_reason: Option<String>,
+    retry_reason: Option<String>,
+    error_message: Option<String>,
+    codex_session: Option<CodexRotateAuthFlowSession>,
+    codex_login_exit_ok: Option<bool>,
+    codex_login_exit_code: Option<i32>,
+    codex_login_stdout_tail: Option<String>,
+    codex_login_stderr_tail: Option<String>,
+    saw_oauth_consent: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+struct FastBrowserStepState {
+    #[serde(default)]
+    action: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+struct FastBrowserState {
+    #[serde(default)]
+    steps: HashMap<String, FastBrowserStepState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+struct FastBrowserRunResult {
+    #[serde(default)]
+    state: Option<FastBrowserState>,
+    #[serde(default)]
+    output: Option<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CredentialStore {
     pub version: u8,
@@ -259,11 +339,17 @@ struct BridgeDeleteSecretPayload<'a> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BridgeResetManagedRuntimePayload<'a> {
+    profile_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket_path: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_bin: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workflow_file: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_ref: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,11 +366,13 @@ struct BridgeLoginOptions<'a> {
     birth_day: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     birth_year: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_session: Option<&'a CodexRotateAuthFlowSession>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BridgeCompleteLoginPayload<'a> {
+struct BridgeCompleteLoginAttemptPayload<'a> {
     profile_name: &'a str,
     email: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,6 +383,15 @@ struct BridgeCompleteLoginPayload<'a> {
     account_login_env_var_value: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<BridgeLoginOptions<'a>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct BridgeLoginAttemptResult {
+    #[serde(default)]
+    result: Option<FastBrowserRunResult>,
+    #[serde(default)]
+    error_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -959,7 +1056,7 @@ fn execute_create_flow_attempt(
         &profile_name,
         &created_email,
         Some(&account_login_locator),
-        Some(workflow_file.as_path()),
+        workflow_metadata.workflow_ref.as_deref(),
         Some(codex_bin().as_str()),
         Some(started_at.as_str()),
         generated_password
@@ -1275,7 +1372,7 @@ fn run_complete_codex_login(
     profile_name: &str,
     email: &str,
     account_login_locator: Option<&CodexRotateSecretLocator>,
-    workflow_file: Option<&Path>,
+    workflow_ref: Option<&str>,
     codex_bin: Option<&str>,
     workflow_run_stamp: Option<&str>,
     account_login_env_var_name: Option<&str>,
@@ -1293,32 +1390,654 @@ fn run_complete_codex_login(
             &fallback_birth_date
         }
     };
-    let workflow_ref = workflow_file.and_then(derive_workflow_ref_from_file_path);
-    let options = BridgeLoginOptions {
-        codex_bin,
-        workflow_file: workflow_file.and_then(|path| path.to_str()),
-        workflow_ref: workflow_ref.as_deref(),
-        workflow_run_stamp,
-        skip_locator_preflight,
-        prefer_signup_recovery,
-        full_name: Some(DEFAULT_OPENAI_FULL_NAME),
-        birth_month: Some(birth_date.birth_month),
-        birth_day: Some(birth_date.birth_day),
-        birth_year: Some(birth_date.birth_year),
-    };
-    let _: Value = run_automation_bridge_with_progress(
-        "complete-codex-login",
-        BridgeCompleteLoginPayload {
-            profile_name,
-            email,
-            account_login_locator,
-            account_login_env_var_name,
-            account_login_env_var_value,
-            options: Some(options),
+    let workflow_ref = resolve_login_workflow_ref(workflow_ref);
+    let wrapped_codex_bin =
+        ensure_managed_browser_wrapper(profile_name, codex_bin.unwrap_or(DEFAULT_CODEX_BIN))?;
+    let wrapped_codex_bin = wrapped_codex_bin.to_string_lossy().into_owned();
+    match account_login_locator {
+        Some(CodexRotateSecretLocator::EnvVar { .. }) => report_progress(
+            progress.as_ref(),
+            format!(
+                "Using a freshly generated OpenAI password for {email}; attempting password login first."
+            ),
+        ),
+        Some(_) => report_progress(
+            progress.as_ref(),
+            format!("Found a stored OpenAI login secret for {email}; attempting password login first."),
+        ),
+        None => report_progress(
+            progress.as_ref(),
+            format!("No stored OpenAI login secret was found for {email}; using one-time-code recovery."),
+        ),
+    }
+
+    let mut allow_signup_recovery = prefer_signup_recovery.unwrap_or(false);
+    let mut codex_session: Option<CodexRotateAuthFlowSession> = None;
+    let result = (|| -> Result<()> {
+        'attempts: for attempt in 1..=DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+            report_progress(
+                progress.as_ref(),
+                if attempt == 1 {
+                    format!("Completing Codex login in managed profile \"{profile_name}\".")
+                } else {
+                    format!(
+                        "Retrying Codex login in managed profile \"{profile_name}\" (attempt {attempt}/{DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS})."
+                    )
+                },
+            );
+
+            for replay_pass in 1..=DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES {
+                let login_workflow_run_stamp = workflow_run_stamp
+                    .map(|stamp| format!("{stamp}-codex-login-{attempt}-{replay_pass}"));
+                let options = BridgeLoginOptions {
+                    codex_bin: Some(wrapped_codex_bin.as_str()),
+                    workflow_ref: Some(workflow_ref.as_str()),
+                    workflow_run_stamp: login_workflow_run_stamp.as_deref(),
+                    skip_locator_preflight,
+                    prefer_signup_recovery: Some(allow_signup_recovery),
+                    full_name: Some(DEFAULT_OPENAI_FULL_NAME),
+                    birth_month: Some(birth_date.birth_month),
+                    birth_day: Some(birth_date.birth_day),
+                    birth_year: Some(birth_date.birth_year),
+                    codex_session: codex_session.as_ref(),
+                };
+                let attempt_result: BridgeLoginAttemptResult =
+                    run_automation_bridge_with_progress(
+                        "complete-codex-login-attempt",
+                        BridgeCompleteLoginAttemptPayload {
+                            profile_name,
+                            email,
+                            account_login_locator,
+                            account_login_env_var_name,
+                            account_login_env_var_value,
+                            options: Some(options),
+                        },
+                        progress.clone(),
+                    )?;
+                let bridge_error_message = attempt_result.error_message.clone();
+                let flow = attempt_result
+                    .result
+                    .as_ref()
+                    .map(read_codex_rotate_auth_flow_summary)
+                    .unwrap_or_default();
+                if let Some(session) = attempt_result
+                    .result
+                    .as_ref()
+                    .and_then(read_codex_rotate_auth_flow_session)
+                    .or_else(|| flow.codex_session.clone())
+                {
+                    codex_session = Some(session);
+                }
+                let current_url = flow
+                    .current_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let next_action = flow
+                    .next_action
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let replay_reason = flow
+                    .replay_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let retry_reason = flow
+                    .retry_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let error_message = flow
+                    .error_message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        bridge_error_message
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    });
+                let managed_runtime_reset_performed =
+                    maybe_reset_managed_runtime_after_failed_attempt(profile_name, error_message)?;
+
+                if flow.saw_oauth_consent == Some(true)
+                    || flow.existing_account_prompt == Some(true)
+                    || replay_reason.is_some_and(|value| value != "auth_prompt")
+                {
+                    allow_signup_recovery = false;
+                }
+
+                if next_action == Some("fail_invalid_credentials") {
+                    return Err(anyhow!(login_error_message(
+                        error_message,
+                        format!("OpenAI rejected the stored password for {email}.")
+                    )));
+                }
+
+                if next_action == Some("replay_auth_url")
+                    && replay_pass < DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES
+                {
+                    let replay_reason_label =
+                        format_retry_reason_label(replay_reason, "the next auth step");
+                    report_progress(
+                        progress.as_ref(),
+                        format!(
+                            "OpenAI still needs {replay_reason_label} for {email}{}. Replaying the workflow-owned Codex auth session in managed profile \"{profile_name}\" ({}/{}).",
+                            current_url
+                                .map(|value| format!(" ({value})"))
+                                .unwrap_or_default(),
+                            replay_pass + 1,
+                            DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES
+                        ),
+                    );
+                    thread::sleep(Duration::from_millis(1_000));
+                    continue;
+                }
+
+                if next_action == Some("retry_attempt") {
+                    if attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                        let delay_ms = codex_login_retry_delay_ms(retry_reason, attempt);
+                        let reset_session =
+                            should_reset_codex_login_session_for_retry(retry_reason, attempt);
+                        if reset_session {
+                            codex_session = None;
+                        }
+                        let retry_reason_label =
+                            format_retry_reason_label(retry_reason, "needs another retry");
+                        report_progress(
+                            progress.as_ref(),
+                            format!(
+                                "OpenAI {retry_reason_label} for {email}{}. {}Waiting {}s before retrying.",
+                                current_url
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default(),
+                                if reset_session {
+                                    "Starting a fresh Codex auth session. "
+                                } else {
+                                    ""
+                                },
+                                delay_ms / 1_000
+                            ),
+                        );
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue 'attempts;
+                    }
+                    return Err(anyhow!(login_error_message(
+                        error_message,
+                        format!("OpenAI could not complete the Codex login for {email}.")
+                    )));
+                }
+
+                if state_mismatch_in_login_flow(&flow, error_message) {
+                    if attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                        let delay_ms = codex_login_retry_delay_ms(Some("state_mismatch"), attempt);
+                        codex_session = None;
+                        report_progress(
+                            progress.as_ref(),
+                            format!(
+                                "OpenAI returned a state mismatch during the Codex callback for {email}{}. Starting a fresh Codex auth session and retrying in {}s.",
+                                current_url
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default(),
+                                delay_ms / 1_000
+                            ),
+                        );
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue 'attempts;
+                    }
+                    return Err(anyhow!(login_error_message(
+                        error_message,
+                        format!(
+                            "OpenAI returned a state mismatch during the Codex callback for {email}{}.",
+                            current_url
+                                .map(|value| format!(" ({value})"))
+                                .unwrap_or_default()
+                        )
+                    )));
+                }
+
+                if let Some(message) = error_message {
+                    if is_retryable_codex_login_workflow_error_message(message)
+                        && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+                    {
+                        let delay_ms =
+                            codex_login_retry_delay_ms(Some("verification_artifact_pending"), attempt);
+                        report_progress(
+                            progress.as_ref(),
+                            format!(
+                                "OpenAI verification is not ready for {email}. Waiting {}s before retrying the same managed-profile flow.",
+                                delay_ms / 1_000
+                            ),
+                        );
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue 'attempts;
+                    }
+                    if is_device_auth_rate_limited(message)
+                        && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+                    {
+                        let delay_ms =
+                            codex_login_retry_delay_ms(Some("device_auth_rate_limit"), attempt);
+                        let reset_session = should_reset_device_auth_session_for_rate_limit(
+                            message,
+                            codex_session.as_ref(),
+                        );
+                        if reset_session {
+                            codex_session = None;
+                        }
+                        report_progress(
+                            progress.as_ref(),
+                            format!(
+                                "Codex device authorization is rate limited for {email}. {}Waiting {}s before retrying.",
+                                if reset_session {
+                                    ""
+                                } else {
+                                    "Reusing the existing device code session when retrying. "
+                                },
+                                delay_ms / 1_000
+                            ),
+                        );
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue 'attempts;
+                    }
+                }
+
+                if managed_runtime_reset_performed && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                    report_progress(
+                        progress.as_ref(),
+                        format!(
+                            "Managed profile \"{profile_name}\" hit a recoverable fast-browser runtime state for {email}. Restarting the managed runtime before retrying."
+                        ),
+                    );
+                    thread::sleep(Duration::from_millis(1_000));
+                    continue 'attempts;
+                }
+
+                if flow.callback_complete != Some(true) && flow.success != Some(true) {
+                    return Err(anyhow!(login_error_message(
+                        error_message,
+                        format!(
+                            "Codex browser login did not reach the callback for {email}{}.",
+                            current_url
+                                .map(|value| format!(" ({value})"))
+                                .unwrap_or_default()
+                        )
+                    )));
+                }
+                if flow.codex_login_exit_ok == Some(false) {
+                    let detail = flow
+                        .codex_login_stderr_tail
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("");
+                    return Err(anyhow!(
+                        "\"codex login\" did not exit cleanly for {email}.{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{detail}")
+                        }
+                    ));
+                }
+                promote_codex_auth_from_session(codex_session.as_ref().or(flow.codex_session.as_ref()))?;
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "Codex browser login exhausted all retry attempts for {email}."
+        ))
+    })();
+    cancel_codex_browser_login_session(codex_session.as_ref());
+    result
+}
+
+fn resolve_login_workflow_ref(workflow_ref: Option<&str>) -> String {
+    workflow_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID.to_string())
+}
+
+fn read_string_value(record: &Map<String, Value>, field: &str) -> Option<String> {
+    record
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn read_bool_value(record: &Map<String, Value>, field: &str) -> Option<bool> {
+    match record.get(field) {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::String(value)) => match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
         },
-        progress,
+        _ => None,
+    }
+}
+
+fn read_i32_value(record: &Map<String, Value>, field: &str) -> Option<i32> {
+    match record.get(field) {
+        Some(Value::Number(value)) => value.as_i64().and_then(|value| i32::try_from(value).ok()),
+        Some(Value::String(value)) => value.trim().parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn read_u16_value(record: &Map<String, Value>, field: &str) -> Option<u16> {
+    match record.get(field) {
+        Some(Value::Number(value)) => value.as_u64().and_then(|value| u16::try_from(value).ok()),
+        Some(Value::String(value)) => value.trim().parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+fn read_u32_value(record: &Map<String, Value>, field: &str) -> Option<u32> {
+    match record.get(field) {
+        Some(Value::Number(value)) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Some(Value::String(value)) => value.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn normalize_codex_rotate_auth_flow_session(raw: &Value) -> Option<CodexRotateAuthFlowSession> {
+    let record = raw.as_object()?;
+    let session = CodexRotateAuthFlowSession {
+        auth_url: read_string_value(record, "auth_url"),
+        callback_url: read_string_value(record, "callback_url"),
+        callback_port: read_u16_value(record, "callback_port"),
+        device_code: read_string_value(record, "device_code"),
+        session_dir: read_string_value(record, "session_dir"),
+        codex_home_path: read_string_value(record, "codex_home_path"),
+        auth_file_path: read_string_value(record, "auth_file_path"),
+        pid: read_u32_value(record, "pid"),
+        stdout_path: read_string_value(record, "stdout_path"),
+        stderr_path: read_string_value(record, "stderr_path"),
+        exit_path: read_string_value(record, "exit_path"),
+    };
+    if session.auth_url.is_none()
+        && session.session_dir.is_none()
+        && session.codex_home_path.is_none()
+        && session.auth_file_path.is_none()
+        && session.stdout_path.is_none()
+        && session.stderr_path.is_none()
+        && session.exit_path.is_none()
+    {
+        return None;
+    }
+    Some(session)
+}
+
+fn read_codex_rotate_auth_flow_summary(result: &FastBrowserRunResult) -> CodexRotateAuthFlowSummary {
+    let Some(record) = result.output.as_ref().and_then(Value::as_object) else {
+        return CodexRotateAuthFlowSummary::default();
+    };
+
+    CodexRotateAuthFlowSummary {
+        stage: read_string_value(record, "stage"),
+        current_url: read_string_value(record, "current_url"),
+        headline: read_string_value(record, "headline"),
+        callback_complete: read_bool_value(record, "callback_complete"),
+        success: read_bool_value(record, "success"),
+        account_ready: read_bool_value(record, "account_ready"),
+        needs_email_verification: read_bool_value(record, "needs_email_verification"),
+        follow_up_step: read_bool_value(record, "follow_up_step"),
+        add_phone_prompt: read_bool_value(record, "add_phone_prompt"),
+        retryable_timeout: read_bool_value(record, "retryable_timeout"),
+        session_ended: read_bool_value(record, "session_ended"),
+        existing_account_prompt: read_bool_value(record, "existing_account_prompt"),
+        username_not_found: read_bool_value(record, "username_not_found"),
+        invalid_credentials: read_bool_value(record, "invalid_credentials"),
+        rate_limit_exceeded: read_bool_value(record, "rate_limit_exceeded"),
+        anti_bot_gate: read_bool_value(record, "anti_bot_gate"),
+        auth_prompt: read_bool_value(record, "auth_prompt"),
+        consent_blocked: read_bool_value(record, "consent_blocked"),
+        consent_error: read_string_value(record, "consent_error"),
+        next_action: read_string_value(record, "next_action"),
+        replay_reason: read_string_value(record, "replay_reason"),
+        retry_reason: read_string_value(record, "retry_reason"),
+        error_message: read_string_value(record, "error_message"),
+        codex_session: record
+            .get("codex_session")
+            .and_then(normalize_codex_rotate_auth_flow_session),
+        codex_login_exit_ok: read_bool_value(record, "codex_login_exit_ok"),
+        codex_login_exit_code: read_i32_value(record, "codex_login_exit_code"),
+        codex_login_stdout_tail: read_string_value(record, "codex_login_stdout_tail"),
+        codex_login_stderr_tail: read_string_value(record, "codex_login_stderr_tail"),
+        saw_oauth_consent: read_bool_value(record, "saw_oauth_consent"),
+    }
+}
+
+fn read_codex_rotate_auth_flow_session(
+    result: &FastBrowserRunResult,
+) -> Option<CodexRotateAuthFlowSession> {
+    let summary = read_codex_rotate_auth_flow_summary(result);
+    if summary.codex_session.is_some() {
+        return summary.codex_session;
+    }
+    let action = result
+        .state
+        .as_ref()
+        .and_then(|state| state.steps.get("start_codex_login_session"))
+        .and_then(|step| step.action.as_ref())
+        .and_then(Value::as_object)?;
+    if let Some(value) = action.get("value") {
+        if let Some(session) = normalize_codex_rotate_auth_flow_session(value) {
+            return Some(session);
+        }
+    }
+    normalize_codex_rotate_auth_flow_session(&Value::Object(action.clone()))
+}
+
+fn extract_fast_browser_timeout_socket_path(output: &str) -> Option<String> {
+    let marker = "Timed out waiting for fast-browser daemon response from ";
+    let start = output.find(marker)? + marker.len();
+    let remainder = &output[start..];
+    let end = remainder.find(".sock")? + ".sock".len();
+    let candidate = remainder[..end].trim();
+    (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
+fn should_reset_fast_browser_daemon_for_socket_close(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("daemon closed the socket before sending a response")
+}
+
+fn should_reset_fast_browser_runtime_for_broken_cwd(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("process.cwd failed")
+        || output.contains("uv_cwd")
+        || output.contains("enoent: process.cwd")
+        || output.contains("current working directory was likely removed")
+}
+
+fn maybe_reset_managed_runtime_after_failed_attempt(
+    profile_name: &str,
+    error_message: Option<&str>,
+) -> Result<bool> {
+    let Some(error_message) = error_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let socket_path = extract_fast_browser_timeout_socket_path(error_message);
+    if socket_path.is_none()
+        && !should_reset_fast_browser_daemon_for_socket_close(error_message)
+        && !should_reset_fast_browser_runtime_for_broken_cwd(error_message)
+    {
+        return Ok(false);
+    }
+
+    let _: Value = run_automation_bridge(
+        "reset-managed-runtime",
+        BridgeResetManagedRuntimePayload {
+            profile_name,
+            socket_path: socket_path.as_deref(),
+        },
     )?;
+    Ok(true)
+}
+
+fn login_error_message(error_message: Option<&str>, fallback: String) -> String {
+    error_message
+        .map(str::to_string)
+        .unwrap_or(fallback)
+}
+
+fn is_retryable_codex_login_workflow_error_message(message: &str) -> bool {
+    let normalized = message.trim().to_lowercase();
+    !normalized.is_empty()
+        && (normalized.contains("signup-verification-code-missing")
+            || normalized.contains("login-verification-code-missing")
+            || normalized.contains("signup-verification-submit-stuck:email_verification")
+            || normalized.contains("login-verification-submit-stuck:email_verification"))
+}
+
+fn codex_login_retry_delays_ms(reason: Option<&str>) -> &'static [u64] {
+    match reason {
+        Some("verification_artifact_pending") => DEFAULT_CODEX_LOGIN_VERIFICATION_RETRY_DELAYS_MS,
+        Some("retryable_timeout") => DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS,
+        Some("device_auth_rate_limit") | Some("rate_limit") => {
+            DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS
+        }
+        _ => DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS,
+    }
+}
+
+fn codex_login_retry_delay_ms(reason: Option<&str>, attempt: usize) -> u64 {
+    let delays = codex_login_retry_delays_ms(reason);
+    let index = attempt.saturating_sub(1).min(delays.len().saturating_sub(1));
+    delays
+        .get(index)
+        .copied()
+        .unwrap_or(DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS[0])
+}
+
+fn should_reset_codex_login_session_for_retry(retry_reason: Option<&str>, attempt: usize) -> bool {
+    retry_reason == Some("state_mismatch")
+        || (retry_reason == Some("retryable_timeout") && attempt >= 2)
+}
+
+fn should_reset_device_auth_session_for_rate_limit(
+    message: &str,
+    session: Option<&CodexRotateAuthFlowSession>,
+) -> bool {
+    let normalized = message.trim().to_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    let has_reusable_device_challenge = session
+        .and_then(|value| value.auth_url.as_deref())
+        .is_some_and(|value| !value.trim().is_empty())
+        && session
+            .and_then(|value| value.device_code.as_deref())
+            .is_some_and(|value| !value.trim().is_empty());
+    if (normalized.contains("device auth failed with status 429")
+        || normalized.contains("device auth failed:") && normalized.contains("429 too many requests"))
+        && has_reusable_device_challenge
+    {
+        return false;
+    }
+    true
+}
+
+fn is_device_auth_rate_limited(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+    normalized.contains("device code request failed with status 429")
+        || normalized.contains("device auth failed with status 429")
+        || normalized.contains("codex-login-exited-before-auth-url:")
+            && normalized.contains("429 too many requests")
+        || normalized.contains("429 too many requests")
+}
+
+fn format_retry_reason_label(reason: Option<&str>, fallback: &str) -> String {
+    reason
+        .map(|value| value.replace('_', " "))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn state_mismatch_in_login_flow(
+    flow: &CodexRotateAuthFlowSummary,
+    error_message: Option<&str>,
+) -> bool {
+    if flow.consent_error.as_deref() == Some("state_mismatch") {
+        return true;
+    }
+    if flow.callback_complete != Some(true) || flow.codex_login_exit_ok != Some(false) {
+        return false;
+    }
+    let combined = [
+        flow.headline.as_deref(),
+        flow.codex_login_stderr_tail.as_deref(),
+        flow.codex_login_stdout_tail.as_deref(),
+        error_message,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+    .to_lowercase();
+    combined.contains("state mismatch")
+}
+
+fn promote_codex_auth_from_session(session: Option<&CodexRotateAuthFlowSession>) -> Result<()> {
+    let Some(auth_file_path) = session
+        .and_then(|value| value.auth_file_path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let auth_file_path = Path::new(auth_file_path);
+    if !auth_file_path.exists() {
+        return Err(anyhow!(
+            "Codex device authorization completed without producing {}.",
+            auth_file_path.display()
+        ));
+    }
+    let paths = resolve_paths()?;
+    if let Some(parent) = paths.codex_auth_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::copy(auth_file_path, &paths.codex_auth_file).with_context(|| {
+        format!(
+            "Failed to copy {} to {}.",
+            auth_file_path.display(),
+            paths.codex_auth_file.display()
+        )
+    })?;
     Ok(())
+}
+
+fn cancel_codex_browser_login_session(session: Option<&CodexRotateAuthFlowSession>) {
+    let Some(pid) = session.and_then(|value| value.pid).filter(|value| *value > 1) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .ok();
+    }
+    #[cfg(windows)]
+    {
+        Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .ok();
+    }
 }
 
 fn build_openai_account_login_locator(email: &str) -> CodexRotateSecretLocator {
@@ -1375,24 +2094,20 @@ fn codex_bin() -> String {
 
 fn load_credential_store() -> Result<CredentialStore> {
     let _ = migrate_legacy_credential_store_if_needed()?;
-    let state = load_rotate_state_json()?;
-    let raw_pending = normalize_pending_credential_map(state.get("pending"));
-    let store = normalize_credential_store(state);
-    let dropped_non_dev_pending = raw_pending
-        .into_values()
-        .filter(|record| should_drop_non_dev_pending_credential(&record.stored.base_email))
-        .collect::<Vec<_>>();
-
-    if !dropped_non_dev_pending.is_empty() {
-        save_credential_store(&store)?;
-        cleanup_dropped_non_dev_pending_secrets(&dropped_non_dev_pending);
-    }
-
-    Ok(store)
+    Ok(normalize_credential_store(load_rotate_state_json()?))
 }
 
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
     let mut state = load_rotate_state_json()?;
+    let dropped_non_dev_pending = normalize_pending_credential_map(state.get("pending"))
+        .into_values()
+        .filter(|record| should_drop_non_dev_pending_credential(&record.stored.base_email))
+        .filter(|record| {
+            !store
+                .pending
+                .contains_key(&normalize_email_key(&record.stored.email))
+        })
+        .collect::<Vec<_>>();
     if !state.is_object() {
         state = Value::Object(Map::new());
     }
@@ -1421,7 +2136,9 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
     } else if let Some(pending) = credential_state.get("pending").cloned() {
         object.insert("pending".to_string(), pending);
     }
-    write_rotate_state_json(&state)
+    write_rotate_state_json(&state)?;
+    cleanup_dropped_non_dev_pending_secrets(&dropped_non_dev_pending);
+    Ok(())
 }
 
 fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
@@ -1868,7 +2585,37 @@ fn slugify_workflow_path_segment(value: &str) -> Option<String> {
 }
 
 fn inspect_managed_profiles() -> Result<ManagedProfilesInspection> {
-    run_automation_bridge("inspect-managed-profiles", json!({}))
+    let paths = resolve_paths()?;
+    let fast_browser_runtime = std::env::var("CODEX_ROTATE_FAST_BROWSER_RUNTIME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| paths.node_bin.clone());
+    let output = Command::new(&fast_browser_runtime)
+        .arg(&paths.fast_browser_script)
+        .arg("inspect-profiles")
+        .current_dir(&paths.repo_root)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to run {} {} inspect-profiles.",
+                fast_browser_runtime,
+                paths.fast_browser_script.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(anyhow!(if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "fast-browser inspect-profiles exited with status {}.",
+                output.status
+            )
+        }));
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("fast-browser inspect-profiles returned invalid JSON.")
 }
 
 fn resolve_managed_profile_name(
@@ -2923,6 +3670,122 @@ document:
     }
 
     #[test]
+    fn resolve_login_workflow_ref_uses_explicit_value() {
+        assert_eq!(
+            resolve_login_workflow_ref(Some("workspace.web.auth-openai-com.custom-flow")),
+            "workspace.web.auth-openai-com.custom-flow"
+        );
+    }
+
+    #[test]
+    fn resolve_login_workflow_ref_falls_back_to_default_for_missing_or_blank_values() {
+        assert_eq!(
+            resolve_login_workflow_ref(None),
+            DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID
+        );
+        assert_eq!(
+            resolve_login_workflow_ref(Some("   ")),
+            DEFAULT_CODEX_ROTATE_ACCOUNT_FLOW_ID
+        );
+    }
+
+    #[test]
+    fn extracts_fast_browser_timeout_socket_path_from_error_output() {
+        assert_eq!(
+            extract_fast_browser_timeout_socket_path(
+                "Timed out waiting for fast-browser daemon response from /tmp/demo.sock",
+            )
+            .as_deref(),
+            Some("/tmp/demo.sock")
+        );
+        assert_eq!(extract_fast_browser_timeout_socket_path("other failure"), None);
+    }
+
+    #[test]
+    fn detects_socket_close_failures_as_managed_runtime_resets() {
+        assert!(should_reset_fast_browser_daemon_for_socket_close(
+            "Error: Daemon closed the socket before sending a response",
+        ));
+        assert!(!should_reset_fast_browser_daemon_for_socket_close(
+            "Timed out waiting for fast-browser daemon response from /tmp/demo.sock",
+        ));
+    }
+
+    #[test]
+    fn detects_broken_cwd_failures_as_managed_runtime_resets() {
+        assert!(should_reset_fast_browser_runtime_for_broken_cwd(
+            "ENOENT: process.cwd failed with error no such file or directory, the current working directory was likely removed without changing the working directory, uv_cwd",
+        ));
+        assert!(!should_reset_fast_browser_runtime_for_broken_cwd(
+            "Bitwarden CLI is locked.",
+        ));
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_raw_fast_browser_output() {
+        let result = FastBrowserRunResult {
+            output: Some(json!({
+                "stage": "email_verification",
+                "success": false,
+                "account_ready": true,
+                "next_action": "retry_verification",
+                "codex_session": {
+                    "auth_url": "https://auth.openai.com",
+                    "callback_port": "8765",
+                    "pid": "4321",
+                    "session_dir": "/tmp/codex-session"
+                }
+            })),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+        assert_eq!(summary.stage.as_deref(), Some("email_verification"));
+        assert_eq!(summary.success, Some(false));
+        assert_eq!(summary.account_ready, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("retry_verification"));
+        assert_eq!(
+            summary
+                .codex_session
+                .as_ref()
+                .and_then(|session| session.callback_port),
+            Some(8765)
+        );
+        assert_eq!(
+            summary.codex_session.as_ref().and_then(|session| session.pid),
+            Some(4321)
+        );
+    }
+
+    #[test]
+    fn reads_auth_flow_session_from_start_step_when_summary_omits_it() {
+        let result = FastBrowserRunResult {
+            state: Some(FastBrowserState {
+                steps: HashMap::from([(
+                    "start_codex_login_session".to_string(),
+                    FastBrowserStepState {
+                        action: Some(json!({
+                            "value": {
+                                "auth_url": "https://auth.openai.com",
+                                "callback_port": "7654",
+                                "pid": "2468",
+                                "stdout_path": "/tmp/codex.stdout"
+                            }
+                        })),
+                    },
+                )]),
+            }),
+            ..FastBrowserRunResult::default()
+        };
+
+        let session = read_codex_rotate_auth_flow_session(&result).expect("session");
+        assert_eq!(session.auth_url.as_deref(), Some("https://auth.openai.com"));
+        assert_eq!(session.callback_port, Some(7654));
+        assert_eq!(session.pid, Some(2468));
+        assert_eq!(session.stdout_path.as_deref(), Some("/tmp/codex.stdout"));
+    }
+
+    #[test]
     fn normalize_gmail_base_address_before_suffixing() {
         assert_eq!(
             normalize_gmail_base_email("Dev.User+17@gmail.com").unwrap(),
@@ -3651,6 +4514,82 @@ document:
     }
 
     #[test]
+    fn codex_login_retry_policy_recognizes_verification_waits() {
+        assert!(is_retryable_codex_login_workflow_error_message(
+            "signup-verification-code-missing"
+        ));
+        assert!(is_retryable_codex_login_workflow_error_message(
+            "login-verification-submit-stuck:email_verification:https://auth.openai.com/email-verification"
+        ));
+        assert!(!is_retryable_codex_login_workflow_error_message(
+            "OpenAI rejected the stored password"
+        ));
+        assert!(!is_retryable_codex_login_workflow_error_message(
+            "device auth failed with status 429"
+        ));
+    }
+
+    #[test]
+    fn codex_login_retry_policy_uses_expected_delay_tables() {
+        assert_eq!(
+            codex_login_retry_delay_ms(Some("verification_artifact_pending"), 1),
+            5_000
+        );
+        assert_eq!(
+            codex_login_retry_delay_ms(Some("verification_artifact_pending"), 2),
+            10_000
+        );
+        assert_eq!(
+            codex_login_retry_delay_ms(Some("device_auth_rate_limit"), 1),
+            30_000
+        );
+        assert_eq!(
+            codex_login_retry_delay_ms(Some("device_auth_rate_limit"), 2),
+            60_000
+        );
+    }
+
+    #[test]
+    fn codex_login_retry_policy_keeps_reusable_device_auth_session_after_post_issue_429() {
+        assert!(!should_reset_device_auth_session_for_rate_limit(
+            "Error logging in with device code: device auth failed with status 429 Too Many Requests",
+            Some(&CodexRotateAuthFlowSession {
+                auth_url: Some("https://auth.openai.com/codex/device".to_string()),
+                device_code: Some("ABCD-12345".to_string()),
+                ..CodexRotateAuthFlowSession::default()
+            })
+        ));
+    }
+
+    #[test]
+    fn codex_login_retry_policy_drops_unissued_device_auth_session_after_429() {
+        assert!(should_reset_device_auth_session_for_rate_limit(
+            "Error logging in with device code: device code request failed with status 429 Too Many Requests",
+            Some(&CodexRotateAuthFlowSession::default())
+        ));
+    }
+
+    #[test]
+    fn codex_login_retry_policy_resets_expected_sessions() {
+        assert!(!should_reset_codex_login_session_for_retry(
+            Some("retryable_timeout"),
+            1
+        ));
+        assert!(should_reset_codex_login_session_for_retry(
+            Some("retryable_timeout"),
+            2
+        ));
+        assert!(should_reset_codex_login_session_for_retry(
+            Some("state_mismatch"),
+            1
+        ));
+        assert!(should_reset_codex_login_session_for_retry(
+            Some("state_mismatch"),
+            2
+        ));
+    }
+
+    #[test]
     fn relogin_family_match_prefers_exact_last_created_email() {
         let mut store = CredentialStore::default();
         store.families.insert(
@@ -3947,5 +4886,59 @@ document:
         }
         fs::remove_dir_all(&rotate_home).ok();
         result.expect("load credential store migration");
+    }
+
+    #[test]
+    fn loading_credential_store_keeps_read_path_side_effect_free() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let rotate_home = unique_temp_dir("codex-rotate-pure-load-store");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        let accounts_path = rotate_home.join("accounts.json");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        }
+
+        let result = (|| -> Result<()> {
+            fs::write(
+                &accounts_path,
+                serde_json::json!({
+                    "pending": {
+                        "bench.5@astronlab.com": {
+                            "email": "bench.5@astronlab.com",
+                            "profile_name": "dev-1",
+                            "base_email": "bench.{n}@astronlab.com",
+                            "suffix": 5,
+                            "selector": null,
+                            "alias": null,
+                            "created_at": "2026-04-05T00:00:00.000Z",
+                            "updated_at": "2026-04-05T00:00:00.000Z",
+                            "started_at": "2026-04-05T00:00:00.000Z"
+                        }
+                    }
+                })
+                .to_string(),
+            )?;
+
+            let before = fs::read_to_string(&accounts_path)?;
+            let store = load_credential_store()?;
+            let after = fs::read_to_string(&accounts_path)?;
+
+            assert!(store.pending.is_empty());
+            assert_eq!(after, before);
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_ROTATE_HOME");
+            },
+        }
+        fs::remove_dir_all(&rotate_home).ok();
+        result.expect("pure credential store load");
     }
 }

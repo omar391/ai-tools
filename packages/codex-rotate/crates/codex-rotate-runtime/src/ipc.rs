@@ -38,6 +38,15 @@ impl RuntimeCapabilities {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMessageKind {
+    #[default]
+    Status,
+    Progress,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StatusSnapshot {
     pub current_email: Option<String>,
@@ -50,6 +59,7 @@ pub struct StatusSnapshot {
     pub last_rotation_to_email: Option<String>,
     pub last_rotation_reason: Option<String>,
     pub last_message: Option<String>,
+    pub last_message_kind: Option<SnapshotMessageKind>,
     pub next_tick_at: Option<String>,
     pub capabilities: RuntimeCapabilities,
 }
