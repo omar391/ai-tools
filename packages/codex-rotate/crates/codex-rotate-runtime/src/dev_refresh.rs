@@ -279,7 +279,10 @@ pub fn preferred_release_cli_binary(build: &LocalCliBuild) -> Result<Option<Path
     if build.profile != BuildProfile::Debug {
         return Ok(None);
     }
-    preferred_release_binary(&build.cli_binary, tracked_cli_source_paths(&build.repo_root))
+    preferred_release_binary(
+        &build.cli_binary,
+        tracked_cli_source_paths(&build.repo_root),
+    )
 }
 
 pub fn preferred_release_tray_binary(build: &LocalTrayBuild) -> Result<Option<PathBuf>> {
@@ -289,7 +292,10 @@ pub fn preferred_release_tray_binary(build: &LocalTrayBuild) -> Result<Option<Pa
     if build.profile != BuildProfile::Debug {
         return Ok(None);
     }
-    preferred_release_binary(&build.tray_binary, tracked_tray_source_paths(&build.repo_root))
+    preferred_release_binary(
+        &build.tray_binary,
+        tracked_tray_source_paths(&build.repo_root),
+    )
 }
 
 pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
@@ -416,7 +422,11 @@ fn launch_agent_environment_variables() -> Vec<(String, String)> {
 
 #[cfg(target_os = "macos")]
 fn launchctl_bootstrap_plist(plist_path: &Path) -> Result<()> {
-    let output = launchctl_output(["bootstrap", &launchctl_user_domain(), &plist_path.display().to_string()])?;
+    let output = launchctl_output([
+        "bootstrap",
+        &launchctl_user_domain(),
+        &plist_path.display().to_string(),
+    ])?;
     if output.status.success() {
         return Ok(());
     }
@@ -571,7 +581,10 @@ fn format_launchctl_failure(action: &str, output: &Output, plist_path: Option<&P
             path.display()
         ),
         None if !detail.is_empty() => {
-            format!("launchctl {action} exited with status {}: {}", output.status, detail)
+            format!(
+                "launchctl {action} exited with status {}: {}",
+                output.status, detail
+            )
         }
         None => format!("launchctl {action} exited with status {}.", output.status),
     }
@@ -785,11 +798,7 @@ fn release_binary_path(current_binary: &Path) -> PathBuf {
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new(""))
         .join("release")
-        .join(
-            current_binary
-                .file_name()
-                .unwrap_or_default(),
-        )
+        .join(current_binary.file_name().unwrap_or_default())
 }
 
 fn detect_local_build(
@@ -1036,9 +1045,18 @@ fn process_is_running(process_id: u32) -> bool {
     #[cfg(windows)]
     {
         Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", process_id), "/FO", "CSV", "/NH"])
+            .args([
+                "/FI",
+                &format!("PID eq {}", process_id),
+                "/FO",
+                "CSV",
+                "/NH",
+            ])
             .output()
-            .map(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&process_id.to_string()))
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&process_id.to_string())
+            })
             .unwrap_or(false)
     }
 }

@@ -148,20 +148,25 @@ fn stream_bridge_progress(
     let reader = BufReader::new(stderr);
     for line in reader.lines() {
         let line = line.context("Failed to read automation bridge stderr.")?;
-        if line.trim().is_empty() {
-            continue;
+        if let Some(forwarded) = bridge_progress_line_for_cli(&line) {
+            progress(forwarded);
         }
-        if let Some(formatted) = format_fast_browser_progress_event_line(&line) {
-            progress(formatted);
-            continue;
-        }
-        let forwarded = line
-            .strip_prefix("[codex-rotate] ")
-            .map(str::to_string)
-            .unwrap_or(line);
-        progress(forwarded);
     }
     Ok(())
+}
+
+fn bridge_progress_line_for_cli(line: &str) -> Option<String> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    if line.starts_with(FAST_BROWSER_EVENT_PREFIX) {
+        return format_fast_browser_progress_event_line(line);
+    }
+    Some(
+        line.strip_prefix("[codex-rotate] ")
+            .map(str::to_string)
+            .unwrap_or_else(|| line.to_string()),
+    )
 }
 
 fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
@@ -228,20 +233,31 @@ fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
     let primary_text = details
         .and_then(|details| read_string_value(details, "step_goal"))
         .or(message);
-    let prefix = [(!scope.is_empty()).then_some(scope), (!state.is_empty()).then_some(state)]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let prefix = [
+        (!scope.is_empty()).then_some(scope),
+        (!state.is_empty()).then_some(state),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
     let suffix = (!detail_parts.is_empty()).then(|| format!(" ({})", detail_parts.join(", ")));
     let core = match (prefix.is_empty(), primary_text, suffix) {
-        (false, Some(primary_text), Some(suffix)) => Some(format!("{prefix}: {primary_text}{suffix}")),
+        (false, Some(primary_text), Some(suffix)) => {
+            Some(format!("{prefix}: {primary_text}{suffix}"))
+        }
         (false, Some(primary_text), None) => Some(format!("{prefix}: {primary_text}")),
         (true, Some(primary_text), Some(suffix)) => Some(format!("{primary_text}{suffix}")),
         (true, Some(primary_text), None) => Some(primary_text),
         (false, None, Some(suffix)) => Some(format!("{prefix}{suffix}")),
         (false, None, None) => Some(prefix),
-        (true, None, Some(suffix)) => Some(suffix.trim_start().trim_end_matches(')').trim_start_matches('(').to_string()),
+        (true, None, Some(suffix)) => Some(
+            suffix
+                .trim_start()
+                .trim_end_matches(')')
+                .trim_start_matches('(')
+                .to_string(),
+        ),
         (true, None, None) => None,
     }?;
     Some(match time {
@@ -253,11 +269,7 @@ fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
 fn should_suppress_fast_browser_progress_event(phase: Option<&str>, status: Option<&str>) -> bool {
     matches!(
         (phase.unwrap_or_default(), status.unwrap_or_default()),
-        ("pre", "start")
-            | ("pre", "ok")
-            | ("post", "start")
-            | ("post", "ok")
-            | ("action", "start")
+        ("pre", "start") | ("pre", "ok") | ("post", "start") | ("post", "ok") | ("action", "start")
     )
 }
 
@@ -289,7 +301,7 @@ fn read_string_value(record: &Map<String, Value>, field: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::format_fast_browser_progress_event_line;
+    use super::{bridge_progress_line_for_cli, format_fast_browser_progress_event_line};
 
     #[test]
     fn formats_fast_browser_progress_events_in_rust() {
@@ -303,7 +315,14 @@ mod tests {
 
     #[test]
     fn suppresses_low_signal_fast_browser_progress_events() {
-        let line = r#"__FAST_BROWSER_EVENT__{"phase":"pre","status":"ok","message":"setup complete"}"#;
+        let line =
+            r#"__FAST_BROWSER_EVENT__{"phase":"pre","status":"ok","message":"setup complete"}"#;
         assert_eq!(format_fast_browser_progress_event_line(line), None);
+    }
+
+    #[test]
+    fn suppresses_raw_fast_browser_event_markers_when_event_is_invalid() {
+        let line = "__FAST_BROWSER_EVENT__not-json";
+        assert_eq!(bridge_progress_line_for_cli(line), None);
     }
 }

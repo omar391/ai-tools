@@ -21,10 +21,8 @@ pub struct CorePaths {
     pub node_bin: String,
 }
 
-const LEGACY_ROTATE_HOME_FILE_PATTERNS: &[&str] = &[
-    "codex-login-browser-capture-",
-    "fast-browser-",
-];
+const LEGACY_ROTATE_HOME_FILE_PATTERNS: &[&str] =
+    &["codex-login-browser-capture-", "fast-browser-"];
 const LEGACY_ROTATE_HOME_DIR_PATTERNS: &[&str] = &["codex-login-browser-shim-"];
 const LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS: &[&str] = &["codex-login-managed-"];
 
@@ -106,7 +104,10 @@ pub fn cleanup_legacy_rotate_home_artifacts(root_dir: &Path) -> Result<()> {
             .with_context(|| format!("Failed to iterate rotate home {}.", root_dir.display()))?;
         let entry_path = entry.path();
         let file_type = entry.file_type().with_context(|| {
-            format!("Failed to inspect rotate home entry {}.", entry_path.display())
+            format!(
+                "Failed to inspect rotate home entry {}.",
+                entry_path.display()
+            )
         })?;
         let entry_name = entry.file_name();
         let entry_name = entry_name.to_string_lossy();
@@ -117,7 +118,10 @@ pub fn cleanup_legacy_rotate_home_artifacts(root_dir: &Path) -> Result<()> {
                 .any(|prefix| entry_name.starts_with(prefix))
         {
             fs::remove_file(&entry_path).with_context(|| {
-                format!("Failed to remove legacy rotate-home file {}.", entry_path.display())
+                format!(
+                    "Failed to remove legacy rotate-home file {}.",
+                    entry_path.display()
+                )
             })?;
             continue;
         }
@@ -144,7 +148,10 @@ pub fn cleanup_legacy_rotate_home_artifacts(root_dir: &Path) -> Result<()> {
             .with_context(|| format!("Failed to read rotate-home bin {}.", entry_path.display()))?
         {
             let bin_entry = bin_entry.with_context(|| {
-                format!("Failed to iterate rotate-home bin {}.", entry_path.display())
+                format!(
+                    "Failed to iterate rotate-home bin {}.",
+                    entry_path.display()
+                )
             })?;
             let bin_entry_path = bin_entry.path();
             let bin_type = bin_entry.file_type().with_context(|| {
@@ -222,10 +229,12 @@ fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{cleanup_legacy_rotate_home_artifacts, resolve_node_binary};
+    use crate::test_support::ENV_MUTEX;
     use std::fs;
 
     #[test]
     fn resolve_node_binary_prefers_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let expected = tempdir.path().join("node");
         fs::write(&expected, "").expect("write node override");
@@ -276,8 +285,11 @@ mod tests {
         fs::write(root.join("fast-browser-1.json"), "").expect("write legacy json");
         fs::create_dir_all(root.join("codex-login-browser-shim-123"))
             .expect("create legacy shim dir");
-        fs::write(bin_dir.join("codex-login-managed-dev-1-deadbeef"), "#!/bin/sh")
-            .expect("write legacy managed wrapper");
+        fs::write(
+            bin_dir.join("codex-login-managed-dev-1-deadbeef"),
+            "#!/bin/sh",
+        )
+        .expect("write legacy managed wrapper");
         fs::write(
             bin_dir.join("codex-login-dev-1-deadbeefcafe"),
             "#!/bin/sh\nexec 'codex' \"$@\"\n",

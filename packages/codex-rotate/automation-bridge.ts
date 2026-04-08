@@ -32,8 +32,6 @@ type BridgeRequest =
         profileName: string;
         email: string;
         accountLoginLocator?: CodexRotateSecretLocator | null;
-        accountLoginEnvVarName?: string | null;
-        accountLoginEnvVarValue?: string | null;
         options?: {
           codexBin?: string;
           workflowRef?: string;
@@ -76,36 +74,6 @@ function respond(response: BridgeResponse): never {
   process.exit(response.ok ? 0 : 1);
 }
 
-async function withTemporaryEnvVar<T>(
-  name: string | null,
-  value: string | null,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const normalizedName = typeof name === "string" ? name.trim() : "";
-  if (!normalizedName) {
-    return await operation();
-  }
-  const hadPrevious = Object.prototype.hasOwnProperty.call(
-    process.env,
-    normalizedName,
-  );
-  const previousValue = process.env[normalizedName];
-  if (typeof value === "string") {
-    process.env[normalizedName] = value;
-  } else {
-    delete process.env[normalizedName];
-  }
-  try {
-    return await operation();
-  } finally {
-    if (hadPrevious && previousValue !== undefined) {
-      process.env[normalizedName] = previousValue;
-    } else {
-      delete process.env[normalizedName];
-    }
-  }
-}
-
 async function handleRequest(request: BridgeRequest): Promise<unknown> {
   switch (request.command) {
     case "prepare-account-secret-ref":
@@ -126,19 +94,14 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
       );
       return { ok: true };
     case "complete-codex-login-attempt":
-      return await withTemporaryEnvVar(
-        request.payload.accountLoginEnvVarName ?? null,
-        request.payload.accountLoginEnvVarValue ?? null,
-        async () =>
-          (await completeCodexLoginViaWorkflowAttempt(
-            request.payload.profileName,
-            request.payload.email,
-            request.payload.accountLoginLocator ?? null,
-            {
-              ...request.payload.options,
-            },
-          )) as unknown,
-      );
+      return (await completeCodexLoginViaWorkflowAttempt(
+        request.payload.profileName,
+        request.payload.email,
+        request.payload.accountLoginLocator ?? null,
+        {
+          ...request.payload.options,
+        },
+      )) as unknown;
     default: {
       const label =
         typeof (request as { command?: unknown }).command === "string"

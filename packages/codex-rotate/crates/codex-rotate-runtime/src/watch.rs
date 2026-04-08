@@ -19,8 +19,8 @@ use codex_rotate_core::workflow::{
 use serde::{Deserialize, Serialize};
 
 use crate::hook::{
-    live_account_matches_summary, read_live_account_if_running, switch_live_account_to_current_auth,
-    AccountReadResult, LiveSwitchResult,
+    live_account_matches_summary, read_live_account_if_running,
+    switch_live_account_to_current_auth, AccountReadResult, LiveSwitchResult,
 };
 use crate::logs::{
     read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
@@ -334,8 +334,7 @@ fn execute_watch_rotation(
                 Err(error) if is_retryable_watch_create_error(&error) => {
                     if let Err(retry_error) = create_attempt() {
                         if is_auto_create_retry_stopped_for_reusable_account(&retry_error) {
-                            let next_result =
-                                rotate_next_internal_with_progress(progress.clone())?;
+                            let next_result = rotate_next_internal_with_progress(progress.clone())?;
                             return Ok(Some(match next_result {
                                 NextResult::Rotated { summary, .. }
                                 | NextResult::Stayed { summary, .. }
@@ -843,6 +842,8 @@ mod tests {
                 last_quota_summary: None,
                 last_quota_blocker: None,
                 last_quota_checked_at: None,
+                last_quota_primary_left_percent: None,
+                last_quota_next_refresh_at: None,
             }],
         };
         assert!(created_account_already_materialized(

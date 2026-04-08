@@ -31,8 +31,12 @@ pub fn ensure_managed_browser_wrapper(profile_name: &str, codex_bin: &str) -> Re
     let shim_dir = bin_dir.join("codex-login-shims");
     ensure_managed_browser_shims(&shim_dir, &paths.node_bin, &opener_path)?;
 
-    let wrapper_path =
-        build_managed_browser_wrapper_path(&paths.rotate_home, profile_name, codex_bin, &opener_path);
+    let wrapper_path = build_managed_browser_wrapper_path(
+        &paths.rotate_home,
+        profile_name,
+        codex_bin,
+        &opener_path,
+    );
     let content = render_managed_browser_wrapper(
         codex_bin,
         profile_name,
@@ -147,7 +151,10 @@ fn render_managed_browser_wrapper(
             "export PATH={}:\"$PATH\"",
             shell_single_quote(&shim_dir.to_string_lossy())
         ),
-        format!("export CODEX_ROTATE_NODE_BIN={}", shell_single_quote(node_bin)),
+        format!(
+            "export CODEX_ROTATE_NODE_BIN={}",
+            shell_single_quote(node_bin)
+        ),
         format!(
             "export CODEX_ROTATE_REAL_CODEX={}",
             shell_single_quote(real_codex_bin)
@@ -187,7 +194,10 @@ fn ensure_managed_browser_shims(shim_dir: &Path, node_bin: &str, opener_path: &P
         let current = fs::read_to_string(&shim_path).ok();
         if current.as_deref() != Some(shim_content.as_str()) {
             fs::write(&shim_path, &shim_content).with_context(|| {
-                format!("Failed to write managed browser shim {}.", shim_path.display())
+                format!(
+                    "Failed to write managed browser shim {}.",
+                    shim_path.display()
+                )
             })?;
         }
         make_executable(&shim_path)?;
@@ -211,10 +221,8 @@ fn make_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_MUTEX;
     use std::process::Command;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn wrapper_path_is_stable_for_same_profile_and_codex_binary() {
@@ -238,7 +246,7 @@ mod tests {
 
     #[test]
     fn wrapper_intercepts_login_through_internal_managed_login_entrypoint() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = tempfile::tempdir().expect("tempdir");
         let rotate_home = fixture.path().join("rotate-home");
         let cli_log_path = fixture.path().join("cli-log.json");
@@ -286,8 +294,9 @@ mod tests {
             std::env::set_var("CODEX_ROTATE_TEST_CLI_LOG", &cli_log_path);
         }
 
-        let wrapper_path = ensure_managed_browser_wrapper("managed-dev-1", &codex_path.to_string_lossy())
-            .expect("wrapper path");
+        let wrapper_path =
+            ensure_managed_browser_wrapper("managed-dev-1", &codex_path.to_string_lossy())
+                .expect("wrapper path");
         let status = Command::new(&wrapper_path)
             .arg("login")
             .status()
@@ -298,7 +307,9 @@ mod tests {
             None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
         }
         match previous_target_cli {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value) },
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value)
+            },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN") },
         }
         match previous_cli {
@@ -315,22 +326,24 @@ mod tests {
         }
 
         assert!(status.success());
-        let logged: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&cli_log_path).expect("read cli log"),
-        )
-        .expect("parse cli log");
+        let logged: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cli_log_path).expect("read cli log"))
+                .expect("parse cli log");
         assert_eq!(logged["profile"], "managed-dev-1");
         assert_eq!(
             logged["argv"],
             serde_json::json!(["internal", "managed-login"])
         );
-        assert_eq!(logged["realCodex"], codex_path.to_string_lossy().to_string());
+        assert_eq!(
+            logged["realCodex"],
+            codex_path.to_string_lossy().to_string()
+        );
         assert!(!codex_marker_path.exists());
     }
 
     #[test]
     fn wrapper_routes_open_based_launches_through_managed_browser_opener() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = tempfile::tempdir().expect("tempdir");
         let rotate_home = fixture.path().join("rotate-home");
         let opener_log_path = fixture.path().join("opener-log.json");
@@ -381,8 +394,9 @@ mod tests {
             std::env::set_var("CODEX_ROTATE_TEST_OPENER_LOG", &opener_log_path);
         }
 
-        let wrapper_path = ensure_managed_browser_wrapper("managed-dev-1", &codex_path.to_string_lossy())
-            .expect("wrapper path");
+        let wrapper_path =
+            ensure_managed_browser_wrapper("managed-dev-1", &codex_path.to_string_lossy())
+                .expect("wrapper path");
         let status = Command::new(&wrapper_path)
             .arg("status")
             .status()
@@ -397,7 +411,9 @@ mod tests {
             None => unsafe { std::env::remove_var("CODEX_ROTATE_BROWSER_OPENER_BIN") },
         }
         match previous_target_cli {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value) },
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value)
+            },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN") },
         }
         match previous_cli {
@@ -414,18 +430,15 @@ mod tests {
         }
 
         assert!(status.success());
-        let logged: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&opener_log_path).expect("read opener log"),
-        )
-        .expect("parse opener log");
+        let logged: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&opener_log_path).expect("read opener log"))
+                .expect("parse opener log");
         assert_eq!(logged["profile"], "managed-dev-1");
-        assert!(
-            logged["argv"]
-                .as_array()
-                .expect("argv array")
-                .iter()
-                .any(|value| value == "https://auth.openai.com/oauth/authorize?state=test-wrapper")
-        );
+        assert!(logged["argv"]
+            .as_array()
+            .expect("argv array")
+            .iter()
+            .any(|value| value == "https://auth.openai.com/oauth/authorize?state=test-wrapper"));
         assert_eq!(logged["browser"], opener_path.to_string_lossy().to_string());
     }
 }

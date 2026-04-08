@@ -19,9 +19,8 @@ use codex_rotate_core::pool::{
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
-    cmd_create_with_progress, cmd_relogin_with_progress,
-    migrate_legacy_credential_store_if_needed, CreateCommandOptions, CreateCommandSource,
-    ReloginOptions,
+    cmd_create_with_progress, cmd_relogin_with_progress, migrate_legacy_credential_store_if_needed,
+    CreateCommandOptions, CreateCommandSource, ReloginOptions,
 };
 
 use crate::dev_refresh::{
@@ -30,7 +29,9 @@ use crate::dev_refresh::{
     maybe_start_background_release_cli_build, preferred_release_cli_binary, rebuild_local_cli,
     stop_other_local_daemons, INSTANCE_HOME_ENV,
 };
-use crate::hook::{read_live_account, read_live_account_if_running, switch_live_account_to_current_auth};
+use crate::hook::{
+    read_live_account, read_live_account_if_running, switch_live_account_to_current_auth,
+};
 use crate::ipc::{
     read_request, write_message, ClientRequest, CreateInvocation, InvokeAction,
     RuntimeCapabilities, ServerMessage, SnapshotMessageKind, StatusSnapshot,
@@ -165,14 +166,12 @@ pub fn run_daemon_forever() -> Result<()> {
         ));
         if let Some(build) = current_process_local_cli_build() {
             let instance_home = paths.rotate_home.to_string_lossy().into_owned();
-            if let Err(error) =
-                stop_other_local_daemons(
-                    &build,
-                    &paths.daemon_socket,
-                    std::process::id(),
-                    Some(instance_home.as_str()),
-                )
-            {
+            if let Err(error) = stop_other_local_daemons(
+                &build,
+                &paths.daemon_socket,
+                std::process::id(),
+                Some(instance_home.as_str()),
+            ) {
                 log_daemon_error(format!("Failed to stop stale daemons: {error:#}"));
             }
         }
@@ -223,9 +222,7 @@ impl Drop for SocketGuard {
 }
 
 fn initialize_runtime(daemon: &SharedDaemon) {
-    let result = daemon.with_state_mut(|state| {
-        refresh_live_account_state(state, true, false)
-    });
+    let result = daemon.with_state_mut(|state| refresh_live_account_state(state, true, false));
 
     if let Err(error) = result {
         daemon.set_error_message(format!("startup failed: {error}"));
@@ -291,37 +288,37 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
         ClientRequest::Invoke { action } => {
             let mut writer = stream;
             let action_name = format!("{action:?}");
-            let response = match panic::catch_unwind(AssertUnwindSafe(|| daemon.handle_invoke(action)))
-            {
-                Ok(Ok(output)) => ServerMessage::Result {
-                    ok: true,
-                    output: Some(output),
-                    error: None,
-                },
-                Ok(Err(error)) => {
-                    log_daemon_error(format!("invoke {action_name} failed: {error:#}"));
-                    ServerMessage::Result {
-                        ok: false,
-                        output: None,
-                        error: Some(error.to_string()),
+            let response =
+                match panic::catch_unwind(AssertUnwindSafe(|| daemon.handle_invoke(action))) {
+                    Ok(Ok(output)) => ServerMessage::Result {
+                        ok: true,
+                        output: Some(output),
+                        error: None,
+                    },
+                    Ok(Err(error)) => {
+                        log_daemon_error(format!("invoke {action_name} failed: {error:#}"));
+                        ServerMessage::Result {
+                            ok: false,
+                            output: None,
+                            error: Some(error.to_string()),
+                        }
                     }
-                }
-                Err(payload) => {
-                    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
-                        (*message).to_string()
-                    } else if let Some(message) = payload.downcast_ref::<String>() {
-                        message.clone()
-                    } else {
-                        "unknown panic payload".to_string()
-                    };
-                    log_daemon_error(format!("invoke {action_name} panicked: {detail}"));
-                    ServerMessage::Result {
-                        ok: false,
-                        output: None,
-                        error: Some(format!("Daemon invoke panicked: {detail}")),
+                    Err(payload) => {
+                        let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                            (*message).to_string()
+                        } else if let Some(message) = payload.downcast_ref::<String>() {
+                            message.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        log_daemon_error(format!("invoke {action_name} panicked: {detail}"));
+                        ServerMessage::Result {
+                            ok: false,
+                            output: None,
+                            error: Some(format!("Daemon invoke panicked: {detail}")),
+                        }
                     }
-                }
-            };
+                };
             write_message(&mut writer, &response)?;
         }
     }
@@ -334,11 +331,7 @@ impl SharedDaemon {
         log_daemon_error(&message);
         let snapshot = {
             let mut state = self.state.lock().expect("daemon state mutex");
-            set_snapshot_message(
-                &mut state.snapshot,
-                SnapshotMessageKind::Error,
-                message,
-            );
+            set_snapshot_message(&mut state.snapshot, SnapshotMessageKind::Error, message);
             state.snapshot.next_tick_at = None;
             state.snapshot.clone()
         };
@@ -694,16 +687,19 @@ fn run_manual_create(
     options: CreateInvocation,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
-    let output = cmd_create_with_progress(CreateCommandOptions {
-        alias: options.alias,
-        profile_name: options.profile_name,
-        base_email: options.base_email,
-        force: options.force,
-        ignore_current: options.ignore_current,
-        restore_previous_auth_after_create: options.restore_previous_auth_after_create,
-        require_usable_quota: options.require_usable_quota,
-        source: CreateCommandSource::Manual,
-    }, progress)?;
+    let output = cmd_create_with_progress(
+        CreateCommandOptions {
+            alias: options.alias,
+            profile_name: options.profile_name,
+            base_email: options.base_email,
+            force: options.force,
+            ignore_current: options.ignore_current,
+            restore_previous_auth_after_create: options.restore_previous_auth_after_create,
+            require_usable_quota: options.require_usable_quota,
+            source: CreateCommandSource::Manual,
+        },
+        progress,
+    )?;
     refresh_static_snapshot(state);
     refresh_quota_state(state, true);
     state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
@@ -756,9 +752,11 @@ fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
     if let Ok(overview) = current_pool_overview() {
         snapshot.inventory_count = Some(overview.inventory_count);
         snapshot.inventory_active_slot = overview.inventory_active_slot;
+        snapshot.inventory_healthy_count = Some(overview.inventory_healthy_count);
     } else {
         snapshot.inventory_count = None;
         snapshot.inventory_active_slot = None;
+        snapshot.inventory_healthy_count = None;
     }
 }
 
@@ -916,6 +914,13 @@ fn move_if_missing(from: &std::path::Path, to: &std::path::Path, is_file: bool) 
         if to.exists() && !from.exists() {
             return Ok(());
         }
+        if !from.exists() {
+            return Err(anyhow::anyhow!(
+                "Failed to move {} to {}: source disappeared after rename fallback ({rename_error}).",
+                from.display(),
+                to.display()
+            ));
+        }
         if is_file {
             fs::copy(from, to).with_context(|| {
                 format!(
@@ -1060,8 +1065,7 @@ mod tests {
         let daemon = SharedDaemon::new();
         let _guard = InvocationGuard::new(daemon.in_flight_invocations.clone());
 
-        let result =
-            maybe_refresh_local_daemon_process(Some(&daemon)).expect("refresh result");
+        let result = maybe_refresh_local_daemon_process(Some(&daemon)).expect("refresh result");
 
         assert!(!result);
     }

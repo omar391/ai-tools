@@ -134,7 +134,10 @@ impl JsonRpcStdioClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-        let stdin = child.stdin.take().context("codex app-server stdin unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("codex app-server stdin unavailable")?;
         let stdout = child
             .stdout
             .take()

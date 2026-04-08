@@ -16,18 +16,18 @@ use codex_rotate_core::pool::{
     cmd_add, cmd_list_stream, cmd_next_with_progress, cmd_prev, cmd_remove, cmd_status_stream,
 };
 use codex_rotate_core::workflow::{
-    cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions,
-    CreateCommandSource, ReloginOptions,
+    cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions, CreateCommandSource,
+    ReloginOptions,
 };
 use codex_rotate_runtime::daemon::run_daemon_forever;
+#[cfg(not(target_os = "macos"))]
+use codex_rotate_runtime::dev_refresh::stop_running_trays;
+#[cfg(target_os = "macos")]
+use codex_rotate_runtime::dev_refresh::tray_service_pid;
 use codex_rotate_runtime::dev_refresh::{
     clear_tray_service_registration, detect_local_tray_build, launch_tray_process,
     local_tray_sources_newer_than_binary, rebuild_local_tray,
 };
-#[cfg(target_os = "macos")]
-use codex_rotate_runtime::dev_refresh::tray_service_pid;
-#[cfg(not(target_os = "macos"))]
-use codex_rotate_runtime::dev_refresh::stop_running_trays;
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
     SnapshotMessageKind, StatusSnapshot,
@@ -66,18 +66,17 @@ fn run() -> Result<()> {
             &mut stdout,
             &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
         )?,
-        Some("create") => {
-            write_output(
-                &mut stdout,
-                &cmd_create_with_progress(
-                    parse_public_create_options(&args[1..])?,
-                    cli_progress_callback(),
-                )?,
-            )?
-        }
-        Some("next") => {
-            write_output(&mut stdout, &cmd_next_with_progress(cli_progress_callback())?)?
-        }
+        Some("create") => write_output(
+            &mut stdout,
+            &cmd_create_with_progress(
+                parse_public_create_options(&args[1..])?,
+                cli_progress_callback(),
+            )?,
+        )?,
+        Some("next") => write_output(
+            &mut stdout,
+            &cmd_next_with_progress(cli_progress_callback())?,
+        )?,
         Some("prev") => write_output(&mut stdout, &cmd_prev()?)?,
         Some("list") => cmd_list_stream(&mut stdout)?,
         Some("status") => cmd_status_stream(&mut stdout)?,
@@ -121,21 +120,15 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("remove") => Some(InvokeAction::Remove {
             selector: parse_remove_selector(args)?.to_string(),
         }),
-        Some("list")
-        | Some("status")
-        | Some("daemon")
-        | Some("tray")
-        | None
-        | Some("help")
-        | Some("--help")
-        | Some("-h") => None,
+        Some("list") | Some("status") | Some("daemon") | Some("tray") | None | Some("help")
+        | Some("--help") | Some("-h") => None,
         Some(_) => None,
     };
 
     Ok(match action {
         Some(action) => {
-            let progress_printer = command_streams_progress(command)
-                .then(DaemonProgressPrinter::spawn);
+            let progress_printer =
+                command_streams_progress(command).then(DaemonProgressPrinter::spawn);
             let result = invoke(action);
             if let Some(printer) = progress_printer {
                 printer.stop();
@@ -157,35 +150,40 @@ struct DaemonProgressPrinter {
 
 impl DaemonProgressPrinter {
     fn spawn() -> Self {
+        let Ok(mut subscription) = subscribe() else {
+            return Self {
+                stop: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            };
+        };
+        if subscription.recv().is_err() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            };
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop_signal = stop.clone();
         let handle = thread::spawn(move || {
-        let Ok(mut subscription) = subscribe() else {
-            return;
-        };
-        if subscription.recv().is_err() {
-            return;
-        }
-        let mut last_printed = None::<String>;
-        while !stop_signal.load(Ordering::Relaxed) {
-            let Ok(snapshot) = subscription.recv_timeout(Duration::from_millis(200)) else {
-                break;
-            };
-            let Some(snapshot) = snapshot else {
-                continue;
-            };
-            if !snapshot_contains_progress(&snapshot) {
-                continue;
+            let mut last_printed = None::<String>;
+            while !stop_signal.load(Ordering::Relaxed) {
+                let snapshot = match subscription.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                if !snapshot_contains_progress(&snapshot) {
+                    continue;
+                }
+                let Some(message) = snapshot.last_message else {
+                    continue;
+                };
+                if last_printed.as_deref() == Some(message.as_str()) {
+                    continue;
+                }
+                last_printed = Some(message.clone());
+                eprintln!("{message}");
             }
-            let Some(message) = snapshot.last_message else {
-                continue;
-            };
-            if last_printed.as_deref() == Some(message.as_str()) {
-                continue;
-            }
-            last_printed = Some(message.clone());
-            eprintln!("{message}");
-        }
         });
         Self {
             stop,
@@ -207,10 +205,7 @@ fn snapshot_contains_progress(snapshot: &StatusSnapshot) -> bool {
 }
 
 fn command_streams_progress(command: Option<&str>) -> bool {
-    matches!(
-        command,
-        Some("create") | Some("next") | Some("relogin")
-    )
+    matches!(command, Some("create") | Some("next") | Some("relogin"))
 }
 
 fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
@@ -221,7 +216,9 @@ fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
             }
             run_daemon_forever()
         }
-        Some("help") | Some("--help") | Some("-h") => write_output(writer, "Usage: codex-rotate daemon"),
+        Some("help") | Some("--help") | Some("-h") => {
+            write_output(writer, "Usage: codex-rotate daemon")
+        }
         Some(other) => Err(anyhow!(
             "Unknown daemon command: \"{other}\". Usage: codex-rotate daemon"
         )),
@@ -329,25 +326,25 @@ fn tray_quit_message() -> Result<String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-    let process_ids = list_running_tray_process_ids(&tray_binary)?;
-    if process_ids.is_empty() {
+        let process_ids = list_running_tray_process_ids(&tray_binary)?;
+        if process_ids.is_empty() {
+            clear_tray_service_registration();
+            return Ok("Codex Rotate tray is not running.".to_string());
+        }
+
+        for process_id in process_ids {
+            stop_process(process_id)
+                .with_context(|| format!("Failed to stop tray pid {}.", process_id))?;
+        }
         clear_tray_service_registration();
-        return Ok("Codex Rotate tray is not running.".to_string());
-    }
 
-    for process_id in process_ids {
-        stop_process(process_id)
-            .with_context(|| format!("Failed to stop tray pid {}.", process_id))?;
-    }
-    clear_tray_service_registration();
+        if wait_for_tray_state(&tray_binary, false) {
+            return Ok("Stopped Codex Rotate tray.".to_string());
+        }
 
-    if wait_for_tray_state(&tray_binary, false) {
-        return Ok("Stopped Codex Rotate tray.".to_string());
-    }
-
-    Err(anyhow!(
-        "Timed out waiting for the Codex Rotate tray to stop."
-    ))
+        Err(anyhow!(
+            "Timed out waiting for the Codex Rotate tray to stop."
+        ))
     }
 }
 
@@ -474,9 +471,9 @@ fn list_running_tray_process_ids(tray_binary: &Path) -> Result<Vec<u32>> {
                 let _pid = parts.next();
                 let first = parts.next();
                 let second = parts.next();
-                tray_binaries.iter().any(|tray_binary| {
-                    command_tokens_match_binary(first, second, tray_binary)
-                })
+                tray_binaries
+                    .iter()
+                    .any(|tray_binary| command_tokens_match_binary(first, second, tray_binary))
             })
             .filter_map(|line| line.split_whitespace().next().and_then(parse_process_id))
             .collect::<Vec<_>>());
@@ -494,8 +491,16 @@ fn tray_binary_candidates(tray_binary: &Path) -> Vec<String> {
         return binaries;
     };
     for candidate in [
-        build.repo_root.join("target").join("debug").join(binary_name),
-        build.repo_root.join("target").join("release").join(binary_name),
+        build
+            .repo_root
+            .join("target")
+            .join("debug")
+            .join(binary_name),
+        build
+            .repo_root
+            .join("target")
+            .join("release")
+            .join(binary_name),
     ] {
         let candidate = candidate.display().to_string();
         if !binaries.contains(&candidate) {
@@ -644,7 +649,10 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
-fn parse_create_options(args: &[String], allow_internal_flags: bool) -> Result<CreateCommandOptions> {
+fn parse_create_options(
+    args: &[String],
+    allow_internal_flags: bool,
+) -> Result<CreateCommandOptions> {
     let mut positionals = Vec::new();
     let mut profile_name = None;
     let mut base_email = None;
@@ -1010,11 +1018,9 @@ mod tests {
 
     #[test]
     fn public_relogin_parser_rejects_internal_flags() {
-        let error = parse_public_relogin_options(&[
-            "acct-123".to_string(),
-            "--manual-login".to_string(),
-        ])
-        .expect_err("public relogin should reject internal flags");
+        let error =
+            parse_public_relogin_options(&["acct-123".to_string(), "--manual-login".to_string()])
+                .expect_err("public relogin should reject internal flags");
         assert!(error.to_string().contains("Unknown relogin option"));
     }
 

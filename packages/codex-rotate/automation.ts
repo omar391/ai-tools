@@ -188,15 +188,9 @@ export interface CodexRotateNamedSecretLocator {
   field_path?: string | null;
 }
 
-export interface CodexRotateEnvVarSecretLocator {
-  kind: "env_var";
-  name: string;
-}
-
 export type CodexRotateSecretLocator =
   | CodexRotateLoginLookupSecretLocator
-  | CodexRotateNamedSecretLocator
-  | CodexRotateEnvVarSecretLocator;
+  | CodexRotateNamedSecretLocator;
 
 interface FastBrowserStepState {
   action?: Record<string, unknown>;
@@ -278,23 +272,11 @@ function ensureRotateDir(): void {
   }
 }
 
-function isStoreBackedSecretLocator(
-  locator: CodexRotateSecretLocator | null | undefined,
-): locator is Exclude<
-  CodexRotateSecretLocator,
-  CodexRotateEnvVarSecretLocator
-> {
-  return Boolean(locator && locator.kind !== "env_var");
-}
-
 function isMissingOptionalSecretLocatorError(
   locator: CodexRotateSecretLocator,
   error: unknown,
 ): boolean {
   const message = error instanceof Error ? error.message : String(error || "");
-  if (locator.kind === "env_var") {
-    return false;
-  }
   return (
     /No Bitwarden login item matched/i.test(message) ||
     /No Bitwarden item matched the exact name/i.test(message)
@@ -313,13 +295,11 @@ async function resolveOptionalCodexRotateSecretLocator(
       ensureDaemonSecretStoreReadyInteractive,
       resolveDaemonSecretLocator,
     } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-    if (isStoreBackedSecretLocator(locator)) {
-      await ensureDaemonSecretStoreReadyInteractive({
-        profileName,
-        store: locator.store ?? "bitwarden-cli",
-        promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
-      });
-    }
+    await ensureDaemonSecretStoreReadyInteractive({
+      profileName,
+      store: locator.store ?? "bitwarden-cli",
+      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
+    });
     try {
       const response = await resolveDaemonSecretLocator({
         profileName,

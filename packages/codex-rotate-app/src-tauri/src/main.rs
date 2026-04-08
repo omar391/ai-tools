@@ -1,6 +1,6 @@
+use codex_rotate_runtime::dev_refresh::clear_tray_service_registration;
 use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
-use codex_rotate_runtime::dev_refresh::clear_tray_service_registration;
 use codex_rotate_tray::{
     error_snapshot, rendered_snapshot, spawn_subscription_loop_controlled,
     spawn_tray_refresh_loop_controlled, SharedRenderState,
@@ -206,13 +206,29 @@ fn paint_percent_digits(rgba: &mut [u8], width: u32, height: u32, center: f32, p
 }
 
 fn paint_activity_badge(rgba: &mut [u8], width: u32, height: u32) {
-    let center_x = width as f32 - 17.0;
-    let center_y = 17.0f32;
-    paint_dot(rgba, width, height, center_x, center_y, 8.5);
-    paint_dot(rgba, width, height, center_x, center_y, 4.5);
+    let center_x = width as i32 - 18;
+    let center_y = 16i32;
+
+    paint_rect(rgba, width, height, center_x - 1, center_y - 7, 2, 14, 255);
+    paint_rect(rgba, width, height, center_x - 7, center_y - 1, 14, 2, 255);
+    paint_dot(
+        rgba,
+        width,
+        height,
+        center_x as f32 + 0.5,
+        center_y as f32 + 0.5,
+        2.5,
+    );
+
+    for (dx, dy) in [(-5, -5), (5, -5), (-5, 5), (5, 5)] {
+        paint_rect(rgba, width, height, center_x + dx, center_y + dy, 2, 2, 220);
+    }
 }
 
-fn build_tray_icon_rgba(quota_percent: Option<u8>, show_activity_badge: bool) -> (Vec<u8>, u32, u32) {
+fn build_tray_icon_rgba(
+    quota_percent: Option<u8>,
+    show_activity_badge: bool,
+) -> (Vec<u8>, u32, u32) {
     let width = 96u32;
     let height = 96u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];

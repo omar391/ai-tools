@@ -1,10 +1,9 @@
 use codex_rotate_runtime::dev_refresh::{
     current_process_local_tray_build, daemon_socket_is_older_than_binary, detect_local_cli_build,
     local_cli_sources_newer_than_binary, local_refresh_disabled,
-    local_tray_sources_newer_than_binary, rebuild_local_cli, rebuild_local_tray,
-    maybe_start_background_release_tray_build,
-    preferred_release_tray_binary, schedule_tray_relaunch_process, spawn_detached_process,
-    stop_running_daemons,
+    local_tray_sources_newer_than_binary, maybe_start_background_release_tray_build,
+    preferred_release_tray_binary, rebuild_local_cli, rebuild_local_tray,
+    schedule_tray_relaunch_process, spawn_detached_process, stop_running_daemons,
 };
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, subscribe, SnapshotMessageKind, StatusSnapshot,
@@ -87,12 +86,19 @@ pub fn rendered_snapshot(snapshot: &StatusSnapshot) -> RenderedSnapshot {
             "Account: {}",
             snapshot.current_email.as_deref().unwrap_or("unknown")
         ),
-        inventory_text: match (snapshot.inventory_active_slot, snapshot.inventory_count) {
-            (Some(slot), Some(count)) if count > 0 && slot <= count => {
-                format!("Inventory: {slot}/{count} account(s)")
+        inventory_text: match (
+            snapshot.inventory_active_slot,
+            snapshot.inventory_healthy_count,
+            snapshot.inventory_count,
+        ) {
+            (Some(slot), Some(healthy), Some(count)) if count > 0 && slot <= count => {
+                format!("Inventory: {slot} current | {healthy} healthy | {count} total")
             }
-            (_, Some(count)) => format!("Inventory: {count} account(s)"),
-            (_, None) => "Inventory: unknown".to_string(),
+            (_, Some(healthy), Some(count)) => {
+                format!("Inventory: {healthy} healthy | {count} total")
+            }
+            (_, _, Some(count)) => format!("Inventory: {count} total"),
+            (_, _, None) => "Inventory: unknown".to_string(),
         },
         plan_text: format!(
             "Plan: {}",
@@ -391,7 +397,7 @@ mod tests {
     fn sample_rendered_snapshot() -> RenderedSnapshot {
         RenderedSnapshot {
             account_text: "Account: dev.1@astronlab.com".to_string(),
-            inventory_text: "Inventory: 2/3 account(s)".to_string(),
+            inventory_text: "Inventory: 2 current | 1 healthy | 3 total".to_string(),
             plan_text: "Plan: free".to_string(),
             quota_text: "Quota: 5h 80% left".to_string(),
             status_text: "Status: watch healthy".to_string(),
@@ -443,13 +449,17 @@ mod tests {
     fn rendered_snapshot_shows_inventory_slot_and_total() {
         let snapshot = StatusSnapshot {
             inventory_active_slot: Some(2),
+            inventory_healthy_count: Some(1),
             inventory_count: Some(3),
             ..StatusSnapshot::default()
         };
 
         let rendered = rendered_snapshot(&snapshot);
 
-        assert_eq!(rendered.inventory_text, "Inventory: 2/3 account(s)");
+        assert_eq!(
+            rendered.inventory_text,
+            "Inventory: 2 current | 1 healthy | 3 total"
+        );
     }
 
     #[test]

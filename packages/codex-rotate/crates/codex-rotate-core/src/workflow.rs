@@ -36,7 +36,6 @@ const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
-const CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR: &str = "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD";
 const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -174,9 +173,6 @@ enum CodexRotateSecretLocator {
         username: String,
         uris: Vec<String>,
         field_path: String,
-    },
-    EnvVar {
-        name: String,
     },
 }
 
@@ -394,10 +390,6 @@ struct BridgeCompleteLoginAttemptPayload<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     account_login_locator: Option<&'a CodexRotateSecretLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_login_env_var_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    account_login_env_var_value: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<BridgeLoginOptions<'a>>,
 }
 
@@ -567,8 +559,6 @@ pub fn cmd_relogin_with_progress(
                 &updated_stored.profile_name,
                 &updated_stored.email,
                 Some(&account_login_locator),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -905,10 +895,6 @@ fn execute_create_flow_attempt(
         Some(entry) => entry.stored.suffix,
         None => fatal(compute_next_account_family_suffix(
             &base_email,
-            family
-                .as_ref()
-                .map(|entry| entry.next_suffix)
-                .unwrap_or_else(|| derive_family_frontier_suffix(&base_email, &known_emails)),
             known_emails,
         ))?,
     };
@@ -1028,17 +1014,23 @@ fn execute_create_flow_attempt(
         }
         return Ok(result);
     }
-    let mut generated_password: Option<String> = None;
-    let mut account_login_locator = build_openai_account_login_locator(&created_email);
+    let account_login_locator = build_openai_account_login_locator(&created_email);
     let mut skip_locator_preflight = false;
     if !reusing_pending {
         report_progress(
             progress.as_ref(),
             format!("Preparing password for {}.", created_email),
         );
-        generated_password = Some(generate_password(18));
-        account_login_locator =
-            build_openai_account_password_env_var_locator(CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR);
+        let generated_password = generate_password(18);
+        let _: CodexRotateSecretRef = run_automation_bridge(
+            "prepare-account-secret-ref",
+            BridgeEnsureSecretPayload {
+                profile_name: &profile_name,
+                email: &created_email,
+                password: generated_password.as_str(),
+            },
+        )
+        .map_err(CreateFlowAttemptFailure::Fatal)?;
         skip_locator_preflight = true;
     }
     let pending = PendingCredential {
@@ -1080,10 +1072,6 @@ fn execute_create_flow_attempt(
         workflow_metadata.workflow_ref.as_deref(),
         Some(codex_bin().as_str()),
         Some(started_at.as_str()),
-        generated_password
-            .as_ref()
-            .map(|_| CREATE_ACCOUNT_LOGIN_PASSWORD_ENV_VAR),
-        generated_password.as_deref(),
         Some(skip_locator_preflight),
         Some(true),
         Some(&birth_date),
@@ -1130,22 +1118,6 @@ fn execute_create_flow_attempt(
         }
         fatal(save_credential_store(&store))?;
         return Err(CreateFlowAttemptFailure::Fatal(error));
-    }
-
-    if let Some(generated_password) = generated_password.as_deref() {
-        report_progress(
-            progress.as_ref(),
-            format!("Saving password secret for {}.", created_email),
-        );
-        let _: CodexRotateSecretRef = run_automation_bridge(
-            "prepare-account-secret-ref",
-            BridgeEnsureSecretPayload {
-                profile_name: &profile_name,
-                email: &created_email,
-                password: generated_password,
-            },
-        )
-        .map_err(CreateFlowAttemptFailure::Fatal)?;
     }
 
     report_progress(
@@ -1396,8 +1368,6 @@ fn run_complete_codex_login(
     workflow_ref: Option<&str>,
     codex_bin: Option<&str>,
     workflow_run_stamp: Option<&str>,
-    account_login_env_var_name: Option<&str>,
-    account_login_env_var_value: Option<&str>,
     skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
     birth_date: Option<&AdultBirthDate>,
@@ -1417,7 +1387,7 @@ fn run_complete_codex_login(
         ensure_managed_browser_wrapper(profile_name, codex_bin.unwrap_or(DEFAULT_CODEX_BIN))?;
     let wrapped_codex_bin = wrapped_codex_bin.to_string_lossy().into_owned();
     match account_login_locator {
-        Some(CodexRotateSecretLocator::EnvVar { .. }) => report_progress(
+        Some(_) if skip_locator_preflight == Some(true) => report_progress(
             progress.as_ref(),
             format!(
                 "Using a freshly generated OpenAI password for {email}; attempting password login first."
@@ -1463,19 +1433,16 @@ fn run_complete_codex_login(
                     birth_year: Some(birth_date.birth_year),
                     codex_session: codex_session.as_ref(),
                 };
-                let attempt_result: BridgeLoginAttemptResult =
-                    run_automation_bridge_with_progress(
-                        "complete-codex-login-attempt",
-                        BridgeCompleteLoginAttemptPayload {
-                            profile_name,
-                            email,
-                            account_login_locator,
-                            account_login_env_var_name,
-                            account_login_env_var_value,
-                            options: Some(options),
-                        },
-                        progress.clone(),
-                    )?;
+                let attempt_result: BridgeLoginAttemptResult = run_automation_bridge_with_progress(
+                    "complete-codex-login-attempt",
+                    BridgeCompleteLoginAttemptPayload {
+                        profile_name,
+                        email,
+                        account_login_locator,
+                        options: Some(options),
+                    },
+                    progress.clone(),
+                )?;
                 let bridge_error_message = attempt_result.error_message.clone();
                 let flow = attempt_result
                     .result
@@ -1624,8 +1591,10 @@ fn run_complete_codex_login(
                     if is_retryable_codex_login_workflow_error_message(message)
                         && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
                     {
-                        let delay_ms =
-                            codex_login_retry_delay_ms(Some("verification_artifact_pending"), attempt);
+                        let delay_ms = codex_login_retry_delay_ms(
+                            Some("verification_artifact_pending"),
+                            attempt,
+                        );
                         report_progress(
                             progress.as_ref(),
                             format!(
@@ -1703,7 +1672,9 @@ fn run_complete_codex_login(
                         }
                     ));
                 }
-                promote_codex_auth_from_session(codex_session.as_ref().or(flow.codex_session.as_ref()))?;
+                promote_codex_auth_from_session(
+                    codex_session.as_ref().or(flow.codex_session.as_ref()),
+                )?;
                 return Ok(());
             }
         }
@@ -1729,15 +1700,12 @@ fn resolve_login_workflow_defaults(workflow_ref: Option<&str>) -> Result<LoginWo
                 paths.account_flow_file.display()
             )
         })?;
-    let full_name = workflow_metadata
-        .default_full_name
-        .clone()
-        .ok_or_else(|| {
-            anyhow!(
-                "Workflow {} is missing input.schema.document.properties.full_name.default.",
-                paths.account_flow_file.display()
-            )
-        })?;
+    let full_name = workflow_metadata.default_full_name.clone().ok_or_else(|| {
+        anyhow!(
+            "Workflow {} is missing input.schema.document.properties.full_name.default.",
+            paths.account_flow_file.display()
+        )
+    })?;
     let birth_date = workflow_metadata.default_birth_date().ok_or_else(|| {
         anyhow!(
             "Workflow {} is missing one or more birth-date defaults.",
@@ -1825,7 +1793,9 @@ fn normalize_codex_rotate_auth_flow_session(raw: &Value) -> Option<CodexRotateAu
     Some(session)
 }
 
-fn read_codex_rotate_auth_flow_summary(result: &FastBrowserRunResult) -> CodexRotateAuthFlowSummary {
+fn read_codex_rotate_auth_flow_summary(
+    result: &FastBrowserRunResult,
+) -> CodexRotateAuthFlowSummary {
     let Some(record) = result.output.as_ref().and_then(Value::as_object) else {
         return CodexRotateAuthFlowSummary::default();
     };
@@ -1939,9 +1909,7 @@ fn maybe_reset_managed_runtime_after_failed_attempt(
 }
 
 fn login_error_message(error_message: Option<&str>, fallback: String) -> String {
-    error_message
-        .map(str::to_string)
-        .unwrap_or(fallback)
+    error_message.map(str::to_string).unwrap_or(fallback)
 }
 
 fn is_retryable_codex_login_workflow_error_message(message: &str) -> bool {
@@ -1966,7 +1934,9 @@ fn codex_login_retry_delays_ms(reason: Option<&str>) -> &'static [u64] {
 
 fn codex_login_retry_delay_ms(reason: Option<&str>, attempt: usize) -> u64 {
     let delays = codex_login_retry_delays_ms(reason);
-    let index = attempt.saturating_sub(1).min(delays.len().saturating_sub(1));
+    let index = attempt
+        .saturating_sub(1)
+        .min(delays.len().saturating_sub(1));
     delays
         .get(index)
         .copied()
@@ -1993,7 +1963,8 @@ fn should_reset_device_auth_session_for_rate_limit(
             .and_then(|value| value.device_code.as_deref())
             .is_some_and(|value| !value.trim().is_empty());
     if (normalized.contains("device auth failed with status 429")
-        || normalized.contains("device auth failed:") && normalized.contains("429 too many requests"))
+        || normalized.contains("device auth failed:")
+            && normalized.contains("429 too many requests"))
         && has_reusable_device_challenge
     {
         return false;
@@ -2072,7 +2043,10 @@ fn promote_codex_auth_from_session(session: Option<&CodexRotateAuthFlowSession>)
 }
 
 fn cancel_codex_browser_login_session(session: Option<&CodexRotateAuthFlowSession>) {
-    let Some(pid) = session.and_then(|value| value.pid).filter(|value| *value > 1) else {
+    let Some(pid) = session
+        .and_then(|value| value.pid)
+        .filter(|value| *value > 1)
+    else {
         return;
     };
     #[cfg(unix)]
@@ -2100,12 +2074,6 @@ fn build_openai_account_login_locator(email: &str) -> CodexRotateSecretLocator {
             "https://chatgpt.com".to_string(),
         ],
         field_path: "/password".to_string(),
-    }
-}
-
-fn build_openai_account_password_env_var_locator(name: &str) -> CodexRotateSecretLocator {
-    CodexRotateSecretLocator::EnvVar {
-        name: name.trim().to_string(),
     }
 }
 
@@ -2499,12 +2467,13 @@ fn parse_workflow_file_metadata(raw: &str) -> WorkflowFileMetadata {
 }
 
 fn yaml_mapping_get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
-    value
-        .as_mapping()?
-        .get(YamlValue::String(key.to_string()))
+    value.as_mapping()?.get(YamlValue::String(key.to_string()))
 }
 
-fn read_workflow_input_property<'a>(root: Option<&'a YamlValue>, field: &str) -> Option<&'a YamlValue> {
+fn read_workflow_input_property<'a>(
+    root: Option<&'a YamlValue>,
+    field: &str,
+) -> Option<&'a YamlValue> {
     let properties = root
         .and_then(|value| yaml_mapping_get(value, "input"))
         .and_then(|value| yaml_mapping_get(value, "schema"))
@@ -2534,9 +2503,7 @@ fn read_yaml_u8(value: &YamlValue) -> Option<u8> {
 
 fn read_yaml_u16(value: &YamlValue) -> Option<u16> {
     match value {
-        YamlValue::Number(value) => value
-            .as_u64()
-            .and_then(|value| u16::try_from(value).ok()),
+        YamlValue::Number(value) => value.as_u64().and_then(|value| u16::try_from(value).ok()),
         YamlValue::String(value) => value.trim().parse::<u16>().ok(),
         _ => None,
     }
@@ -2876,32 +2843,18 @@ fn extract_account_family_suffix(candidate_email: &str, base_email: &str) -> Res
     })
 }
 
-fn compute_next_account_family_suffix(
-    base_email: &str,
-    family_next_suffix: u32,
-    known_emails: Vec<String>,
-) -> Result<u32> {
+fn compute_next_account_family_suffix(base_email: &str, known_emails: Vec<String>) -> Result<u32> {
     let mut used = HashSet::new();
     for email in known_emails {
         if let Some(suffix) = extract_account_family_suffix(&email, base_email)? {
             used.insert(suffix);
         }
     }
-    let mut candidate = family_next_suffix.max(1);
+    let mut candidate = 1;
     while used.contains(&candidate) {
         candidate += 1;
     }
     Ok(candidate)
-}
-
-fn derive_family_frontier_suffix(base_email: &str, known_emails: &[String]) -> u32 {
-    known_emails
-        .iter()
-        .filter_map(|email| extract_account_family_suffix(email, base_email).ok())
-        .flatten()
-        .max()
-        .map(|suffix| suffix.saturating_add(1))
-        .unwrap_or(1)
 }
 
 fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<String> {
@@ -3063,12 +3016,8 @@ fn normalize_gmail_base_email(email: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-fn compute_next_gmail_alias_suffix(
-    base_email: &str,
-    family_next_suffix: u32,
-    known_emails: Vec<String>,
-) -> Result<u32> {
-    compute_next_account_family_suffix(base_email, family_next_suffix, known_emails)
+fn compute_next_gmail_alias_suffix(base_email: &str, known_emails: Vec<String>) -> Result<u32> {
+    compute_next_account_family_suffix(base_email, known_emails)
 }
 
 #[cfg(test)]
@@ -3564,12 +3513,10 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_MUTEX;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -3763,7 +3710,10 @@ input:
             .as_deref(),
             Some("/tmp/demo.sock")
         );
-        assert_eq!(extract_fast_browser_timeout_socket_path("other failure"), None);
+        assert_eq!(
+            extract_fast_browser_timeout_socket_path("other failure"),
+            None
+        );
     }
 
     #[test]
@@ -3817,7 +3767,10 @@ input:
             Some(8765)
         );
         assert_eq!(
-            summary.codex_session.as_ref().and_then(|session| session.pid),
+            summary
+                .codex_session
+                .as_ref()
+                .and_then(|session| session.pid),
             Some(4321)
         );
     }
@@ -3859,11 +3812,10 @@ input:
     }
 
     #[test]
-    fn compute_next_gmail_alias_suffix_respects_known_emails_and_frontier() {
+    fn compute_next_gmail_alias_suffix_fills_first_gap() {
         assert_eq!(
             compute_next_gmail_alias_suffix(
                 "dev.user@gmail.com",
-                1,
                 vec![
                     "dev.user+1@gmail.com".to_string(),
                     "dev.user+7@gmail.com".to_string(),
@@ -3876,14 +3828,13 @@ input:
         assert_eq!(
             compute_next_gmail_alias_suffix(
                 "dev.user@gmail.com",
-                5,
                 vec![
                     "dev.user+1@gmail.com".to_string(),
                     "dev.user+2@gmail.com".to_string(),
                 ],
             )
             .unwrap(),
-            5
+            3
         );
     }
 
@@ -3900,7 +3851,6 @@ input:
         assert_eq!(
             compute_next_account_family_suffix(
                 "dev.{N}@hotspotprime.com",
-                1,
                 vec![
                     "dev.1@hotspotprime.com".to_string(),
                     "dev.4@hotspotprime.com".to_string(),
@@ -3913,11 +3863,38 @@ input:
         assert_eq!(
             compute_next_account_family_suffix(
                 "dev.{N}@astronlab.com",
-                3,
                 vec!["dev.21@astronlab.com".to_string()],
             )
             .unwrap(),
-            3
+            1
+        );
+    }
+
+    #[test]
+    fn compute_next_account_family_suffix_fills_missing_dev_slots_before_frontier() {
+        assert_eq!(
+            compute_next_account_family_suffix(
+                "dev.{N}@astronlab.com",
+                vec![
+                    "dev.45@astronlab.com".to_string(),
+                    "dev.47@astronlab.com".to_string(),
+                    "dev.48@astronlab.com".to_string(),
+                    "dev.58@astronlab.com".to_string(),
+                ],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            compute_next_account_family_suffix(
+                "dev.{N}@astronlab.com",
+                (1..=58)
+                    .filter(|suffix| *suffix != 46)
+                    .map(|suffix| format!("dev.{suffix}@astronlab.com"))
+                    .collect(),
+            )
+            .unwrap(),
+            46
         );
     }
 
@@ -4569,23 +4546,6 @@ input:
                     ]
                 );
             }
-            CodexRotateSecretLocator::EnvVar { .. } => {
-                panic!("expected login lookup locator")
-            }
-        }
-    }
-
-    #[test]
-    fn builds_openai_password_env_var_locator() {
-        let locator =
-            build_openai_account_password_env_var_locator("CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD");
-        match locator {
-            CodexRotateSecretLocator::EnvVar { name } => {
-                assert_eq!(name, "CODEX_ROTATE_OPENAI_ACCOUNT_PASSWORD");
-            }
-            CodexRotateSecretLocator::LoginLookup { .. } => {
-                panic!("expected env var locator")
-            }
         }
     }
 
@@ -4727,19 +4687,6 @@ input:
     }
 
     #[test]
-    fn derive_family_frontier_suffix_uses_highest_observed_suffix() {
-        let known = vec![
-            "dev.20@astronlab.com".to_string(),
-            "dev.22@astronlab.com".to_string(),
-            "dev.23@astronlab.com".to_string(),
-        ];
-        assert_eq!(
-            derive_family_frontier_suffix("dev.{n}@astronlab.com", &known),
-            24
-        );
-    }
-
-    #[test]
     fn add_reconciliation_moves_matching_pending_into_family_state() {
         let mut store = CredentialStore::default();
         store.pending.insert(
@@ -4783,6 +4730,8 @@ input:
             last_quota_summary: None,
             last_quota_blocker: None,
             last_quota_checked_at: None,
+            last_quota_primary_left_percent: None,
+            last_quota_next_refresh_at: None,
         };
 
         let pending = store.pending.remove("dev.24@astronlab.com").unwrap();
@@ -4813,7 +4762,7 @@ input:
 
     #[test]
     fn migrates_legacy_credential_store_into_accounts_json() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let rotate_home = unique_temp_dir("codex-rotate-legacy-store");
         fs::create_dir_all(&rotate_home).expect("create rotate home");
         let accounts_path = rotate_home.join("accounts.json");
@@ -4896,7 +4845,7 @@ input:
 
     #[test]
     fn loading_credential_store_migrates_legacy_file_automatically() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let rotate_home = unique_temp_dir("codex-rotate-load-store");
         fs::create_dir_all(&rotate_home).expect("create rotate home");
         let legacy_path = rotate_home.join("credentials.json");
@@ -4966,7 +4915,7 @@ input:
 
     #[test]
     fn loading_credential_store_keeps_read_path_side_effect_free() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let rotate_home = unique_temp_dir("codex-rotate-pure-load-store");
         fs::create_dir_all(&rotate_home).expect("create rotate home");
         let accounts_path = rotate_home.join("accounts.json");

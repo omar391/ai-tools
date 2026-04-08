@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -29,6 +29,7 @@ const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
+const LIST_STALE_QUOTA_REFRESH_LIMIT: usize = 2;
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -61,6 +62,10 @@ pub struct AccountEntry {
     pub last_quota_blocker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_quota_checked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_quota_primary_left_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_quota_next_refresh_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +79,7 @@ pub struct AccountInspection {
 pub struct PoolOverview {
     pub inventory_count: usize,
     pub inventory_active_slot: Option<usize>,
+    pub inventory_healthy_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -269,6 +275,8 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
         last_quota_summary: None,
         last_quota_blocker: None,
         last_quota_checked_at: None,
+        last_quota_primary_left_percent: None,
+        last_quota_next_refresh_at: None,
     });
     pool.active_index = pool.accounts.len() - 1;
     save_pool(&pool)?;
@@ -291,7 +299,9 @@ pub fn cmd_next() -> Result<String> {
     cmd_next_with_progress(None)
 }
 
-pub fn cmd_next_with_progress(progress: Option<Arc<dyn Fn(String) + Send + Sync>>) -> Result<String> {
+pub fn cmd_next_with_progress(
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
     match rotate_next_internal_with_progress(progress)? {
         NextResult::Rotated { message, .. }
         | NextResult::Stayed { message, .. }
@@ -512,6 +522,8 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         return Ok(());
     }
 
+    dirty |= refresh_stale_list_quota_entries(&mut pool, &paths.codex_auth_file)?;
+
     let mut usable_count = 0;
     let mut exhausted_count = 0;
     let mut unavailable_count = 0;
@@ -581,6 +593,21 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     Ok(())
 }
 
+fn refresh_stale_list_quota_entries(pool: &mut Pool, auth_path: &Path) -> Result<bool> {
+    let refresh_order =
+        build_list_quota_refresh_order(pool, Utc::now(), LIST_STALE_QUOTA_REFRESH_LIMIT);
+    let mut dirty = false;
+    for index in refresh_order {
+        let inspection = inspect_account(
+            &mut pool.accounts[index],
+            auth_path,
+            index == pool.active_index,
+        )?;
+        dirty |= inspection.updated;
+    }
+    Ok(dirty)
+}
+
 fn format_cached_quota_line(entry: &AccountEntry) -> String {
     let checked_suffix = entry
         .last_quota_checked_at
@@ -601,6 +628,158 @@ fn format_cached_quota_line(entry: &AccountEntry) -> String {
     }
 
     "unknown (run codex-rotate status or rotate to refresh)".to_string()
+}
+
+fn build_list_quota_refresh_order(
+    pool: &Pool,
+    now: DateTime<Utc>,
+    max_refreshes: usize,
+) -> Vec<usize> {
+    if max_refreshes == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = pool
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| cached_quota_state_is_stale(entry, now))
+        .map(|(index, entry)| {
+            let priority = if index == pool.active_index {
+                0
+            } else if entry.last_quota_usable == Some(true) {
+                1
+            } else {
+                2
+            };
+            (index, priority, cached_quota_checked_at(entry))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    candidates
+        .into_iter()
+        .take(max_refreshes)
+        .map(|(index, _, _)| index)
+        .collect()
+}
+
+fn cached_quota_state_is_stale(entry: &AccountEntry, now: DateTime<Utc>) -> bool {
+    if let Some(next_refresh_at) = cached_quota_next_refresh_at(entry) {
+        return now >= next_refresh_at;
+    }
+    let Some(checked_at) = cached_quota_checked_at(entry) else {
+        return true;
+    };
+    if let Some(next_refresh_at) = legacy_cached_quota_next_refresh_at(entry, checked_at) {
+        return now >= next_refresh_at;
+    }
+    now >= checked_at + cached_quota_refresh_interval(entry)
+}
+
+fn cached_quota_checked_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
+    entry
+        .last_quota_checked_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn cached_quota_next_refresh_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
+    entry
+        .last_quota_next_refresh_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn cached_quota_refresh_interval(entry: &AccountEntry) -> Duration {
+    match entry.last_quota_usable {
+        Some(true) => match entry.last_quota_primary_left_percent.unwrap_or(0) {
+            value if value > 20 => Duration::seconds(60),
+            value if value > 10 => Duration::seconds(30),
+            _ => Duration::seconds(15),
+        },
+        Some(false) | None => Duration::seconds(15),
+    }
+}
+
+fn legacy_cached_quota_next_refresh_at(
+    entry: &AccountEntry,
+    checked_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if entry.last_quota_usable != Some(false) {
+        return None;
+    }
+    let blocker = entry.last_quota_blocker.as_deref()?;
+    let reset_text = blocker.split("resets in ").nth(1)?.trim();
+    Some(checked_at + parse_compact_duration(reset_text)?)
+}
+
+fn parse_compact_duration(value: &str) -> Option<Duration> {
+    let mut seconds = 0_i64;
+    for part in value.split_whitespace() {
+        if part.len() < 2 {
+            return None;
+        }
+        let (amount, unit) = part.split_at(part.len() - 1);
+        let amount = amount.parse::<i64>().ok()?;
+        seconds += match unit {
+            "d" => amount.saturating_mul(86_400),
+            "h" => amount.saturating_mul(3_600),
+            "m" => amount.saturating_mul(60),
+            "s" => amount,
+            _ => return None,
+        };
+    }
+    Some(Duration::seconds(seconds))
+}
+
+fn compute_quota_next_refresh_at(
+    inspection: &AccountInspection,
+    checked_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    if let Some(usage) = inspection.usage.as_ref() {
+        if has_usable_quota(usage) {
+            return checked_at + cached_quota_refresh_interval_from_usage(usage);
+        }
+        if let Some(primary_window) = usage
+            .rate_limit
+            .as_ref()
+            .and_then(|limits| limits.primary_window.as_ref())
+        {
+            if get_quota_left(Some(primary_window))
+                .map(|value| value <= 0.0)
+                .unwrap_or(false)
+                && primary_window.reset_after_seconds >= 0
+            {
+                return checked_at + Duration::seconds(primary_window.reset_after_seconds);
+            }
+        }
+    }
+    checked_at + Duration::seconds(15)
+}
+
+fn cached_quota_refresh_interval_from_usage(usage: &UsageResponse) -> Duration {
+    match get_quota_left(
+        usage
+            .rate_limit
+            .as_ref()
+            .and_then(|limits| limits.primary_window.as_ref()),
+    )
+    .map(|value| value.round() as u8)
+    .unwrap_or(0)
+    {
+        value if value > 20 => Duration::seconds(60),
+        value if value > 10 => Duration::seconds(30),
+        _ => Duration::seconds(15),
+    }
 }
 
 pub fn cmd_status() -> Result<String> {
@@ -624,6 +803,11 @@ pub fn current_pool_overview() -> Result<PoolOverview> {
         } else {
             Some(pool.active_index.saturating_add(1))
         },
+        inventory_healthy_count: pool
+            .accounts
+            .iter()
+            .filter(|entry| entry.last_quota_usable == Some(true))
+            .count(),
     })
 }
 
@@ -1053,6 +1237,8 @@ fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) 
             last_quota_summary: None,
             last_quota_blocker: None,
             last_quota_checked_at: None,
+            last_quota_primary_left_percent: None,
+            last_quota_next_refresh_at: None,
         });
         pool.active_index = pool.accounts.len() - 1;
         let _ = reconcile_added_account_credential_state(&pool.accounts[pool.active_index])?;
@@ -1227,8 +1413,22 @@ fn apply_quota_inspection_to_account(
     inspection: &AccountInspection,
     checked_at: &str,
 ) -> bool {
+    let checked_at_value = DateTime::parse_from_rfc3339(checked_at)
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
     let next_usable = inspection.usage.as_ref().map(has_usable_quota);
     let next_summary = inspection.usage.as_ref().map(format_compact_quota);
+    let next_primary_left_percent = inspection.usage.as_ref().and_then(|usage| {
+        get_quota_left(
+            usage
+                .rate_limit
+                .as_ref()
+                .and_then(|limits| limits.primary_window.as_ref()),
+        )
+        .map(|value| value.round() as u8)
+    });
+    let next_refresh_at = compute_quota_next_refresh_at(inspection, checked_at_value)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
     let next_blocker = inspection
         .usage
         .as_ref()
@@ -1245,12 +1445,16 @@ fn apply_quota_inspection_to_account(
     let changed = entry.last_quota_usable != next_usable
         || entry.last_quota_summary != next_summary
         || entry.last_quota_blocker != next_blocker
-        || entry.last_quota_checked_at.as_deref() != Some(checked_at);
+        || entry.last_quota_checked_at.as_deref() != Some(checked_at)
+        || entry.last_quota_primary_left_percent != next_primary_left_percent
+        || entry.last_quota_next_refresh_at.as_deref() != Some(next_refresh_at.as_str());
 
     entry.last_quota_usable = next_usable;
     entry.last_quota_summary = next_summary;
     entry.last_quota_blocker = next_blocker;
     entry.last_quota_checked_at = Some(checked_at.to_string());
+    entry.last_quota_primary_left_percent = next_primary_left_percent;
+    entry.last_quota_next_refresh_at = Some(next_refresh_at);
     changed
 }
 
@@ -1707,9 +1911,13 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_MUTEX;
     use base64::Engine;
     use serde_json::json;
-    use std::sync::Mutex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration as StdDuration, Instant};
 
     fn stored_entry(usable: Option<bool>, checked_at: Option<&str>) -> AccountEntry {
         AccountEntry {
@@ -1734,10 +1942,58 @@ mod tests {
             last_quota_summary: None,
             last_quota_blocker: None,
             last_quota_checked_at: checked_at.map(ToOwned::to_owned),
+            last_quota_primary_left_percent: None,
+            last_quota_next_refresh_at: None,
         }
     }
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    fn restore_env_var(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(key);
+            },
+        }
+    }
+
+    fn spawn_usage_server(body: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind usage server");
+        listener
+            .set_nonblocking(true)
+            .expect("set usage server nonblocking");
+        let address = listener.local_addr().expect("usage server address");
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 4096];
+                        let _ = stream.read(&mut buffer);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write usage response");
+                        stream.flush().expect("flush usage response");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            panic!("timed out waiting for quota request");
+                        }
+                        thread::sleep(StdDuration::from_millis(10));
+                    }
+                    Err(error) => panic!("usage server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}/usage"), handle)
+    }
 
     fn make_jwt(payload: serde_json::Value) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1868,8 +2124,163 @@ mod tests {
     }
 
     #[test]
+    fn cached_list_quota_state_respects_usable_ttl() {
+        let now = DateTime::parse_from_rfc3339("2026-04-08T12:01:00.000Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let mut fresh = stored_entry(Some(true), Some("2026-04-08T12:00:30.000Z"));
+        fresh.last_quota_primary_left_percent = Some(40);
+        assert!(!cached_quota_state_is_stale(&fresh, now));
+
+        let mut stale = stored_entry(Some(true), Some("2026-04-08T11:59:50.000Z"));
+        stale.last_quota_primary_left_percent = Some(40);
+        assert!(cached_quota_state_is_stale(&stale, now));
+    }
+
+    #[test]
+    fn cached_list_quota_state_waits_for_zero_percent_reset_time() {
+        let checked_at = DateTime::parse_from_rfc3339("2026-04-08T12:00:00.000Z")
+            .expect("parse checked_at")
+            .with_timezone(&Utc);
+        let mut exhausted = stored_entry(Some(false), Some("2026-04-08T12:00:00.000Z"));
+        exhausted.last_quota_blocker = Some("5h quota exhausted, resets in 2h 15m".to_string());
+
+        let before_reset = DateTime::parse_from_rfc3339("2026-04-08T14:14:59.000Z")
+            .expect("parse before_reset")
+            .with_timezone(&Utc);
+        let after_reset = DateTime::parse_from_rfc3339("2026-04-08T14:15:01.000Z")
+            .expect("parse after_reset")
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            legacy_cached_quota_next_refresh_at(&exhausted, checked_at),
+            Some(
+                DateTime::parse_from_rfc3339("2026-04-08T14:15:00.000Z")
+                    .expect("parse expected reset")
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(!cached_quota_state_is_stale(&exhausted, before_reset));
+        assert!(cached_quota_state_is_stale(&exhausted, after_reset));
+    }
+
+    #[test]
+    fn list_quota_refresh_order_prioritizes_active_then_oldest_stale_usable() {
+        let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+
+        let mut active = stored_entry(Some(false), Some("2026-04-08T12:04:00.000Z"));
+        active.last_quota_blocker = Some("rate limited".to_string());
+
+        let mut oldest_stale_usable = stored_entry(Some(true), Some("2026-04-08T12:03:30.000Z"));
+        oldest_stale_usable.last_quota_primary_left_percent = Some(40);
+
+        let mut fresher_stale_usable = stored_entry(Some(true), Some("2026-04-08T12:04:10.000Z"));
+        fresher_stale_usable.last_quota_primary_left_percent = Some(40);
+
+        let mut fresh_usable = stored_entry(Some(true), Some("2026-04-08T12:04:45.000Z"));
+        fresh_usable.last_quota_primary_left_percent = Some(40);
+
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![
+                active,
+                fresher_stale_usable,
+                fresh_usable,
+                oldest_stale_usable,
+            ],
+        };
+
+        assert_eq!(build_list_quota_refresh_order(&pool, now, 2), vec![0, 3]);
+    }
+
+    #[test]
+    fn cmd_list_refreshes_stale_cached_usable_quota() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut stale = stored_entry(Some(true), Some("2026-04-07T12:00:00.000Z"));
+            stale.email = "dev.60@astronlab.com".to_string();
+            stale.account_id = "acct-60".to_string();
+            stale.label = "dev.60@astronlab.com_free".to_string();
+            stale.auth = make_auth("dev.60@astronlab.com", "acct-60", "free");
+            stale.auth.tokens.account_id = "acct-60".to_string();
+            stale.last_quota_summary = Some("5h 99% left".to_string());
+            stale.last_quota_primary_left_percent = Some(99);
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![stale],
+            })?;
+
+            let (usage_url, handle) = spawn_usage_server(
+                json!({
+                    "user_id": "user-60",
+                    "account_id": "acct-60",
+                    "email": "dev.60@astronlab.com",
+                    "plan_type": "free",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 60.0,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 7200,
+                            "reset_at": 0
+                        },
+                        "secondary_window": null
+                    },
+                    "code_review_rate_limit": null,
+                    "additional_rate_limits": null,
+                    "credits": null,
+                    "promo": null
+                })
+                .to_string(),
+            );
+            unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &usage_url);
+            }
+
+            let output = cmd_list()?;
+            handle.join().expect("usage server should finish");
+
+            assert!(output.contains("5h 40% left"));
+
+            let refreshed = load_pool()?;
+            assert_eq!(
+                refreshed.accounts[0].last_quota_primary_left_percent,
+                Some(40)
+            );
+            assert!(refreshed.accounts[0]
+                .last_quota_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("5h 40% left"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should refresh stale cached quota");
+    }
+
+    #[test]
     fn sync_pool_active_account_adds_missing_current_auth_to_pool() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
 
@@ -1924,4 +2335,41 @@ mod tests {
         assert_eq!(pool.active_index, 0);
     }
 
+    #[test]
+    fn current_pool_overview_counts_cached_healthy_accounts() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            save_pool(&Pool {
+                active_index: 1,
+                accounts: vec![
+                    stored_entry(Some(false), Some("2026-04-08T12:00:00.000Z")),
+                    stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z")),
+                    stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z")),
+                    stored_entry(None, None),
+                ],
+            })?;
+
+            let overview = current_pool_overview()?;
+            assert_eq!(overview.inventory_count, 4);
+            assert_eq!(overview.inventory_active_slot, Some(2));
+            assert_eq!(overview.inventory_healthy_count, 2);
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("overview should count healthy accounts");
+    }
 }
