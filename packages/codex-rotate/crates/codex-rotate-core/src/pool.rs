@@ -524,6 +524,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let refresh_order =
         build_list_quota_refresh_order(&pool, Utc::now(), LIST_STALE_QUOTA_REFRESH_LIMIT);
     let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
+    let display_order = build_list_account_display_order(&pool);
 
     let mut usable_count = 0;
     let mut exhausted_count = 0;
@@ -538,23 +539,31 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     output.push_line(format!("{BOLD}Total Accounts{RESET}"))?;
     output.push_line(String::new())?;
 
-    for index in 0..pool.accounts.len() {
+    for index in display_order {
         let is_active = index == pool.active_index;
+        let account_header_line = build_list_account_header_line(&pool.accounts[index], is_active);
+        output.push_line(account_header_line.clone())?;
+
         if refresh_indices.contains(&index) {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
             dirty |= inspection.updated;
         }
+
         let quota_line = format_cached_quota_line(&pool.accounts[index]);
+        let mut account_lines = vec![account_header_line];
+        let account_detail_lines =
+            build_list_account_detail_lines(&pool.accounts[index], &quota_line);
+        for line in &account_detail_lines {
+            output.push_line(line.clone())?;
+        }
+        account_lines.extend(account_detail_lines);
+
         let is_healthy = matches!(pool.accounts[index].last_quota_usable, Some(true));
         match pool.accounts[index].last_quota_usable {
             Some(true) => usable_count += 1,
             Some(false) => exhausted_count += 1,
             None => unavailable_count += 1,
-        }
-        let account_lines = build_list_account_lines(&pool.accounts[index], is_active, &quota_line);
-        for line in &account_lines {
-            output.push_line(line.clone())?;
         }
         if is_healthy {
             healthy_account_sections.push(account_lines);
@@ -600,17 +609,13 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     Ok(())
 }
 
-fn build_list_account_lines(
-    entry: &AccountEntry,
-    is_active: bool,
-    quota_line: &str,
-) -> Vec<String> {
+fn build_list_account_header_line(entry: &AccountEntry, is_active: bool) -> String {
     let label = if is_active {
         format!("{BOLD}{}{RESET}", entry.label)
     } else {
         entry.label.clone()
     };
-    let mut lines = vec![format!(
+    format!(
         "  {} {}  {CYAN}{}{RESET}  {DIM}{}{RESET}  {DIM}{}{RESET}",
         if is_active {
             format!("{GREEN}>{RESET}")
@@ -621,11 +626,18 @@ fn build_list_account_lines(
         entry.email,
         entry.plan_type,
         format_short_account_id(&entry.account_id)
-    )];
+    )
+}
+
+fn build_list_account_detail_lines(entry: &AccountEntry, quota_line: &str) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(alias) = entry.alias.as_ref() {
         lines.push(format!("    {DIM}alias{RESET}  {}", alias));
     }
     lines.push(format!("    {DIM}quota{RESET}  {}", quota_line));
+    if let Some(next_refresh_at) = format_list_quota_refresh_eta(entry) {
+        lines.push(format!("    {DIM}next refresh{RESET}  {}", next_refresh_at));
+    }
     lines
 }
 
@@ -649,6 +661,25 @@ fn format_cached_quota_line(entry: &AccountEntry) -> String {
     }
 
     "unknown (run codex-rotate status or rotate to refresh)".to_string()
+}
+
+fn format_list_quota_refresh_eta(entry: &AccountEntry) -> Option<String> {
+    effective_cached_quota_next_refresh_at(entry)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+fn build_list_account_display_order(pool: &Pool) -> Vec<usize> {
+    let mut indices = (0..pool.accounts.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        let left_eta = effective_cached_quota_next_refresh_at(&pool.accounts[*left]);
+        let right_eta = effective_cached_quota_next_refresh_at(&pool.accounts[*right]);
+        left_eta
+            .is_none()
+            .cmp(&right_eta.is_none())
+            .then_with(|| left_eta.cmp(&right_eta))
+            .then_with(|| left.cmp(right))
+    });
+    indices
 }
 
 fn build_list_quota_refresh_order(
@@ -692,16 +723,10 @@ fn build_list_quota_refresh_order(
 }
 
 fn cached_quota_state_is_stale(entry: &AccountEntry, now: DateTime<Utc>) -> bool {
-    if let Some(next_refresh_at) = cached_quota_next_refresh_at(entry) {
-        return now >= next_refresh_at;
-    }
-    let Some(checked_at) = cached_quota_checked_at(entry) else {
+    let Some(next_refresh_at) = effective_cached_quota_next_refresh_at(entry) else {
         return true;
     };
-    if let Some(next_refresh_at) = legacy_cached_quota_next_refresh_at(entry, checked_at) {
-        return now >= next_refresh_at;
-    }
-    now >= checked_at + cached_quota_refresh_interval(entry)
+    now >= next_refresh_at
 }
 
 fn cached_quota_checked_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
@@ -718,6 +743,15 @@ fn cached_quota_next_refresh_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.with_timezone(&Utc))
+}
+
+fn effective_cached_quota_next_refresh_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
+    if let Some(next_refresh_at) = cached_quota_next_refresh_at(entry) {
+        return Some(next_refresh_at);
+    }
+    let checked_at = cached_quota_checked_at(entry)?;
+    legacy_cached_quota_next_refresh_at(entry, checked_at)
+        .or_else(|| Some(checked_at + cached_quota_refresh_interval(entry)))
 }
 
 fn cached_quota_refresh_interval(entry: &AccountEntry) -> Duration {
@@ -2227,6 +2261,28 @@ mod tests {
     }
 
     #[test]
+    fn list_account_display_order_sorts_by_next_quota_refresh_eta() {
+        let mut later = stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z"));
+        later.label = "later".to_string();
+        later.last_quota_primary_left_percent = Some(80);
+        later.last_quota_next_refresh_at = Some("2026-04-08T12:20:00.000Z".to_string());
+
+        let mut unknown = stored_entry(None, None);
+        unknown.label = "unknown".to_string();
+
+        let mut sooner = stored_entry(Some(false), Some("2026-04-08T12:00:00.000Z"));
+        sooner.label = "sooner".to_string();
+        sooner.last_quota_blocker = Some("7d quota exhausted, resets in 10m".to_string());
+
+        let pool = Pool {
+            active_index: 1,
+            accounts: vec![later, unknown, sooner],
+        };
+
+        assert_eq!(build_list_account_display_order(&pool), vec![2, 0, 1]);
+    }
+
+    #[test]
     fn cmd_list_refreshes_stale_cached_usable_quota() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -2376,6 +2432,117 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("list should print total and healthy sections");
+    }
+
+    #[test]
+    fn cmd_list_sorts_total_accounts_by_quota_refresh_eta() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut later = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
+            later.label = "dev.later@astronlab.com_free".to_string();
+            later.email = "dev.later@astronlab.com".to_string();
+            later.account_id = "acct-later".to_string();
+            later.last_quota_summary = Some("7d 88% left".to_string());
+            later.last_quota_primary_left_percent = Some(88);
+            later.last_quota_next_refresh_at = Some("2099-01-03T00:00:00.000Z".to_string());
+
+            let mut unknown = stored_entry(None, None);
+            unknown.label = "dev.unknown@astronlab.com_free".to_string();
+            unknown.email = "dev.unknown@astronlab.com".to_string();
+            unknown.account_id = "acct-unknown".to_string();
+
+            let mut sooner = stored_entry(Some(false), Some("2026-04-09T02:00:00.000Z"));
+            sooner.label = "dev.sooner@astronlab.com_free".to_string();
+            sooner.email = "dev.sooner@astronlab.com".to_string();
+            sooner.account_id = "acct-sooner".to_string();
+            sooner.last_quota_summary = Some("7d 0% left".to_string());
+            sooner.last_quota_blocker = Some("7d quota exhausted, resets in 1d".to_string());
+            sooner.last_quota_primary_left_percent = Some(0);
+            sooner.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+            save_pool(&Pool {
+                active_index: 2,
+                accounts: vec![later, unknown, sooner],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+            let total_index = output.find("Total Accounts").expect("total section");
+            let healthy_index = output
+                .find("Healthy Accounts (1 account(s))")
+                .expect("healthy section");
+            let total_section = &output[total_index..healthy_index];
+
+            let sooner_index = total_section
+                .find("dev.sooner@astronlab.com_free")
+                .expect("sooner account");
+            let later_index = total_section
+                .find("dev.later@astronlab.com_free")
+                .expect("later account");
+            let unknown_index = total_section
+                .find("dev.unknown@astronlab.com_free")
+                .expect("unknown account");
+
+            assert!(sooner_index < later_index);
+            assert!(later_index < unknown_index);
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should sort total accounts by quota refresh eta");
+    }
+
+    #[test]
+    fn cmd_list_shows_next_quota_refresh_eta_when_available() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut entry = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
+            entry.label = "dev.eta@astronlab.com_free".to_string();
+            entry.email = "dev.eta@astronlab.com".to_string();
+            entry.account_id = "acct-eta".to_string();
+            entry.last_quota_summary = Some("7d 88% left".to_string());
+            entry.last_quota_primary_left_percent = Some(88);
+            entry.last_quota_next_refresh_at = Some("2099-01-03T00:00:00.000Z".to_string());
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![entry],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+
+            assert!(output.contains("next refresh"));
+            assert!(output.contains("2099-01-03T00:00:00.000Z"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should show next quota refresh eta");
     }
 
     #[test]
