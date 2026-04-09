@@ -634,10 +634,15 @@ fn build_list_account_detail_lines(entry: &AccountEntry, quota_line: &str) -> Ve
     if let Some(alias) = entry.alias.as_ref() {
         lines.push(format!("    {DIM}alias{RESET}  {}", alias));
     }
-    lines.push(format!("    {DIM}quota{RESET}  {}", quota_line));
-    if let Some(next_refresh_at) = format_list_quota_refresh_eta(entry) {
-        lines.push(format!("    {DIM}next refresh{RESET}  {}", next_refresh_at));
-    }
+    let quota_detail_line = if let Some(next_refresh_at) = format_list_quota_refresh_eta(entry) {
+        format!(
+            "    {DIM}quota{RESET}  {} {DIM}| next refresh{RESET} {}",
+            quota_line, next_refresh_at
+        )
+    } else {
+        format!("    {DIM}quota{RESET}  {}", quota_line)
+    };
+    lines.push(quota_detail_line);
     lines
 }
 
@@ -2535,8 +2540,8 @@ mod tests {
 
             let output = strip_ansi(&cmd_list()?);
 
-            assert!(output.contains("next refresh"));
-            assert!(output.contains("2099-01-03T00:00:00.000Z"));
+            assert!(output.contains("| next refresh 2099-01-03T00:00:00.000Z"));
+            assert!(!output.contains("\n    next refresh"));
             Ok(())
         })();
 
