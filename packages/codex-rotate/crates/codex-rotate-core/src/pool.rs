@@ -528,51 +528,37 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut usable_count = 0;
     let mut exhausted_count = 0;
     let mut unavailable_count = 0;
+    let mut healthy_account_sections = Vec::new();
     output.push_line(String::new())?;
     output.push_line(format!(
         "{BOLD}Codex OAuth Account Pool{RESET} ({} account(s))",
         pool.accounts.len()
     ))?;
     output.push_line(String::new())?;
+    output.push_line(format!("{BOLD}Total Accounts{RESET}"))?;
+    output.push_line(String::new())?;
 
     for index in 0..pool.accounts.len() {
         let is_active = index == pool.active_index;
-        let label = if is_active {
-            format!("{BOLD}{}{RESET}", pool.accounts[index].label)
-        } else {
-            pool.accounts[index].label.clone()
-        };
-        let email = pool.accounts[index].email.clone();
-        let plan_type = pool.accounts[index].plan_type.clone();
-        let account_id = pool.accounts[index].account_id.clone();
-        let alias = pool.accounts[index].alias.clone();
-        output.push_line(format!(
-            "  {} {}  {CYAN}{}{RESET}  {DIM}{}{RESET}  {DIM}{}{RESET}",
-            if is_active {
-                format!("{GREEN}>{RESET}")
-            } else {
-                " ".to_string()
-            },
-            label,
-            email,
-            plan_type,
-            format_short_account_id(&account_id)
-        ))?;
-        if let Some(alias) = alias {
-            output.push_line(format!("    {DIM}alias{RESET}  {}", alias))?;
-        }
         if refresh_indices.contains(&index) {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
             dirty |= inspection.updated;
         }
         let quota_line = format_cached_quota_line(&pool.accounts[index]);
+        let is_healthy = matches!(pool.accounts[index].last_quota_usable, Some(true));
         match pool.accounts[index].last_quota_usable {
             Some(true) => usable_count += 1,
             Some(false) => exhausted_count += 1,
             None => unavailable_count += 1,
         }
-        output.push_line(format!("    {DIM}quota{RESET}  {}", quota_line))?;
+        let account_lines = build_list_account_lines(&pool.accounts[index], is_active, &quota_line);
+        for line in &account_lines {
+            output.push_line(line.clone())?;
+        }
+        if is_healthy {
+            healthy_account_sections.push(account_lines);
+        }
     }
 
     if dirty {
@@ -596,7 +582,51 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         ))?;
     }
     output.push_line(String::new())?;
+    output.push_line(format!(
+        "{BOLD}Healthy Accounts{RESET} ({} account(s))",
+        usable_count
+    ))?;
+    output.push_line(String::new())?;
+    if healthy_account_sections.is_empty() {
+        output.push_line(format!("  {DIM}No healthy accounts.{RESET}"))?;
+    } else {
+        for account_lines in healthy_account_sections {
+            for line in account_lines {
+                output.push_line(line)?;
+            }
+        }
+    }
+    output.push_line(String::new())?;
     Ok(())
+}
+
+fn build_list_account_lines(
+    entry: &AccountEntry,
+    is_active: bool,
+    quota_line: &str,
+) -> Vec<String> {
+    let label = if is_active {
+        format!("{BOLD}{}{RESET}", entry.label)
+    } else {
+        entry.label.clone()
+    };
+    let mut lines = vec![format!(
+        "  {} {}  {CYAN}{}{RESET}  {DIM}{}{RESET}  {DIM}{}{RESET}",
+        if is_active {
+            format!("{GREEN}>{RESET}")
+        } else {
+            " ".to_string()
+        },
+        label,
+        entry.email,
+        entry.plan_type,
+        format_short_account_id(&entry.account_id)
+    )];
+    if let Some(alias) = entry.alias.as_ref() {
+        lines.push(format!("    {DIM}alias{RESET}  {}", alias));
+    }
+    lines.push(format!("    {DIM}quota{RESET}  {}", quota_line));
+    lines
 }
 
 fn format_cached_quota_line(entry: &AccountEntry) -> String {
@@ -1913,6 +1943,16 @@ mod tests {
         }
     }
 
+    fn strip_ansi(input: &str) -> String {
+        input
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(GREEN, "")
+            .replace(YELLOW, "")
+            .replace(CYAN, "")
+            .replace(RESET, "")
+    }
+
     fn spawn_usage_server(body: String) -> (String, thread::JoinHandle<()>) {
         spawn_usage_server_with_delay(body, StdDuration::from_millis(0))
     }
@@ -2267,6 +2307,75 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("list should refresh stale cached quota");
+    }
+
+    #[test]
+    fn cmd_list_prints_total_and_healthy_sections_separately() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut healthy = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
+            healthy.label = "dev.healthy@astronlab.com_free".to_string();
+            healthy.email = "dev.healthy@astronlab.com".to_string();
+            healthy.account_id = "acct-healthy".to_string();
+            healthy.last_quota_summary = Some("7d 88% left".to_string());
+            healthy.last_quota_primary_left_percent = Some(88);
+            healthy.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+            let mut exhausted = stored_entry(Some(false), Some("2026-04-09T02:00:00.000Z"));
+            exhausted.label = "dev.exhausted@astronlab.com_free".to_string();
+            exhausted.email = "dev.exhausted@astronlab.com".to_string();
+            exhausted.account_id = "acct-exhausted".to_string();
+            exhausted.last_quota_summary = Some("7d 0% left".to_string());
+            exhausted.last_quota_blocker = Some("7d quota exhausted, resets in 6d".to_string());
+            exhausted.last_quota_primary_left_percent = Some(0);
+            exhausted.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![healthy, exhausted],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+
+            assert!(output.contains("Total Accounts"));
+            assert!(output.contains("Healthy Accounts (1 account(s))"));
+
+            let total_index = output.find("Total Accounts").expect("total section");
+            let healthy_index = output
+                .find("Healthy Accounts (1 account(s))")
+                .expect("healthy section");
+            assert!(healthy_index > total_index);
+
+            assert_eq!(
+                output
+                    .match_indices("dev.healthy@astronlab.com_free")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                output
+                    .match_indices("dev.exhausted@astronlab.com_free")
+                    .count(),
+                1
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should print total and healthy sections");
     }
 
     #[test]
