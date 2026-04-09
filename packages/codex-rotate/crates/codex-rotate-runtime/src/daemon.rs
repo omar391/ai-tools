@@ -620,6 +620,8 @@ fn run_watch_check(
             SnapshotMessageKind::Error,
             format!("quota probe failed: {}", error),
         );
+    } else if let Some(message) = result.logs_availability.status_message() {
+        set_snapshot_message(&mut state.snapshot, SnapshotMessageKind::Status, message);
     } else {
         set_snapshot_message(
             &mut state.snapshot,

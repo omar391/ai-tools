@@ -22,7 +22,8 @@ const HEALTHY_QUOTA_CONTINUE_THRESHOLD_PERCENT: u8 = 10;
 const OTEL_METADATA_LOOKUP_WINDOW: i64 = 2_000;
 const THREAD_RESUME_SETTLE_MS: u64 = 1_000;
 const QUOTA_EXHAUSTION_ERROR_MESSAGE: &str = "You've hit your usage limit.";
-const MODEL_CAPACITY_ERROR_MESSAGE: &str = "Selected model is at capacity. Please try a different model.";
+const MODEL_CAPACITY_ERROR_MESSAGE: &str =
+    "Selected model is at capacity. Please try a different model.";
 const MODEL_CAPACITY_RETRY_DELAY_SECS: i64 = 30;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,7 +112,9 @@ struct RecoveryProcessingResult {
 
 pub fn read_latest_recoverable_turn_failure_log_id() -> Result<Option<i64>> {
     let paths = resolve_paths()?;
-    let connection = open_logs_connection(&paths.codex_logs_db_file)?;
+    let Some(connection) = open_logs_connection_if_available(&paths.codex_logs_db_file)? else {
+        return Ok(None);
+    };
     read_latest_recoverable_turn_failure_log_id_from_connection(&connection)
 }
 
@@ -120,9 +123,19 @@ pub fn run_thread_recovery_iteration(
 ) -> Result<RecoveryIterationResult> {
     let port = options.port.unwrap_or(DEFAULT_PORT);
     let paths = resolve_paths()?;
-    let connection = open_logs_connection(&paths.codex_logs_db_file)?;
+    let pending = options.pending || !options.pending_events.is_empty();
+    let Some(connection) = open_logs_connection_if_available(&paths.codex_logs_db_file)? else {
+        return Ok(RecoveryIterationResult {
+            last_log_id: options.last_log_id,
+            pending,
+            pending_events: options.pending_events,
+            detected: 0,
+            continued_thread_ids: Vec::new(),
+            dropped_thread_ids: Vec::new(),
+        });
+    };
 
-    if options.last_log_id.is_none() && !options.pending {
+    if options.last_log_id.is_none() && !pending {
         let last_log_id = read_latest_recoverable_turn_failure_log_id_from_connection(&connection)?;
         return Ok(RecoveryIterationResult {
             last_log_id,
@@ -492,7 +505,8 @@ limit 1
 }
 
 fn parse_otel_failure_metadata(body: &str) -> Option<OtelFailureMetadata> {
-    if !body.contains("event.kind=response.completed") || !contains_recoverable_error_message(body) {
+    if !body.contains("event.kind=response.completed") || !contains_recoverable_error_message(body)
+    {
         return None;
     }
     Some(OtelFailureMetadata {
@@ -573,7 +587,10 @@ fn can_continue_without_email(
 
 fn model_capacity_retry_due(event: &ThreadRecoveryEvent) -> bool {
     matches!(event.kind, ThreadRecoveryKind::ModelCapacity)
-        && Utc::now().timestamp() >= event.source_ts.saturating_add(MODEL_CAPACITY_RETRY_DELAY_SECS)
+        && Utc::now().timestamp()
+            >= event
+                .source_ts
+                .saturating_add(MODEL_CAPACITY_RETRY_DELAY_SECS)
 }
 
 fn merge_thread_recovery_events(
@@ -823,10 +840,68 @@ fn open_logs_connection(logs_db_path: &Path) -> Result<Connection> {
     .with_context(|| format!("Failed to open {}.", logs_db_path.display()))
 }
 
+fn open_logs_connection_if_available(logs_db_path: &Path) -> Result<Option<Connection>> {
+    if !logs_db_path.exists() {
+        return Ok(None);
+    }
+    let connection = open_logs_connection(logs_db_path)?;
+    if !logs_table_exists(&connection)? {
+        return Ok(None);
+    }
+    Ok(Some(connection))
+}
+
+fn logs_table_exists(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare(
+        r#"
+select 1
+from sqlite_master
+where type = 'table'
+  and name = 'logs'
+limit 1
+        "#,
+    )?;
+    let mut rows = statement.query([])?;
+    Ok(rows.next()?.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn logs_connection_unavailable_when_database_is_missing() {
+        let missing = std::env::temp_dir().join(format!(
+            "codex-rotate-thread-recovery-missing-{}.sqlite",
+            std::process::id()
+        ));
+        std::fs::remove_file(&missing).ok();
+
+        assert!(open_logs_connection_if_available(&missing)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn logs_connection_unavailable_when_logs_table_is_missing() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table metadata (
+  id integer primary key,
+  value text
+);
+                "#,
+            )
+            .unwrap();
+
+        assert!(open_logs_connection_if_available(file.path())
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn parses_otel_failure_metadata() {

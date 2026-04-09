@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum CodexLogsAvailability {
+    MissingDatabase,
+    MissingTable,
+    Ready,
+}
+
+impl CodexLogsAvailability {
+    pub fn status_message(self) -> Option<&'static str> {
+        match self {
+            Self::MissingDatabase => Some("watch waiting for Codex logs database"),
+            Self::MissingTable => Some("watch waiting for Codex logs schema"),
+            Self::Ready => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CodexSignalKind {
     RateLimitsUpdated,
     UsageLimitReached,
@@ -32,13 +50,38 @@ pub fn read_codex_signals(
     after_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<CodexLogSignal>> {
+    if !logs_db_path.exists() {
+        return Ok(Vec::new());
+    }
     with_log_connection(logs_db_path, |connection| {
-        query_codex_signals(connection, after_id, limit)
+        match query_logs_availability(connection)? {
+            CodexLogsAvailability::Ready => query_codex_signals(connection, after_id, limit),
+            CodexLogsAvailability::MissingDatabase | CodexLogsAvailability::MissingTable => {
+                Ok(Vec::new())
+            }
+        }
     })
 }
 
 pub fn read_latest_codex_signal_id(logs_db_path: &Path) -> Result<Option<i64>> {
-    with_log_connection(logs_db_path, query_latest_codex_signal_id)
+    if !logs_db_path.exists() {
+        return Ok(None);
+    }
+    with_log_connection(logs_db_path, |connection| {
+        match query_logs_availability(connection)? {
+            CodexLogsAvailability::Ready => query_latest_codex_signal_id(connection),
+            CodexLogsAvailability::MissingDatabase | CodexLogsAvailability::MissingTable => {
+                Ok(None)
+            }
+        }
+    })
+}
+
+pub fn codex_logs_availability(logs_db_path: &Path) -> Result<CodexLogsAvailability> {
+    if !logs_db_path.exists() {
+        return Ok(CodexLogsAvailability::MissingDatabase);
+    }
+    with_log_connection(logs_db_path, query_logs_availability)
 }
 
 fn query_codex_signals(
@@ -121,6 +164,28 @@ limit 1
     }
 }
 
+fn query_logs_availability(connection: &Connection) -> Result<CodexLogsAvailability> {
+    if logs_table_exists(connection)? {
+        Ok(CodexLogsAvailability::Ready)
+    } else {
+        Ok(CodexLogsAvailability::MissingTable)
+    }
+}
+
+fn logs_table_exists(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare(
+        r#"
+select 1
+from sqlite_master
+where type = 'table'
+  and name = 'logs'
+limit 1
+        "#,
+    )?;
+    let mut rows = statement.query([])?;
+    Ok(rows.next()?.is_some())
+}
+
 pub fn classify_signal(target: &str, body: &str) -> Option<CodexSignalKind> {
     if target == "codex_app_server::outgoing_message"
         && body.starts_with("app-server event: account/rateLimits/updated")
@@ -190,6 +255,48 @@ fn shared_log_reader() -> &'static Mutex<SharedLogReader> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn reports_missing_database_when_logs_db_does_not_exist() {
+        let missing = std::env::temp_dir().join(format!(
+            "codex-rotate-missing-logs-{}.sqlite",
+            std::process::id()
+        ));
+        std::fs::remove_file(&missing).ok();
+
+        assert_eq!(
+            codex_logs_availability(&missing).unwrap(),
+            CodexLogsAvailability::MissingDatabase
+        );
+        assert_eq!(read_codex_signals(&missing, None, 50).unwrap(), Vec::new());
+        assert_eq!(read_latest_codex_signal_id(&missing).unwrap(), None);
+    }
+
+    #[test]
+    fn reports_missing_table_when_logs_db_has_no_logs_schema() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table metadata (
+  id integer primary key,
+  value text
+);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            codex_logs_availability(file.path()).unwrap(),
+            CodexLogsAvailability::MissingTable
+        );
+        assert_eq!(
+            read_codex_signals(file.path(), None, 50).unwrap(),
+            Vec::new()
+        );
+        assert_eq!(read_latest_codex_signal_id(file.path()).unwrap(), None);
+    }
 
     #[test]
     fn filters_only_real_quota_signals() {

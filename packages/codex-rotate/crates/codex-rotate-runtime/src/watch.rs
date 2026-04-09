@@ -23,7 +23,8 @@ use crate::hook::{
     switch_live_account_to_current_auth, AccountReadResult, LiveSwitchResult,
 };
 use crate::logs::{
-    read_codex_signals, read_latest_codex_signal_id, CodexLogSignal, CodexSignalKind,
+    codex_logs_availability, read_codex_signals, read_latest_codex_signal_id, CodexLogSignal,
+    CodexLogsAvailability, CodexSignalKind,
 };
 use crate::paths::resolve_paths;
 use crate::runtime_log::log_daemon_error;
@@ -88,6 +89,7 @@ pub struct WatchIterationResult {
     pub rotated: bool,
     pub rotation: Option<AuthSummary>,
     pub live: Option<LiveSwitchResult>,
+    pub logs_availability: CodexLogsAvailability,
 }
 
 pub struct WatchIterationOptions {
@@ -112,9 +114,8 @@ pub fn read_watch_state() -> Result<WatchState> {
 pub fn write_watch_state(state: &WatchState) -> Result<()> {
     let paths = resolve_paths()?;
     if let Some(parent) = paths.watch_state_file.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create {}.", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(state)?;
     write_file_atomically(&paths.watch_state_file, &raw)
@@ -124,6 +125,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let port = options.port.unwrap_or(9333);
     let cooldown_ms = options.cooldown_ms.unwrap_or(DEFAULT_COOLDOWN_MS);
     let paths = resolve_paths()?;
+    let logs_availability = codex_logs_availability(&paths.codex_logs_db_file)?;
 
     let previous_state = read_watch_state()?;
     let mut after_signal_id = options.after_signal_id.or(previous_state.last_signal_id);
@@ -297,6 +299,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         rotated,
         rotation,
         live,
+        logs_availability,
     })
 }
 
