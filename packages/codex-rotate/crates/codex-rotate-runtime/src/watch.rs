@@ -35,6 +35,7 @@ use crate::thread_recovery::{
 
 pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 20;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
+const SIGNAL_CURSOR_RESET_LOOKBACK_LOGS: i64 = 2_000;
 const THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS: i64 = 2_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -128,20 +129,30 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let logs_availability = codex_logs_availability(&paths.codex_logs_db_file)?;
 
     let previous_state = read_watch_state()?;
+    let latest_codex_signal_id = read_latest_codex_signal_id(&paths.codex_logs_db_file)?;
     let mut after_signal_id = options.after_signal_id.or(previous_state.last_signal_id);
+    let (normalized_after_signal_id, signal_log_cursor_reset) = normalize_log_cursor(
+        after_signal_id,
+        latest_codex_signal_id,
+        SIGNAL_CURSOR_RESET_LOOKBACK_LOGS,
+    );
+    after_signal_id = normalized_after_signal_id;
     if after_signal_id.is_none() {
-        after_signal_id = read_latest_codex_signal_id(&paths.codex_logs_db_file)?;
+        after_signal_id = latest_codex_signal_id;
     }
 
     let current_auth = load_codex_auth(&paths.codex_auth_file)?;
     let current_summary = summarize_codex_auth(&current_auth);
-    let (decision, mut quota_cache) = decide_rotation(
+    let (mut decision, mut quota_cache) = decide_rotation(
         &current_auth,
         &current_summary,
         after_signal_id,
         previous_state.quota.as_ref(),
         options.force_quota_refresh,
     )?;
+    if signal_log_cursor_reset && decision.signals.is_empty() {
+        decision.last_signal_id = latest_codex_signal_id;
+    }
     let live_account = match read_live_account_if_running(Some(port))? {
         Some(live_account) => {
             ensure_live_account_matches_current_auth(port, &current_summary, live_account)?
@@ -200,18 +211,24 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .signals
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
-    let mut thread_recovery_log_id = previous_state.last_thread_recovery_log_id;
-    let mut latest_recoverable_turn_failure_log_id = None;
-    if !previous_state.thread_recovery_pending && !usage_limit_signal_seen && !rotated {
-        latest_recoverable_turn_failure_log_id = read_latest_recoverable_turn_failure_log_id()?;
-        if thread_recovery_log_id.is_none() {
-            thread_recovery_log_id = latest_recoverable_turn_failure_log_id;
-        }
+    let latest_recoverable_turn_failure_log_id = read_latest_recoverable_turn_failure_log_id()?;
+    let (mut thread_recovery_log_id, recoverable_turn_failure_log_reset) = normalize_log_cursor(
+        previous_state.last_thread_recovery_log_id,
+        latest_recoverable_turn_failure_log_id,
+        THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS,
+    );
+    if !previous_state.thread_recovery_pending
+        && !usage_limit_signal_seen
+        && !rotated
+        && thread_recovery_log_id.is_none()
+    {
+        thread_recovery_log_id = latest_recoverable_turn_failure_log_id;
     }
     let recoverable_turn_failure_log_advanced = latest_recoverable_turn_failure_log_id
         .zip(thread_recovery_log_id)
         .map(|(latest, current)| latest > current)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || recoverable_turn_failure_log_reset;
     let bootstrap_thread_recovery = !previous_state.thread_recovery_backfill_complete;
 
     let mut next_state = WatchState {
@@ -301,6 +318,19 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         live,
         logs_availability,
     })
+}
+
+fn normalize_log_cursor(
+    cursor: Option<i64>,
+    latest_available_id: Option<i64>,
+    lookback_logs: i64,
+) -> (Option<i64>, bool) {
+    match (cursor, latest_available_id) {
+        (Some(current), Some(latest)) if current > latest => {
+            (Some(latest.saturating_sub(lookback_logs.max(0))), true)
+        }
+        _ => (cursor, false),
+    }
 }
 
 fn execute_watch_rotation(
@@ -1019,5 +1049,21 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn normalize_log_cursor_resets_when_current_db_ids_roll_over() {
+        assert_eq!(
+            normalize_log_cursor(Some(9_174_8411), Some(91_649), 2_000),
+            (Some(89_649), true)
+        );
+    }
+
+    #[test]
+    fn normalize_log_cursor_keeps_current_when_id_space_is_consistent() {
+        assert_eq!(
+            normalize_log_cursor(Some(91_000), Some(91_649), 2_000),
+            (Some(91_000), false)
+        );
     }
 }

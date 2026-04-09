@@ -10,6 +10,7 @@ pub struct CorePaths {
     pub rotate_home: PathBuf,
     pub codex_auth_file: PathBuf,
     pub codex_logs_db_file: PathBuf,
+    pub codex_state_db_file: PathBuf,
     pub pool_file: PathBuf,
     pub watch_state_file: PathBuf,
     pub profile_dir: PathBuf,
@@ -25,6 +26,8 @@ const LEGACY_ROTATE_HOME_FILE_PATTERNS: &[&str] =
     &["codex-login-browser-capture-", "fast-browser-"];
 const LEGACY_ROTATE_HOME_DIR_PATTERNS: &[&str] = &["codex-login-browser-shim-"];
 const LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS: &[&str] = &["codex-login-managed-"];
+const DEFAULT_CODEX_LOGS_DB_FILE: &str = "logs_1.sqlite";
+const DEFAULT_CODEX_STATE_DB_FILE: &str = "state_5.sqlite";
 
 pub fn resolve_paths() -> Result<CorePaths> {
     let repo_root = repo_root()?;
@@ -70,7 +73,8 @@ pub fn resolve_paths() -> Result<CorePaths> {
         codex_home: codex_home.clone(),
         rotate_home: rotate_home.clone(),
         codex_auth_file: codex_home.join("auth.json"),
-        codex_logs_db_file: codex_home.join("logs_1.sqlite"),
+        codex_logs_db_file: resolve_codex_logs_db_file(&codex_home),
+        codex_state_db_file: resolve_codex_state_db_file(&codex_home),
         repo_root: repo_root.clone(),
         pool_file: rotate_home.join("accounts.json"),
         watch_state_file: rotate_home.join("watch-state.json"),
@@ -86,6 +90,78 @@ pub fn resolve_paths() -> Result<CorePaths> {
         automation_bridge_entrypoint,
         node_bin: resolve_node_binary(),
     })
+}
+
+fn resolve_codex_logs_db_file(codex_home: &Path) -> PathBuf {
+    resolve_latest_versioned_db_file(
+        codex_home,
+        "logs_",
+        ".sqlite",
+        "logs.sqlite",
+        DEFAULT_CODEX_LOGS_DB_FILE,
+    )
+}
+
+fn resolve_codex_state_db_file(codex_home: &Path) -> PathBuf {
+    resolve_latest_versioned_db_file(
+        codex_home,
+        "state_",
+        ".sqlite",
+        "state.sqlite",
+        DEFAULT_CODEX_STATE_DB_FILE,
+    )
+}
+
+fn resolve_latest_versioned_db_file(
+    codex_home: &Path,
+    versioned_prefix: &str,
+    versioned_suffix: &str,
+    unversioned_name: &str,
+    default_name: &str,
+) -> PathBuf {
+    let mut latest_versioned = None::<(u32, PathBuf)>;
+    let mut unversioned = None::<PathBuf>;
+
+    if let Ok(entries) = fs::read_dir(codex_home) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == unversioned_name {
+                unversioned = Some(path);
+                continue;
+            }
+
+            let Some(version) = parse_versioned_db_name(&name, versioned_prefix, versioned_suffix)
+            else {
+                continue;
+            };
+            match latest_versioned.as_ref() {
+                Some((existing, _)) if *existing >= version => {}
+                _ => latest_versioned = Some((version, path)),
+            }
+        }
+    }
+
+    latest_versioned
+        .map(|(_, path)| path)
+        .or(unversioned)
+        .unwrap_or_else(|| codex_home.join(default_name))
+}
+
+fn parse_versioned_db_name(name: &str, prefix: &str, suffix_marker: &str) -> Option<u32> {
+    let suffix = name.strip_prefix(prefix)?.strip_suffix(suffix_marker)?;
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<u32>().ok()
 }
 
 pub fn legacy_credentials_file() -> Result<PathBuf> {
@@ -228,7 +304,11 @@ fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_legacy_rotate_home_artifacts, resolve_node_binary};
+    use super::{
+        cleanup_legacy_rotate_home_artifacts, resolve_codex_logs_db_file,
+        resolve_codex_state_db_file, resolve_node_binary, DEFAULT_CODEX_LOGS_DB_FILE,
+        DEFAULT_CODEX_STATE_DB_FILE,
+    };
     use crate::test_support::ENV_MUTEX;
     use std::fs;
 
@@ -271,6 +351,74 @@ mod tests {
         }
 
         assert_eq!(resolved, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn prefers_highest_versioned_codex_logs_db() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("logs_1.sqlite"), "").unwrap();
+        fs::write(temp.path().join("logs_2.sqlite"), "").unwrap();
+        fs::write(temp.path().join("logs_12.sqlite"), "").unwrap();
+
+        assert_eq!(
+            resolve_codex_logs_db_file(temp.path()),
+            temp.path().join("logs_12.sqlite")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unversioned_codex_logs_db() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("logs.sqlite"), "").unwrap();
+
+        assert_eq!(
+            resolve_codex_logs_db_file(temp.path()),
+            temp.path().join("logs.sqlite")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_codex_logs_db_name_when_none_exist() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_codex_logs_db_file(temp.path()),
+            temp.path().join(DEFAULT_CODEX_LOGS_DB_FILE)
+        );
+    }
+
+    #[test]
+    fn prefers_highest_versioned_codex_state_db() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("state_1.sqlite"), "").unwrap();
+        fs::write(temp.path().join("state_3.sqlite"), "").unwrap();
+        fs::write(temp.path().join("state_5.sqlite"), "").unwrap();
+
+        assert_eq!(
+            resolve_codex_state_db_file(temp.path()),
+            temp.path().join("state_5.sqlite")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unversioned_codex_state_db() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("state.sqlite"), "").unwrap();
+
+        assert_eq!(
+            resolve_codex_state_db_file(temp.path()),
+            temp.path().join("state.sqlite")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_codex_state_db_name_when_none_exist() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_codex_state_db_file(temp.path()),
+            temp.path().join(DEFAULT_CODEX_STATE_DB_FILE)
+        );
     }
 
     #[test]

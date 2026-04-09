@@ -38,6 +38,12 @@ pub fn is_cdp_ready(port: u16) -> bool {
     fetch_json::<Value>(&format!("http://127.0.0.1:{port}/json/version")).is_ok()
 }
 
+pub fn is_cdp_page_ready(port: u16) -> bool {
+    list_cdp_targets(port)
+        .map(|targets| has_codex_page_target(&targets))
+        .unwrap_or(false)
+}
+
 pub fn connect_to_local_codex_page(port: u16) -> Result<CdpConnection> {
     let websocket_debugger_url = local_codex_page_websocket_url(port)?;
     connect_to_debugger_url(&websocket_debugger_url)
@@ -89,6 +95,12 @@ fn local_codex_page_websocket_url(port: u16) -> Result<String> {
         .find(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
         .ok_or_else(|| anyhow!("No Codex page target is available on port {port}."))?;
     Ok(page.websocket_debugger_url)
+}
+
+fn has_codex_page_target(targets: &[CdpTargetInfo]) -> bool {
+    targets
+        .iter()
+        .any(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
 }
 
 fn ensure_shared_connection<'a>(
@@ -221,4 +233,31 @@ fn cdp_http_client() -> &'static Client {
             .build()
             .expect("failed to build CDP HTTP client")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_codex_page_target, CdpTargetInfo};
+
+    fn target(target_type: &str, url: &str) -> CdpTargetInfo {
+        CdpTargetInfo {
+            id: "target-id".to_string(),
+            target_type: target_type.to_string(),
+            title: "target".to_string(),
+            url: url.to_string(),
+            websocket_debugger_url: "ws://127.0.0.1/devtools/page/target-id".to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_page_target_helper_requires_app_page() {
+        assert!(!has_codex_page_target(&[
+            target("service_worker", "app://-/index.html"),
+            target("page", "https://example.com"),
+        ]));
+        assert!(has_codex_page_target(&[
+            target("page", "https://example.com"),
+            target("page", "app://-/index.html#/threads/abc"),
+        ]));
+    }
 }

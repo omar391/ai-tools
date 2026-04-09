@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::cdp::is_cdp_ready;
+use crate::cdp::is_cdp_page_ready;
 use crate::paths::resolve_paths;
 
 pub fn ensure_debug_codex_instance(
@@ -19,7 +19,7 @@ pub fn ensure_debug_codex_instance(
     let port = port.unwrap_or(9333);
     let profile_dir = profile_dir.unwrap_or(&paths.debug_profile_dir);
 
-    if is_cdp_ready(port) {
+    if is_cdp_page_ready(port) {
         return Ok(());
     }
 
@@ -63,7 +63,7 @@ pub fn ensure_debug_codex_instance(
 
     let deadline = Instant::now() + Duration::from_millis(wait_ms.unwrap_or(15_000));
     while Instant::now() < deadline {
-        if is_cdp_ready(port) {
+        if is_cdp_page_ready(port) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(500));

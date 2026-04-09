@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
@@ -24,7 +27,12 @@ const THREAD_RESUME_SETTLE_MS: u64 = 1_000;
 const QUOTA_EXHAUSTION_ERROR_MESSAGE: &str = "You've hit your usage limit.";
 const MODEL_CAPACITY_ERROR_MESSAGE: &str =
     "Selected model is at capacity. Please try a different model.";
-const MODEL_CAPACITY_RETRY_DELAY_SECS: i64 = 30;
+const TRANSPORT_DISCONNECT_ERROR_PREFIX: &str = "stream disconnected before completion:";
+const TRANSIENT_RECOVERY_RETRY_DELAY_SECS: i64 = 15;
+const STALLED_TURN_RECOVERY_DELAY_SECS: i64 = 180;
+const MAX_STALLED_THREAD_SCAN_THREADS: usize = 16;
+const ROLLOUT_TAIL_SCAN_BYTES: usize = 262_144;
+const SYNTHETIC_RECOVERY_SOURCE_LOG_ID: i64 = 0;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +40,8 @@ pub enum ThreadRecoveryKind {
     #[default]
     QuotaExhausted,
     ModelCapacity,
+    TransportDisconnected,
+    StalledTurn,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +120,13 @@ struct RecoveryProcessingResult {
     pending_events: Vec<ThreadRecoveryEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StalledTurnSnapshot {
+    thread_id: String,
+    turn_id: String,
+    last_event_ts: i64,
+}
+
 pub fn read_latest_recoverable_turn_failure_log_id() -> Result<Option<i64>> {
     let paths = resolve_paths()?;
     let Some(connection) = open_logs_connection_if_available(&paths.codex_logs_db_file)? else {
@@ -135,10 +152,30 @@ pub fn run_thread_recovery_iteration(
         });
     };
 
-    if options.last_log_id.is_none() && !pending {
-        let last_log_id = read_latest_recoverable_turn_failure_log_id_from_connection(&connection)?;
+    let seeded_last_log_id = if options.last_log_id.is_none() && !pending {
+        read_latest_recoverable_turn_failure_log_id_from_connection(&connection)?
+    } else {
+        options.last_log_id
+    };
+
+    let detected_log_events = if options.last_log_id.is_none() && !pending {
+        Vec::new()
+    } else {
+        scan_recoverable_turn_failure_events(
+            &connection,
+            options.last_log_id,
+            MAX_RECOVERY_SCAN_EVENTS,
+        )?
+    };
+    let stalled_turn_events = scan_stalled_turn_recovery_events(
+        &connection,
+        &paths.codex_state_db_file,
+        Utc::now().timestamp(),
+        MAX_STALLED_THREAD_SCAN_THREADS,
+    )?;
+    if seeded_last_log_id.is_none() && !pending && stalled_turn_events.is_empty() {
         return Ok(RecoveryIterationResult {
-            last_log_id,
+            last_log_id: None,
             pending: false,
             pending_events: Vec::new(),
             detected: 0,
@@ -146,16 +183,14 @@ pub fn run_thread_recovery_iteration(
             dropped_thread_ids: Vec::new(),
         });
     }
-
-    let detected_events = scan_recoverable_turn_failure_events(
-        &connection,
-        options.last_log_id,
-        MAX_RECOVERY_SCAN_EVENTS,
-    )?;
+    let detected_events = detected_log_events
+        .into_iter()
+        .chain(stalled_turn_events)
+        .collect::<Vec<_>>();
     let candidate_events = merge_thread_recovery_events(&options.pending_events, detected_events);
     if candidate_events.is_empty() {
         return Ok(RecoveryIterationResult {
-            last_log_id: options.last_log_id,
+            last_log_id: seeded_last_log_id,
             pending: false,
             pending_events: Vec::new(),
             detected: 0,
@@ -188,8 +223,9 @@ pub fn run_thread_recovery_iteration(
     let last_log_id = candidate_events
         .iter()
         .map(|event| event.source_log_id)
+        .filter(|log_id| *log_id > 0)
         .max()
-        .or(options.last_log_id);
+        .or(seeded_last_log_id);
 
     Ok(RecoveryIterationResult {
         last_log_id,
@@ -256,7 +292,17 @@ fn resolve_recoverable_turn_failure_event(
             }
         }
         ThreadRecoveryKind::ModelCapacity => {
-            if !model_capacity_retry_due(event) {
+            if !transient_recovery_retry_due(event) {
+                return Ok(RecoveryResolution::Blocked);
+            }
+        }
+        ThreadRecoveryKind::TransportDisconnected => {
+            if !transient_recovery_retry_due(event) {
+                return Ok(RecoveryResolution::Blocked);
+            }
+        }
+        ThreadRecoveryKind::StalledTurn => {
+            if !transient_recovery_retry_due(event) {
                 return Ok(RecoveryResolution::Blocked);
             }
         }
@@ -383,6 +429,7 @@ where id > ?1
   and (
     feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
     or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+    or feedback_log_body like '%Turn error: stream disconnected before completion:%'
   )
 order by id asc
 limit ?2
@@ -421,6 +468,7 @@ where target = 'codex_core::codex'
   and (
     feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
     or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+    or feedback_log_body like '%Turn error: stream disconnected before completion:%'
   )
 order by id desc
 limit 1
@@ -520,6 +568,8 @@ fn parse_thread_recovery_kind(message: &str) -> Option<ThreadRecoveryKind> {
         Some(ThreadRecoveryKind::QuotaExhausted)
     } else if message.contains(MODEL_CAPACITY_ERROR_MESSAGE) {
         Some(ThreadRecoveryKind::ModelCapacity)
+    } else if message.starts_with(TRANSPORT_DISCONNECT_ERROR_PREFIX) {
+        Some(ThreadRecoveryKind::TransportDisconnected)
     } else {
         None
     }
@@ -585,12 +635,25 @@ fn can_continue_without_email(
                 .unwrap_or(false))
 }
 
-fn model_capacity_retry_due(event: &ThreadRecoveryEvent) -> bool {
-    matches!(event.kind, ThreadRecoveryKind::ModelCapacity)
-        && Utc::now().timestamp()
-            >= event
-                .source_ts
-                .saturating_add(MODEL_CAPACITY_RETRY_DELAY_SECS)
+fn transient_recovery_retry_due(event: &ThreadRecoveryEvent) -> bool {
+    matches!(
+        event.kind,
+        ThreadRecoveryKind::ModelCapacity
+            | ThreadRecoveryKind::TransportDisconnected
+            | ThreadRecoveryKind::StalledTurn
+    ) && Utc::now().timestamp()
+        >= event
+            .source_ts
+            .saturating_add(transient_recovery_retry_delay_secs(event.kind))
+}
+
+fn transient_recovery_retry_delay_secs(kind: ThreadRecoveryKind) -> i64 {
+    match kind {
+        ThreadRecoveryKind::StalledTurn => STALLED_TURN_RECOVERY_DELAY_SECS,
+        ThreadRecoveryKind::QuotaExhausted
+        | ThreadRecoveryKind::ModelCapacity
+        | ThreadRecoveryKind::TransportDisconnected => TRANSIENT_RECOVERY_RETRY_DELAY_SECS,
+    }
 }
 
 fn merge_thread_recovery_events(
@@ -609,6 +672,168 @@ fn merge_thread_recovery_events(
     let mut events = merged.into_values().collect::<Vec<_>>();
     events.sort_by_key(|event| event.source_log_id);
     events
+}
+
+fn scan_stalled_turn_recovery_events(
+    connection: &Connection,
+    state_db_path: &Path,
+    now_ts: i64,
+    limit: usize,
+) -> Result<Vec<ThreadRecoveryEvent>> {
+    let Some(state_connection) = open_state_connection_if_available(state_db_path)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = state_connection.prepare(
+        r#"
+select id, rollout_path, updated_at
+from threads
+where archived = 0
+  and rollout_path != ''
+order by updated_at desc
+limit ?1
+        "#,
+    )?;
+    let rows = statement.query_map(params![limit.clamp(1, 64) as i64], |row| {
+        let thread_id: String = row.get(0)?;
+        let rollout_path: String = row.get(1)?;
+        let updated_at: i64 = row.get(2)?;
+        Ok((thread_id, rollout_path, updated_at))
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (thread_id, rollout_path, updated_at) = row?;
+        let Some(snapshot) =
+            detect_stalled_turn_snapshot(&thread_id, Path::new(&rollout_path), updated_at, now_ts)?
+        else {
+            continue;
+        };
+        let source_log_id = find_turn_source_log_id(connection, &thread_id, &snapshot.turn_id)?
+            .unwrap_or(SYNTHETIC_RECOVERY_SOURCE_LOG_ID);
+        events.push(ThreadRecoveryEvent {
+            source_log_id,
+            source_ts: snapshot.last_event_ts,
+            thread_id,
+            kind: ThreadRecoveryKind::StalledTurn,
+            exhausted_turn_id: Some(snapshot.turn_id),
+            exhausted_email: None,
+            exhausted_account_id: None,
+            message: "turn stalled without completion".to_string(),
+        });
+    }
+
+    Ok(events)
+}
+
+fn detect_stalled_turn_snapshot(
+    thread_id: &str,
+    rollout_path: &Path,
+    fallback_ts: i64,
+    now_ts: i64,
+) -> Result<Option<StalledTurnSnapshot>> {
+    if !rollout_path.exists() {
+        return Ok(None);
+    }
+    let tail = read_file_tail(rollout_path, ROLLOUT_TAIL_SCAN_BYTES)?;
+    let mut terminal_turn_ids = HashSet::<String>::new();
+    let mut latest_event_ts = None::<i64>;
+
+    for line in tail.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if latest_event_ts.is_none() {
+            latest_event_ts = rollout_event_timestamp(&value).or(Some(fallback_ts));
+        }
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match payload_type {
+            "task_complete" | "turn_aborted" => {
+                if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+                    terminal_turn_ids.insert(turn_id.to_string());
+                }
+            }
+            "task_started" => {
+                let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if terminal_turn_ids.contains(turn_id) {
+                    return Ok(None);
+                }
+                let last_event_ts = latest_event_ts.unwrap_or(fallback_ts);
+                if last_event_ts.saturating_add(STALLED_TURN_RECOVERY_DELAY_SECS) > now_ts {
+                    return Ok(None);
+                }
+                return Ok(Some(StalledTurnSnapshot {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    last_event_ts,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_file_tail(path: &Path, max_bytes: usize) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open rollout {}.", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("Failed to stat rollout {}.", path.display()))?
+        .len();
+    let max_bytes = max_bytes.max(1) as u64;
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("Failed to seek rollout {}.", path.display()))?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf)
+        .with_context(|| format!("Failed to read rollout {}.", path.display()))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn rollout_event_timestamp(value: &Value) -> Option<i64> {
+    let raw = value.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
+}
+
+fn find_turn_source_log_id(
+    connection: &Connection,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<i64>> {
+    let mut statement = connection.prepare(
+        r#"
+select id
+from logs
+where thread_id = ?1
+  and feedback_log_body like '%' || ?2 || '%'
+order by id desc
+limit 1
+        "#,
+    )?;
+    let mut rows = statement.query(params![thread_id, turn_id])?;
+    if let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
 }
 
 fn process_thread_recovery_events<F>(
@@ -657,6 +882,8 @@ impl ThreadRecoveryKind {
         match self {
             ThreadRecoveryKind::QuotaExhausted => "quota exhaustion",
             ThreadRecoveryKind::ModelCapacity => "model capacity",
+            ThreadRecoveryKind::TransportDisconnected => "transport disconnect",
+            ThreadRecoveryKind::StalledTurn => "stalled turn",
         }
     }
 }
@@ -832,6 +1059,25 @@ fn normalize_email(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
+fn open_state_connection(state_db_path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open {}.", state_db_path.display()))
+}
+
+fn open_state_connection_if_available(state_db_path: &Path) -> Result<Option<Connection>> {
+    if !state_db_path.exists() {
+        return Ok(None);
+    }
+    let connection = open_state_connection(state_db_path)?;
+    if !threads_table_exists(&connection)? {
+        return Ok(None);
+    }
+    Ok(Some(connection))
+}
+
 fn open_logs_connection(logs_db_path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
         logs_db_path,
@@ -852,22 +1098,31 @@ fn open_logs_connection_if_available(logs_db_path: &Path) -> Result<Option<Conne
 }
 
 fn logs_table_exists(connection: &Connection) -> Result<bool> {
+    sqlite_table_exists(connection, "logs")
+}
+
+fn threads_table_exists(connection: &Connection) -> Result<bool> {
+    sqlite_table_exists(connection, "threads")
+}
+
+fn sqlite_table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
     let mut statement = connection.prepare(
         r#"
 select 1
 from sqlite_master
 where type = 'table'
-  and name = 'logs'
+  and name = ?1
 limit 1
         "#,
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([table_name])?;
     Ok(rows.next()?.is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -1059,6 +1314,44 @@ insert into logs (id, ts, target, feedback_log_body) values
     }
 
     #[test]
+    fn parses_transport_disconnect_event_from_codex_core_log() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text
+);
+insert into logs (id, ts, target, feedback_log_body) values
+  (
+    10,
+    1775680284,
+    'codex_core::codex',
+    'session_loop{thread_id=thread-transport}:submission_dispatch{otel.name="op.dispatch.user_input"}:turn{otel.name="session_task.turn" thread.id=thread-transport turn.id=turn-transport model=gpt-5.4}:run_turn: Turn error: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)'
+  );
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_recoverable_turn_failure_events(&connection, None, 50).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread_id, "thread-transport");
+        assert_eq!(events[0].kind, ThreadRecoveryKind::TransportDisconnected);
+        assert_eq!(
+            events[0].exhausted_turn_id.as_deref(),
+            Some("turn-transport")
+        );
+        assert_eq!(
+            events[0].message,
+            "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)"
+        );
+    }
+
+    #[test]
     fn newer_user_turn_marks_event_as_resolved() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
@@ -1133,14 +1426,15 @@ insert into logs (id, ts, target, feedback_log_body) values
   (12, 1002, 'codex_otel.log_only', 'event.kind=response.completed error.message=You''ve hit your usage limit. conversation.id=thread-b'),
   (13, 1003, 'codex_core::codex', 'session_loop{thread_id=thread-c}:turn{thread.id=thread-c turn.id=turn-c}:run_turn: Turn error: You''ve hit your usage limit. Upgrade to Plus to continue using Codex.'),
   (14, 1004, 'log', 'error.message=You''ve hit your usage limit. not authoritative'),
-  (15, 1005, 'codex_core::codex', 'session_loop{thread_id=thread-d}:turn{thread.id=thread-d turn.id=turn-d}:run_turn: Turn error: Selected model is at capacity. Please try a different model.');
+  (15, 1005, 'codex_core::codex', 'session_loop{thread_id=thread-d}:turn{thread.id=thread-d turn.id=turn-d}:run_turn: Turn error: Selected model is at capacity. Please try a different model.'),
+  (16, 1006, 'codex_core::codex', 'session_loop{thread_id=thread-e}:turn{thread.id=thread-e turn.id=turn-e}:run_turn: Turn error: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)');
                 "#,
             )
             .unwrap();
 
         assert_eq!(
             read_latest_recoverable_turn_failure_log_id_from_connection(&connection).unwrap(),
-            Some(15)
+            Some(16)
         );
     }
 
@@ -1162,12 +1456,12 @@ insert into logs (id, ts, target, feedback_log_body) values
     }
 
     #[test]
-    fn model_capacity_retry_due_requires_delay_window() {
+    fn transient_recovery_retry_due_requires_delay_window() {
         let event = ThreadRecoveryEvent {
             source_log_id: 10,
             source_ts: Utc::now()
                 .timestamp()
-                .saturating_sub(MODEL_CAPACITY_RETRY_DELAY_SECS - 5),
+                .saturating_sub(TRANSIENT_RECOVERY_RETRY_DELAY_SECS - 5),
             thread_id: "thread-capacity".to_string(),
             kind: ThreadRecoveryKind::ModelCapacity,
             exhausted_turn_id: Some("turn-capacity".to_string()),
@@ -1175,15 +1469,182 @@ insert into logs (id, ts, target, feedback_log_body) values
             exhausted_account_id: None,
             message: MODEL_CAPACITY_ERROR_MESSAGE.to_string(),
         };
-        assert!(!model_capacity_retry_due(&event));
+        assert!(!transient_recovery_retry_due(&event));
 
         let ready = ThreadRecoveryEvent {
             source_ts: Utc::now()
                 .timestamp()
-                .saturating_sub(MODEL_CAPACITY_RETRY_DELAY_SECS + 1),
+                .saturating_sub(TRANSIENT_RECOVERY_RETRY_DELAY_SECS + 1),
             ..event
         };
-        assert!(model_capacity_retry_due(&ready));
+        assert!(transient_recovery_retry_due(&ready));
+    }
+
+    #[test]
+    fn transient_transport_retry_due_requires_delay_window() {
+        let event = ThreadRecoveryEvent {
+            source_log_id: 10,
+            source_ts: Utc::now()
+                .timestamp()
+                .saturating_sub(TRANSIENT_RECOVERY_RETRY_DELAY_SECS - 5),
+            thread_id: "thread-transport".to_string(),
+            kind: ThreadRecoveryKind::TransportDisconnected,
+            exhausted_turn_id: Some("turn-transport".to_string()),
+            exhausted_email: None,
+            exhausted_account_id: None,
+            message: "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)".to_string(),
+        };
+        assert!(!transient_recovery_retry_due(&event));
+
+        let ready = ThreadRecoveryEvent {
+            source_ts: Utc::now()
+                .timestamp()
+                .saturating_sub(TRANSIENT_RECOVERY_RETRY_DELAY_SECS + 1),
+            ..event
+        };
+        assert!(transient_recovery_retry_due(&ready));
+    }
+
+    #[test]
+    fn detects_stalled_turn_from_rollout_tail() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let rollout_path = tempdir.path().join("stalled-rollout.jsonl");
+        let state_file = tempdir.path().join("state_5.sqlite");
+        let logs_file = tempdir.path().join("logs_2.sqlite");
+
+        let last_event_ts = Utc
+            .with_ymd_and_hms(2026, 4, 9, 7, 29, 9)
+            .single()
+            .unwrap()
+            .timestamp();
+        std::fs::write(
+            &rollout_path,
+            concat!(
+                "{\"timestamp\":\"2026-04-09T07:28:33Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-stalled\"}}\n",
+                "{\"timestamp\":\"2026-04-09T07:29:09Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"working\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let state_connection = Connection::open(&state_file).unwrap();
+        state_connection
+            .execute_batch(&format!(
+                r#"
+create table threads (
+  id text primary key,
+  rollout_path text not null,
+  updated_at integer not null,
+  archived integer not null default 0
+);
+insert into threads (id, rollout_path, updated_at, archived) values
+  ('thread-stalled', '{}', {}, 0);
+                "#,
+                rollout_path.display(),
+                last_event_ts
+            ))
+            .unwrap();
+
+        let logs_connection = Connection::open(&logs_file).unwrap();
+        logs_connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text,
+  thread_id text
+);
+insert into logs (id, ts, target, feedback_log_body, thread_id) values
+  (
+    42,
+    1775719713,
+    'codex_core::codex',
+    'session_loop{thread_id=thread-stalled}: Submission sub=Submission { id: "turn-stalled", op: UserInput { items: [Text { text: "continue with skipped msgs" }] } }',
+    'thread-stalled'
+  );
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_stalled_turn_recovery_events(
+            &logs_connection,
+            &state_file,
+            last_event_ts + STALLED_TURN_RECOVERY_DELAY_SECS + 1,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread_id, "thread-stalled");
+        assert_eq!(events[0].kind, ThreadRecoveryKind::StalledTurn);
+        assert_eq!(events[0].source_log_id, 42);
+        assert_eq!(events[0].exhausted_turn_id.as_deref(), Some("turn-stalled"));
+    }
+
+    #[test]
+    fn completed_turn_is_not_marked_as_stalled() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let rollout_path = tempdir.path().join("completed-rollout.jsonl");
+        let state_file = tempdir.path().join("state_5.sqlite");
+        let logs_file = tempdir.path().join("logs_2.sqlite");
+
+        let last_event_ts = Utc
+            .with_ymd_and_hms(2026, 4, 9, 7, 29, 9)
+            .single()
+            .unwrap()
+            .timestamp();
+        std::fs::write(
+            &rollout_path,
+            concat!(
+                "{\"timestamp\":\"2026-04-09T07:28:33Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-complete\"}}\n",
+                "{\"timestamp\":\"2026-04-09T07:29:09Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-complete\",\"last_agent_message\":null}}\n"
+            ),
+        )
+        .unwrap();
+
+        let state_connection = Connection::open(&state_file).unwrap();
+        state_connection
+            .execute_batch(&format!(
+                r#"
+create table threads (
+  id text primary key,
+  rollout_path text not null,
+  updated_at integer not null,
+  archived integer not null default 0
+);
+insert into threads (id, rollout_path, updated_at, archived) values
+  ('thread-complete', '{}', {}, 0);
+                "#,
+                rollout_path.display(),
+                last_event_ts
+            ))
+            .unwrap();
+
+        let logs_connection = Connection::open(&logs_file).unwrap();
+        logs_connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text,
+  thread_id text
+);
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_stalled_turn_recovery_events(
+            &logs_connection,
+            &state_file,
+            last_event_ts + STALLED_TURN_RECOVERY_DELAY_SECS + 1,
+            8,
+        )
+        .unwrap();
+
+        assert!(events.is_empty());
     }
 
     #[test]
