@@ -207,6 +207,199 @@ struct CommandResult {
     stderr: String,
 }
 
+struct DaemonCreateHarness {
+    sandbox: PathBuf,
+    rotate_home: PathBuf,
+    codex_home: PathBuf,
+    debug_port: u16,
+    _dummy_cdp: DummyCdpServer,
+    _env: EnvGuard,
+    _extra_env: ExtraEnvGuard,
+    daemon: Child,
+    create: Child,
+    bridge_child_pid: u32,
+}
+
+impl DaemonCreateHarness {
+    fn start(prefix: &str) -> Result<Self> {
+        let sandbox = unique_temp_dir(prefix);
+        let rotate_home = sandbox.join("rotate-home");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&rotate_home)?;
+        fs::create_dir_all(&codex_home)?;
+
+        let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
+        write_executable(
+            &fast_browser_runtime,
+            "#!/bin/sh\nset -eu\nif [ \"${2-}\" = \"inspect-profiles\" ]; then\n  printf '%s\\n' '{\"managedProfiles\":{\"default\":\"dev-1\",\"profiles\":[{\"name\":\"dev-1\"}]}}'\n  exit 0\nfi\nprintf 'unexpected fast-browser runtime args: %s\\n' \"$*\" >&2\nexit 1\n",
+        )?;
+
+        let automation_bridge = sandbox.join("automation-bridge.py");
+        fs::write(
+            &automation_bridge,
+            r#"import json
+import os
+import subprocess
+import sys
+import time
+
+def respond(payload, code=0):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+def request_file():
+    args = sys.argv[1:]
+    index = args.index("--request-file")
+    return args[index + 1]
+
+with open(request_file(), "r", encoding="utf-8") as handle:
+    request = json.load(handle)
+
+command = request["command"]
+if command == "prepare-account-secret-ref":
+    respond(
+        {
+            "ok": True,
+            "result": {
+                "type": "secret_ref",
+                "store": "bitwarden-cli",
+                "object_id": "test-secret",
+            },
+        }
+    )
+elif command == "delete-account-secret-ref":
+    respond({"ok": True, "result": True})
+elif command == "reset-managed-runtime":
+    respond({"ok": True, "result": {"ok": True}})
+elif command == "complete-codex-login-attempt":
+    pid_file = os.environ["CODEX_ROTATE_TEST_CHILD_PID_FILE"]
+    subprocess.Popen(
+        [
+            "/bin/sh",
+            "-lc",
+            f"trap 'exit 0' TERM INT; echo $$ > '{pid_file}'; while true; do sleep 1; done",
+        ]
+    )
+    while True:
+        time.sleep(1)
+else:
+    respond(
+        {
+            "ok": False,
+            "error": {"message": f"unsupported automation bridge command: {command}"},
+        },
+        1,
+    )
+"#,
+        )?;
+
+        let child_pid_file = sandbox.join("bridge-child.pid");
+        let python3 = find_binary("python3")?;
+        let dummy_cdp = DummyCdpServer::start()?;
+        let debug_port = dummy_cdp.port;
+        let env = EnvGuard::set(&rotate_home, &codex_home, debug_port);
+        let extra_env = ExtraEnvGuard::set(&[
+            (
+                "CODEX_ROTATE_AUTOMATION_BRIDGE",
+                automation_bridge.as_os_str().to_os_string(),
+            ),
+            ("NODE_BIN", python3.as_os_str().to_os_string()),
+            (
+                "CODEX_ROTATE_FAST_BROWSER_RUNTIME",
+                fast_browser_runtime.as_os_str().to_os_string(),
+            ),
+            (
+                "CODEX_ROTATE_TEST_CHILD_PID_FILE",
+                child_pid_file.as_os_str().to_os_string(),
+            ),
+        ]);
+
+        let mut daemon = spawn_daemon(&rotate_home, &codex_home, debug_port)?;
+        wait_for_socket(&mut daemon, Duration::from_secs(10))?;
+
+        let mut create = configured_command(&rotate_home, &codex_home, debug_port)
+            .arg("create")
+            .arg("--force")
+            .arg("--profile")
+            .arg("dev-1")
+            .arg("--base-email")
+            .arg("dev.{n}@astronlab.com")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn {} create --force", cli_binary()))?;
+
+        let bridge_child_pid =
+            wait_for_pid_file_from_child(&child_pid_file, &mut create, Duration::from_secs(10))?;
+        assert!(
+            process_is_running(bridge_child_pid),
+            "expected bridge child {} to be running",
+            bridge_child_pid
+        );
+
+        Ok(Self {
+            sandbox,
+            rotate_home,
+            codex_home,
+            debug_port,
+            _dummy_cdp: dummy_cdp,
+            _env: env,
+            _extra_env: extra_env,
+            daemon,
+            create,
+            bridge_child_pid,
+        })
+    }
+
+    fn assert_daemon_still_running(&self) -> Result<()> {
+        let daemon_check = run_cli(
+            &["daemon"],
+            &self.rotate_home,
+            &self.codex_home,
+            self.debug_port,
+        )?;
+        assert_eq!(daemon_check.code, 0);
+        assert_eq!(
+            normalized(&daemon_check.stdout),
+            "Codex Rotate daemon is already running."
+        );
+        Ok(())
+    }
+
+    fn expect_cancel_on_signal(&mut self, signal: &str, expected_signal: i32) -> Result<()> {
+        send_signal(self.create.id(), signal)?;
+
+        let status = wait_for_exit(&mut self.create, Duration::from_secs(10))?;
+        assert!(
+            !status.success(),
+            "{signal} should stop the CLI instead of completing successfully"
+        );
+        assert!(
+            status.signal() == Some(expected_signal) || status.code().is_some_and(|code| code != 0),
+            "expected {signal}/non-zero exit, got {status:?}"
+        );
+
+        wait_for_process_exit(self.bridge_child_pid, Duration::from_secs(10))?;
+        self.assert_daemon_still_running()?;
+        Ok(())
+    }
+}
+
+impl Drop for DaemonCreateHarness {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-CONT", &self.create.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = terminate_child(&mut self.create);
+        let _ = terminate_child(&mut self.daemon);
+        fs::remove_dir_all(&self.sandbox).ok();
+    }
+}
+
 fn configured_command(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Command {
     let mut command = Command::new(cli_binary());
     command
@@ -277,7 +470,12 @@ fn wait_for_socket(child: &mut Child, timeout: Duration) -> Result<()> {
 
 fn terminate_child(child: &mut Child) -> Result<()> {
     let pid = child.id().to_string();
-    let _ = Command::new("kill").arg("-TERM").arg(&pid).status();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(&pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(_status) = child.try_wait()? {
@@ -321,6 +519,19 @@ fn process_is_running(process_id: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn send_signal(process_id: u32, signal: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .args([signal, &process_id.to_string()])
+        .status()
+        .with_context(|| format!("send {signal} to process {process_id}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "{signal} should succeed for process {process_id}"
+        ));
+    }
+    Ok(())
 }
 
 fn read_child_output(child: &mut Child) -> (String, String) {
@@ -482,148 +693,39 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
 #[test]
 fn ctrl_c_cancels_only_the_in_flight_daemon_create_request() -> Result<()> {
     let _guard = env_mutex().lock().expect("env mutex");
-    let sandbox = unique_temp_dir("codex-rotate-cancel-e2e");
-    let rotate_home = sandbox.join("rotate-home");
-    let codex_home = sandbox.join("codex-home");
-    fs::create_dir_all(&rotate_home)?;
-    fs::create_dir_all(&codex_home)?;
+    let mut harness = DaemonCreateHarness::start("codex-rotate-cancel-int-e2e")?;
+    harness.expect_cancel_on_signal("-INT", 2)?;
+    Ok(())
+}
 
-    let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
-    write_executable(
-        &fast_browser_runtime,
-        "#!/bin/sh\nset -eu\nif [ \"${2-}\" = \"inspect-profiles\" ]; then\n  printf '%s\\n' '{\"managedProfiles\":{\"default\":\"dev-1\",\"profiles\":[{\"name\":\"dev-1\"}]}}'\n  exit 0\nfi\nprintf 'unexpected fast-browser runtime args: %s\\n' \"$*\" >&2\nexit 1\n",
-    )?;
+#[test]
+fn sigterm_cancels_only_the_in_flight_daemon_create_request() -> Result<()> {
+    let _guard = env_mutex().lock().expect("env mutex");
+    let mut harness = DaemonCreateHarness::start("codex-rotate-cancel-term-e2e")?;
+    harness.expect_cancel_on_signal("-TERM", 15)?;
+    Ok(())
+}
 
-    let automation_bridge = sandbox.join("automation-bridge.py");
-    fs::write(
-        &automation_bridge,
-        r#"import json
-import os
-import subprocess
-import sys
-import time
+#[test]
+fn sigtstp_suspends_cli_without_canceling_daemon_create_request() -> Result<()> {
+    let _guard = env_mutex().lock().expect("env mutex");
+    let mut harness = DaemonCreateHarness::start("codex-rotate-cancel-tstp-e2e")?;
 
-def respond(payload, code=0):
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
-    sys.exit(code)
+    send_signal(harness.create.id(), "-TSTP")?;
+    thread::sleep(Duration::from_millis(500));
 
-def request_file():
-    args = sys.argv[1:]
-    index = args.index("--request-file")
-    return args[index + 1]
-
-with open(request_file(), "r", encoding="utf-8") as handle:
-    request = json.load(handle)
-
-command = request["command"]
-if command == "prepare-account-secret-ref":
-    respond(
-        {
-            "ok": True,
-            "result": {
-                "type": "secret_ref",
-                "store": "bitwarden-cli",
-                "object_id": "test-secret",
-            },
-        }
-    )
-elif command == "delete-account-secret-ref":
-    respond({"ok": True, "result": True})
-elif command == "reset-managed-runtime":
-    respond({"ok": True, "result": {"ok": True}})
-elif command == "complete-codex-login-attempt":
-    pid_file = os.environ["CODEX_ROTATE_TEST_CHILD_PID_FILE"]
-    subprocess.Popen(
-        [
-            "/bin/sh",
-            "-lc",
-            f"trap 'exit 0' TERM INT; echo $$ > '{pid_file}'; while true; do sleep 1; done",
-        ]
-    )
-    while True:
-        time.sleep(1)
-else:
-    respond(
-        {
-            "ok": False,
-            "error": {"message": f"unsupported automation bridge command: {command}"},
-        },
-        1,
-    )
-"#,
-    )?;
-
-    let child_pid_file = sandbox.join("bridge-child.pid");
-    let python3 = find_binary("python3")?;
-    let dummy_cdp = DummyCdpServer::start()?;
-    let _env = EnvGuard::set(&rotate_home, &codex_home, dummy_cdp.port);
-    let _extra_env = ExtraEnvGuard::set(&[
-        (
-            "CODEX_ROTATE_AUTOMATION_BRIDGE",
-            automation_bridge.as_os_str().to_os_string(),
-        ),
-        ("NODE_BIN", python3.as_os_str().to_os_string()),
-        (
-            "CODEX_ROTATE_FAST_BROWSER_RUNTIME",
-            fast_browser_runtime.as_os_str().to_os_string(),
-        ),
-        (
-            "CODEX_ROTATE_TEST_CHILD_PID_FILE",
-            child_pid_file.as_os_str().to_os_string(),
-        ),
-    ]);
-
-    let mut daemon = spawn_daemon(&rotate_home, &codex_home, dummy_cdp.port)?;
-    wait_for_socket(&mut daemon, Duration::from_secs(10))?;
-
-    let mut create = configured_command(&rotate_home, &codex_home, dummy_cdp.port)
-        .arg("create")
-        .arg("--force")
-        .arg("--profile")
-        .arg("dev-1")
-        .arg("--base-email")
-        .arg("dev.{n}@astronlab.com")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {} create --force", cli_binary()))?;
-
-    let bridge_child_pid =
-        wait_for_pid_file_from_child(&child_pid_file, &mut create, Duration::from_secs(10))?;
     assert!(
-        process_is_running(bridge_child_pid),
-        "expected bridge child {} to be running",
-        bridge_child_pid
-    );
-
-    let signal_status = Command::new("kill")
-        .args(["-INT", &create.id().to_string()])
-        .status()
-        .context("send SIGINT to create CLI")?;
-    assert!(signal_status.success(), "SIGINT should succeed");
-
-    let status = wait_for_exit(&mut create, Duration::from_secs(10))?;
-    assert!(
-        !status.success(),
-        "SIGINT should stop the CLI instead of completing successfully"
+        harness.create.try_wait()?.is_none(),
+        "SIGTSTP should suspend the CLI instead of exiting it"
     );
     assert!(
-        status.signal() == Some(2) || status.code().is_some_and(|code| code != 0),
-        "expected SIGINT/non-zero exit, got {status:?}"
+        process_is_running(harness.bridge_child_pid),
+        "suspending the CLI should not cancel the in-flight bridge child {}",
+        harness.bridge_child_pid
     );
+    harness.assert_daemon_still_running()?;
 
-    wait_for_process_exit(bridge_child_pid, Duration::from_secs(10))?;
-
-    let daemon_check = run_cli(&["daemon"], &rotate_home, &codex_home, dummy_cdp.port)?;
-    assert_eq!(daemon_check.code, 0);
-    assert_eq!(
-        normalized(&daemon_check.stdout),
-        "Codex Rotate daemon is already running."
-    );
-
-    terminate_child(&mut daemon)?;
-    fs::remove_dir_all(&sandbox).ok();
+    send_signal(harness.create.id(), "-CONT")?;
+    harness.expect_cancel_on_signal("-INT", 2)?;
     Ok(())
 }
