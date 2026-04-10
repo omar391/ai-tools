@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod bridge;
+pub mod cancel;
 pub mod fs_security;
 pub mod managed_browser;
 pub mod paths;

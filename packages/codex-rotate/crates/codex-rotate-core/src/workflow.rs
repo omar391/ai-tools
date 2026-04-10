@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +19,7 @@ use crate::auth::{
 use crate::bridge::{
     run_automation_bridge, run_automation_bridge_with_progress, AutomationProgressCallback,
 };
+use crate::cancel;
 use crate::managed_browser::ensure_managed_browser_wrapper;
 use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::pool::{
@@ -736,6 +736,7 @@ fn execute_create_flow_with_progress(
 ) -> Result<CreateCommandResult> {
     let mut attempt = 1usize;
     loop {
+        cancel::check_canceled()?;
         match execute_create_flow_attempt(options, progress.clone()) {
             Ok(result) => return Ok(result),
             Err(CreateFlowAttemptFailure::Retryable(error))
@@ -757,7 +758,7 @@ fn execute_create_flow_with_progress(
                     AUTO_CREATE_RETRY_DELAY.as_secs()
                 );
                 attempt = attempt.saturating_add(1);
-                thread::sleep(AUTO_CREATE_RETRY_DELAY);
+                cancel::sleep_with_cancellation(AUTO_CREATE_RETRY_DELAY)?;
             }
             Err(CreateFlowAttemptFailure::Retryable(error))
             | Err(CreateFlowAttemptFailure::Fatal(error)) => return Err(error),
@@ -1437,6 +1438,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
     let mut codex_session: Option<CodexRotateAuthFlowSession> = None;
     let result = (|| -> Result<()> {
         'attempts: for attempt in 1..=DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+            cancel::check_canceled()?;
             report_progress(
                 progress.as_ref(),
                 if attempt == 1 {
@@ -1449,6 +1451,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
             );
 
             for replay_pass in 1..=DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES {
+                cancel::check_canceled()?;
                 let login_workflow_run_stamp = workflow_run_stamp
                     .map(|stamp| format!("{stamp}-codex-login-{attempt}-{replay_pass}"));
                 let options = BridgeLoginOptions {
@@ -1551,7 +1554,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                             DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES
                         ),
                     );
-                    thread::sleep(Duration::from_millis(1_000));
+                    cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
                     continue;
                 }
 
@@ -1580,7 +1583,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                                 delay_ms / 1_000
                             ),
                         );
-                        thread::sleep(Duration::from_millis(delay_ms));
+                        cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
                         continue 'attempts;
                     }
                     return Err(anyhow!(login_error_message(
@@ -1603,7 +1606,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                                 delay_ms / 1_000
                             ),
                         );
-                        thread::sleep(Duration::from_millis(delay_ms));
+                        cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
                         continue 'attempts;
                     }
                     return Err(anyhow!(login_error_message(
@@ -1632,7 +1635,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                                 delay_ms / 1_000
                             ),
                         );
-                        thread::sleep(Duration::from_millis(delay_ms));
+                        cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
                         continue 'attempts;
                     }
                     if is_device_auth_rate_limited(message)
@@ -1659,7 +1662,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                                 delay_ms / 1_000
                             ),
                         );
-                        thread::sleep(Duration::from_millis(delay_ms));
+                        cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
                         continue 'attempts;
                     }
                 }
@@ -1671,7 +1674,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                             "Managed profile \"{profile_name}\" hit a recoverable fast-browser runtime state for {email}. Restarting the managed runtime before retrying."
                         ),
                     );
-                    thread::sleep(Duration::from_millis(1_000));
+                    cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
                     continue 'attempts;
                 }
 

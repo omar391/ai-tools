@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +30,17 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .expect("system time")
         .as_nanos();
     PathBuf::from("/tmp").join(format!("{prefix}-{stamp}"))
+}
+
+fn find_binary(binary_name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set."))?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(binary_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!("Could not find {} in PATH.", binary_name))
 }
 
 struct EnvGuard {
@@ -91,6 +103,31 @@ fn restore_var(name: &str, value: Option<OsString>) {
         None => unsafe {
             std::env::remove_var(name);
         },
+    }
+}
+
+struct ExtraEnvGuard {
+    values: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl ExtraEnvGuard {
+    fn set(values: &[(&'static str, OsString)]) -> Self {
+        let mut previous = Vec::with_capacity(values.len());
+        for (name, value) in values {
+            previous.push((*name, std::env::var_os(name)));
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+        Self { values: previous }
+    }
+}
+
+impl Drop for ExtraEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.values.drain(..) {
+            restore_var(name, value);
+        }
     }
 }
 
@@ -170,17 +207,23 @@ struct CommandResult {
     stderr: String,
 }
 
+fn configured_command(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Command {
+    let mut command = Command::new(cli_binary());
+    command
+        .env("CODEX_ROTATE_HOME", rotate_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
+    command
+}
+
 fn run_cli(
     args: &[&str],
     rotate_home: &Path,
     codex_home: &Path,
     debug_port: u16,
 ) -> Result<CommandResult> {
-    let output = Command::new(cli_binary())
+    let output = configured_command(rotate_home, codex_home, debug_port)
         .args(args)
-        .env("CODEX_ROTATE_HOME", rotate_home)
-        .env("CODEX_HOME", codex_home)
-        .env("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string())
         .output()
         .with_context(|| format!("run {}", cli_binary()))?;
     Ok(CommandResult {
@@ -191,11 +234,8 @@ fn run_cli(
 }
 
 fn spawn_daemon(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Result<Child> {
-    Command::new(cli_binary())
+    configured_command(rotate_home, codex_home, debug_port)
         .arg("daemon")
-        .env("CODEX_ROTATE_HOME", rotate_home)
-        .env("CODEX_HOME", codex_home)
-        .env("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -254,6 +294,105 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 
 fn normalized(value: &str) -> String {
     value.replace("\r\n", "\n").trim().to_string()
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for child process {} to exit.",
+                child.id()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn process_is_running(process_id: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &process_id.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn read_child_output(child: &mut Child) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stdout.take() {
+        let _ = stream.read_to_string(&mut stdout);
+    }
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_string(&mut stderr);
+    }
+    (stdout, stderr)
+}
+
+fn wait_for_pid_file_from_child(path: &Path, child: &mut Child, timeout: Duration) -> Result<u32> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                return Ok(pid);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            let (stdout, stderr) = read_child_output(child);
+            return Err(anyhow::anyhow!(
+                "Child exited before creating pid file {} (status: {}). stdout: {} stderr: {}",
+                path.display(),
+                status,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+    let (stdout, stderr) = read_child_output(child);
+    Err(anyhow::anyhow!(
+        "Timed out waiting for pid file {}. stdout: {} stderr: {}",
+        path.display(),
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+fn wait_for_process_exit(process_id: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_is_running(process_id) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(anyhow::anyhow!(
+        "Timed out waiting for process {} to exit.",
+        process_id
+    ))
+}
+
+fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -335,6 +474,155 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     );
 
     drop(subscription);
+    terminate_child(&mut daemon)?;
+    fs::remove_dir_all(&sandbox).ok();
+    Ok(())
+}
+
+#[test]
+fn ctrl_c_cancels_only_the_in_flight_daemon_create_request() -> Result<()> {
+    let _guard = env_mutex().lock().expect("env mutex");
+    let sandbox = unique_temp_dir("codex-rotate-cancel-e2e");
+    let rotate_home = sandbox.join("rotate-home");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&rotate_home)?;
+    fs::create_dir_all(&codex_home)?;
+
+    let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
+    write_executable(
+        &fast_browser_runtime,
+        "#!/bin/sh\nset -eu\nif [ \"${2-}\" = \"inspect-profiles\" ]; then\n  printf '%s\\n' '{\"managedProfiles\":{\"default\":\"dev-1\",\"profiles\":[{\"name\":\"dev-1\"}]}}'\n  exit 0\nfi\nprintf 'unexpected fast-browser runtime args: %s\\n' \"$*\" >&2\nexit 1\n",
+    )?;
+
+    let automation_bridge = sandbox.join("automation-bridge.py");
+    fs::write(
+        &automation_bridge,
+        r#"import json
+import os
+import subprocess
+import sys
+import time
+
+def respond(payload, code=0):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+def request_file():
+    args = sys.argv[1:]
+    index = args.index("--request-file")
+    return args[index + 1]
+
+with open(request_file(), "r", encoding="utf-8") as handle:
+    request = json.load(handle)
+
+command = request["command"]
+if command == "prepare-account-secret-ref":
+    respond(
+        {
+            "ok": True,
+            "result": {
+                "type": "secret_ref",
+                "store": "bitwarden-cli",
+                "object_id": "test-secret",
+            },
+        }
+    )
+elif command == "delete-account-secret-ref":
+    respond({"ok": True, "result": True})
+elif command == "reset-managed-runtime":
+    respond({"ok": True, "result": {"ok": True}})
+elif command == "complete-codex-login-attempt":
+    pid_file = os.environ["CODEX_ROTATE_TEST_CHILD_PID_FILE"]
+    subprocess.Popen(
+        [
+            "/bin/sh",
+            "-lc",
+            f"trap 'exit 0' TERM INT; echo $$ > '{pid_file}'; while true; do sleep 1; done",
+        ]
+    )
+    while True:
+        time.sleep(1)
+else:
+    respond(
+        {
+            "ok": False,
+            "error": {"message": f"unsupported automation bridge command: {command}"},
+        },
+        1,
+    )
+"#,
+    )?;
+
+    let child_pid_file = sandbox.join("bridge-child.pid");
+    let python3 = find_binary("python3")?;
+    let dummy_cdp = DummyCdpServer::start()?;
+    let _env = EnvGuard::set(&rotate_home, &codex_home, dummy_cdp.port);
+    let _extra_env = ExtraEnvGuard::set(&[
+        (
+            "CODEX_ROTATE_AUTOMATION_BRIDGE",
+            automation_bridge.as_os_str().to_os_string(),
+        ),
+        ("NODE_BIN", python3.as_os_str().to_os_string()),
+        (
+            "CODEX_ROTATE_FAST_BROWSER_RUNTIME",
+            fast_browser_runtime.as_os_str().to_os_string(),
+        ),
+        (
+            "CODEX_ROTATE_TEST_CHILD_PID_FILE",
+            child_pid_file.as_os_str().to_os_string(),
+        ),
+    ]);
+
+    let mut daemon = spawn_daemon(&rotate_home, &codex_home, dummy_cdp.port)?;
+    wait_for_socket(&mut daemon, Duration::from_secs(10))?;
+
+    let mut create = configured_command(&rotate_home, &codex_home, dummy_cdp.port)
+        .arg("create")
+        .arg("--force")
+        .arg("--profile")
+        .arg("dev-1")
+        .arg("--base-email")
+        .arg("dev.{n}@astronlab.com")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {} create --force", cli_binary()))?;
+
+    let bridge_child_pid =
+        wait_for_pid_file_from_child(&child_pid_file, &mut create, Duration::from_secs(10))?;
+    assert!(
+        process_is_running(bridge_child_pid),
+        "expected bridge child {} to be running",
+        bridge_child_pid
+    );
+
+    let signal_status = Command::new("kill")
+        .args(["-INT", &create.id().to_string()])
+        .status()
+        .context("send SIGINT to create CLI")?;
+    assert!(signal_status.success(), "SIGINT should succeed");
+
+    let status = wait_for_exit(&mut create, Duration::from_secs(10))?;
+    assert!(
+        !status.success(),
+        "SIGINT should stop the CLI instead of completing successfully"
+    );
+    assert!(
+        status.signal() == Some(2) || status.code().is_some_and(|code| code != 0),
+        "expected SIGINT/non-zero exit, got {status:?}"
+    );
+
+    wait_for_process_exit(bridge_child_pid, Duration::from_secs(10))?;
+
+    let daemon_check = run_cli(&["daemon"], &rotate_home, &codex_home, dummy_cdp.port)?;
+    assert_eq!(daemon_check.code, 0);
+    assert_eq!(
+        normalized(&daemon_check.stdout),
+        "Codex Rotate daemon is already running."
+    );
+
     terminate_child(&mut daemon)?;
     fs::remove_dir_all(&sandbox).ok();
     Ok(())

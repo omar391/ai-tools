@@ -1,7 +1,8 @@
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -9,9 +10,12 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 
+use crate::cancel;
 use crate::paths::{cleanup_legacy_rotate_home_artifacts, resolve_paths};
 
 const FAST_BROWSER_EVENT_PREFIX: &str = "__FAST_BROWSER_EVENT__";
+const BRIDGE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const BRIDGE_TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize)]
 struct BridgeRequest<'a, TPayload> {
@@ -51,6 +55,7 @@ where
     TPayload: Serialize,
     TResult: DeserializeOwned,
 {
+    cancel::check_canceled()?;
     let paths = resolve_paths()?;
     cleanup_legacy_rotate_home_artifacts(&paths.rotate_home)?;
     let request = serde_json::to_vec(&BridgeRequest { command, payload })?;
@@ -67,6 +72,8 @@ where
     {
         process.arg("--experimental-strip-types");
     }
+    #[cfg(unix)]
+    prepare_bridge_command(&mut process);
     let child = process
         .arg(&paths.automation_bridge_entrypoint)
         .arg("--request-file")
@@ -91,6 +98,11 @@ where
         })?;
 
     let mut child = child;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Automation bridge stdout was unavailable.")?;
+    let stdout_reader = thread::spawn(move || read_bridge_stdout(stdout));
     let stderr_reader = match progress {
         Some(progress) => {
             let stderr = child
@@ -104,14 +116,28 @@ where
         None => None,
     };
 
-    let output = child.wait_with_output()?;
+    let output = match wait_for_bridge_process(&mut child) {
+        Ok(output) => output,
+        Err(error) => {
+            terminate_bridge_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            if let Some(reader) = stderr_reader {
+                let _ = reader.join();
+            }
+            return Err(error);
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("Automation bridge stdout reader panicked."))??;
     if let Some(reader) = stderr_reader {
         reader
             .join()
             .map_err(|_| anyhow!("Automation bridge progress reader panicked."))??;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let response = serde_json::from_slice::<BridgeResponse>(&output.stdout).ok();
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let response = serde_json::from_str::<BridgeResponse>(&stdout).ok();
     if let Some(response) = response {
         if response.ok && output.status.success() {
             return serde_json::from_value(response.result).with_context(|| {
@@ -139,6 +165,75 @@ where
     Err(anyhow!(
         "Automation bridge returned invalid JSON for {command}."
     ))
+}
+
+#[cfg(unix)]
+fn prepare_bridge_command(command: &mut Command) {
+    use std::os::raw::c_int;
+    use std::os::unix::process::CommandExt;
+
+    unsafe extern "C" {
+        fn setsid() -> c_int;
+    }
+
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn wait_for_bridge_process(child: &mut Child) -> Result<BridgeProcessOutput> {
+    loop {
+        cancel::check_canceled()?;
+        if let Some(status) = child.try_wait()? {
+            return Ok(BridgeProcessOutput { status });
+        }
+        thread::sleep(BRIDGE_WAIT_POLL_INTERVAL);
+    }
+}
+
+fn terminate_bridge_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &process_group])
+            .status();
+        let deadline = Instant::now() + BRIDGE_TERMINATE_TIMEOUT;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) | Err(_) => thread::sleep(BRIDGE_WAIT_POLL_INTERVAL),
+            }
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &process_group])
+            .status();
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+fn read_bridge_stdout(stdout: impl Read) -> Result<Vec<u8>> {
+    let mut reader = BufReader::new(stdout);
+    let mut buffer = Vec::new();
+    reader
+        .read_to_end(&mut buffer)
+        .context("Failed to read automation bridge stdout.")?;
+    Ok(buffer)
+}
+
+struct BridgeProcessOutput {
+    status: ExitStatus,
 }
 
 fn stream_bridge_progress(

@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +26,7 @@ use crate::watch::{
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
+use codex_rotate_core::cancel;
 use codex_rotate_core::pool::{
     cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
     rotate_next_internal_with_progress, NextResult,
@@ -50,6 +51,7 @@ const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TRAY_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
+const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct DaemonState {
@@ -224,6 +226,70 @@ impl Drop for SocketGuard {
     }
 }
 
+#[cfg(unix)]
+struct ClientDisconnectMonitor {
+    canceled: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl ClientDisconnectMonitor {
+    fn attach(stream: &UnixStream) -> Result<Self> {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let mut reader = stream.try_clone()?;
+        reader
+            .set_read_timeout(Some(CLIENT_DISCONNECT_POLL_INTERVAL))
+            .context("Failed to configure daemon disconnect monitor timeout.")?;
+        let canceled_signal = canceled.clone();
+        let done_signal = done.clone();
+        let handle = thread::spawn(move || {
+            let mut buffer = [0_u8; 1];
+            while !done_signal.load(Ordering::Relaxed) {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        canceled_signal.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        canceled_signal.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            canceled,
+            done,
+            handle: Some(handle),
+        })
+    }
+
+    fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.canceled.clone()
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::SeqCst)
+    }
+
+    fn finish(mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn initialize_runtime(daemon: &SharedDaemon) {
     let result = daemon.with_state_mut(|state| {
         hydrate_quota_cache_from_watch_state(state);
@@ -294,38 +360,51 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
         ClientRequest::Invoke { action } => {
             let mut writer = stream;
             let action_name = format!("{action:?}");
-            let response =
-                match panic::catch_unwind(AssertUnwindSafe(|| daemon.handle_invoke(action))) {
-                    Ok(Ok(output)) => ServerMessage::Result {
-                        ok: true,
-                        output: Some(output),
-                        error: None,
-                    },
-                    Ok(Err(error)) => {
+            let disconnect_monitor = ClientDisconnectMonitor::attach(&writer)?;
+            let cancel_token = disconnect_monitor.cancel_token();
+            let response = match panic::catch_unwind(AssertUnwindSafe(|| {
+                cancel::with_cancel_token(cancel_token, || daemon.handle_invoke(action))
+            })) {
+                Ok(Ok(output)) => ServerMessage::Result {
+                    ok: true,
+                    output: Some(output),
+                    error: None,
+                },
+                Ok(Err(error)) => {
+                    if disconnect_monitor.is_canceled() {
+                        log_daemon_info(format!(
+                            "invoke {action_name} canceled after the client disconnected."
+                        ));
+                    } else {
                         log_daemon_error(format!("invoke {action_name} failed: {error:#}"));
-                        ServerMessage::Result {
-                            ok: false,
-                            output: None,
-                            error: Some(error.to_string()),
-                        }
                     }
-                    Err(payload) => {
-                        let detail = if let Some(message) = payload.downcast_ref::<&str>() {
-                            (*message).to_string()
-                        } else if let Some(message) = payload.downcast_ref::<String>() {
-                            message.clone()
-                        } else {
-                            "unknown panic payload".to_string()
-                        };
-                        log_daemon_error(format!("invoke {action_name} panicked: {detail}"));
-                        ServerMessage::Result {
-                            ok: false,
-                            output: None,
-                            error: Some(format!("Daemon invoke panicked: {detail}")),
-                        }
+                    ServerMessage::Result {
+                        ok: false,
+                        output: None,
+                        error: Some(error.to_string()),
                     }
-                };
-            write_message(&mut writer, &response)?;
+                }
+                Err(payload) => {
+                    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                        (*message).to_string()
+                    } else if let Some(message) = payload.downcast_ref::<String>() {
+                        message.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    log_daemon_error(format!("invoke {action_name} panicked: {detail}"));
+                    ServerMessage::Result {
+                        ok: false,
+                        output: None,
+                        error: Some(format!("Daemon invoke panicked: {detail}")),
+                    }
+                }
+            };
+            let client_disconnected = disconnect_monitor.is_canceled();
+            disconnect_monitor.finish();
+            if !client_disconnected {
+                write_message(&mut writer, &response)?;
+            }
         }
     }
 
@@ -1004,6 +1083,8 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1071,6 +1152,27 @@ mod tests {
             request_count,
             stop,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_disconnect_monitor_only_marks_its_own_stream_closed() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("unix stream pair");
+        let monitor = ClientDisconnectMonitor::attach(&server_stream).expect("attach monitor");
+
+        assert!(!monitor.is_canceled());
+        drop(client_stream);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !monitor.is_canceled() {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            monitor.is_canceled(),
+            "monitor should observe peer shutdown"
+        );
+        monitor.finish();
     }
 
     #[test]
