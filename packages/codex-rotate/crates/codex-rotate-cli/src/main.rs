@@ -21,10 +21,11 @@ use codex_rotate_core::workflow::{
 #[cfg(not(target_os = "macos"))]
 use codex_rotate_refresh::stop_running_trays;
 use codex_rotate_refresh::{
-    clear_tray_service_registration, detect_local_build, launch_tray_process, rebuild_local_binary,
-    preferred_release_binary, sources_newer_than_binary, tray_service_pid, TargetKind,
+    clear_tray_service_registration, detect_local_build, launch_tray_process,
+    preferred_release_binary, rebuild_local_binary, sources_newer_than_binary, tray_service_pid,
+    TargetKind,
 };
-use codex_rotate_runtime::daemon::run_daemon_forever;
+use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
     SnapshotMessageKind, StatusSnapshot,
@@ -206,20 +207,61 @@ fn command_streams_progress(command: Option<&str>) -> bool {
 }
 
 fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
-    match args.first().map(String::as_str) {
-        None => {
-            if daemon_is_reachable() {
-                return write_output(writer, "Codex Rotate daemon is already running.");
-            }
-            run_daemon_forever()
-        }
-        Some("help") | Some("--help") | Some("-h") => {
-            write_output(writer, "Usage: codex-rotate daemon")
-        }
-        Some(other) => Err(anyhow!(
-            "Unknown daemon command: \"{other}\". Usage: codex-rotate daemon"
-        )),
+    if matches!(
+        args.first().map(String::as_str),
+        Some("help") | Some("--help") | Some("-h")
+    ) {
+        return match args.len() {
+            1 => write_output(writer, "Usage: codex-rotate daemon"),
+            _ => Err(anyhow!(
+                "Unknown daemon command: \"{}\". Usage: codex-rotate daemon",
+                args[1]
+            )),
+        };
     }
+
+    let options = parse_daemon_run_options(args)?;
+    if !options.takeover && daemon_is_reachable() {
+        return write_output(writer, "Codex Rotate daemon is already running.");
+    }
+    run_daemon_forever(options)
+}
+
+fn parse_daemon_run_options(args: &[String]) -> Result<DaemonRunOptions> {
+    let mut options = DaemonRunOptions::default();
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == DAEMON_TAKEOVER_ARG {
+            options.takeover = true;
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--instance-home=") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!("Usage: codex-rotate daemon"));
+            }
+            options.instance_home = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if arg == "--instance-home" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!("Usage: codex-rotate daemon"));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!("Usage: codex-rotate daemon"));
+            }
+            options.instance_home = Some(value.to_string());
+            index += 2;
+            continue;
+        }
+        return Err(anyhow!(
+            "Unknown daemon command: \"{arg}\". Usage: codex-rotate daemon"
+        ));
+    }
+    Ok(options)
 }
 
 fn run_internal_command(args: &[String]) -> Result<()> {
@@ -1126,14 +1168,8 @@ mod tests {
             fs::set_permissions(&tray_stub_path, permissions).expect("set tray stub permissions");
 
             let previous_tray_bin = std::env::var_os("CODEX_ROTATE_TRAY_BIN");
-            let previous_launchd_label = std::env::var_os("CODEX_ROTATE_TRAY_LAUNCHD_LABEL");
-            let launchd_label = format!(
-                "com.astronlab.codex-rotate.tray.test.{}",
-                std::process::id()
-            );
             unsafe {
                 std::env::set_var("CODEX_ROTATE_TRAY_BIN", &tray_stub_path);
-                std::env::set_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL", &launchd_label);
             }
 
             let test_result = (|| -> Result<()> {
@@ -1174,10 +1210,6 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_BIN", value) },
                 None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_BIN") },
             }
-            match previous_launchd_label {
-                Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL", value) },
-                None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_LAUNCHD_LABEL") },
-            }
 
             test_result?;
 
@@ -1210,6 +1242,22 @@ mod tests {
             Ok(())
         })
         .expect("daemon command");
+    }
+
+    #[test]
+    fn parse_daemon_run_options_accepts_hidden_takeover_args() {
+        let options = parse_daemon_run_options(&[
+            "--takeover".to_string(),
+            "--instance-home=/tmp/codex-home".to_string(),
+        ])
+        .expect("parse daemon options");
+        assert_eq!(
+            options,
+            DaemonRunOptions {
+                instance_home: Some("/tmp/codex-home".to_string()),
+                takeover: true,
+            }
+        );
     }
 
     #[cfg(unix)]

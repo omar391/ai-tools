@@ -59,20 +59,13 @@ pub fn ensure_managed_browser_wrapper(profile_name: &str, codex_bin: &str) -> Re
 }
 
 fn resolve_managed_browser_opener_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CODEX_ROTATE_BROWSER_OPENER_BIN").map(PathBuf::from) {
-        return Ok(path);
-    }
     Ok(resolve_paths()?
         .asset_root
         .join("codex-login-managed-browser-opener.ts"))
 }
 
 fn resolve_rotate_cli_binary_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("CODEX_ROTATE_CLI_BIN").map(PathBuf::from))
-        .or_else(|| env::var_os("CODEX_ROTATE_BIN").map(PathBuf::from))
-    {
+    if let Some(path) = env::var_os("CODEX_ROTATE_CLI_BIN").map(PathBuf::from) {
         return Ok(path);
     }
     env::current_exe().context("Failed to resolve the codex-rotate CLI binary.")
@@ -155,15 +148,12 @@ fn render_managed_browser_wrapper(
             "export CODEX_ROTATE_NODE_BIN={}",
             shell_single_quote(node_bin)
         ),
-        format!(
-            "export CODEX_ROTATE_REAL_CODEX={}",
-            shell_single_quote(real_codex_bin)
-        ),
         "if [ \"$1\" = \"login\" ]; then".to_string(),
         "  shift".to_string(),
         format!(
-            "  exec {} internal managed-login \"$@\"",
-            shell_single_quote(&rotate_cli_bin.to_string_lossy())
+            "  exec {} internal managed-login --codex-bin {} \"$@\"",
+            shell_single_quote(&rotate_cli_bin.to_string_lossy()),
+            shell_single_quote(real_codex_bin)
         ),
         "fi".to_string(),
         format!("exec {} \"$@\"", shell_single_quote(real_codex_bin)),
@@ -250,7 +240,7 @@ mod tests {
         let fixture = tempfile::tempdir().expect("tempdir");
         let rotate_home = fixture.path().join("rotate-home");
         let cli_log_path = fixture.path().join("cli-log.json");
-        let cli_path = fixture.path().join("fake-codex-rotate.sh");
+        let cli_path = fixture.path().join("fake-codex-rotate.mjs");
         let codex_marker_path = fixture.path().join("codex-invoked.txt");
         let codex_path = fixture.path().join("fake-codex.sh");
 
@@ -266,32 +256,21 @@ mod tests {
 
         fs::write(
             &cli_path,
-            [
-                "#!/bin/sh".to_string(),
-                "cat <<EOF > \"$CODEX_ROTATE_TEST_CLI_LOG\"".to_string(),
-                "{\"argv\":[\"$1\",\"$2\"],\"profile\":\"$FAST_BROWSER_PROFILE\",\"realCodex\":\"$CODEX_ROTATE_REAL_CODEX\"}"
-                    .to_string(),
-                "EOF".to_string(),
-                "exit 0".to_string(),
-                String::new(),
-            ]
-            .join("\n"),
+            format!(
+                "#!/usr/bin/env node\nimport {{ writeFileSync }} from \"node:fs\";\nwriteFileSync({}, JSON.stringify({{ argv: process.argv.slice(2), profile: process.env.FAST_BROWSER_PROFILE || null }}));\n",
+                serde_json::to_string(&cli_log_path.to_string_lossy().to_string())
+                    .expect("serialize cli log path")
+            ),
         )
         .expect("write fake cli");
         make_executable(&cli_path).expect("chmod fake cli");
 
         let previous_home = std::env::var_os("CODEX_ROTATE_HOME");
-        let previous_target_cli = std::env::var_os("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN");
         let previous_cli = std::env::var_os("CODEX_ROTATE_CLI_BIN");
-        let previous_bin = std::env::var_os("CODEX_ROTATE_BIN");
-        let previous_log = std::env::var_os("CODEX_ROTATE_TEST_CLI_LOG");
 
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
-            std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", &cli_path);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", &cli_path);
-            std::env::set_var("CODEX_ROTATE_BIN", &cli_path);
-            std::env::set_var("CODEX_ROTATE_TEST_CLI_LOG", &cli_log_path);
         }
 
         let wrapper_path =
@@ -306,23 +285,9 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
         }
-        match previous_target_cli {
-            Some(value) => unsafe {
-                std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value)
-            },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN") },
-        }
         match previous_cli {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_CLI_BIN", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_CLI_BIN") },
-        }
-        match previous_bin {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BIN", value) },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_BIN") },
-        }
-        match previous_log {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TEST_CLI_LOG", value) },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_TEST_CLI_LOG") },
         }
 
         assert!(status.success());
@@ -332,11 +297,12 @@ mod tests {
         assert_eq!(logged["profile"], "managed-dev-1");
         assert_eq!(
             logged["argv"],
-            serde_json::json!(["internal", "managed-login"])
-        );
-        assert_eq!(
-            logged["realCodex"],
-            codex_path.to_string_lossy().to_string()
+            serde_json::json!([
+                "internal",
+                "managed-login",
+                "--codex-bin",
+                codex_path.to_string_lossy().to_string()
+            ])
         );
         assert!(!codex_marker_path.exists());
     }
@@ -346,25 +312,20 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = tempfile::tempdir().expect("tempdir");
         let rotate_home = fixture.path().join("rotate-home");
+        let asset_root = fixture.path().join("assets");
         let opener_log_path = fixture.path().join("opener-log.json");
-        let opener_path = fixture.path().join("fake-opener.mjs");
+        let opener_path = asset_root.join("codex-login-managed-browser-opener.ts");
         let cli_path = fixture.path().join("fake-codex-rotate.sh");
         let codex_path = fixture.path().join("fake-codex.sh");
 
+        fs::create_dir_all(&asset_root).expect("create asset root");
         fs::write(
             &opener_path,
-            [
-                "#!/usr/bin/env node".to_string(),
-                "import { writeFileSync } from \"node:fs\";".to_string(),
-                "const logPath = process.env.CODEX_ROTATE_TEST_OPENER_LOG;".to_string(),
-                "writeFileSync(logPath, JSON.stringify({".to_string(),
-                "  argv: process.argv.slice(2),".to_string(),
-                "  profile: process.env.FAST_BROWSER_PROFILE || null,".to_string(),
-                "  browser: process.env.BROWSER || null,".to_string(),
-                "}));".to_string(),
-                String::new(),
-            ]
-            .join("\n"),
+            format!(
+                "#!/usr/bin/env node\nimport {{ writeFileSync }} from \"node:fs\";\nwriteFileSync({}, JSON.stringify({{ argv: process.argv.slice(2), profile: process.env.FAST_BROWSER_PROFILE || null, browser: process.env.BROWSER || null }}));\n",
+                serde_json::to_string(&opener_log_path.to_string_lossy().to_string())
+                    .expect("serialize opener log path")
+            ),
         )
         .expect("write opener");
         make_executable(&opener_path).expect("chmod opener");
@@ -379,19 +340,13 @@ mod tests {
         make_executable(&codex_path).expect("chmod fake codex");
 
         let previous_home = std::env::var_os("CODEX_ROTATE_HOME");
-        let previous_opener = std::env::var_os("CODEX_ROTATE_BROWSER_OPENER_BIN");
-        let previous_target_cli = std::env::var_os("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN");
+        let previous_asset_root = std::env::var_os("CODEX_ROTATE_ASSET_ROOT");
         let previous_cli = std::env::var_os("CODEX_ROTATE_CLI_BIN");
-        let previous_bin = std::env::var_os("CODEX_ROTATE_BIN");
-        let previous_log = std::env::var_os("CODEX_ROTATE_TEST_OPENER_LOG");
 
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
-            std::env::set_var("CODEX_ROTATE_BROWSER_OPENER_BIN", &opener_path);
-            std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", &cli_path);
+            std::env::set_var("CODEX_ROTATE_ASSET_ROOT", &asset_root);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", &cli_path);
-            std::env::set_var("CODEX_ROTATE_BIN", &cli_path);
-            std::env::set_var("CODEX_ROTATE_TEST_OPENER_LOG", &opener_log_path);
         }
 
         let wrapper_path =
@@ -406,27 +361,13 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
         }
-        match previous_opener {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BROWSER_OPENER_BIN", value) },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_BROWSER_OPENER_BIN") },
-        }
-        match previous_target_cli {
-            Some(value) => unsafe {
-                std::env::set_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN", value)
-            },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_WRAPPER_TARGET_CLI_BIN") },
+        match previous_asset_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_ASSET_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_ASSET_ROOT") },
         }
         match previous_cli {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_CLI_BIN", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_CLI_BIN") },
-        }
-        match previous_bin {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BIN", value) },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_BIN") },
-        }
-        match previous_log {
-            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TEST_OPENER_LOG", value) },
-            None => unsafe { std::env::remove_var("CODEX_ROTATE_TEST_OPENER_LOG") },
         }
 
         assert!(status.success());

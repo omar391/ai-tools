@@ -5,12 +5,11 @@ use anyhow::{Context, Result};
 
 use crate::targets::LocalBinaryBuild;
 
-pub const INSTANCE_HOME_ENV: &str = "CODEX_ROTATE_INSTANCE_HOME";
+pub const INSTANCE_HOME_ARG: &str = "--instance-home";
 
 pub fn stop_running_daemons(cli_binary: &Path, daemon_socket: &Path) -> Result<()> {
-    let instance_home = std::env::var(INSTANCE_HOME_ENV).ok();
     let mut pids = daemon_pids_from_lsof(daemon_socket).unwrap_or_default();
-    for pid in daemon_pids_from_ps(cli_binary, instance_home.as_deref())? {
+    for pid in daemon_pids_from_ps(cli_binary, None)? {
         if !pids.contains(&pid) {
             pids.push(pid);
         }
@@ -151,20 +150,19 @@ fn daemon_pids_from_lsof(daemon_socket: &Path) -> Result<Vec<u32>> {
 fn daemon_pids_from_ps(cli_binary: &Path, instance_home: Option<&str>) -> Result<Vec<u32>> {
     let cli_binary = cli_binary.display().to_string();
     process_ids_from_ps("running daemon processes", move |line| {
-        if !matches_instance_home_marker(line, instance_home) {
-            return false;
-        }
         let mut parts = line.split_whitespace();
         let _pid = parts.next();
-        let first = parts.next();
-        let second = parts.next();
-        let third = parts.next();
-        let fourth = parts.next();
+        let command_parts = parts.collect::<Vec<_>>();
+        let first = command_parts.first().copied();
+        let second = command_parts.get(1).copied();
         if shell_like_command(first) {
             return false;
         }
-        command_tokens_match_binary(first, second, &cli_binary)
-            && command_args_after_binary(first, second, third, fourth).starts_with(&["daemon"])
+        if !command_tokens_match_binary(first, second, &cli_binary) {
+            return false;
+        }
+        let args = command_args_after_binary(&command_parts);
+        args.starts_with(&["daemon"]) && matches_instance_home_arg(&args, instance_home)
     })
 }
 
@@ -183,18 +181,15 @@ fn command_tokens_match_binary(first: Option<&str>, second: Option<&str>, binary
     first == Some(binary) || second == Some(binary)
 }
 
-fn command_args_after_binary<'a>(
-    first: Option<&'a str>,
-    second: Option<&'a str>,
-    third: Option<&'a str>,
-    fourth: Option<&'a str>,
-) -> Vec<&'a str> {
-    match (first, second) {
-        (Some(_), Some(_)) if shell_like_command(first) => vec![],
-        (Some(_), Some(binary)) if binary.ends_with("codex-rotate") => {
-            third.into_iter().chain(fourth).collect()
+fn command_args_after_binary<'a>(command_parts: &'a [&'a str]) -> Vec<&'a str> {
+    match command_parts {
+        [first, second, remaining @ ..]
+            if second.ends_with("codex-rotate") && !shell_like_command(Some(first)) =>
+        {
+            remaining.to_vec()
         }
-        _ => second.into_iter().chain(third).chain(fourth).collect(),
+        [_, remaining @ ..] => remaining.to_vec(),
+        [] => Vec::new(),
     }
 }
 
@@ -228,9 +223,15 @@ where
         .collect())
 }
 
-pub(crate) fn matches_instance_home_marker(line: &str, instance_home: Option<&str>) -> bool {
+pub(crate) fn matches_instance_home_arg(args: &[&str], instance_home: Option<&str>) -> bool {
     match instance_home {
-        Some(home) => line.contains(&format!("{INSTANCE_HOME_ENV}={home}")),
+        Some(home) => {
+            args.windows(2)
+                .any(|window| matches!(window, ["--instance-home", value] if *value == home))
+                || args
+                    .iter()
+                    .any(|value| value.strip_prefix("--instance-home=") == Some(home))
+        }
         None => true,
     }
 }
@@ -270,18 +271,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_home_marker_filters_other_homes() {
+    fn instance_home_arg_filters_other_homes() {
         let home = "/tmp/codex-home-a";
-        let matching = format!(
-            "123 /Volumes/demo/target/debug/codex-rotate daemon {}={}",
-            INSTANCE_HOME_ENV, home
-        );
-        let other = format!(
-            "123 /Volumes/demo/target/debug/codex-rotate daemon {}={}",
-            INSTANCE_HOME_ENV, "/tmp/codex-home-b"
-        );
-        assert!(matches_instance_home_marker(&matching, Some(home)));
-        assert!(!matches_instance_home_marker(&other, Some(home)));
-        assert!(matches_instance_home_marker(&other, None));
+        let matching = ["daemon", "--instance-home", home];
+        let other = ["daemon", "--instance-home=/tmp/codex-home-b"];
+        assert!(matches_instance_home_arg(&matching, Some(home)));
+        assert!(!matches_instance_home_arg(&other, Some(home)));
+        assert!(matches_instance_home_arg(&other, None));
     }
 }

@@ -411,6 +411,8 @@ struct BridgeLoginOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_signup_recovery: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prefer_password_login: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     full_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     birth_month: Option<u8>,
@@ -766,6 +768,7 @@ pub fn cmd_relogin_with_progress(
                 workflow_run_stamp: None,
                 skip_locator_preflight: None,
                 prefer_signup_recovery: None,
+                prefer_password_login: None,
                 birth_date: None,
                 progress: progress.clone(),
             })
@@ -1318,6 +1321,7 @@ fn execute_create_flow_attempt(
         workflow_run_stamp: Some(started_at.as_str()),
         skip_locator_preflight: Some(skip_locator_preflight),
         prefer_signup_recovery: Some(true),
+        prefer_password_login: skip_locator_preflight.then_some(true),
         birth_date: Some(&birth_date),
         progress: progress.clone(),
     });
@@ -1638,6 +1642,7 @@ struct CompleteCodexLoginArgs<'a> {
     workflow_run_stamp: Option<&'a str>,
     skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
+    prefer_password_login: Option<bool>,
     birth_date: Option<&'a AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
 }
@@ -1657,6 +1662,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         workflow_run_stamp,
         skip_locator_preflight,
         prefer_signup_recovery,
+        prefer_password_login,
         birth_date,
         progress,
     } = args;
@@ -1716,6 +1722,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     workflow_run_stamp: login_workflow_run_stamp.as_deref(),
                     skip_locator_preflight,
                     prefer_signup_recovery: Some(allow_signup_recovery),
+                    prefer_password_login,
                     full_name: Some(workflow_defaults.full_name.as_str()),
                     birth_month: Some(birth_date.birth_month),
                     birth_day: Some(birth_date.birth_day),

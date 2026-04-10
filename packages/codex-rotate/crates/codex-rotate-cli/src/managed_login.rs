@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -10,13 +9,10 @@ const CLIENT_NAME: &str = "codex-rotate-managed-login";
 const CLIENT_VERSION: &str = "1.0.0";
 
 pub fn run_managed_login(args: &[String]) -> Result<()> {
-    let codex_bin = env::var("CODEX_ROTATE_REAL_CODEX")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "codex".to_string());
+    let options = parse_managed_login_options(args)?;
+    let codex_bin = options.codex_bin.unwrap_or_else(|| "codex".to_string());
 
-    if args.iter().any(|arg| arg == "--device-auth") {
+    if options.device_auth {
         return run_device_auth_login(&codex_bin);
     }
 
@@ -61,6 +57,53 @@ pub fn run_managed_login(args: &[String]) -> Result<()> {
     close_result?;
     eprintln!("Successfully logged in");
     Ok(())
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ManagedLoginOptions {
+    codex_bin: Option<String>,
+    device_auth: bool,
+}
+
+fn parse_managed_login_options(args: &[String]) -> Result<ManagedLoginOptions> {
+    let mut options = ManagedLoginOptions::default();
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == "--device-auth" {
+            options.device_auth = true;
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--codex-bin=") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "Usage: codex-rotate internal managed-login [--codex-bin <path>] [--device-auth]"
+                ));
+            }
+            options.codex_bin = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if arg == "--codex-bin" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!(
+                    "Usage: codex-rotate internal managed-login [--codex-bin <path>] [--device-auth]"
+                ));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "Usage: codex-rotate internal managed-login [--codex-bin <path>] [--device-auth]"
+                ));
+            }
+            options.codex_bin = Some(value.to_string());
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(options)
 }
 
 pub fn run_managed_browser_wrapper(args: &[String]) -> Result<()> {
@@ -117,6 +160,39 @@ fn parse_callback_origin(auth_url: &str) -> Option<String> {
             .map(|value| format!(":{value}"))
             .unwrap_or_default()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_managed_login_options_extracts_hidden_codex_bin() {
+        let options = parse_managed_login_options(&[
+            "--codex-bin".to_string(),
+            "/tmp/codex".to_string(),
+            "--device-auth".to_string(),
+            "--passthrough".to_string(),
+        ])
+        .expect("parse managed login options");
+
+        assert_eq!(
+            options,
+            ManagedLoginOptions {
+                codex_bin: Some("/tmp/codex".to_string()),
+                device_auth: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_managed_login_options_rejects_missing_codex_bin_value() {
+        let error = parse_managed_login_options(&["--codex-bin".to_string()])
+            .expect_err("missing codex bin value should fail");
+        assert!(error
+            .to_string()
+            .contains("Usage: codex-rotate internal managed-login"));
+    }
 }
 
 struct JsonRpcStdioClient {

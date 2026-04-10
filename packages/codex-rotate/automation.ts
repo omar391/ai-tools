@@ -295,6 +295,19 @@ function isMissingOptionalSecretLocatorError(
   );
 }
 
+export function isUnavailableOptionalSecretLocatorError(
+  error: unknown,
+): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return (
+    /Bitwarden CLI is locked/i.test(message) ||
+    /Bitwarden CLI is not logged in/i.test(message) ||
+    /Bitwarden CLI is not ready/i.test(message) ||
+    /timed out while trying to read Bitwarden CLI status/i.test(message) ||
+    /failed to read secret-store status/i.test(message)
+  );
+}
+
 async function resolveOptionalCodexRotateSecretLocator(
   profileName: string,
   locator: CodexRotateSecretLocator | null | undefined,
@@ -326,6 +339,9 @@ async function resolveOptionalCodexRotateSecretLocator(
       return locator;
     } catch (error) {
       if (isMissingOptionalSecretLocatorError(locator, error)) {
+        return null;
+      }
+      if (isUnavailableOptionalSecretLocatorError(error)) {
         return null;
       }
       throw error;
@@ -1355,6 +1371,7 @@ async function runCodexBrowserLoginWorkflow(
     workflowRef?: string;
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
+    preferPasswordLogin?: boolean;
     fullName?: string;
     birthMonth?: number;
     birthDay?: number;
@@ -1417,6 +1434,12 @@ async function runCodexBrowserLoginWorkflow(
       full_name: fullName,
       prefer_signup_recovery:
         options?.preferSignupRecovery === true ? "true" : "false",
+      ...(options?.preferPasswordLogin !== undefined
+        ? {
+            prefer_password_login:
+              options.preferPasswordLogin === true ? "true" : "false",
+          }
+        : {}),
       birth_month: String(birthMonth),
       birth_day: String(birthDay),
       birth_year: String(birthYear),
@@ -1441,6 +1464,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
     workflowRef?: string;
     workflowRunStamp?: string;
     preferSignupRecovery?: boolean;
+    preferPasswordLogin?: boolean;
     fullName?: string;
     birthMonth?: number;
     birthDay?: number;
@@ -1468,6 +1492,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
         workflowRef: options?.workflowRef,
         codexSession: options?.codexSession ?? null,
         preferSignupRecovery: options?.preferSignupRecovery === true,
+        preferPasswordLogin: options?.preferPasswordLogin,
         fullName: options?.fullName,
         birthMonth: options?.birthMonth,
         birthDay: options?.birthDay,

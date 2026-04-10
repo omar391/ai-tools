@@ -1,6 +1,12 @@
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,6 +16,7 @@ import {
   buildFastBrowserWorkflowError,
   hydrateFastBrowserRunResultFromObservability,
   isFastBrowserRunResultFailure,
+  isUnavailableOptionalSecretLocatorError,
   shouldPromptForCodexRotateSecretUnlock,
 } from "./automation.ts";
 
@@ -147,6 +154,11 @@ async function loadMinimalStepScript(stepId: string) {
         metadata?: {
           templateRef?: string;
         };
+        run?: {
+          script?: {
+            code?: string;
+          };
+        };
         with?: {
           body?: {
             script?: string;
@@ -155,6 +167,7 @@ async function loadMinimalStepScript(stepId: string) {
       }
     | undefined;
   const script =
+    step?.run?.script?.code ||
     step?.with?.body?.script ||
     (step?.metadata?.templateRef
       ? workflow.use?.functions?.[step.metadata.templateRef]?.with?.body?.script
@@ -172,6 +185,11 @@ async function loadWorkflowStepScript(workflowPath: string, stepId: string) {
         metadata?: {
           templateRef?: string;
         };
+        run?: {
+          script?: {
+            code?: string;
+          };
+        };
         with?: {
           body?: {
             script?: string;
@@ -180,6 +198,7 @@ async function loadWorkflowStepScript(workflowPath: string, stepId: string) {
       }
     | undefined;
   const script =
+    step?.run?.script?.code ||
     step?.with?.body?.script ||
     (step?.metadata?.templateRef
       ? workflow.use?.functions?.[step.metadata.templateRef]?.with?.body?.script
@@ -374,6 +393,28 @@ async function runWorkflowStepScriptOnContent(
   }
 }
 
+async function runWorkflowRunScript(
+  workflowPath: string,
+  stepId: string,
+  args: Record<string, unknown> = {},
+  state: Record<string, unknown> = {},
+  env: Record<string, unknown> = {},
+) {
+  const script = await loadWorkflowStepScript(workflowPath, stepId);
+  const execute = new AsyncFunction(
+    "args",
+    "state",
+    "env",
+    "process",
+    "console",
+    script,
+  );
+  return (await execute(args, state, env, process, console)) as Record<
+    string,
+    unknown
+  >;
+}
+
 describe("fast-browser daemon recovery", () => {
   test("automation module still imports when the original cwd is deleted", () => {
     const automationModuleUrl = new URL("./automation.ts", import.meta.url)
@@ -404,6 +445,30 @@ console.log(typeof automation.completeCodexLoginViaWorkflowAttempt);
 
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("function");
+  });
+});
+
+describe("optional secret locator fallback", () => {
+  test("treats locked or stalled Bitwarden preflight as optional", () => {
+    expect(
+      isUnavailableOptionalSecretLocatorError(
+        new Error(
+          "Bitwarden CLI is locked. Re-run this command interactively.",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isUnavailableOptionalSecretLocatorError(
+        new Error(
+          "Bitwarden CLI timed out while trying to read Bitwarden CLI status.",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isUnavailableOptionalSecretLocatorError(
+        new Error("No Bitwarden item matched the exact name."),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -823,6 +888,227 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
         version: "1.0.7",
       },
     ]);
+  });
+});
+
+describe("device-auth detached session seeding", () => {
+  test("reuses a recoverable caller-provided detached device-auth challenge", async () => {
+    const fixtureRoot = mkdtempSync(
+      join(tmpdir(), "codex-rotate-device-auth-"),
+    );
+    try {
+      const stdoutPath = join(fixtureRoot, "stdout.log");
+      writeFileSync(
+        stdoutPath,
+        [
+          "Open this URL in your browser:",
+          "https://auth.openai.com/codex/device?user_code_flow=1",
+          "Then enter code ABCD-12345",
+        ].join("\n"),
+      );
+
+      const result = await runWorkflowRunScript(
+        deviceAuthWorkflowPath,
+        "seed_existing_codex_login_session",
+        {
+          codex_login_stdout_path: stdoutPath,
+          codex_session_dir: join(fixtureRoot, "session"),
+        },
+        {},
+        {},
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.reusable_challenge).toBe(true);
+      expect(result.auth_url).toBe(
+        "https://auth.openai.com/codex/device?user_code_flow=1",
+      );
+      expect(result.device_code).toBe("ABCD-12345");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("does not treat path-only stale detached session artifacts as reusable", async () => {
+    const fixtureRoot = mkdtempSync(
+      join(tmpdir(), "codex-rotate-device-auth-"),
+    );
+    try {
+      const stdoutPath = join(fixtureRoot, "stdout.log");
+      const stderrPath = join(fixtureRoot, "stderr.log");
+      writeFileSync(stdoutPath, "still starting\n");
+      writeFileSync(stderrPath, "");
+
+      const result = await runWorkflowRunScript(
+        deviceAuthWorkflowPath,
+        "seed_existing_codex_login_session",
+        {
+          codex_login_stdout_path: stdoutPath,
+          codex_login_stderr_path: stderrPath,
+          codex_session_dir: join(fixtureRoot, "session"),
+        },
+        {},
+        {},
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.reusable_challenge).toBe(false);
+      expect(result.auth_url).toBeNull();
+      expect(result.device_code).toBeNull();
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("device-auth security toggle detection", () => {
+  test("finds the Codex device-code toggle even when the container also includes the adjacent Codex CLI row", async () => {
+    const result = await runWorkflowStepScriptOnContent(
+      deviceAuthWorkflowPath,
+      "ensure_device_code_authorization_enabled",
+      `
+        <html>
+          <body>
+            <div role="dialog" aria-label="Settings">
+              <div>General</div>
+              <div>Security</div>
+              <section>
+                <div>Trusted Devices</div>
+                <div>Secure sign in with ChatGPT</div>
+                <div>
+                  <div>Codex CLI</div>
+                  <div>Allow Codex CLI to use models from the API.</div>
+                  <button type="button">Disconnect</button>
+                  <div>
+                    <div>Enable device code authorization for Codex</div>
+                    <div>
+                      Use device code sign-in for headless or remote environments
+                      where the normal browser flow isn't available.
+                    </div>
+                    <label>
+                      <input type="checkbox" />
+                    </label>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.enabled).toBe(true);
+    expect(result.error).toBeNull();
+  });
+});
+
+describe("device-auth recovery preference", () => {
+  test("prefers manual one-time-code recovery on the prepare branch even when a stored-password locator exists", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_one_time_code_recovery_flag",
+      {
+        prefer_password_login: "false",
+        account_login_locator: {
+          kind: "login_lookup",
+          username: "dev.64@astronlab.com",
+          uris: ["https://auth.openai.com"],
+        },
+      },
+      {
+        steps: {
+          cache_effective_prepare_after_login_email_state: {
+            action: {
+              value: {
+                effective_prepare_after_login_email_state: {
+                  stage: "login_password",
+                },
+              },
+            },
+          },
+        },
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.has_locator).toBe(true);
+    expect(result.prefer_password_login).toBe(false);
+    expect(result.should_recover).toBe(true);
+  });
+
+  test("prefers manual one-time-code recovery on the device-auth login branch even when a stored-password locator exists", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_device_auth_one_time_code_recovery_flag",
+      {
+        prefer_password_login: "false",
+        account_login_locator: {
+          kind: "login_lookup",
+          username: "dev.64@astronlab.com",
+          uris: ["https://auth.openai.com"],
+        },
+      },
+      {
+        steps: {
+          classify_device_auth_after_login_email: {
+            action: {
+              stage: "login_password",
+            },
+          },
+          fill_device_auth_login_password: {
+            action: {
+              ok: true,
+              skipped: false,
+            },
+          },
+        },
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.has_locator).toBe(true);
+    expect(result.prefer_password_login).toBe(false);
+    expect(result.should_recover).toBe(true);
+  });
+
+  test("defaults to password-first on the device-auth login branch when a stored-password locator exists", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_device_auth_one_time_code_recovery_flag",
+      {
+        account_login_locator: {
+          kind: "login_lookup",
+          username: "dev.64@astronlab.com",
+          uris: ["https://auth.openai.com"],
+        },
+      },
+      {
+        steps: {
+          classify_device_auth_after_login_email: {
+            action: {
+              stage: "login_password",
+            },
+          },
+          fill_device_auth_login_password: {
+            action: {
+              ok: true,
+              skipped: false,
+            },
+          },
+        },
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.has_locator).toBe(true);
+    expect(result.prefer_password_login).toBe(true);
+    expect(result.should_recover).toBe(false);
   });
 });
 
@@ -2260,6 +2546,202 @@ describe("device-auth workflow", () => {
     expect(result.next_stage).toBe("signup_password");
     expect(result.current_url).toBe(
       "https://auth.openai.com/create-account/password",
+    );
+  });
+
+  test("does not block the prepare login-email submit behind a skipped signup click", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const submitStep = workflow.do?.find(
+      (entry) => "submit_prepare_login_email" in entry,
+    )?.submit_prepare_login_email as { if?: string } | undefined;
+
+    expect(submitStep?.if).toContain(
+      "state.steps.click_prepare_signup_button?.action?.skipped === true",
+    );
+  });
+
+  test("keeps password-first defaults aligned across device-auth guards", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText.includes("prefer_password_login ?? 'false'")).toBe(
+      false,
+    );
+  });
+
+  test("does not gate device-auth password attempts on a visible locator expression", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).not.toContain(
+      "fill_device_auth_login_password:\n      if: \"${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null",
+    );
+    expect(workflowText).toContain("password_attempted");
+  });
+
+  test("preserves an omitted preferPasswordLogin flag instead of coercing it to false", () => {
+    const automationText = readFileSync(
+      join(repoRoot, "packages", "codex-rotate", "automation.ts"),
+      "utf8",
+    );
+
+    expect(automationText).toContain(
+      "preferPasswordLogin: options?.preferPasswordLogin,",
+    );
+    expect(automationText).not.toContain(
+      "preferPasswordLogin: options?.preferPasswordLogin === true,",
+    );
+  });
+
+  test("retries unknown auth classifications before caching device-auth login state", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("classify_prepare_login_entry_retry");
+    expect(workflowText).toContain("classify_device_auth_login_entry_retry");
+  });
+
+  test("clears prepare-login security verification before caching the effective device-auth login state", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("clear_prepare_login_security_gate");
+    expect(workflowText).toContain(
+      "classify_prepare_login_entry_after_security_gate",
+    );
+  });
+
+  test("logs out via the ChatGPT security settings control during device-auth prepare", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "logout_prepare_chatgpt_app_shell",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <div role="dialog" aria-label="Settings">
+              <div>Security</div>
+              <button type="button" id="logout">Log out</button>
+            </div>
+            <script>
+              document.getElementById("logout")?.addEventListener("click", () => {
+                document.body.innerHTML = "<h1>Logged out</h1>";
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.clicked_text).toBe("Log out");
+  });
+
+  test("waits for the ChatGPT settings shell before the prepare logout click", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("wait_for_prepare_chatgpt_security_settings_shell");
+    expect(workflowText).toContain("log out of all devices");
+    expect(workflowText).toContain(
+      "clear_prepare_device_auth_site_state_after_ui_logout",
+    );
+  });
+
+  test("uses the direct OpenAI login surface as the existing-account fallback during device-auth prepare", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("https://auth.openai.com/log-in");
+  });
+
+  test("forces the direct auth fallback when prepare remains on an authenticated ChatGPT shell", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const fallbackStep = workflow.do?.find(
+      (entry) => "open_prepare_direct_auth_entry_fallback" in entry,
+    )?.open_prepare_direct_auth_entry_fallback as { if?: string } | undefined;
+
+    expect(fallbackStep?.if).toContain("stage !== 'public_chatgpt'");
+    expect(fallbackStep?.if).not.toContain("stage === 'blank_chatgpt'");
+    expect(fallbackStep?.if).not.toContain("stage === 'unknown'");
+    expect(fallbackStep?.if).not.toContain("stage === 'security_verification'");
+  });
+
+  test("reduces the effective prepare login state through the scripted candidate picker", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_prepare_login_entry_state" in entry,
+    )?.cache_effective_prepare_login_entry_state as
+      | {
+          run?: {
+            script?: {
+              code?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(cacheStep?.run?.script?.code).toContain("const candidates = [");
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_login_entry_after_security_gate",
+    );
+  });
+
+  test("recovers the prepare email branch from retryable invalid-state shells", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("click_prepare_login_email_timeout_retry");
+    expect(workflowText).toContain(
+      "classify_prepare_after_login_email_timeout_retry_submit",
+    );
+    expect(workflowText).toContain(
+      "cache_effective_prepare_after_login_email_state",
+    );
+  });
+
+  test("treats oauth consent as a successful authenticated prepare state for device auth", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_flow_result",
+      {},
+      {
+        vars: {
+          reuse_device_auth_session: false,
+        },
+        steps: {
+          classify_prepare_after_login_verification_submit: {
+            action: {
+              stage: "oauth_consent",
+              oauth_continue_visible: true,
+              current_url:
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.prepare_flow_ready).toBe(true);
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.stage,
+    ).toBe("oauth_consent");
+  });
+
+  test("returns to the exact device-auth verification URL after Gmail collection", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const returnStep = workflow.do?.find(
+      (entry) => "return_to_device_auth_login_verification_page" in entry,
+    )?.return_to_device_auth_login_verification_page as
+      | {
+          with?: {
+            body?: {
+              url?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(returnStep?.with?.body?.url).toContain(
+      "state.steps.classify_device_auth_after_login_password_gate?.action?.current_url",
+    );
+    expect(returnStep?.with?.body?.url).not.toBe(
+      "https://auth.openai.com/email-verification",
     );
   });
 

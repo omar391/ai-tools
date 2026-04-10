@@ -10,8 +10,6 @@ use crate::process::spawn_detached_process;
 
 #[cfg(target_os = "macos")]
 pub const MACOS_TRAY_LAUNCHD_LABEL: &str = "com.astronlab.codex-rotate.tray";
-#[cfg(target_os = "macos")]
-const MACOS_TRAY_LAUNCHD_LABEL_ENV: &str = "CODEX_ROTATE_TRAY_LAUNCHD_LABEL";
 
 pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -366,13 +364,7 @@ fn launchctl_service_target(label: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn tray_launchd_label() -> String {
-    std::env::var(MACOS_TRAY_LAUNCHD_LABEL_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            default_tray_launchd_label().unwrap_or_else(|_| MACOS_TRAY_LAUNCHD_LABEL.to_string())
-        })
+    default_tray_launchd_label().unwrap_or_else(|_| MACOS_TRAY_LAUNCHD_LABEL.to_string())
 }
 
 #[cfg(target_os = "macos")]

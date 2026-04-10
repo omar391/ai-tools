@@ -10,7 +10,7 @@ pub use build::{
 };
 pub use process::{
     spawn_detached_process, stop_other_local_daemons, stop_running_daemons, stop_running_trays,
-    INSTANCE_HOME_ENV,
+    INSTANCE_HOME_ARG,
 };
 pub use targets::{
     current_process_local_build, detect_local_build, BuildProfile, LocalBinaryBuild, TargetKind,

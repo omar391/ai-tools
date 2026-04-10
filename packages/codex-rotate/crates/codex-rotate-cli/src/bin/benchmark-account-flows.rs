@@ -474,9 +474,6 @@ fn resolve_cli_binary(repo_root: &Path) -> Result<PathBuf> {
         "codex-rotate"
     };
     let mut candidates = Vec::new();
-    if let Some(value) = env::var_os("CODEX_ROTATE_BENCHMARK_CLI_BIN") {
-        candidates.push(PathBuf::from(value));
-    }
     if let Some(value) = env::var_os("CODEX_ROTATE_CLI_BIN") {
         candidates.push(PathBuf::from(value));
     }

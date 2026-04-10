@@ -40,18 +40,24 @@ use codex_rotate_refresh::{
     current_process_local_build, daemon_socket_is_older_than_binary,
     ensure_tray_process_registered, local_refresh_disabled, maybe_start_background_release_build,
     preferred_release_binary, rebuild_local_binary, sources_newer_than_binary,
-    stop_other_local_daemons, TargetKind, INSTANCE_HOME_ENV,
+    stop_other_local_daemons, TargetKind, INSTANCE_HOME_ARG,
 };
 
 const DEFAULT_PORT: u16 = 9333;
 const RISKY_INTERVAL_SECONDS: u64 = 15;
 const HEALTHY_INTERVAL_SECONDS: u64 = 30;
 const LOW_QUOTA_WATCH_THRESHOLD_PERCENT: u8 = 20;
-const DAEMON_TAKEOVER_ENV: &str = "CODEX_ROTATE_DAEMON_TAKEOVER";
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TRAY_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub const DAEMON_TAKEOVER_ARG: &str = "--takeover";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DaemonRunOptions {
+    pub instance_home: Option<String>,
+    pub takeover: bool,
+}
 
 #[derive(Default)]
 struct DaemonState {
@@ -133,8 +139,21 @@ fn managed_codex_port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-pub fn run_daemon_forever() -> Result<()> {
-    if maybe_refresh_local_daemon_process(None)? {
+fn apply_instance_home_override(instance_home: Option<&str>) {
+    let Some(instance_home) = instance_home
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", instance_home);
+    }
+}
+
+pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
+    apply_instance_home_override(options.instance_home.as_deref());
+    if maybe_refresh_local_daemon_process(None, options.takeover)? {
         return Ok(());
     }
     migrate_runtime_state()?;
@@ -142,13 +161,10 @@ pub fn run_daemon_forever() -> Result<()> {
     #[cfg(unix)]
     {
         let paths = resolve_paths()?;
-        unsafe {
-            std::env::set_var(INSTANCE_HOME_ENV, &paths.rotate_home);
-        }
         fs::create_dir_all(&paths.rotate_home)
             .with_context(|| format!("Failed to create {}.", paths.rotate_home.display()))?;
 
-        if takeover_requested() {
+        if options.takeover {
             wait_for_previous_daemon_to_release_socket();
         }
         if crate::ipc::daemon_is_reachable() {
@@ -170,7 +186,10 @@ pub fn run_daemon_forever() -> Result<()> {
             paths.daemon_socket.display()
         ));
         if let Some(build) = current_process_local_build(TargetKind::Cli) {
-            let instance_home = paths.rotate_home.to_string_lossy().into_owned();
+            let instance_home = options
+                .instance_home
+                .clone()
+                .unwrap_or_else(|| paths.rotate_home.to_string_lossy().into_owned());
             if let Err(error) = stop_other_local_daemons(
                 &build,
                 &paths.daemon_socket,
@@ -308,7 +327,7 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
 
     thread::spawn(move || loop {
         daemon.clear_next_tick();
-        match maybe_refresh_local_daemon_process(Some(&daemon)) {
+        match maybe_refresh_local_daemon_process(Some(&daemon), false) {
             Ok(true) => std::process::exit(0),
             Ok(false) => {}
             Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
@@ -486,11 +505,14 @@ impl Drop for InvocationGuard {
     }
 }
 
-fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<bool> {
+fn maybe_refresh_local_daemon_process(
+    daemon: Option<&SharedDaemon>,
+    takeover_requested: bool,
+) -> Result<bool> {
     if local_refresh_disabled() {
         return Ok(false);
     }
-    if takeover_requested() {
+    if takeover_requested {
         return Ok(false);
     }
     if daemon.is_some_and(SharedDaemon::has_in_flight_invocations) {
@@ -519,8 +541,9 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
         ));
         Command::new(&release_binary)
             .arg("daemon")
-            .env(DAEMON_TAKEOVER_ENV, "1")
-            .env(INSTANCE_HOME_ENV, &instance_home)
+            .arg(DAEMON_TAKEOVER_ARG)
+            .arg(INSTANCE_HOME_ARG)
+            .arg(&instance_home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -545,8 +568,9 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
 
     Command::new(&build.binary_path)
         .arg("daemon")
-        .env(DAEMON_TAKEOVER_ENV, "1")
-        .env(INSTANCE_HOME_ENV, &instance_home)
+        .arg(DAEMON_TAKEOVER_ARG)
+        .arg(INSTANCE_HOME_ARG)
+        .arg(&instance_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -558,10 +582,6 @@ fn maybe_refresh_local_daemon_process(daemon: Option<&SharedDaemon>) -> Result<b
             )
         })?;
     Ok(true)
-}
-
-fn takeover_requested() -> bool {
-    matches!(std::env::var(DAEMON_TAKEOVER_ENV).as_deref(), Ok("1"))
 }
 
 fn wait_for_previous_daemon_to_release_socket() {
@@ -1223,24 +1243,31 @@ mod tests {
     #[test]
     fn takeover_child_skips_local_daemon_refresh() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
-        let previous_takeover = std::env::var_os(DAEMON_TAKEOVER_ENV);
-
-        unsafe {
-            std::env::set_var(DAEMON_TAKEOVER_ENV, "1");
-        }
-
-        let result = maybe_refresh_local_daemon_process(None).expect("refresh result");
-
-        match previous_takeover {
-            Some(value) => unsafe {
-                std::env::set_var(DAEMON_TAKEOVER_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(DAEMON_TAKEOVER_ENV);
-            },
-        }
+        let result = maybe_refresh_local_daemon_process(None, true).expect("refresh result");
 
         assert!(!result);
+    }
+
+    #[test]
+    fn instance_home_override_updates_resolved_rotate_home() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let override_home = tempdir.path().join("rotate-instance");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path().join("original-home"));
+        }
+
+        apply_instance_home_override(Some(&override_home.to_string_lossy()));
+        let resolved_rotate_home = resolve_paths().expect("resolve paths").rotate_home;
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+
+        assert_eq!(resolved_rotate_home, override_home);
     }
 
     #[test]
@@ -1248,7 +1275,8 @@ mod tests {
         let daemon = SharedDaemon::new();
         let _guard = InvocationGuard::new(daemon.in_flight_invocations.clone());
 
-        let result = maybe_refresh_local_daemon_process(Some(&daemon)).expect("refresh result");
+        let result =
+            maybe_refresh_local_daemon_process(Some(&daemon), false).expect("refresh result");
 
         assert!(!result);
     }

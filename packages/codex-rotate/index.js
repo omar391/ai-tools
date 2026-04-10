@@ -12,7 +12,6 @@ const CLI_BINARY_NAME =
 
 function resolveCliBinary() {
   const candidates = [
-    process.env.CODEX_ROTATE_BIN,
     process.env.CODEX_ROTATE_CLI_BIN,
     join(MODULE_DIR, "bin", CLI_BINARY_NAME),
     join(MODULE_DIR, "dist", "bin", CLI_BINARY_NAME),

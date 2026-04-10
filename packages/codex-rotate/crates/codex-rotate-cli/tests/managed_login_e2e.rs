@@ -58,8 +58,10 @@ fn internal_managed_login_starts_codex_app_server_and_exits_on_completion() {
     fs::set_permissions(&fake_codex_path, permissions).expect("set fake codex permissions");
 
     let result = Command::new(env!("CARGO_BIN_EXE_codex-rotate"))
-        .args(["internal", "managed-login"])
-        .env("CODEX_ROTATE_REAL_CODEX", &fake_codex_path)
+        .arg("internal")
+        .arg("managed-login")
+        .arg("--codex-bin")
+        .arg(&fake_codex_path)
         .output()
         .expect("run managed login");
 

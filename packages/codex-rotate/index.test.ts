@@ -39,7 +39,7 @@ printf 'wrapper-ok\n'
         cwd: REPO_ROOT,
         env: {
           ...process.env,
-          CODEX_ROTATE_BIN: cliStubPath,
+          CODEX_ROTATE_CLI_BIN: cliStubPath,
         },
         encoding: "utf8",
       });
@@ -71,7 +71,7 @@ printf 'tray-wrapper-ok\n'
         cwd: REPO_ROOT,
         env: {
           ...process.env,
-          CODEX_ROTATE_BIN: cliStubPath,
+          CODEX_ROTATE_CLI_BIN: cliStubPath,
         },
         encoding: "utf8",
       });
@@ -103,7 +103,7 @@ printf 'legacy-wrapper-ok\n'
         cwd: REPO_ROOT,
         env: {
           ...process.env,
-          CODEX_ROTATE_BIN: cliStubPath,
+          CODEX_ROTATE_CLI_BIN: cliStubPath,
         },
         encoding: "utf8",
       });

@@ -2,7 +2,7 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-device-auth
-  version: 1.3.0
+  version: 1.3.6
   summary: "Managed-profile OpenAI device-auth flow that first reaches a normal authenticated ChatGPT session, then completes Codex device authorization inside the same workflow."
   metadata:
     preferredProfile: dev-1
@@ -41,6 +41,8 @@ input:
         account_login_locator:
           type: object
           format: secret-locator
+        prefer_password_login:
+          default: "true"
         full_name:
           default: "Dev Astronlab"
         birth_month:
@@ -432,6 +434,113 @@ use:
               session_ended: sessionEnded,
               anti_bot_gate: antiBotGate,
               auth_prompt: stage === "login_email" || stage === "login_password" || stage === "signup_email" || stage === "signup_password" || stage === "auth_prompt",
+            };
+    clear_openai_security_gate:
+      metadata:
+        description: Pause for HIL when OpenAI or Cloudflare requires human verification.
+        mode: hil
+        targetRef: primary
+        pause:
+          responder: human
+          verifyPersistence: false
+          restorePreferredMode: false
+        browser:
+          screenshot: true
+          validation:
+            post:
+              kind: js
+              expression: "const bodyText = document.body ? document.body.innerText : '';\nconst title = document.title || '';\nconst hasTurnstile = !!document.querySelector('input[name=\"cf-turnstile-response\"], iframe[src*=\"challenge\"], iframe[title*=\"Widget containing\"]');\nconst stillBlocked = hasTurnstile\n  || /just a moment/i.test(title)\n  || /performing security verification|security verification|verify you are human|verifying you are human|verify you are not a bot/i.test(bodyText);\nreturn {\n  ok: !stillBlocked,\n  current_url: location.href,\n  still_blocked: stillBlocked,\n};\n"
+      call: afn.request_input
+      with:
+        body:
+          hilMode: page
+          message: If OpenAI or Cloudflare shows a human-verification page or checkbox, complete it in the HIL viewer and wait until the normal auth page is visible.
+          source: |
+            const blockedNow = async () => {
+              const title = await page.title().catch(() => "");
+              const bodyText = await page.locator("body").innerText().catch(() => "");
+              const hasTurnstile = await page.locator("input[name='cf-turnstile-response'], iframe[src*='challenge'], iframe[title*='Widget containing']").count().catch(() => 0) > 0;
+              return hasTurnstile
+                || /just a moment/i.test(title)
+                || /performing security verification|security verification|verify you are human|verifying you are human|verify you are not a bot/i.test(bodyText);
+            };
+
+            if (!(await blockedNow())) {
+              return {
+                ok: true,
+                skipped: true,
+                blocked: false,
+                current_url: page.url(),
+              };
+            }
+
+            const clickLocator = async (locator, strategy) => {
+              if (!locator || (await locator.count().catch(() => 0)) === 0) {
+                return null;
+              }
+              if (!(await locator.isVisible().catch(() => false))) {
+                return null;
+              }
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              const attempts = [
+                async () => locator.click({ timeout: 2000 }),
+                async () => locator.click({ timeout: 2000, force: true }),
+                async () => locator.press(" "),
+                async () => locator.press("Enter"),
+              ];
+              for (const attempt of attempts) {
+                await attempt().catch(() => {});
+                await page.waitForTimeout(1500).catch(() => {});
+                if (!(await blockedNow())) {
+                  return strategy;
+                }
+              }
+              return null;
+            };
+
+            const clickBoundingBox = async (locator, strategy) => {
+              if (!locator || (await locator.count().catch(() => 0)) === 0) {
+                return null;
+              }
+              if (!(await locator.isVisible().catch(() => false))) {
+                return null;
+              }
+              const box = await locator.boundingBox().catch(() => null);
+              if (!box) {
+                return null;
+              }
+              const x = box.x + Math.min(24, Math.max(10, box.width * 0.12));
+              const y = box.y + (box.height / 2);
+              await page.mouse.move(x, y, { steps: 8 }).catch(() => {});
+              await page.waitForTimeout(150).catch(() => {});
+              await page.mouse.click(x, y, { delay: 120 }).catch(() => {});
+              await page.waitForTimeout(1500).catch(() => {});
+              if (!(await blockedNow())) {
+                return strategy;
+              }
+              return null;
+            };
+
+            const strategies = [
+              async () => clickLocator(page.getByRole("checkbox", { name: /verify you are human/i }).first(), "role-checkbox"),
+              async () => clickLocator(page.locator("input[type='checkbox']").first(), "input-checkbox"),
+              async () => clickBoundingBox(page.getByText(/verify you are human/i).first(), "text-bbox"),
+              async () => clickBoundingBox(page.locator("iframe[src*='challenge'], iframe[title*='Widget containing']").first(), "iframe-bbox"),
+            ];
+
+            let strategy = null;
+            for (const attempt of strategies) {
+              strategy = await attempt();
+              if (strategy) {
+                break;
+              }
+            }
+
+            return {
+              ok: true,
+              blocked: await blockedNow(),
+              strategy,
+              current_url: page.url(),
             };
     fill_openai_email_field:
       metadata:
@@ -2047,7 +2156,7 @@ use:
             const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
             const targetText = /enable device code authorization for codex/i;
             const supportingText = /device code sign-in|headless|remote environments/i;
-            const unrelatedSecurityContent = /secure sign in with chatgpt|trusted devices|log out of this device|log out of all devices|text message|password|codex cli|disconnect/i;
+            const unrelatedSecurityContent = /secure sign in with chatgpt|trusted devices|log out of this device|log out of all devices|text message|password/i;
             const forceCycleWhenEnabled = args.force_cycle_when_enabled === true;
 
             const readEnabled = async (locator) => {
@@ -2153,9 +2262,6 @@ use:
                   continue;
                 }
                 if (containerText.length > 320) {
-                  continue;
-                }
-                if (unrelatedSecurityContent.test(containerText)) {
                   continue;
                 }
                 const toggles = container.locator("[role='switch'], input[type='checkbox'], button[aria-checked], button[aria-pressed]");
@@ -2272,7 +2378,6 @@ use:
                     /enable device code authorization for codex/i.test(entry.text)
                     && /device code sign-in|headless|remote environments/i.test(entry.text)
                     && entry.text.length <= 320
-                    && !unrelatedSecurityContent.test(entry.text)
                   )
                   .sort((left, right) => left.text.length - right.text.length)[0];
                 if (target?.node instanceof Element) {
@@ -2490,13 +2595,13 @@ do:
         description: "Clear ChatGPT/OpenAI site state and visit the explicit ChatGPT logout URL before the target-account prepare flow."
         browser:
           clearSiteDataForOrigins:
-            - "https://auth.openai.com"
-            - "https://chatgpt.com"
-            - "https://chat.openai.com"
+            - https://auth.openai.com
+            - https://chatgpt.com
+            - https://chat.openai.com
       call: afn.driver.browser.navigate
       with:
         body:
-          url: "https://chatgpt.com/auth/logout"
+          url: https://chatgpt.com/auth/logout
   - reopen_public_chatgpt_entry_for_prepare:
       if: "${state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true}"
       metadata:
@@ -2568,6 +2673,7 @@ do:
             const loginCtaVisible = (latest.visible_buttons || []).some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
             const signupCtaVisible = (latest.visible_buttons || []).some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
             const blankShell = chatGptShell && combinedText.length === 0;
+            const securityVerification = /just a moment|enable javascript and cookies to continue|verification successful/i.test(combinedText);
             const accountReady = (securityOpen || settingsShell || composerShell) && !sessionExpired;
             return {
               ok: true,
@@ -2575,14 +2681,107 @@ do:
               headline: latest.body_text.split("\n").map((value) => value.trim()).filter(Boolean)[0] || latest.title || null,
               stage: blankShell
                 ? "blank_chatgpt"
-                : (accountReady
+                : (securityVerification
+                    ? "security_verification"
+                    : (accountReady
                     ? "app_shell"
                     : ((logoutUrl || sessionExpired || loginCtaVisible || signupCtaVisible || publicShellSignals)
                         ? "public_chatgpt"
-                        : "unknown")),
+                        : "unknown"))),
               account_ready: accountReady,
               settings_shell: settingsShell,
               security_open: securityOpen,
+              security_verification: securityVerification,
+              session_expired: sessionExpired,
+              login_cta_visible: loginCtaVisible,
+              signup_cta_visible: signupCtaVisible,
+              logout_url: logoutUrl,
+              blank_shell: blankShell,
+              visible_buttons: latest.visible_buttons || [],
+              body_text_length: latest.body_text.length,
+            };
+  - wait_after_prepare_public_chatgpt_security_verification:
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.inspect_prepare_public_chatgpt_entry?.action?.stage === 'security_verification' || state.steps.inspect_prepare_public_chatgpt_entry?.action?.stage === 'unknown')}"
+      metadata:
+        description: Give the ChatGPT entry shell time to clear security-verification interstitials before deciding that a direct auth fallback is necessary.
+      wait:
+        milliseconds: 4000
+  - inspect_prepare_public_chatgpt_entry_after_security_wait:
+      if: "${state.steps.wait_after_prepare_public_chatgpt_security_verification?.action?.ok === true && state.steps.wait_after_prepare_public_chatgpt_security_verification?.action?.skipped !== true}"
+      metadata:
+        description: Re-inspect the ChatGPT entry after waiting through any security-verification interstitial.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          screenshot: true
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const title = await page.title().catch(() => "");
+            const latest = await page.evaluate((titleText) => {
+              const normalizeInner = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const buttons = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']"))
+                .filter((node) => isVisible(node))
+                .map((node) => {
+                  if (node instanceof HTMLInputElement) {
+                    return normalizeInner(node.value || node.getAttribute("aria-label") || "");
+                  }
+                  return normalizeInner(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                })
+                .filter(Boolean)
+                .slice(0, 20);
+              const bodyText = normalizeInner(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              return {
+                current_url: location.href,
+                title: normalizeInner(titleText || document.title || ""),
+                body_text: bodyText,
+                visible_buttons: buttons,
+              };
+            }, title);
+            const combinedText = normalize([latest.title, latest.body_text, ...(latest.visible_buttons || [])].join(" "));
+            const currentUrl = String(latest.current_url || page.url());
+            const chatGptShell = /chatgpt\.com/i.test(currentUrl);
+            const logoutUrl = /chatgpt\.com\/auth\/logout/i.test(currentUrl);
+            const settingsShell = chatGptShell && /general|notifications|personalization|apps|data controls|security|account/i.test(combinedText);
+            const securityOpen = chatGptShell && /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(combinedText);
+            const composerShell = chatGptShell && /new chat|search chats|chat history|projects|what are you working on|what’s on your mind today|where should we begin|upgrade plan|explore gpts/i.test(combinedText);
+            const sessionExpired = chatGptShell && /your session has expired|please log in again to continue using the app/i.test(combinedText);
+            const publicShellSignals = chatGptShell && /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started|where should we begin/i.test(combinedText);
+            const loginCtaVisible = (latest.visible_buttons || []).some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
+            const signupCtaVisible = (latest.visible_buttons || []).some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
+            const blankShell = chatGptShell && combinedText.length === 0;
+            const securityVerification = /just a moment|enable javascript and cookies to continue|verification successful/i.test(combinedText);
+            const accountReady = (securityOpen || settingsShell || composerShell) && !sessionExpired;
+            return {
+              ok: true,
+              current_url: currentUrl,
+              headline: latest.body_text.split("\n").map((value) => value.trim()).filter(Boolean)[0] || latest.title || null,
+              stage: blankShell
+                ? "blank_chatgpt"
+                : (securityVerification
+                    ? "security_verification"
+                    : (accountReady
+                    ? "app_shell"
+                    : ((logoutUrl || sessionExpired || loginCtaVisible || signupCtaVisible || publicShellSignals)
+                        ? "public_chatgpt"
+                        : "unknown"))),
+              account_ready: accountReady,
+              settings_shell: settingsShell,
+              security_open: securityOpen,
+              security_verification: securityVerification,
               session_expired: sessionExpired,
               login_cta_visible: loginCtaVisible,
               signup_cta_visible: signupCtaVisible,
@@ -2691,10 +2890,74 @@ do:
         description: "Cache the most recent ChatGPT shell inspection before attempting the explicit UI logout path."
       set:
         prepare_public_entry_before_logout: "${state.steps.dismiss_prepare_chatgpt_onboarding_modal?.action?.stage ? state.steps.dismiss_prepare_chatgpt_onboarding_modal?.action : (state.steps.inspect_prepare_public_chatgpt_entry?.action || {})}"
-  - logout_prepare_chatgpt_app_shell:
+  - open_prepare_chatgpt_security_settings_for_logout:
       if: "${state.vars.reuse_device_auth_session !== true && state.vars.prepare_public_entry_before_logout?.stage === 'app_shell'}"
       metadata:
-        description: "When the explicit logout URL still lands on an authenticated ChatGPT shell, use the profile menu to log out before continuing."
+        description: Open ChatGPT security settings so the current managed session can be logged out before device-auth prepare continues.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://chatgpt.com/#settings/Security
+  - wait_for_prepare_chatgpt_security_settings_shell:
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.open_prepare_chatgpt_security_settings_for_logout?.action?.ok === true && state.steps.open_prepare_chatgpt_security_settings_for_logout?.action?.skipped !== true}"
+      metadata:
+        description: Wait for the ChatGPT settings shell to render before attempting the prepare-logout control.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const ok = await page.waitForFunction(() => {
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
+              const root = dialog || document.body;
+              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim().toLowerCase();
+              return Boolean(dialog) && /general/.test(text) && /security/.test(text) && /account/.test(text);
+            }, { timeout: 10000 }).then(() => true).catch(() => false);
+            const title = await page.title().catch(() => "");
+            const shell = await page.evaluate(() => {
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
+              const root = dialog || document.body;
+              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim();
+              return {
+                dialog_visible: Boolean(dialog),
+                text,
+              };
+            }).catch(() => ({ dialog_visible: false, text: "" }));
+            const normalizedText = String(shell.text || "").replace(/\s+/g, " ").trim();
+            return {
+              ok,
+              current_url: page.url(),
+              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+              dialog_visible: shell.dialog_visible === true,
+              settings_shell: shell.dialog_visible === true && /general|notifications|apps|data controls|security|account/i.test(normalizedText),
+            };
+  - logout_prepare_chatgpt_app_shell:
+      if: "${state.vars.reuse_device_auth_session !== true && state.vars.prepare_public_entry_before_logout?.stage === 'app_shell' && state.steps.wait_for_prepare_chatgpt_security_settings_shell?.action?.ok === true && state.steps.wait_for_prepare_chatgpt_security_settings_shell?.action?.skipped !== true}"
+      metadata:
+        description: When the explicit logout URL still lands on an authenticated ChatGPT shell, use the ChatGPT security settings logout control before continuing.
         mode: headless_ok
         targetRef: primary
         browser:
@@ -2703,83 +2966,86 @@ do:
       with:
         body:
           script: |
-            const profileButtons = [
-              page.getByText(/^Dev Astronlab$/i).first(),
-              page.locator("aside, nav, [role='navigation']").getByText(/Dev Astronlab/i).first(),
-              page.getByRole("button", { name: /dev astronlab/i }).first(),
-              page.locator("button, a, [role='button']").filter({ hasText: /dev astronlab/i }).first(),
-            ];
-            let opened = false;
-            for (const candidate of profileButtons) {
-              if (!(await candidate.count().catch(() => 0))) {
-                continue;
-              }
-              if (!(await candidate.isVisible().catch(() => false))) {
-                continue;
-              }
-              await candidate.scrollIntoViewIfNeeded().catch(() => {});
-              await candidate.click({ timeout: 5000 }).catch(() => {});
-              await page.waitForTimeout(500).catch(() => {});
-              opened = true;
-              break;
-            }
-            if (!opened) {
-              return {
-                ok: false,
-                error: "chatgpt-profile-menu-not-found",
-                current_url: page.url(),
+            const result = await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                if (node.closest("script,style,noscript,template,[hidden],[aria-hidden=\"true\"]")) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
               };
-            }
-            const logoutCandidates = [
-              page.getByRole("menuitem", { name: /^log out$/i }).first(),
-              page.getByRole("button", { name: /^log out$/i }).first(),
-              page.getByRole("link", { name: /^log out$/i }).first(),
-              page.locator("[role='menuitem'], button, a, [role='button']").filter({ hasText: /^log out$/i }).first(),
-              page.getByText(/^log out$/i).first(),
-            ];
-            let logoutControl = null;
-            for (const candidate of logoutCandidates) {
-              if (!(await candidate.count().catch(() => 0))) {
-                continue;
-              }
-              if (!(await candidate.isVisible().catch(() => false))) {
-                continue;
-              }
-              logoutControl = candidate;
-              break;
-            }
-            if (!logoutControl) {
-              return {
-                ok: false,
-                error: "chatgpt-logout-control-not-found",
-                current_url: page.url(),
+              const labelMatches = (label) => {
+                return /^(log out|sign out)$/i.test(label)
+                  || /log out of this device/i.test(label)
+                  || /log out of all devices/i.test(label);
               };
+              const controls = Array.from(document.querySelectorAll("button, [role='button'], input[type='submit']"))
+                .filter((node) => isVisible(node))
+                .map((node) => ({
+                  node,
+                  label: normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")),
+                }));
+              const logoutButton = controls.find((candidate) => labelMatches(candidate.label));
+              if (!(logoutButton?.node instanceof HTMLElement)) {
+                return { ok: false, error: "logout-button-not-found" };
+              }
+              logoutButton.node.click();
+              return { ok: true, clicked_text: logoutButton.label || "Log out" };
+            }).catch((error) => ({
+              ok: false,
+              error: String(error?.message || error || "logout-click-failed"),
+            }));
+            if (result.ok) {
+              await page.waitForTimeout(1800).catch(() => {});
             }
-            await logoutControl.scrollIntoViewIfNeeded().catch(() => {});
-            await logoutControl.click({ timeout: 5000 }).catch(() => {});
-            await page.waitForTimeout(1200).catch(() => {});
-            return {
-              ok: true,
-              current_url: page.url(),
-            };
-  - reopen_public_chatgpt_entry_after_ui_logout:
+            return { ...result, current_url: page.url() };
+  - park_on_blank_after_prepare_ui_logout:
       if: "${state.steps.logout_prepare_chatgpt_app_shell?.action?.ok === true && state.steps.logout_prepare_chatgpt_app_shell?.action?.skipped !== true}"
       metadata:
-        description: "Reopen the public ChatGPT entry after the profile-menu logout fallback."
+        description: Move the managed page to about:blank before clearing OpenAI site state again after the settings-based logout.
       call: afn.driver.browser.navigate
       with:
         body:
-          url: "https://chatgpt.com/"
+          url: "about:blank"
+  - clear_prepare_device_auth_site_state_after_ui_logout:
+      if: "${state.steps.park_on_blank_after_prepare_ui_logout?.action?.ok === true && state.steps.park_on_blank_after_prepare_ui_logout?.action?.skipped !== true}"
+      metadata:
+        description: Clear ChatGPT/OpenAI site state again after the settings-based logout so the next public entry reopen is forced from a clean browser session.
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+            - https://chat.openai.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://chatgpt.com/auth/logout
+  - reopen_public_chatgpt_entry_after_ui_logout:
+      if: "${state.steps.clear_prepare_device_auth_site_state_after_ui_logout?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state_after_ui_logout?.action?.skipped !== true}"
+      metadata:
+        description: Reopen the public ChatGPT entry after the settings-based logout fallback.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://chatgpt.com/?codex_rotate_public_entry=after_logout
   - wait_after_public_chatgpt_entry_after_ui_logout:
       if: "${state.steps.reopen_public_chatgpt_entry_after_ui_logout?.action?.ok === true && state.steps.reopen_public_chatgpt_entry_after_ui_logout?.action?.skipped !== true}"
       metadata:
-        description: "Let the public ChatGPT entry settle after the profile-menu logout fallback."
+        description: Let the public ChatGPT entry settle after the settings-based logout fallback.
       wait:
         milliseconds: 1200
   - inspect_prepare_public_chatgpt_entry_after_ui_logout:
       if: "${state.steps.reopen_public_chatgpt_entry_after_ui_logout?.action?.ok === true && state.steps.reopen_public_chatgpt_entry_after_ui_logout?.action?.skipped !== true}"
       metadata:
-        description: "Re-inspect the ChatGPT entry after the profile-menu logout fallback."
+        description: "Re-inspect the ChatGPT entry after the settings-based logout fallback."
         mode: headless_ok
         targetRef: primary
         browser:
@@ -2860,10 +3126,40 @@ do:
       if: "${state.vars.reuse_device_auth_session !== true}"
       metadata:
         description: "Cache the effective public ChatGPT entry state after any logout fallback."
-      set:
-        effective_prepare_public_entry_state: "${(state.steps.inspect_prepare_public_chatgpt_entry_after_ui_logout?.action?.skipped !== true && (state.steps.inspect_prepare_public_chatgpt_entry_after_ui_logout?.action?.stage || state.steps.inspect_prepare_public_chatgpt_entry_after_ui_logout?.action?.current_url)) ? state.steps.inspect_prepare_public_chatgpt_entry_after_ui_logout?.action : (state.steps.inspect_prepare_public_chatgpt_entry?.action || {})}"
+      run:
+        script:
+          language: javascript
+          code: |
+            const candidates = [
+              state.steps?.inspect_prepare_public_chatgpt_entry_after_ui_logout?.action,
+              state.steps?.inspect_prepare_public_chatgpt_entry_after_security_wait?.action,
+              state.steps?.inspect_prepare_public_chatgpt_entry?.action,
+            ];
+            const effective = candidates.find((candidate) => {
+              return candidate
+                && typeof candidate === "object"
+                && candidate.skipped !== true
+                && (candidate.stage || candidate.current_url);
+            }) || {};
+            return {
+              effective_prepare_public_entry_state: {
+                ok: effective.ok === true,
+                current_url: effective.current_url || null,
+                headline: effective.headline || null,
+                stage: effective.stage || null,
+                account_ready: effective.account_ready === true,
+                settings_shell: effective.settings_shell === true,
+                security_open: effective.security_open === true,
+                security_verification: effective.security_verification === true,
+                session_expired: effective.session_expired === true,
+                login_cta_visible: effective.login_cta_visible === true,
+                signup_cta_visible: effective.signup_cta_visible === true,
+                logout_url: effective.logout_url === true,
+                blank_shell: effective.blank_shell === true,
+              },
+            };
   - open_prepare_direct_auth_entry_fallback:
-      if: "${state.vars.reuse_device_auth_session !== true && (state.vars.effective_prepare_public_entry_state?.stage === 'blank_chatgpt' || state.vars.effective_prepare_public_entry_state?.stage === 'unknown' || state.vars.effective_prepare_public_entry_state?.stage === 'app_shell')}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.cache_effective_prepare_public_entry_state?.action?.value?.effective_prepare_public_entry_state?.stage !== 'public_chatgpt'}"
       metadata:
         description: "Open the direct OpenAI login or signup entry when ChatGPT does not expose a trustworthy logged-out entry shell."
       call: afn.driver.browser.navigate
@@ -2871,12 +3167,12 @@ do:
         body:
           url: "${(inputs.account_login_locator != null || String(inputs.prefer_signup_recovery ?? 'true') === 'false') ? 'https://auth.openai.com/log-in' : 'https://auth.openai.com/create-account'}"
   - click_prepare_signup_button:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.stage === 'public_chatgpt' && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.cache_effective_prepare_public_entry_state?.action?.value?.effective_prepare_public_entry_state?.stage === 'public_chatgpt' && String(inputs.prefer_signup_recovery ?? 'true') !== 'false'}"
       metadata:
         templateRef: click_chatgpt_signup_button
         description: "Open the ChatGPT signup entry from the logged-out shell during the local device-auth prepare branch."
   - click_prepare_login_button:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.effective_prepare_public_entry_state?.stage === 'public_chatgpt' && (String(inputs.prefer_signup_recovery ?? 'true') === 'false' || state.steps.click_prepare_signup_button?.action?.ok !== true)}"
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.cache_effective_prepare_public_entry_state?.action?.value?.effective_prepare_public_entry_state?.stage === 'public_chatgpt' && (String(inputs.prefer_signup_recovery ?? 'true') === 'false' || state.steps.click_prepare_signup_button?.action?.skipped === true || state.steps.click_prepare_signup_button?.action?.ok !== true)}"
       metadata:
         templateRef: click_chatgpt_login_button
         description: "Open the ChatGPT login entry from the logged-out shell during the local device-auth prepare branch."
@@ -2898,7 +3194,7 @@ do:
       wait:
         milliseconds: 900
   - stabilize_prepare_login_surface:
-      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.open_prepare_direct_auth_entry_fallback?.action?.ok === true || state.steps.click_prepare_signup_button?.action?.ok === true || state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true || /auth\\.openai\\.com|chatgpt\\.com\\/auth\\/login_with/i.test(String(state.vars.effective_prepare_public_entry_state?.current_url || '')))}"
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.open_prepare_direct_auth_entry_fallback?.action?.ok === true || state.steps.click_prepare_signup_button?.action?.ok === true || state.steps.click_prepare_login_button?.action?.ok === true || state.steps.choose_prepare_email_login_option?.action?.ok === true || /auth\\.openai\\.com|chatgpt\\.com\\/auth\\/login_with/i.test(String(state.steps.cache_effective_prepare_public_entry_state?.action?.value?.effective_prepare_public_entry_state?.current_url || '')))}"
       metadata:
         templateRef: wait_for_openai_surface_ready
         description: "Wait for the local device-auth prepare login surface to render."
@@ -2909,6 +3205,16 @@ do:
         description: "Classify the OpenAI login surface during the local device-auth prepare branch."
         browser:
           screenshot: true
+  - clear_prepare_login_security_gate:
+      if: "${state.steps.classify_prepare_login_entry?.action?.anti_bot_gate === true || state.steps.classify_prepare_login_entry?.action?.stage === 'security_verification'}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any OpenAI or Cloudflare security gate on the device-auth prepare login entry.
+  - classify_prepare_login_entry_after_security_gate:
+      if: "${state.steps.clear_prepare_login_security_gate?.action?.ok === true && state.steps.clear_prepare_login_security_gate?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the prepare login surface after any security gate handling.
   - click_prepare_login_button_from_auth_landing:
       if: "${state.steps.classify_prepare_login_entry?.action?.stage === 'public_chatgpt' && /chatgpt\\.com\\/auth\\/login/i.test(String(state.steps.classify_prepare_login_entry?.action?.current_url || '')) && state.steps.classify_prepare_login_entry?.action?.login_cta_visible === true}"
       metadata:
@@ -2936,14 +3242,59 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Reclassify the prepare login surface after the ChatGPT auth landing's secondary login step."
+  - wait_after_prepare_login_entry_unknown:
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.classify_prepare_login_entry_after_auth_landing?.action?.skipped !== true && state.steps.classify_prepare_login_entry_after_auth_landing?.action?.stage === 'unknown'}"
+      metadata:
+        description: Give the OpenAI prepare login shell a moment to finish rendering when the secondary auth-landing classification returns unknown.
+      wait:
+        milliseconds: 900
+  - wait_after_prepare_login_entry_initial_unknown:
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.classify_prepare_login_entry_after_auth_landing?.action?.skipped === true || !state.steps.classify_prepare_login_entry_after_auth_landing?.action?.stage) && state.steps.classify_prepare_login_entry?.action?.stage === 'unknown'}"
+      metadata:
+        description: Give the initial OpenAI prepare login shell a moment to finish rendering when the first classification returns unknown.
+      wait:
+        milliseconds: 900
+  - classify_prepare_login_entry_retry:
+      if: "${(state.steps.wait_after_prepare_login_entry_unknown?.action?.ok === true && state.steps.wait_after_prepare_login_entry_unknown?.action?.skipped !== true) || (state.steps.wait_after_prepare_login_entry_initial_unknown?.action?.ok === true && state.steps.wait_after_prepare_login_entry_initial_unknown?.action?.skipped !== true)}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Retry the prepare login classification after a short settle when OpenAI first reports an unknown auth surface.
   - cache_effective_prepare_login_entry_state:
       if: "${state.vars.reuse_device_auth_session !== true}"
       metadata:
         description: "Cache the effective prepare login-entry state after any secondary ChatGPT auth-landing recovery."
-      set:
-        effective_prepare_login_entry_state: "${(state.steps.classify_prepare_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_prepare_login_entry_after_auth_landing?.action?.stage || state.steps.classify_prepare_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_prepare_login_entry_after_auth_landing?.action : (((state.steps.classify_prepare_login_entry?.action?.skipped !== true) && (state.steps.classify_prepare_login_entry?.action?.stage || state.steps.classify_prepare_login_entry?.action?.current_url)) ? state.steps.classify_prepare_login_entry?.action : {})}"
+      run:
+        script:
+          language: javascript
+          code: |
+            const candidates = [
+              state.steps?.classify_prepare_login_entry_retry?.action,
+              state.steps?.classify_prepare_login_entry_after_auth_landing?.action,
+              state.steps?.classify_prepare_login_entry_after_security_gate?.action,
+              state.steps?.classify_prepare_login_entry?.action,
+            ];
+            const effective = candidates.find((candidate) => {
+              return candidate
+                && typeof candidate === "object"
+                && candidate.skipped !== true
+                && (candidate.stage || candidate.current_url);
+            }) || {};
+            return {
+              effective_prepare_login_entry_state: {
+                ok: effective.ok === true,
+                current_url: effective.current_url || null,
+                headline: effective.headline || null,
+                stage: effective.stage || null,
+                email_input: effective.email_input === true,
+                password_input: effective.password_input === true,
+                anti_bot_gate: effective.anti_bot_gate === true,
+                login_cta_visible: effective.login_cta_visible === true,
+                signup_cta_visible: effective.signup_cta_visible === true,
+                one_time_code_cta: effective.one_time_code_cta === true,
+              },
+            };
   - fill_prepare_login_email:
-      if: "${state.vars.effective_prepare_login_entry_state?.stage === 'login_email' || state.vars.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.vars.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_prepare_login_entry_state?.email_input === true)}"
+      if: "${state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'login_email' || state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.email_input === true)}"
       metadata:
         templateRef: fill_openai_email_field
         description: "Fill the target email on the local device-auth prepare auth branch."
@@ -2953,7 +3304,7 @@ do:
         templateRef: submit_signup_email_form
         description: "Submit the signup email step on the local device-auth prepare branch."
   - submit_prepare_login_email:
-      if: "${state.steps.click_prepare_signup_button?.action?.ok !== true && (state.vars.effective_prepare_login_entry_state?.stage === 'login_email' || state.vars.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.vars.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_prepare_login_entry_state?.email_input === true)) && state.steps.fill_prepare_login_email?.action?.ok === true && state.steps.fill_prepare_login_email?.action?.skipped !== true}"
+      if: "${(state.steps.click_prepare_signup_button?.action?.skipped === true || state.steps.click_prepare_signup_button?.action?.ok !== true) && (state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'login_email' || state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'signup_email' || (state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.stage === 'auth_prompt' && state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.email_input === true)) && state.steps.fill_prepare_login_email?.action?.ok === true && state.steps.fill_prepare_login_email?.action?.skipped !== true}"
       metadata:
         templateRef: submit_login_email_form
         description: "Submit the login email step on the local device-auth prepare branch."
@@ -2964,7 +3315,7 @@ do:
       wait:
         milliseconds: 900
   - classify_prepare_after_login_email:
-      if: "${state.steps.submit_prepare_signup_email?.action?.ok === true || state.steps.submit_prepare_login_email?.action?.ok === true || state.vars.effective_prepare_login_entry_state?.ok === true}"
+      if: "${state.steps.submit_prepare_signup_email?.action?.ok === true || state.steps.submit_prepare_login_email?.action?.ok === true || state.steps.cache_effective_prepare_login_entry_state?.action?.value?.effective_prepare_login_entry_state?.ok === true}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after the email step."
@@ -2986,13 +3337,90 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after retrying the email submit."
+  - click_prepare_login_email_timeout_retry:
+      if: "${state.steps.classify_prepare_after_login_email?.action?.retryable_timeout === true}"
+      metadata:
+        templateRef: click_retryable_try_again
+        description: Retry the prepare email step when OpenAI shows its retryable invalid-state shell.
+  - wait_after_prepare_login_email_timeout_retry:
+      if: "${state.steps.click_prepare_login_email_timeout_retry?.action?.ok === true && state.steps.click_prepare_login_email_timeout_retry?.action?.skipped !== true}"
+      metadata:
+        description: Allow the retryable prepare email timeout shell to return to the auth form.
+      wait:
+        milliseconds: 900
+  - classify_prepare_after_login_email_timeout_retry:
+      if: "${state.steps.click_prepare_login_email_timeout_retry?.action?.ok === true && state.steps.click_prepare_login_email_timeout_retry?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Classify the prepare login surface after clicking Try again from the retryable invalid-state shell.
+  - refill_prepare_login_email_after_timeout_retry:
+      if: "${state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'login_email' || state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'signup_email' || (state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_after_login_email_timeout_retry?.action?.email_input === true)}"
+      metadata:
+        templateRef: fill_openai_email_field
+        description: Refill the target email after the retryable invalid-state shell resets the prepare auth form.
+  - submit_prepare_signup_email_after_timeout_retry:
+      if: "${state.steps.click_prepare_signup_button?.action?.ok === true && state.steps.click_prepare_signup_button?.action?.skipped !== true && state.steps.refill_prepare_login_email_after_timeout_retry?.action?.ok === true && state.steps.refill_prepare_login_email_after_timeout_retry?.action?.skipped !== true}"
+      metadata:
+        templateRef: submit_signup_email_form
+        description: Submit the prepare signup email step after recovering from the retryable invalid-state shell.
+  - submit_prepare_login_email_after_timeout_retry:
+      if: "${(state.steps.click_prepare_signup_button?.action?.skipped === true || state.steps.click_prepare_signup_button?.action?.ok !== true) && (state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'login_email' || state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'signup_email' || (state.steps.classify_prepare_after_login_email_timeout_retry?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_after_login_email_timeout_retry?.action?.email_input === true)) && state.steps.refill_prepare_login_email_after_timeout_retry?.action?.ok === true && state.steps.refill_prepare_login_email_after_timeout_retry?.action?.skipped !== true}"
+      metadata:
+        templateRef: submit_login_email_form
+        description: Submit the prepare login email step after recovering from the retryable invalid-state shell.
+  - wait_after_prepare_login_email_timeout_retry_submit:
+      if: "${(state.steps.submit_prepare_signup_email_after_timeout_retry?.action?.ok === true && state.steps.submit_prepare_signup_email_after_timeout_retry?.action?.skipped !== true) || (state.steps.submit_prepare_login_email_after_timeout_retry?.action?.ok === true && state.steps.submit_prepare_login_email_after_timeout_retry?.action?.skipped !== true)}"
+      metadata:
+        description: Allow the recovered prepare email submit to settle before classifying the next page.
+      wait:
+        milliseconds: 900
+  - classify_prepare_after_login_email_timeout_retry_submit:
+      if: "${(state.steps.submit_prepare_signup_email_after_timeout_retry?.action?.ok === true && state.steps.submit_prepare_signup_email_after_timeout_retry?.action?.skipped !== true) || (state.steps.submit_prepare_login_email_after_timeout_retry?.action?.ok === true && state.steps.submit_prepare_login_email_after_timeout_retry?.action?.skipped !== true)}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the prepare login surface after resubmitting the recovered email form.
+  - cache_effective_prepare_after_login_email_state:
+      metadata:
+        description: Cache the effective prepare auth state immediately after the email step and any retryable timeout recovery.
+      run:
+        script:
+          language: javascript
+          code: |
+            const candidates = [
+              state.steps?.classify_prepare_after_login_email_timeout_retry_submit?.action,
+              state.steps?.classify_prepare_after_login_email_timeout_retry?.action,
+              state.steps?.classify_prepare_after_login_email_retry?.action,
+              state.steps?.classify_prepare_after_login_email?.action,
+            ];
+            const effective = candidates.find((candidate) => {
+              return candidate
+                && typeof candidate === "object"
+                && candidate.skipped !== true
+                && (candidate.stage || candidate.current_url);
+            }) || {};
+            return {
+              effective_prepare_after_login_email_state: {
+                ok: effective.ok === true,
+                current_url: effective.current_url || null,
+                headline: effective.headline || null,
+                stage: effective.stage || null,
+                email_verification: effective.email_verification === true,
+                email_input: effective.email_input === true,
+                password_input: effective.password_input === true,
+                auth_prompt: effective.auth_prompt === true,
+                retryable_timeout: effective.retryable_timeout === true,
+                invalid_credentials: effective.invalid_credentials === true,
+                reset_password_prompt: effective.reset_password_prompt === true,
+                username_not_found: effective.username_not_found === true,
+              },
+            };
   - fill_prepare_login_password:
-      if: "${(state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the stored password on the prepare login branch before falling back to recovery."
   - submit_prepare_login_password:
-      if: "${(state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.fill_prepare_login_password?.action?.ok === true && state.steps.fill_prepare_login_password?.action?.skipped !== true}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && state.steps.fill_prepare_login_password?.action?.ok === true && state.steps.fill_prepare_login_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the stored password on the prepare login branch."
@@ -3003,19 +3431,19 @@ do:
       wait:
         milliseconds: 900
   - classify_prepare_after_login_password:
-      if: "${(state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare login surface after submitting the stored password."
   - classify_prepare_after_login_password_gate:
-      if: "${(state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login state after any password-step handling."
         browser:
           screenshot: true
   - wait_for_prepare_signup_password_field:
-      if: "${state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'signup_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'signup_password'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'signup_password'}"
       metadata:
         description: "Wait for the signup password field to become visible before filling it."
         mode: headless_ok
@@ -3084,7 +3512,7 @@ do:
                   submit_disabled: submitDisabled,
                 };
   - submit_prepare_signup_password:
-      if: "${(state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'signup_password' || state.steps.classify_prepare_after_login_email?.action?.stage === 'signup_password') && state.steps.fill_prepare_signup_password?.action?.ok === true && state.steps.fill_prepare_signup_password?.action?.skipped !== true}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'signup_password' && state.steps.fill_prepare_signup_password?.action?.ok === true && state.steps.fill_prepare_signup_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the new account password on the prepare signup branch."
@@ -3113,16 +3541,21 @@ do:
         script:
           language: javascript
           code: |
-            const afterRetry = state.steps?.classify_prepare_after_login_email_retry?.action || {};
-            const afterEmail = state.steps?.classify_prepare_after_login_email?.action || {};
+            const afterEmail = state.steps?.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state || {};
             const afterPassword = state.steps?.classify_prepare_after_login_password_gate?.action || {};
             const hasLocator = args.account_login_locator != null;
-            const passwordStage = afterRetry.stage === "login_password" || afterEmail.stage === "login_password";
+            const preferPasswordLogin = String(args.prefer_password_login ?? "true").trim().toLowerCase() !== "false";
+            const passwordStage = afterEmail.stage === "login_password";
             const passwordAuthPrompt =
-              (afterRetry.stage === "auth_prompt" || afterEmail.stage === "auth_prompt")
-              && (afterRetry.password_input === true || afterEmail.password_input === true);
+              afterEmail.stage === "auth_prompt"
+              && afterEmail.password_input === true;
+            const passwordAttempted =
+              (state.steps?.fill_prepare_login_password?.action?.ok === true && state.steps?.fill_prepare_login_password?.action?.skipped !== true)
+              || (state.steps?.submit_prepare_login_password?.action?.ok === true && state.steps?.submit_prepare_login_password?.action?.skipped !== true)
+              || (state.steps?.classify_prepare_after_login_password_gate?.action?.ok === true && state.steps?.classify_prepare_after_login_password_gate?.action?.skipped !== true);
             const shouldRecover =
-              ((!hasLocator) && (passwordStage || passwordAuthPrompt))
+              ((!preferPasswordLogin) && (passwordStage || passwordAuthPrompt))
+              || ((passwordStage || passwordAuthPrompt) && preferPasswordLogin && passwordAttempted !== true)
               || afterPassword.invalid_credentials === true
               || afterPassword.reset_password_prompt === true
               || afterPassword.username_not_found === true;
@@ -3130,8 +3563,10 @@ do:
               ok: true,
               should_recover: shouldRecover,
               has_locator: hasLocator,
+              prefer_password_login: preferPasswordLogin,
               password_stage: passwordStage,
               password_auth_prompt: passwordAuthPrompt,
+              password_attempted: passwordAttempted,
             };
   - choose_prepare_one_time_code_recovery:
       if: "${state.steps.compute_prepare_one_time_code_recovery_flag?.action?.value?.should_recover === true}"
@@ -3164,7 +3599,7 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after reopening one-time-code recovery."
   - collect_prepare_login_verification_artifact:
-      if: "${state.steps.classify_prepare_after_login_email?.action?.email_verification === true || state.steps.classify_prepare_after_login_email_retry?.action?.email_verification === true || state.steps.classify_prepare_after_login_password_gate?.action?.email_verification === true || state.steps.classify_prepare_after_recovery_choice?.action?.email_verification === true || state.steps.classify_prepare_after_recovery_timeout_retry?.action?.email_verification === true || state.steps.classify_prepare_after_timeout_reopen?.action?.email_verification === true || state.steps.classify_prepare_after_signup_password_gate?.action?.email_verification === true}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.email_verification === true || state.steps.classify_prepare_after_login_password_gate?.action?.email_verification === true || state.steps.classify_prepare_after_recovery_choice?.action?.email_verification === true || state.steps.classify_prepare_after_recovery_timeout_retry?.action?.email_verification === true || state.steps.classify_prepare_after_timeout_reopen?.action?.email_verification === true || state.steps.classify_prepare_after_signup_password_gate?.action?.email_verification === true}"
       metadata:
         description: "Collect the prepare-branch OTP from Gmail on the same managed profile."
         ref:
@@ -3186,7 +3621,7 @@ do:
       call: afn.driver.browser.navigate
       with:
         body:
-          url: "${state.steps.classify_prepare_after_timeout_reopen?.action?.current_url || state.steps.classify_prepare_after_recovery_timeout_retry?.action?.current_url || state.steps.classify_prepare_after_recovery_choice?.action?.current_url || state.steps.classify_prepare_after_login_password_gate?.action?.current_url || state.steps.classify_prepare_after_signup_password_gate?.action?.current_url || state.steps.classify_prepare_after_login_email_retry?.action?.current_url || state.steps.classify_prepare_after_login_email?.action?.current_url || 'https://auth.openai.com/email-verification'}"
+          url: "${state.steps.classify_prepare_after_timeout_reopen?.action?.current_url || state.steps.classify_prepare_after_recovery_timeout_retry?.action?.current_url || state.steps.classify_prepare_after_recovery_choice?.action?.current_url || state.steps.classify_prepare_after_login_password_gate?.action?.current_url || state.steps.classify_prepare_after_signup_password_gate?.action?.current_url || state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.current_url || 'https://auth.openai.com/email-verification'}"
   - stabilize_prepare_login_verification_surface:
       if: "${state.steps.return_to_prepare_login_verification_page?.action?.ok === true}"
       metadata:
@@ -3415,14 +3850,19 @@ do:
               prepareStartedFromAuthenticatedShell
               && (stage === "app_shell" || latest.account_ready === true)
               && executedPrepareInteraction !== true;
-            const authenticatedChatgptShell =
+            const authenticatedPrepareState =
               latest.account_ready === true
               || latest.chatgpt_app_shell === true
-              || stage === "app_shell";
+              || stage === "app_shell"
+              || stage === "oauth_consent"
+              || latest.oauth_continue_visible === true
+              || latest.success === true
+              || stage === "success"
+              || stage === "callback_complete";
             const prepareFlowReady =
               stage !== ""
               && staleAuthenticatedShellOnly !== true
-              && authenticatedChatgptShell === true;
+              && authenticatedPrepareState === true;
             return {
               prepare_flow_output: latest,
               prepare_flow_ready: prepareFlowReady,
@@ -3770,8 +4210,56 @@ do:
         description: "Allow the confirmed Codex device-code authorization setting to propagate before starting the detached Codex device-auth session."
       wait:
         milliseconds: 10000
+  - seed_existing_codex_login_session:
+      if: "${state.vars.prepare_flow_ready === true && state.vars.reuse_device_auth_session !== true && (state.steps.reconfirm_device_code_authorization_enabled?.action?.enabled === true || state.steps.ensure_device_code_authorization_enabled?.action?.enabled === true) && state.steps.wait_after_device_code_toggle_reconfirm?.action?.ok === true && (String(inputs.auth_url || '').trim() !== '' || String(inputs.device_code || '').trim() !== '' || String(inputs.codex_login_stdout_path || '').trim() !== '' || String(inputs.codex_login_stderr_path || '').trim() !== '' || String(inputs.codex_session_dir || '').trim() !== '')}"
+      metadata:
+        description: Normalize any caller-provided detached Codex device-auth session before deciding whether a fresh one must be started.
+      run:
+        script:
+          language: javascript
+          code: |
+            const fs = await import("node:fs");
+            const stripAnsi = (raw) => String(raw || "").replace(/\u001b\[[0-9;]*m/g, "");
+            const readText = (filePath) =>
+              (!filePath || !fs.existsSync(filePath)) ? "" : fs.readFileSync(filePath, "utf8");
+            const extractDeviceChallenge = (raw) => {
+              const cleaned = stripAnsi(raw);
+              const authMatch = cleaned.match(/https:\/\/auth\.openai\.com\/codex\/device\b[^\s"'<>]*/);
+              const codeMatch = cleaned.match(/\b[A-Z0-9]{4}-[A-Z0-9]{5}\b/);
+              return {
+                auth_url: authMatch ? authMatch[0] : null,
+                device_code: codeMatch ? codeMatch[0] : null,
+              };
+            };
+            const explicitAuthUrl = String(args.auth_url || "").trim();
+            const explicitDeviceCode = String(args.device_code || "").trim().toUpperCase();
+            const stdoutPath = String(args.codex_login_stdout_path || "").trim();
+            const stderrPath = String(args.codex_login_stderr_path || "").trim();
+            const exitPath = String(args.codex_login_exit_path || "").trim();
+            const sessionDir = String(args.codex_session_dir || "").trim() || null;
+            const codexHomePath = String(args.codex_home_path || "").trim() || null;
+            const authFilePath = String(args.codex_auth_file_path || "").trim() || null;
+            const pidValue = Number(args.codex_login_pid || 0);
+            const recovered = extractDeviceChallenge(
+              readText(stdoutPath) + "\n" + readText(stderrPath)
+            );
+            const authUrl = explicitAuthUrl || recovered.auth_url || null;
+            const deviceCode = explicitDeviceCode || recovered.device_code || null;
+            return {
+              ok: true,
+              reusable_challenge: Boolean(authUrl && deviceCode),
+              auth_url: authUrl,
+              device_code: deviceCode,
+              session_dir: sessionDir,
+              codex_home_path: codexHomePath,
+              auth_file_path: authFilePath,
+              pid: Number.isInteger(pidValue) && pidValue > 0 ? pidValue : null,
+              stdout_path: stdoutPath || null,
+              stderr_path: stderrPath || null,
+              exit_path: exitPath || null,
+            };
   - start_codex_login_session:
-      if: "${state.vars.prepare_flow_ready === true && state.vars.reuse_device_auth_session !== true && (state.steps.reconfirm_device_code_authorization_enabled?.action?.enabled === true || state.steps.ensure_device_code_authorization_enabled?.action?.enabled === true) && state.steps.wait_after_device_code_toggle_reconfirm?.action?.ok === true && !String(inputs.auth_url || '').trim() && !String(inputs.device_code || '').trim() && !String(inputs.codex_login_stdout_path || '').trim() && !String(inputs.codex_session_dir || '').trim()}"
+      if: "${state.vars.prepare_flow_ready === true && state.vars.reuse_device_auth_session !== true && (state.steps.reconfirm_device_code_authorization_enabled?.action?.enabled === true || state.steps.ensure_device_code_authorization_enabled?.action?.enabled === true) && state.steps.wait_after_device_code_toggle_reconfirm?.action?.ok === true && state.steps.seed_existing_codex_login_session?.action?.value?.reusable_challenge !== true}"
       metadata:
         description: "Start a detached codex device-auth session on the host and capture its stdout/stderr paths."
       run:
@@ -3846,15 +4334,21 @@ do:
                 error: "device-auth-toggle-not-enabled",
               };
             }
-            const explicitAuthUrl = String(args.auth_url || "").trim();
-            const explicitDeviceCode = String(args.device_code || "").trim();
-            const stdoutPath = String(args.codex_login_stdout_path || state.steps.start_codex_login_session?.action?.value?.stdout_path || "").trim();
-            const stderrPath = String(args.codex_login_stderr_path || state.steps.start_codex_login_session?.action?.value?.stderr_path || "").trim();
-            const exitPath = String(args.codex_login_exit_path || state.steps.start_codex_login_session?.action?.value?.exit_path || "").trim();
-            const sessionDir = String(args.codex_session_dir || state.steps.start_codex_login_session?.action?.value?.session_dir || "").trim() || null;
-            const codexHomePath = String(args.codex_home_path || state.steps.start_codex_login_session?.action?.value?.codex_home_path || "").trim() || null;
-            const authFilePath = String(args.codex_auth_file_path || state.steps.start_codex_login_session?.action?.value?.auth_file_path || "").trim() || null;
-            const pidValue = Number(args.codex_login_pid || state.steps.start_codex_login_session?.action?.value?.pid || 0);
+            const seededSession =
+              state.steps?.seed_existing_codex_login_session?.action?.value
+              && typeof state.steps.seed_existing_codex_login_session.action.value === "object"
+              && !Array.isArray(state.steps.seed_existing_codex_login_session.action.value)
+                ? state.steps.seed_existing_codex_login_session.action.value
+                : {};
+            const explicitAuthUrl = String(args.auth_url || seededSession.auth_url || "").trim();
+            const explicitDeviceCode = String(args.device_code || seededSession.device_code || "").trim();
+            const stdoutPath = String(args.codex_login_stdout_path || seededSession.stdout_path || state.steps.start_codex_login_session?.action?.value?.stdout_path || "").trim();
+            const stderrPath = String(args.codex_login_stderr_path || seededSession.stderr_path || state.steps.start_codex_login_session?.action?.value?.stderr_path || "").trim();
+            const exitPath = String(args.codex_login_exit_path || seededSession.exit_path || state.steps.start_codex_login_session?.action?.value?.exit_path || "").trim();
+            const sessionDir = String(args.codex_session_dir || seededSession.session_dir || state.steps.start_codex_login_session?.action?.value?.session_dir || "").trim() || null;
+            const codexHomePath = String(args.codex_home_path || seededSession.codex_home_path || state.steps.start_codex_login_session?.action?.value?.codex_home_path || "").trim() || null;
+            const authFilePath = String(args.codex_auth_file_path || seededSession.auth_file_path || state.steps.start_codex_login_session?.action?.value?.auth_file_path || "").trim() || null;
+            const pidValue = Number(args.codex_login_pid || seededSession.pid || state.steps.start_codex_login_session?.action?.value?.pid || 0);
             const stripAnsi = (raw) => String(raw || "").replace(/\u001b\[[0-9;]*m/g, "");
             const extractDeviceChallenge = (raw) => {
               const cleaned = stripAnsi(raw);
@@ -3969,11 +4463,11 @@ do:
               exit_path: exitPath || null,
             };
   - cache_codex_login_session:
-      if: "${state.steps.start_codex_login_session?.action?.ok === true || state.steps.capture_codex_login_url?.action?.ok === true || String(inputs.auth_url || '').trim() !== '' || String(inputs.codex_login_stdout_path || '').trim() !== '' || String(inputs.codex_session_dir || '').trim() !== ''}"
+      if: "${state.steps.seed_existing_codex_login_session?.action?.ok === true || state.steps.start_codex_login_session?.action?.ok === true || state.steps.capture_codex_login_url?.action?.ok === true || String(inputs.auth_url || '').trim() !== '' || String(inputs.codex_login_stdout_path || '').trim() !== '' || String(inputs.codex_login_stderr_path || '').trim() !== '' || String(inputs.codex_session_dir || '').trim() !== ''}"
       metadata:
         description: "Cache the current Codex login session metadata for later exit handling."
       set:
-        codex_login: "${state.steps.capture_codex_login_url?.action?.value || state.steps.start_codex_login_session?.action?.value || { auth_url: String(inputs.auth_url || '').trim() || null, device_code: String(inputs.device_code || '').trim() || null, session_dir: String(inputs.codex_session_dir || '').trim() || null, codex_home_path: String(inputs.codex_home_path || '').trim() || null, auth_file_path: String(inputs.codex_auth_file_path || '').trim() || null, pid: (inputs.codex_login_pid ?? null), stdout_path: String(inputs.codex_login_stdout_path || '').trim() || null, stderr_path: String(inputs.codex_login_stderr_path || '').trim() || null, exit_path: String(inputs.codex_login_exit_path || '').trim() || null }}"
+        codex_login: "${state.steps.capture_codex_login_url?.action?.value || state.steps.seed_existing_codex_login_session?.action?.value || state.steps.start_codex_login_session?.action?.value || { auth_url: String(inputs.auth_url || '').trim() || null, device_code: String(inputs.device_code || '').trim() || null, session_dir: String(inputs.codex_session_dir || '').trim() || null, codex_home_path: String(inputs.codex_home_path || '').trim() || null, auth_file_path: String(inputs.codex_auth_file_path || '').trim() || null, pid: (inputs.codex_login_pid ?? null), stdout_path: String(inputs.codex_login_stdout_path || '').trim() || null, stderr_path: String(inputs.codex_login_stderr_path || '').trim() || null, exit_path: String(inputs.codex_login_exit_path || '').trim() || null }}"
   - restore_codex_login_challenge_from_artifacts:
       if: "${(String(state.vars.codex_login?.auth_url || '').trim() === '' || String(state.vars.codex_login?.device_code || '').trim() === '') && (String(state.vars.codex_login?.stdout_path || inputs.codex_login_stdout_path || '').trim() !== '' || String(state.vars.codex_login?.stderr_path || inputs.codex_login_stderr_path || '').trim() !== '')}"
       metadata:
@@ -4128,12 +4622,29 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Reclassify the device-auth login surface after the ChatGPT auth landing's secondary login step."
+  - wait_after_device_auth_login_entry_unknown:
+      if: "${state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage === 'unknown'}"
+      metadata:
+        description: Give the device-auth login shell a moment to finish rendering when the secondary auth-landing classification returns unknown.
+      wait:
+        milliseconds: 900
+  - wait_after_device_auth_login_entry_initial_unknown:
+      if: "${(state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped === true || !state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage) && state.steps.classify_device_auth_login_entry?.action?.stage === 'unknown'}"
+      metadata:
+        description: Give the initial device-auth login shell a moment to finish rendering when the first classification returns unknown.
+      wait:
+        milliseconds: 900
+  - classify_device_auth_login_entry_retry:
+      if: "${(state.steps.wait_after_device_auth_login_entry_unknown?.action?.ok === true && state.steps.wait_after_device_auth_login_entry_unknown?.action?.skipped !== true) || (state.steps.wait_after_device_auth_login_entry_initial_unknown?.action?.ok === true && state.steps.wait_after_device_auth_login_entry_initial_unknown?.action?.skipped !== true)}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Retry the device-auth login classification after a short settle when OpenAI first reports an unknown auth surface.
   - cache_effective_device_auth_login_entry_state:
       if: "${state.steps.advance_device_authorization_login?.action?.ok === true && state.steps.advance_device_authorization_login?.action?.skipped !== true}"
       metadata:
         description: "Cache the effective device-auth login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {})}"
+        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_retry?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_retry?.action?.stage || state.steps.classify_device_auth_login_entry_retry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_retry?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {}))}"
   - fill_device_auth_login_email:
       if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true))}"
       metadata:
@@ -4172,12 +4683,12 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after retrying the email submit."
   - fill_device_auth_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the stored password on the device-auth login branch before falling back to recovery."
   - submit_device_auth_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the stored password on the device-auth login branch."
@@ -4188,12 +4699,12 @@ do:
       wait:
         milliseconds: 900
   - classify_device_auth_after_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login surface after submitting the stored password."
   - classify_device_auth_after_login_password_gate:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login state after any password-step handling."
@@ -4209,12 +4720,18 @@ do:
             const afterEmail = state.steps?.classify_device_auth_after_login_email?.action || {};
             const afterPassword = state.steps?.classify_device_auth_after_login_password_gate?.action || {};
             const hasLocator = args.account_login_locator != null;
+            const preferPasswordLogin = String(args.prefer_password_login ?? "true").trim().toLowerCase() !== "false";
             const passwordStage = afterRetry.stage === "login_password" || afterEmail.stage === "login_password";
             const passwordAuthPrompt =
               (afterRetry.stage === "auth_prompt" || afterEmail.stage === "auth_prompt")
               && (afterRetry.password_input === true || afterEmail.password_input === true);
+            const passwordAttempted =
+              (state.steps?.fill_device_auth_login_password?.action?.ok === true && state.steps?.fill_device_auth_login_password?.action?.skipped !== true)
+              || (state.steps?.submit_device_auth_login_password?.action?.ok === true && state.steps?.submit_device_auth_login_password?.action?.skipped !== true)
+              || (state.steps?.classify_device_auth_after_login_password_gate?.action?.ok === true && state.steps?.classify_device_auth_after_login_password_gate?.action?.skipped !== true);
             const shouldRecover =
-              ((!hasLocator) && (passwordStage || passwordAuthPrompt))
+              ((!preferPasswordLogin) && (passwordStage || passwordAuthPrompt))
+              || ((passwordStage || passwordAuthPrompt) && preferPasswordLogin && passwordAttempted !== true)
               || afterPassword.invalid_credentials === true
               || afterPassword.reset_password_prompt === true
               || afterPassword.username_not_found === true;
@@ -4222,8 +4739,10 @@ do:
               ok: true,
               should_recover: shouldRecover,
               has_locator: hasLocator,
+              prefer_password_login: preferPasswordLogin,
               password_stage: passwordStage,
               password_auth_prompt: passwordAuthPrompt,
+              password_attempted: passwordAttempted,
             };
   - choose_device_auth_one_time_code_recovery:
       if: "${state.steps.compute_device_auth_one_time_code_recovery_flag?.action?.value?.should_recover === true}"
@@ -4321,7 +4840,7 @@ do:
       call: afn.driver.browser.navigate
       with:
         body:
-          url: "https://auth.openai.com/email-verification"
+          url: "${state.steps.classify_device_auth_after_return_recovery?.action?.current_url || state.steps.classify_device_auth_after_timeout_reopen?.action?.current_url || state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.current_url || state.steps.classify_device_auth_after_recovery_choice?.action?.current_url || state.steps.classify_device_auth_after_login_password_gate?.action?.current_url || state.steps.classify_device_auth_after_login_email_retry?.action?.current_url || state.steps.classify_device_auth_after_login_email?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - stabilize_device_auth_login_verification_surface:
       if: "${state.steps.return_to_device_auth_login_verification_page?.action?.ok === true && state.steps.return_to_device_auth_login_verification_page?.action?.skipped !== true}"
       metadata:
@@ -5092,13 +5611,14 @@ do:
               stderr_tail: tail(stderrPath) || null,
             };
   - finalize_device_auth_tail_summary:
-      if: "${state.vars.prepare_flow_ready === true && String(state.vars.codex_login?.auth_url || '').trim() !== ''}"
+      if: "${state.vars.prepare_flow_ready === true && (String(state.vars.codex_login?.auth_url || '').trim() !== '' || String(state.vars.codex_login?.stdout_path || '').trim() !== '' || String(state.vars.codex_login?.stderr_path || '').trim() !== '' || String(inputs.codex_login_stdout_path || '').trim() !== '' || String(inputs.codex_login_stderr_path || '').trim() !== '')}"
       metadata:
         description: "Build the final device-authorization outcome from the browser surface and detached Codex session."
       run:
         script:
           language: javascript
           code: |
+            const fs = await import("node:fs");
             const prepare = state.vars.prepare_flow_output || {};
             const existingShell = state.steps.inspect_existing_chatgpt_session?.action || {};
             const shell = state.steps.inspect_chatgpt_shell?.action || {};
@@ -5110,6 +5630,22 @@ do:
             const afterCallbackCode = state.steps.inspect_device_authorization_after_callback_code?.action || {};
             const exitResult = state.steps.wait_for_codex_login_exit?.action?.value || {};
             const session = state.vars?.codex_login && typeof state.vars.codex_login === "object" && !Array.isArray(state.vars.codex_login) ? state.vars.codex_login : {};
+            const readText = (filePath) => (!filePath || !fs.existsSync(filePath)) ? "" : fs.readFileSync(filePath, "utf8");
+            const stripAnsi = (raw) => String(raw || "").replace(/\u001b\[[0-9;]*m/g, "");
+            const extractDeviceChallenge = (raw) => {
+              const cleaned = stripAnsi(raw);
+              const authMatch = cleaned.match(/https:\/\/auth\.openai\.com\/codex\/device\b[^\s"'<>]*/);
+              const codeMatch = cleaned.match(/\b[A-Z0-9]{4}-[A-Z0-9]{5}\b/);
+              return {
+                auth_url: authMatch ? authMatch[0] : null,
+                device_code: codeMatch ? codeMatch[0] : null,
+              };
+            };
+            const recoveredChallenge = extractDeviceChallenge(
+              readText(String(session.stdout_path || "")) + "\n" + readText(String(session.stderr_path || ""))
+            );
+            const resolvedAuthUrl = String(session.auth_url || recoveredChallenge.auth_url || "").trim() || null;
+            const resolvedDeviceCode = String(session.device_code || recoveredChallenge.device_code || "").trim() || null;
             const lastSurface = afterCallbackCode.current_url ? afterCallbackCode : (finalInspect.current_url ? finalInspect : (afterCode.current_url ? afterCode : inspect));
             const callbackComplete = /\/deviceauth\/callback(?:[/?#]|$)/i.test(
               String(lastSurface.current_url || inspect.current_url || "")
@@ -5142,13 +5678,7 @@ do:
               || existingShell.stage === "app_shell"
               || shell.account_ready === true
               || shell.stage === "app_shell";
-            const issuedDeviceChallenge = Boolean(
-              String(session.auth_url || "").trim()
-              || String(session.device_code || "").trim()
-              || String(session.exit_path || "").trim()
-              || String(session.stdout_path || "").trim()
-              || String(session.stderr_path || "").trim()
-            );
+            const issuedDeviceChallenge = Boolean(resolvedAuthUrl && resolvedDeviceCode);
             const cliCompleted = exitResult.ok === true
               && exitResult.skipped !== true
               && exitResult.timeout !== true
@@ -5213,10 +5743,10 @@ do:
               retry_reason: retryReason,
               error_message: success ? null : errorMessage,
               codex_session: {
-                auth_url: session.auth_url || null,
+                auth_url: resolvedAuthUrl,
                 callback_url: session.callback_url || null,
                 callback_port: session.callback_port ?? null,
-                device_code: session.device_code || null,
+                device_code: resolvedDeviceCode,
                 session_dir: session.session_dir || null,
                 codex_home_path: session.codex_home_path || null,
                 auth_file_path: session.auth_file_path || null,
