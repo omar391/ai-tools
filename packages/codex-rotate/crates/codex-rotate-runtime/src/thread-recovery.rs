@@ -278,7 +278,7 @@ fn resolve_recoverable_turn_failure_event(
         .map(|thread| thread.status.kind.as_str());
 
     if matches!(thread_status_kind, Some("active")) {
-        return Ok(RecoveryResolution::Blocked);
+        return Ok(recovery_resolution_for_active_thread(event.kind));
     }
 
     match event.kind {
@@ -771,6 +771,9 @@ fn detect_stalled_turn_snapshot(
                 if terminal_turn_ids.contains(turn_id) {
                     return Ok(None);
                 }
+                if !task_started_is_stalled_turn_eligible(payload) {
+                    return Ok(None);
+                }
                 let last_event_ts = latest_event_ts.unwrap_or(fallback_ts);
                 if last_event_ts.saturating_add(STALLED_TURN_RECOVERY_DELAY_SECS) > now_ts {
                     return Ok(None);
@@ -866,6 +869,22 @@ where
         dropped_thread_ids,
         pending_events,
     })
+}
+
+fn recovery_resolution_for_active_thread(kind: ThreadRecoveryKind) -> RecoveryResolution {
+    match kind {
+        ThreadRecoveryKind::StalledTurn => RecoveryResolution::Dropped,
+        ThreadRecoveryKind::QuotaExhausted
+        | ThreadRecoveryKind::ModelCapacity
+        | ThreadRecoveryKind::TransportDisconnected => RecoveryResolution::Blocked,
+    }
+}
+
+fn task_started_is_stalled_turn_eligible(payload: &Value) -> bool {
+    payload
+        .get("collaboration_mode_kind")
+        .and_then(Value::as_str)
+        != Some("plan")
 }
 
 fn is_terminal_thread_recovery_error(error: &anyhow::Error) -> bool {
@@ -1648,6 +1667,71 @@ create table logs (
     }
 
     #[test]
+    fn plan_mode_turn_is_not_marked_as_stalled() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let rollout_path = tempdir.path().join("plan-rollout.jsonl");
+        let state_file = tempdir.path().join("state_5.sqlite");
+        let logs_file = tempdir.path().join("logs_2.sqlite");
+
+        let last_event_ts = Utc
+            .with_ymd_and_hms(2026, 4, 9, 7, 29, 9)
+            .single()
+            .unwrap()
+            .timestamp();
+        std::fs::write(
+            &rollout_path,
+            concat!(
+                "{\"timestamp\":\"2026-04-09T07:28:33Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-plan\",\"collaboration_mode_kind\":\"plan\"}}\n",
+                "{\"timestamp\":\"2026-04-09T07:29:09Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"working\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let state_connection = Connection::open(&state_file).unwrap();
+        state_connection
+            .execute_batch(&format!(
+                r#"
+create table threads (
+  id text primary key,
+  rollout_path text not null,
+  updated_at integer not null,
+  archived integer not null default 0
+);
+insert into threads (id, rollout_path, updated_at, archived) values
+  ('thread-plan', '{}', {}, 0);
+                "#,
+                rollout_path.display(),
+                last_event_ts
+            ))
+            .unwrap();
+
+        let logs_connection = Connection::open(&logs_file).unwrap();
+        logs_connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text,
+  thread_id text
+);
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_stalled_turn_recovery_events(
+            &logs_connection,
+            &state_file,
+            last_event_ts + STALLED_TURN_RECOVERY_DELAY_SECS + 1,
+            8,
+        )
+        .unwrap();
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn merge_thread_recovery_events_keeps_latest_event_per_thread() {
         let merged = merge_thread_recovery_events(
             &[ThreadRecoveryEvent {
@@ -1728,6 +1812,18 @@ create table logs (
         assert_eq!(result.continued_thread_ids, vec!["thread-b".to_string()]);
         assert_eq!(result.pending_events.len(), 1);
         assert_eq!(result.pending_events[0].thread_id, "thread-a");
+    }
+
+    #[test]
+    fn active_thread_drops_stalled_turn_recovery_but_blocks_other_recovery_kinds() {
+        assert_eq!(
+            recovery_resolution_for_active_thread(ThreadRecoveryKind::StalledTurn),
+            RecoveryResolution::Dropped
+        );
+        assert_eq!(
+            recovery_resolution_for_active_thread(ThreadRecoveryKind::QuotaExhausted),
+            RecoveryResolution::Blocked
+        );
     }
 
     #[test]
