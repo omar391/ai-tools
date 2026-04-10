@@ -425,11 +425,23 @@ fn scan_recoverable_turn_failure_events(
 select id, ts, feedback_log_body
 from logs
 where id > ?1
-  and target = 'codex_core::codex'
   and (
-    feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
-    or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
-    or feedback_log_body like '%Turn error: stream disconnected before completion:%'
+    (
+      target = 'codex_core::codex'
+      and (
+        feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+        or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+        or feedback_log_body like '%Turn error: stream disconnected before completion:%'
+      )
+    )
+    or (
+      target = 'codex_core::compact_remote'
+      and (
+        feedback_log_body like '%compact_error=You''ve hit your usage limit.%'
+        or feedback_log_body like '%compact_error=Selected model is at capacity. Please try a different model.%'
+        or feedback_log_body like '%compact_error=stream disconnected before completion:%'
+      )
+    )
   )
 order by id asc
 limit ?2
@@ -464,11 +476,23 @@ fn read_latest_recoverable_turn_failure_log_id_from_connection(
         r#"
 select id
 from logs
-where target = 'codex_core::codex'
-  and (
-    feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
-    or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
-    or feedback_log_body like '%Turn error: stream disconnected before completion:%'
+where (
+    (
+      target = 'codex_core::codex'
+      and (
+        feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
+        or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
+        or feedback_log_body like '%Turn error: stream disconnected before completion:%'
+      )
+    )
+    or (
+      target = 'codex_core::compact_remote'
+      and (
+        feedback_log_body like '%compact_error=You''ve hit your usage limit.%'
+        or feedback_log_body like '%compact_error=Selected model is at capacity. Please try a different model.%'
+        or feedback_log_body like '%compact_error=stream disconnected before completion:%'
+      )
+    )
   )
 order by id desc
 limit 1
@@ -494,7 +518,7 @@ fn parse_codex_core_recoverable_turn_failure_event(
     let Some(thread_id) = thread_id else {
         return Ok(None);
     };
-    let message = extract_after(body, "Turn error: ");
+    let message = extract_recoverable_error_message(body);
     let Some(message) = message else {
         return Ok(None);
     };
@@ -518,6 +542,10 @@ fn parse_codex_core_recoverable_turn_failure_event(
         exhausted_account_id: metadata.exhausted_account_id,
         message,
     }))
+}
+
+fn extract_recoverable_error_message(body: &str) -> Option<String> {
+    extract_after(body, "Turn error: ").or_else(|| extract_after(body, "compact_error="))
 }
 
 fn find_otel_failure_metadata_for_turn(
@@ -1333,6 +1361,41 @@ insert into logs (id, ts, target, feedback_log_body) values
     }
 
     #[test]
+    fn parses_quota_exhaustion_event_from_remote_compact_log() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text
+);
+insert into logs (id, ts, target, feedback_log_body) values
+  (
+    10,
+    1775847287,
+    'codex_core::compact_remote',
+    'session_loop{thread_id=thread-compact}:submission_dispatch{otel.name="op.dispatch.user_input" submission.id="submission-compact" codex.op="user_input"}:turn{otel.name="session_task.turn" thread.id=thread-compact turn.id=turn-compact model=gpt-5.4}:run_turn: remote compaction failed turn_id=turn-compact compact_error=You''ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Apr 18th, 2026 12:19 AM.'
+  );
+                "#,
+            )
+            .unwrap();
+
+        let events = scan_recoverable_turn_failure_events(&connection, None, 50).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread_id, "thread-compact");
+        assert_eq!(events[0].kind, ThreadRecoveryKind::QuotaExhausted);
+        assert_eq!(events[0].exhausted_turn_id.as_deref(), Some("turn-compact"));
+        assert!(events[0].exhausted_email.is_none());
+        assert!(events[0]
+            .message
+            .starts_with("You've hit your usage limit."));
+    }
+
+    #[test]
     fn parses_transport_disconnect_event_from_codex_core_log() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
@@ -1446,14 +1509,15 @@ insert into logs (id, ts, target, feedback_log_body) values
   (13, 1003, 'codex_core::codex', 'session_loop{thread_id=thread-c}:turn{thread.id=thread-c turn.id=turn-c}:run_turn: Turn error: You''ve hit your usage limit. Upgrade to Plus to continue using Codex.'),
   (14, 1004, 'log', 'error.message=You''ve hit your usage limit. not authoritative'),
   (15, 1005, 'codex_core::codex', 'session_loop{thread_id=thread-d}:turn{thread.id=thread-d turn.id=turn-d}:run_turn: Turn error: Selected model is at capacity. Please try a different model.'),
-  (16, 1006, 'codex_core::codex', 'session_loop{thread_id=thread-e}:turn{thread.id=thread-e turn.id=turn-e}:run_turn: Turn error: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)');
+  (16, 1006, 'codex_core::codex', 'session_loop{thread_id=thread-e}:turn{thread.id=thread-e turn.id=turn-e}:run_turn: Turn error: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)'),
+  (17, 1007, 'codex_core::compact_remote', 'session_loop{thread_id=thread-f}:turn{thread.id=thread-f turn.id=turn-f}:run_turn: remote compaction failed turn_id=turn-f compact_error=You''ve hit your usage limit. Upgrade to Plus to continue using Codex.');
                 "#,
             )
             .unwrap();
 
         assert_eq!(
             read_latest_recoverable_turn_failure_log_id_from_connection(&connection).unwrap(),
-            Some(16)
+            Some(17)
         );
     }
 
