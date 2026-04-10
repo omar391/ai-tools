@@ -217,7 +217,7 @@ use:
       call: afn.driver.browser.exec_script
       with:
         body:
-          script: "const ready = await page.waitForFunction(() => {\n  const bodyText = document.body ? String(document.body.innerText || document.body.textContent || \"\") : \"\";\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    if (node.closest(\"script,style,noscript,template,[hidden],[aria-hidden=\\\"true\\\"]\")) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n  const emailInput = hasVisible(\"input[type='email'], input[name='email'], input[autocomplete='email'], input[autocomplete='username']\");\n  const passwordInput = hasVisible(\"input[type='password'], input[name='password'], input[name='new-password'], input[autocomplete='current-password'], input[autocomplete='new-password']\");\n  const codeInput = hasVisible(\"input[name*='code' i], input[autocomplete='one-time-code'], input[inputmode='numeric']\");\n  const actionableButton = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\")).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    if (!(rect.width > 0 && rect.height > 0)) {\n      return false;\n    }\n    const text = String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\")).replace(/\\s+/g, \" \").trim();\n    return /sign up|create account|log in|sign in|continue|verify|allow|authorize|accept|one-time code/i.test(text);\n  });\n  const meaningfulText = /welcome back|create an account|create a password|verify your email|check your inbox|about you|add your phone number|security verification|your session has ended/i.test(bodyText);\n  return emailInput || passwordInput || codeInput || actionableButton || meaningfulText;\n}, { timeout: 8000 }).then(() => true).catch(() => false);\nreturn {\n  ok: ready,\n  current_url: page.url(),\n};\n"
+          script: "const ready = await page.waitForFunction(() => {\n  const bodyText = document.body ? String(document.body.innerText || document.body.textContent || \"\") : \"\";\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    if (node.closest(\"script,style,noscript,template,[hidden],[aria-hidden=\\\"true\\\"]\")) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n  const emailInput = hasVisible(\"input[type='email'], input[name='email'], input[autocomplete='email'], input[autocomplete='username']\");\n  const passwordInput = hasVisible(\"input[type='password'], input[name='password'], input[name='new-password'], input[autocomplete='current-password'], input[autocomplete='new-password']\");\n  const codeInput = hasVisible(\"input[name*='code' i], input[name*='otp' i], input[autocomplete='one-time-code'], input[aria-label*='code' i], input[aria-label*='otp' i], input[placeholder*='code' i], input[placeholder*='otp' i], input[inputmode='numeric'][maxlength='1'], input[inputmode='numeric'][maxlength='6']\");\n  const actionableButton = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\")).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    if (!(rect.width > 0 && rect.height > 0)) {\n      return false;\n    }\n    const text = String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\")).replace(/\\s+/g, \" \").trim();\n    return /sign up|create account|log in|sign in|continue|verify|allow|authorize|accept|one-time code/i.test(text);\n  });\n  const meaningfulText = /welcome back|create an account|create a password|verify your email|check your inbox|about you|add your phone number|security verification|your session has ended/i.test(bodyText);\n  return emailInput || passwordInput || codeInput || actionableButton || meaningfulText;\n}, { timeout: 8000 }).then(() => true).catch(() => false);\nreturn {\n  ok: ready,\n  current_url: page.url(),\n};\n"
     replay_captured_auth_url:
       metadata:
         description: "Replay the captured Codex auth URL and tolerate redirect-driven navigation aborts when the browser lands on a real auth or callback page."
@@ -327,7 +327,7 @@ use:
               const host = location.hostname;
               const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
               const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
-              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
               const antiBotGate = /just a moment/i.test(title)
                 || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
                 || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
@@ -553,7 +553,7 @@ use:
               const host = location.hostname;
               const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
               const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
-              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
               const antiBotGate = /just a moment/i.test(title)
                 || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
                 || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
@@ -761,10 +761,27 @@ use:
       with:
         body:
           script: |
-            const fullName = String(args.full_name || "Dev Astronlab").trim();
-            const month = String(args.birth_month || "1").trim();
-            const day = String(args.birth_day || "24").trim();
-            const year = String(args.birth_year || "1990").trim();
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const digitsOnly = (value) => String(value || "").replace(/\D+/g, "");
+            const fullName = normalize(args.full_name || "Dev Astronlab");
+            const month = normalize(args.birth_month || "1");
+            const day = normalize(args.birth_day || "24");
+            const year = normalize(args.birth_year || "1990");
+            const birthdayValue = month.padStart(2, "0") + "/" + day.padStart(2, "0") + "/" + year;
+            const birthdayDigits = digitsOnly(birthdayValue);
+            const monthNumber = Math.max(1, Math.min(12, Number.parseInt(month, 10) || 1));
+            const dayNumber = Math.max(1, Math.min(31, Number.parseInt(day, 10) || 1));
+            const yearNumber = Math.max(1900, Number.parseInt(year, 10) || 1990);
+            const today = new Date();
+            let ageYears = today.getFullYear() - yearNumber;
+            const birthdayPassedThisYear = (today.getMonth() + 1) > monthNumber
+              || ((today.getMonth() + 1) === monthNumber && today.getDate() >= dayNumber);
+            if (!birthdayPassedThisYear) {
+              ageYears -= 1;
+            }
+            ageYears = Math.max(18, ageYears);
+            const ageValue = String(ageYears);
+            const ageDigits = digitsOnly(ageValue);
             const monthNames = {
               "1": ["1", "01", "jan", "january"],
               "2": ["2", "02", "feb", "february"],
@@ -779,7 +796,6 @@ use:
               "11": ["11", "nov", "november"],
               "12": ["12", "dec", "december"],
             };
-            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
             const monthTokens = (monthNames[month] || [month]).map((value) => normalize(value).toLowerCase());
             const dayTokens = [day, day.padStart(2, "0")].map((value) => normalize(value));
             const findVisible = async (selectors) => {
@@ -798,6 +814,58 @@ use:
             const readInputValue = async (locator) => {
               return await locator.inputValue().catch(() => null);
             };
+            const valuesMatch = (actualValue, expectedValue) => {
+              return normalize(actualValue) === normalize(expectedValue)
+                || digitsOnly(actualValue) === digitsOnly(expectedValue);
+            };
+            const setInputValue = async (locator, value) => {
+              await locator.evaluate((node, nextValue) => {
+                if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) {
+                  return;
+                }
+                const proto = node instanceof HTMLTextAreaElement
+                  ? window.HTMLTextAreaElement.prototype
+                  : window.HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+                if (descriptor && typeof descriptor.set === "function") {
+                  descriptor.set.call(node, nextValue);
+                } else {
+                  node.value = nextValue;
+                }
+                node.dispatchEvent(new InputEvent("input", {
+                  bubbles: true,
+                  data: String(nextValue || ""),
+                  inputType: "insertText",
+                }));
+                node.dispatchEvent(new Event("change", { bubbles: true }));
+                node.blur();
+              }, value).catch(() => {});
+            };
+            const describeInput = async (locator) => {
+              return await locator.evaluate((node) => {
+                if (!(node instanceof HTMLInputElement)) {
+                  return null;
+                }
+                const labeledByText = String(node.getAttribute("aria-labelledby") || "")
+                  .split(/\s+/)
+                  .filter(Boolean)
+                  .map((id) => document.getElementById(id)?.textContent || "")
+                  .join(" ");
+                const labelText = node.id
+                  ? document.querySelector('label[for="' + CSS.escape(node.id) + '"]')?.textContent || ""
+                  : "";
+                return {
+                  name: String(node.getAttribute("name") || ""),
+                  placeholder: String(node.getAttribute("placeholder") || ""),
+                  ariaLabel: String(node.getAttribute("aria-label") || ""),
+                  labeledBy: String(labeledByText || ""),
+                  label: String(labelText || ""),
+                  type: String(node.getAttribute("type") || ""),
+                  inputMode: String(node.getAttribute("inputmode") || ""),
+                  value: String(node.value || ""),
+                };
+              }).catch(() => null);
+            };
             const readSelectValue = async (locator) => {
               return await locator.evaluate((node) => {
                 if (!(node instanceof HTMLSelectElement)) {
@@ -810,7 +878,129 @@ use:
                 };
               }).catch(() => null);
             };
+            const fillTextInput = async (locator, value) => {
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await locator.fill("").catch(() => {});
+              await locator.fill(value).catch(async () => {
+                await locator.press("Meta+A").catch(() => {});
+                await locator.press("Control+A").catch(() => {});
+                await locator.press("Backspace").catch(() => {});
+                await locator.type(value, { delay: 20 }).catch(() => {});
+              });
+              await locator.evaluate((node) => {
+                if (!(node instanceof HTMLInputElement)) {
+                  return;
+                }
+                node.dispatchEvent(new Event("input", { bubbles: true }));
+                node.dispatchEvent(new Event("change", { bubbles: true }));
+                node.blur();
+              }).catch(() => {});
+              let currentValue = await readInputValue(locator);
+              if (valuesMatch(currentValue, value)) {
+                return;
+              }
+              await setInputValue(locator, value);
+              currentValue = await readInputValue(locator);
+              if (valuesMatch(currentValue, value)) {
+                return;
+              }
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await page.keyboard.press("Meta+A").catch(() => {});
+              await page.keyboard.press("Control+A").catch(() => {});
+              await page.keyboard.press("Backspace").catch(() => {});
+              await page.keyboard.type(value, { delay: 20 }).catch(() => {});
+              await locator.evaluate((node) => {
+                if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+                  node.blur();
+                }
+              }).catch(() => {});
+            };
+            const fillBirthdayInput = async (locator) => {
+              const birthdayDigitsValue = month.padStart(2, "0") + day.padStart(2, "0") + year;
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await page.keyboard.press("Meta+A").catch(() => {});
+              await page.keyboard.press("Control+A").catch(() => {});
+              await page.keyboard.press("Backspace").catch(() => {});
+              await page.keyboard.type(birthdayDigitsValue, { delay: 20 }).catch(() => {});
+              await locator.evaluate((node) => {
+                if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+                  node.blur();
+                }
+              }).catch(() => {});
+              let currentValue = await readInputValue(locator);
+              if (digitsOnly(currentValue) === birthdayDigits) {
+                return;
+              }
+              await setInputValue(locator, birthdayValue);
+              currentValue = await readInputValue(locator);
+              if (digitsOnly(currentValue) === birthdayDigits) {
+                return;
+              }
+              await setInputValue(locator, birthdayDigitsValue);
+            };
+            const fillAgeInput = async (locator) => {
+              await fillTextInput(locator, ageValue);
+              let currentValue = await readInputValue(locator);
+              if (digitsOnly(currentValue) === ageDigits) {
+                return;
+              }
+              await setInputValue(locator, ageValue);
+              currentValue = await readInputValue(locator);
+              if (digitsOnly(currentValue) === ageDigits) {
+                return;
+              }
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await page.keyboard.press("Meta+A").catch(() => {});
+              await page.keyboard.press("Control+A").catch(() => {});
+              await page.keyboard.press("Backspace").catch(() => {});
+              await page.keyboard.type(ageValue, { delay: 20 }).catch(() => {});
+              await locator.evaluate((node) => {
+                if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+                  node.blur();
+                }
+              }).catch(() => {});
+            };
+            const typeIntoFocusedField = async (value) => {
+              await page.keyboard.press("Meta+A").catch(() => {});
+              await page.keyboard.press("Control+A").catch(() => {});
+              await page.keyboard.press("Backspace").catch(() => {});
+              await page.keyboard.type(value, { delay: 20 }).catch(() => {});
+            };
+            const clickLabelField = async (patterns) => {
+              for (const pattern of patterns) {
+                const candidates = [
+                  page.getByText(pattern, { exact: true }).first(),
+                  page.locator("label, div, span, p").filter({ hasText: pattern }).first(),
+                ];
+                for (const candidate of candidates) {
+                  if (!(await candidate.count().catch(() => 0))) {
+                    continue;
+                  }
+                  if (!(await candidate.isVisible().catch(() => false))) {
+                    continue;
+                  }
+                  await candidate.scrollIntoViewIfNeeded().catch(() => {});
+                  if (await candidate.click({ timeout: 1000 }).then(() => true).catch(() => false)) {
+                    return true;
+                  }
+                  const box = await candidate.boundingBox().catch(() => null);
+                  if (box) {
+                    const clickX = Math.max(box.x + Math.min(box.width * 0.5, 80), box.x + 8);
+                    const clickY = box.y + box.height + 20;
+                    await page.mouse.click(clickX, clickY).catch(() => {});
+                    return true;
+                  }
+                }
+              }
+              return false;
+            };
             const visibleSelects = [];
+            const pageBodyText = normalize(await page.locator("body").innerText().catch(() => "")).toLowerCase();
+            const prefersAgeField = /\bhow old are you\b/.test(pageBodyText)
+              || (/\bage\b/.test(pageBodyText)
+                && !/\bbirthday\b|\bdate of birth\b|\bbirth date\b/.test(pageBodyText));
             const selectCount = await page.locator("select").count().catch(() => 0);
             for (let index = 0; index < selectCount; index += 1) {
               const locator = page.locator("select").nth(index);
@@ -818,11 +1008,12 @@ use:
                 visibleSelects.push(locator);
               }
             }
-            const nameField = await findVisible([
+            let nameField = await findVisible([
               'input[name="name"]',
               'input[name*="name" i]',
               'input[autocomplete="name"]',
               'input[placeholder*="name" i]',
+              'input[aria-label*="name" i]',
             ]);
             const monthField = await findVisible([
               'select[name*="month" i]',
@@ -836,12 +1027,6 @@ use:
               'select[name*="year" i]',
               'select[aria-label*="year" i]',
             ]) || visibleSelects[2] || null;
-            if (!nameField || !monthField || !dayField || !yearField) {
-              throw new Error("about-you-fields-not-found");
-            }
-            await nameField.scrollIntoViewIfNeeded().catch(() => {});
-            await nameField.click().catch(() => {});
-            await nameField.fill(fullName).catch(() => {});
             const selectValue = async (locator, targetValue, acceptedTokens = []) => {
               const options = await locator.evaluate((node) => {
                 if (!(node instanceof HTMLSelectElement)) {
@@ -869,40 +1054,296 @@ use:
                 await locator.selectOption({ label: chosen.label }).catch(() => {});
               });
             };
-            await selectValue(monthField, month, monthTokens);
-            await selectValue(dayField, day, dayTokens);
-            await selectValue(yearField, year, [year]);
-            await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
-            await page.waitForTimeout(250).catch(() => {});
-            const nameActual = normalize(await readInputValue(nameField));
-            const monthActual = await readSelectValue(monthField);
-            const dayActual = await readSelectValue(dayField);
-            const yearActual = await readSelectValue(yearField);
             const submit = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]')
               .filter({ hasText: /continue|next|finish creating account|submit|verify/i })
               .first();
-            const submitFound = (await submit.count().catch(() => 0)) > 0;
-            const submitDisabled = submitFound ? await submit.isDisabled().catch(() => null) : null;
-            const submitText = submitFound
-              ? await submit.evaluate((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).catch(() => null)
-              : null;
-            const monthMatches = monthTokens.includes(normalize(monthActual?.label || monthActual?.value || "").toLowerCase());
-            const dayMatches = dayTokens.includes(normalize(dayActual?.label || dayActual?.value || ""));
-            const yearMatches = normalize(yearActual?.label || yearActual?.value || "") === normalize(year);
+            const readSubmitState = async () => {
+              const submitFound = (await submit.count().catch(() => 0)) > 0;
+              const submitDisabled = submitFound ? await submit.isDisabled().catch(() => null) : null;
+              const submitText = submitFound
+                ? await submit.evaluate((node) => String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")).replace(/\s+/g, " ").trim()).catch(() => null)
+                : null;
+              return {
+                found: submitFound,
+                disabled: submitDisabled,
+                text: normalize(submitText || "") || null,
+              };
+            };
+            const readVisibleBirthdayValue = async () => {
+              const bodyText = normalize(await page.locator("body").innerText().catch(() => ""));
+              const match = bodyText.match(/(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{4})/);
+              if (!match) {
+                return null;
+              }
+              return match[1].padStart(2, "0") + "/" + match[2].padStart(2, "0") + "/" + match[3];
+            };
+            const tryFocusedAboutYouFallback = async () => {
+              let typedSomething = false;
+              const nameValueLocator = nameField || visibleInputs[0]?.locator || null;
+              const aboutYouValueLocator = birthdayField || ageField || null;
+              const aboutYouFieldKind = ageField ? "age" : (birthdayField ? "birthday" : null);
+              if (nameValueLocator) {
+                await fillTextInput(nameValueLocator, fullName);
+                typedSomething = true;
+              } else {
+                const focusedName = await clickLabelField([/full name/i, /^name$/i]);
+                if (focusedName) {
+                  await typeIntoFocusedField(fullName);
+                  typedSomething = true;
+                }
+              }
+              const visibleBirthdayBefore = aboutYouFieldKind === "birthday"
+                ? await readVisibleBirthdayValue()
+                : null;
+              if (!aboutYouValueLocator && typedSomething && visibleBirthdayBefore) {
+                await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
+                await page.waitForTimeout(250).catch(() => {});
+                const submitState = await readSubmitState();
+                const nameActual = nameValueLocator
+                  ? normalize(await readInputValue(nameValueLocator))
+                  : null;
+                return {
+                  ok: true,
+                  name_value: nameActual || null,
+                  month_value: null,
+                  day_value: null,
+                  year_value: null,
+                  birthday_value: visibleBirthdayBefore,
+                  age_value: null,
+                  submit_disabled: submitState.disabled,
+                  submit_text: submitState.text,
+                  current_url: page.url(),
+                };
+              }
+              if (!aboutYouValueLocator && typedSomething) {
+                await page.keyboard.press("Tab").catch(() => {});
+                await page.waitForTimeout(100).catch(() => {});
+              }
+              if (birthdayField) {
+                await fillBirthdayInput(birthdayField);
+                typedSomething = true;
+              } else if (ageField) {
+                await fillAgeInput(ageField);
+                typedSomething = true;
+              } else {
+                const focusedValueField = prefersAgeField
+                  ? await clickLabelField([/^age$/i, /how old are you/i, /your age/i])
+                  : await clickLabelField([/birthday/i, /date of birth/i, /birth date/i]);
+                if (focusedValueField) {
+                  await typeIntoFocusedField(prefersAgeField ? ageValue : birthdayValue);
+                  typedSomething = true;
+                }
+              }
+              await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
+              await page.waitForTimeout(250).catch(() => {});
+              const submitState = await readSubmitState();
+              const visibleBirthdayAfter = await readVisibleBirthdayValue();
+              const nameActual = nameValueLocator
+                ? normalize(await readInputValue(nameValueLocator))
+                : null;
+              const ageActual = ageField
+                ? normalize(await readInputValue(ageField))
+                : null;
+              if (typedSomething && (submitState.disabled === false || (nameActual === fullName && (visibleBirthdayAfter || visibleBirthdayBefore || digitsOnly(ageActual) === ageDigits)))) {
+                return {
+                  ok: true,
+                  name_value: nameActual || null,
+                  month_value: null,
+                  day_value: null,
+                  year_value: null,
+                  birthday_value: visibleBirthdayAfter || visibleBirthdayBefore,
+                  age_value: ageActual || null,
+                  submit_disabled: submitState.disabled,
+                  submit_text: submitState.text,
+                  current_url: page.url(),
+                };
+              }
+              return null;
+            };
+            if (nameField && monthField && dayField && yearField) {
+              await fillTextInput(nameField, fullName);
+              await selectValue(monthField, month, monthTokens);
+              await selectValue(dayField, day, dayTokens);
+              await selectValue(yearField, year, [year]);
+              await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
+              await page.waitForTimeout(250).catch(() => {});
+              const nameActual = normalize(await readInputValue(nameField));
+              const monthActual = await readSelectValue(monthField);
+              const dayActual = await readSelectValue(dayField);
+              const yearActual = await readSelectValue(yearField);
+              const submitState = await readSubmitState();
+              const monthMatches = monthTokens.includes(normalize(monthActual?.label || monthActual?.value || "").toLowerCase());
+              const dayMatches = dayTokens.includes(normalize(dayActual?.label || dayActual?.value || ""));
+              const yearMatches = normalize(yearActual?.label || yearActual?.value || "") === normalize(year);
+              const result = {
+                ok: nameActual === fullName && monthMatches && dayMatches && yearMatches && submitState.disabled === false,
+                name_value: nameActual || null,
+                month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
+                day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
+                year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
+                birthday_value: null,
+                submit_disabled: submitState.disabled,
+                submit_text: submitState.text,
+                error: null,
+              };
+              if (!result.ok) {
+                result.error = "about-you-form-not-ready";
+                throw new Error("about-you-fill-failed:" + JSON.stringify(result));
+              }
+              return {
+                ...result,
+                current_url: page.url(),
+              };
+            }
+            const inputCount = await page.locator("input").count().catch(() => 0);
+            const visibleInputs = [];
+            let fallbackNameField = null;
+            let birthdayField = null;
+            let ageField = null;
+            let fallbackBirthdayField = null;
+            for (let index = 0; index < inputCount; index += 1) {
+              const locator = page.locator("input").nth(index);
+              if (!(await locator.isVisible().catch(() => false))) {
+                continue;
+              }
+              const details = await describeInput(locator);
+              if (!details) {
+                continue;
+              }
+              visibleInputs.push({
+                locator,
+                details,
+              });
+              const hints = normalize(
+                String(details.name || "")
+                  + " "
+                  + String(details.placeholder || "")
+                  + " "
+                  + String(details.ariaLabel || "")
+                  + " "
+                  + String(details.labeledBy || "")
+                  + " "
+                  + String(details.label || "")
+              ).toLowerCase();
+              const currentValue = normalize(details.value || "");
+              const likelyName = hints.includes("full name")
+                || hints === "name"
+                || hints.startsWith("name ")
+                || hints.endsWith(" name")
+                || hints.includes(" name ");
+              const likelyAge = hints === "age"
+                || hints.startsWith("age ")
+                || hints.endsWith(" age")
+                || hints.includes(" age ")
+                || hints.includes("how old are you");
+              const likelyBirthday = hints.includes("birthday")
+                || hints.includes("birth date")
+                || hints.includes("date of birth")
+                || normalize(details.placeholder || "").includes("/")
+                || /^\d{2}\/\d{2}\/\d{4}$/.test(currentValue);
+              if (likelyName && !fallbackNameField) {
+                fallbackNameField = locator;
+              }
+              if (likelyAge && !ageField) {
+                ageField = locator;
+              }
+              if (!hints.includes("name") && !likelyAge && !fallbackBirthdayField) {
+                fallbackBirthdayField = locator;
+              }
+              if (likelyBirthday) {
+                birthdayField = locator;
+                break;
+              }
+            }
+            if (!birthdayField) {
+              birthdayField = fallbackBirthdayField;
+            }
+            if (!nameField) {
+              nameField = fallbackNameField;
+            }
+            if (!birthdayField) {
+              for (const entry of visibleInputs) {
+                const currentValue = normalize(entry.details.value || "");
+                if (/^\d{2}\/\d{2}\/\d{4}$/.test(currentValue)) {
+                  birthdayField = entry.locator;
+                  break;
+                }
+              }
+            }
+            if (!nameField) {
+              for (const entry of visibleInputs) {
+                if (birthdayField && entry.locator === birthdayField) {
+                  continue;
+                }
+                const currentValue = normalize(entry.details.value || "");
+                if (!/^\d{2}\/\d{2}\/\d{4}$/.test(currentValue)) {
+                  nameField = entry.locator;
+                  break;
+                }
+              }
+            }
+            if ((!nameField || (!birthdayField && !ageField)) && visibleInputs.length >= 2) {
+              nameField = nameField || visibleInputs[0]?.locator || null;
+              if (!birthdayField && !ageField) {
+                if (prefersAgeField) {
+                  ageField = visibleInputs[1]?.locator || null;
+                } else {
+                  birthdayField = visibleInputs[1]?.locator || null;
+                }
+              }
+            }
+            if (visibleInputs.length === 1) {
+              nameField = nameField || visibleInputs[0]?.locator || null;
+              birthdayField = null;
+              ageField = null;
+            }
+            if (nameField && birthdayField && nameField === birthdayField) {
+              birthdayField = null;
+            }
+            if (nameField && ageField && nameField === ageField) {
+              ageField = null;
+            }
+            if (!nameField || (!birthdayField && !ageField)) {
+              const focusedFallback = await tryFocusedAboutYouFallback();
+              if (focusedFallback) {
+                return focusedFallback;
+              }
+            }
+            if (!nameField || (!birthdayField && !ageField)) {
+              throw new Error("about-you-fields-not-found");
+            }
+            await fillTextInput(nameField, fullName);
+            if (birthdayField) {
+              await fillBirthdayInput(birthdayField);
+            } else if (ageField) {
+              await fillAgeInput(ageField);
+            }
+            await page.locator("body").click({ position: { x: 8, y: 8 } }).catch(() => {});
+            await page.waitForTimeout(250).catch(() => {});
+            const nameActual = normalize(await readInputValue(nameField));
+            const birthdayActual = birthdayField ? normalize(await readInputValue(birthdayField)) : null;
+            const ageActual = ageField ? normalize(await readInputValue(ageField)) : null;
+            const submitState = await readSubmitState();
             const result = {
-              ok: nameActual === normalize(fullName) && monthMatches && dayMatches && yearMatches && submitDisabled === false,
+              ok: submitState.disabled === false || (
+                nameActual === fullName
+                  && (
+                    (birthdayField && digitsOnly(birthdayActual) === birthdayDigits)
+                    || (ageField && digitsOnly(ageActual) === ageDigits)
+                  )
+              ),
               name_value: nameActual || null,
-              month_value: normalize(monthActual?.label || monthActual?.value || "") || null,
-              day_value: normalize(dayActual?.label || dayActual?.value || "") || null,
-              year_value: normalize(yearActual?.label || yearActual?.value || "") || null,
-              submit_disabled: submitDisabled,
-              submit_text: normalize(submitText || "") || null,
+              month_value: null,
+              day_value: null,
+              year_value: null,
+              birthday_value: birthdayActual || null,
+              age_value: ageActual || null,
+              submit_disabled: submitState.disabled,
+              submit_text: submitState.text,
               error: null,
             };
             if (!result.ok) {
               result.error = "about-you-form-not-ready";
-            }
-            if (!result.ok) {
               throw new Error("about-you-fill-failed:" + JSON.stringify(result));
             }
             return {
@@ -937,7 +1378,7 @@ use:
               const host = location.hostname;
               const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
               const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
-              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
               const antiBotGate = /just a moment/i.test(title)
                 || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
                 || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
@@ -1261,8 +1702,9 @@ use:
               const title = normalize(document.title || "");
               const path = location.pathname;
               const host = location.hostname;
+              const authPath = /^\/(?:auth|api\/auth)\b/.test(path);
               const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
-              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
               const antiBotGate = /just a moment/i.test(title)
                 || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
                 || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
@@ -1291,6 +1733,8 @@ use:
                 const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
                 return /continue to codex|continue to openai|authorize|allow|accept/i.test(text);
               });
+              const appShell = /\bNew chat\b|\bProjects\b|\bLog out\b|\bUpgrade plan\b|\bExplore GPTs\b/i.test(bodyText);
+              const accountReady = ((/chatgpt\.com|chat\.openai\.com/i.test(host) && !authPath && !antiBotGate) || appShell);
               let stage = "unknown";
               if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
                 stage = "callback_complete";
@@ -1306,6 +1750,8 @@ use:
                 stage = "add_phone";
               } else if (oauthContinueVisible) {
                 stage = "oauth_consent";
+              } else if (accountReady) {
+                stage = "account_ready";
               } else if (aboutYou) {
                 stage = "about_you";
               } else if (needsEmailVerification) {
@@ -1323,6 +1769,18 @@ use:
                 headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
               };
             });
+
+            const initialState = await detectStage();
+            if (initialState.stage !== "about_you") {
+              return {
+                ok: true,
+                strategy: "already-advanced",
+                next_stage: initialState.stage,
+                current_url: initialState.current_url,
+                headline: initialState.headline,
+                transitions: [initialState],
+              };
+            }
 
             const fieldSelectors = [
               'input[name="name"]',
@@ -1359,6 +1817,7 @@ use:
               "rate_limit",
               "session_ended",
               "callback_complete",
+              "account_ready",
             ]);
 
             const clickVisibleContinue = async () => {
@@ -2014,11 +2473,11 @@ do:
         templateRef: classify_openai_surface
         description: "Refresh the signup state after password-step security handling."
   - collect_signup_verification_artifact:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: "Collect the signup OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:a9544a3c9d3dc1bed813a75d323d7bb6429c6aecabb0b92bb8fddca4038c6dd3
+          digest: sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2028,7 +2487,7 @@ do:
           message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
           link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
   - return_to_signup_verification_page:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: "Return from Gmail to the active OpenAI signup verification page before submitting the OTP."
         mode: headless_ok
@@ -2038,22 +2497,22 @@ do:
         body:
           url: "${state.steps.classify_after_signup_password_gate?.action?.current_url || state.steps.classify_after_signup_password?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - classify_signup_verification_ready:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: "Confirm the OpenAI signup verification page is active again after returning from Gmail."
   - clear_signup_verification_return_gate:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true && state.steps.classify_signup_verification_ready?.action?.anti_bot_gate === true}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification' && state.steps.classify_signup_verification_ready?.action?.anti_bot_gate === true}"
       metadata:
         templateRef: clear_openai_security_gate
         description: "Clear any security gate encountered when returning to the signup verification page."
   - classify_signup_verification_ready_gate:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the signup verification state after returning from Gmail."
   - submit_signup_verification_code:
-      if: "${state.steps.classify_after_signup_password_gate?.action?.needs_email_verification === true && state.steps.classify_signup_verification_ready_gate?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_signup_password_gate?.action?.stage === 'email_verification' && state.steps.classify_signup_verification_ready_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: "Fill and submit the signup OTP from Gmail."
         mode: headless_ok
@@ -2061,7 +2520,7 @@ do:
       call: afn.driver.browser.exec_script
       with:
         body:
-          script: "const code = String(\n  state.steps.collect_signup_verification_artifact?.action?.result?.output?.code\n  || state.steps.collect_signup_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code\n  || \"\"\n).replace(/\\D+/g, \"\").slice(0, 6);\nif (code.length < 6) {\n  throw new Error(\"signup-verification-code-missing\");\n}\nconst verificationSelector = 'input[name*=\"code\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[placeholder*=\"code\" i], input[inputmode=\"numeric\"]';\nconst detectStage = async () => await page.evaluate(() => {\n  const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n  const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || \"\") : \"\");\n  const title = normalize(document.title || \"\");\n  const path = location.pathname;\n  const host = location.hostname;\n  const emailInput = hasVisible(\"input[type=\\\"email\\\"], input[name=\\\"email\\\"], input[autocomplete=\\\"email\\\"], input[autocomplete=\\\"username\\\"]\");\n  const passwordInput = hasVisible(\"input[type=\\\"password\\\"], input[name=\\\"password\\\"], input[name=\\\"new-password\\\"], input[autocomplete=\\\"current-password\\\"], input[autocomplete=\\\"new-password\\\"]\");\n  const verificationInput = hasVisible(\"input[name*=\\\"code\\\" i], input[autocomplete=\\\"one-time-code\\\"], input[inputmode=\\\"numeric\\\"]\");\n  const antiBotGate = /just a moment/i.test(title)\n    || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)\n    || hasVisible(\"input[name=\\\"cf-turnstile-response\\\"], iframe[src*=\\\"challenge\\\"], iframe[title*=\\\"Widget containing\\\"]\");\n  const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);\n  const sessionEnded = /your session has ended/i.test(bodyText);\n  const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);\n  const addPhonePrompt = /add-phone/i.test(path)\n    || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);\n  const followUpStep = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)\n    || /about-you/i.test(path);\n  const needsEmailVerification = verificationInput\n    || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)\n    || /email-verification/i.test(path);\n  const existingAccountPrompt = /an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText);\n  const oauthContinueVisible = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\")).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    if (!(rect.width > 0 && rect.height > 0)) {\n      return false;\n    }\n    const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\"));\n    return /continue to codex|continue to openai|authorize|allow|accept/i.test(text);\n  });\n  let stage = \"unknown\";\n  if (/^(localhost|127\\.0\\.0\\.1)$/i.test(host)) {\n    stage = \"callback_complete\";\n  } else if (antiBotGate) {\n    stage = \"security_verification\";\n  } else if (rateLimitExceeded) {\n    stage = \"rate_limit\";\n  } else if (sessionEnded) {\n    stage = \"session_ended\";\n  } else if (retryableTimeout) {\n    stage = \"retryable_timeout\";\n  } else if (addPhonePrompt) {\n    stage = \"add_phone\";\n  } else if (followUpStep) {\n    stage = \"about_you\";\n  } else if (needsEmailVerification) {\n    stage = \"email_verification\";\n  } else if (existingAccountPrompt) {\n    stage = \"existing_account_prompt\";\n  } else if (oauthContinueVisible) {\n    stage = \"oauth_consent\";\n  } else if (/\\/create-account(?:\\/|$)/i.test(path) && passwordInput) {\n    stage = \"signup_password\";\n  } else if (/\\/create-account(?:\\/|$)/i.test(path) && emailInput) {\n    stage = \"signup_email\";\n  } else if (emailInput || passwordInput || verificationInput) {\n    stage = \"auth_prompt\";\n  }\n  return {\n    stage,\n    current_url: location.href,\n    headline: bodyText.split(\"\\n\").map((value) => value.trim()).filter(Boolean)[0] || title || null,\n  };\n});\nconst input = page.locator(verificationSelector).first();\nawait input.waitFor({ state: \"visible\", timeout: 8000 }).catch(() => {});\nif ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {\n  const before = await detectStage();\n  throw new Error(\"signup-verification-input-not-ready:\" + String(before.stage || \"unknown\") + \":\" + String(before.current_url || page.url()));\n}\nawait input.click().catch(() => {});\nawait input.press(\"Meta+A\").catch(() => {});\nawait input.press(\"Control+A\").catch(() => {});\nawait input.press(\"Backspace\").catch(() => {});\nawait input.pressSequentially(code, { delay: 45 }).catch(() => {});\nawait page.waitForTimeout(150).catch(() => {});\nconst value = String(await input.inputValue().catch(() => \"\")).replace(/\\D+/g, \"\").slice(0, 6);\nif (value.length < 6 || value !== code) {\n  throw new Error(\"signup-verification-input-mismatch:\" + (value || \"empty\"));\n}\nconst allowedStages = new Set([\n  \"about_you\",\n  \"add_phone\",\n  \"existing_account_prompt\",\n  \"oauth_consent\",\n  \"security_verification\",\n  \"retryable_timeout\",\n  \"rate_limit\",\n  \"session_ended\",\n  \"callback_complete\",\n]);\nconst clickVisibleContinue = async () => {\n  const result = await input.evaluate((field) => {\n    const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n    const isVisible = (node) => {\n      if (!(node instanceof Element)) {\n        return false;\n      }\n      const style = window.getComputedStyle(node);\n      if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n        return false;\n      }\n      const rect = node.getBoundingClientRect();\n      return rect.width > 0 && rect.height > 0;\n    };\n    const readLabel = (node) => {\n      if (!(node instanceof Element)) {\n        return \"\";\n      }\n      if (node instanceof HTMLInputElement) {\n        return normalize(node.value || node.getAttribute(\"aria-label\") || \"\");\n      }\n      return normalize(node.innerText || node.textContent || node.getAttribute(\"aria-label\") || \"\");\n    };\n    const form = field instanceof Element ? field.closest(\"form\") : null;\n    const scope = form || document;\n    const candidates = Array.from(scope.querySelectorAll(\"button, input[type='submit'], [role='button']\"))\n      .filter((node) => isVisible(node) && node.getAttribute(\"aria-disabled\") !== \"true\" && !node.hasAttribute(\"disabled\"));\n    const preferred = candidates.find((node) => {\n      const label = readLabel(node);\n      const isSubmitNode = (node instanceof HTMLButtonElement && node.type === \"submit\")\n        || (node instanceof HTMLInputElement && node.type === \"submit\");\n      return isSubmitNode && /continue|next|verify|submit|authorize|allow|accept/i.test(label);\n    }) || candidates.find((node) => /continue|next|verify|submit|authorize|allow|accept/i.test(readLabel(node)));\n    if (preferred instanceof HTMLElement) {\n      preferred.click();\n      return {\n        ok: true,\n        strategy: \"form-dom-click\",\n        label: readLabel(preferred) || null,\n      };\n    }\n    if (form instanceof HTMLFormElement) {\n      form.requestSubmit();\n      return {\n        ok: true,\n        strategy: \"form-request-submit\",\n        label: null,\n      };\n    }\n    return null;\n  }).catch(() => null);\n  return result;\n};\nconst attempts = [\n  async () => clickVisibleContinue(),\n  async () => {\n    await input.press(\"Enter\").catch(() => {});\n    return { strategy: \"press-enter\", label: null };\n  },\n  async () => {\n    await input.evaluate((field) => {\n      if (field instanceof HTMLElement) {\n        field.blur();\n      }\n      const form = field instanceof Element ? field.closest(\"form\") : null;\n      if (form instanceof HTMLFormElement) {\n        form.requestSubmit();\n      }\n    }).catch(() => {});\n    return { strategy: \"request-submit\", label: null };\n  },\n];\nconst transitions = [];\nfor (const attempt of attempts) {\n  const performed = await attempt();\n  if (!performed) {\n    continue;\n  }\n  await page.waitForTimeout(1200).catch(() => {});\n  const after = await detectStage();\n  transitions.push({ ...performed, ...after });\n  if (allowedStages.has(after.stage) && after.stage !== \"email_verification\") {\n    return {\n      ok: true,\n      code,\n      strategy: performed.strategy,\n      clicked_text: performed.label || null,\n      next_stage: after.stage,\n      current_url: after.current_url,\n      headline: after.headline,\n      transitions,\n    };\n  }\n}\nconst finalState = await detectStage();\nthrow new Error(\"signup-verification-submit-stuck:\" + String(finalState.stage || \"unknown\") + \":\" + String(finalState.current_url || page.url()));\n"
+          script: "const readSixDigitCode = (value) => {\n  const match = String(value || \"\").match(/(?:^|\\D)(\\d{6})(?:\\D|$)/);\n  return match?.[1] || null;\n};\nconst extractVerificationCode = (action) => {\n  const outputs = [\n    action?.result?.result?.output,\n    action?.result?.output,\n    action?.output,\n  ].filter((value) => value && typeof value === \"object\");\n  for (const output of outputs) {\n    const directCode =\n      readSixDigitCode(output.code)\n      || readSixDigitCode(output.verification_code)\n      || readSixDigitCode(output.otp)\n      || readSixDigitCode(output.one_time_code);\n    if (directCode) {\n      return directCode;\n    }\n  }\n  for (const output of outputs) {\n    const derivedCode =\n      readSixDigitCode(output.message_subject)\n      || readSixDigitCode(output.message_preview)\n      || readSixDigitCode(output.verification_link_text);\n    if (derivedCode) {\n      return derivedCode;\n    }\n  }\n  return readSixDigitCode(\n    action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code\n    || action?.result?.state?.steps?.collect_verification_artifact?.action?.code\n    || \"\"\n  );\n};\nconst code = String(\n  extractVerificationCode(state.steps.collect_signup_verification_artifact?.action)\n  || \"\"\n).replace(/\\D+/g, \"\").slice(0, 6);\nif (code.length < 6) {\n  throw new Error(\"signup-verification-code-missing\");\n}\nconst verificationSelector = 'input[name*=\"code\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[placeholder*=\"code\" i], input[inputmode=\"numeric\"]';\nconst detectStage = async () => await page.evaluate(() => {\n  const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n  const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || \"\") : \"\");\n  const title = normalize(document.title || \"\");\n  const path = location.pathname;\n  const host = location.hostname;\n  const emailInput = hasVisible(\"input[type=\\\"email\\\"], input[name=\\\"email\\\"], input[autocomplete=\\\"email\\\"], input[autocomplete=\\\"username\\\"]\");\n  const passwordInput = hasVisible(\"input[type=\\\"password\\\"], input[name=\\\"password\\\"], input[name=\\\"new-password\\\"], input[autocomplete=\\\"current-password\\\"], input[autocomplete=\\\"new-password\\\"]\");\n  const verificationInput = hasVisible(\"input[name*=\\\"code\\\" i], input[autocomplete=\\\"one-time-code\\\"], input[inputmode=\\\"numeric\\\"]\");\n  const antiBotGate = /just a moment/i.test(title)\n    || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)\n    || hasVisible(\"input[name=\\\"cf-turnstile-response\\\"], iframe[src*=\\\"challenge\\\"], iframe[title*=\\\"Widget containing\\\"]\");\n  const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);\n  const sessionEnded = /your session has ended/i.test(bodyText);\n  const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);\n  const addPhonePrompt = /add-phone/i.test(path)\n    || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);\n  const followUpStep = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)\n    || /about-you/i.test(path);\n  const needsEmailVerification = verificationInput\n    || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)\n    || /email-verification/i.test(path);\n  const existingAccountPrompt = /an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText);\n  const oauthContinueVisible = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\")).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    if (!(rect.width > 0 && rect.height > 0)) {\n      return false;\n    }\n    const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\"));\n    return /continue to codex|continue to openai|authorize|allow|accept/i.test(text);\n  });\n  let stage = \"unknown\";\n  if (/^(localhost|127\\.0\\.0\\.1)$/i.test(host)) {\n    stage = \"callback_complete\";\n  } else if (antiBotGate) {\n    stage = \"security_verification\";\n  } else if (rateLimitExceeded) {\n    stage = \"rate_limit\";\n  } else if (sessionEnded) {\n    stage = \"session_ended\";\n  } else if (retryableTimeout) {\n    stage = \"retryable_timeout\";\n  } else if (addPhonePrompt) {\n    stage = \"add_phone\";\n  } else if (followUpStep) {\n    stage = \"about_you\";\n  } else if (needsEmailVerification) {\n    stage = \"email_verification\";\n  } else if (existingAccountPrompt) {\n    stage = \"existing_account_prompt\";\n  } else if (oauthContinueVisible) {\n    stage = \"oauth_consent\";\n  } else if (/\\/create-account(?:\\/|$)/i.test(path) && passwordInput) {\n    stage = \"signup_password\";\n  } else if (/\\/create-account(?:\\/|$)/i.test(path) && emailInput) {\n    stage = \"signup_email\";\n  } else if (emailInput || passwordInput || verificationInput) {\n    stage = \"auth_prompt\";\n  }\n  return {\n    stage,\n    current_url: location.href,\n    headline: bodyText.split(\"\\n\").map((value) => value.trim()).filter(Boolean)[0] || title || null,\n    incorrect_code: /incorrect code/i.test(bodyText),\n  };\n});\nconst inputLocator = page.locator(verificationSelector);\nconst inputCount = await inputLocator.count().catch(() => 0);\nconst inputs = [];\nfor (let index = 0; index < inputCount; index += 1) {\n  const candidate = inputLocator.nth(index);\n  if (await candidate.isVisible().catch(() => false)) {\n    inputs.push(candidate);\n  }\n}\nconst input = inputs[0] || inputLocator.first();\nawait input.waitFor({ state: \"visible\", timeout: 8000 }).catch(() => {});\nif ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {\n  const before = await detectStage();\n  throw new Error(\"signup-verification-input-not-ready:\" + String(before.stage || \"unknown\") + \":\" + String(before.current_url || page.url()));\n}\nconst fillField = async (locator, value) => {\n  await locator.scrollIntoViewIfNeeded().catch(() => {});\n  await locator.click({ timeout: 1500 }).catch(() => {});\n  await locator.fill(\"\").catch(() => {});\n  const filled = await locator.fill(value).then(() => true).catch(() => false);\n  if (!filled) {\n    await locator.press(\"Meta+A\").catch(() => {});\n    await locator.press(\"Control+A\").catch(() => {});\n    await locator.press(\"Backspace\").catch(() => {});\n    await locator.pressSequentially(value, { delay: 45 }).catch(() => {});\n  }\n};\nconst readCombinedValue = async () => {\n  const parts = [];\n  for (const locator of inputs.length ? inputs : [input]) {\n    parts.push(String(await locator.inputValue().catch(() => \"\")).replace(/\\D+/g, \"\"));\n  }\n  return parts.join(\"\").slice(0, code.length);\n};\nif (inputs.length > 1) {\n  for (let index = 0; index < inputs.length && index < code.length; index += 1) {\n    await fillField(inputs[index], code[index]);\n  }\n} else {\n  await fillField(input, code);\n}\nawait page.waitForTimeout(150).catch(() => {});\nlet value = await readCombinedValue();\nif (value !== code && inputs.length > 1) {\n  await input.click({ timeout: 1500 }).catch(() => {});\n  await input.press(\"Meta+A\").catch(() => {});\n  await input.press(\"Control+A\").catch(() => {});\n  await input.press(\"Backspace\").catch(() => {});\n  await input.pressSequentially(code, { delay: 45 }).catch(() => {});\n  await page.waitForTimeout(150).catch(() => {});\n  value = await readCombinedValue();\n}\nif (value.length < 6 || value !== code) {\n  throw new Error(\"signup-verification-input-mismatch:\" + (value || \"empty\"));\n}\nconst allowedStages = new Set([\n  \"about_you\",\n  \"add_phone\",\n  \"existing_account_prompt\",\n  \"oauth_consent\",\n  \"security_verification\",\n  \"retryable_timeout\",\n  \"rate_limit\",\n  \"session_ended\",\n  \"callback_complete\",\n]);\nconst clickVisibleContinue = async () => {\n  const result = await input.evaluate((field) => {\n    const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n    const isVisible = (node) => {\n      if (!(node instanceof Element)) {\n        return false;\n      }\n      const style = window.getComputedStyle(node);\n      if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n        return false;\n      }\n      const rect = node.getBoundingClientRect();\n      return rect.width > 0 && rect.height > 0;\n    };\n    const readLabel = (node) => {\n      if (!(node instanceof Element)) {\n        return \"\";\n      }\n      if (node instanceof HTMLInputElement) {\n        return normalize(node.value || node.getAttribute(\"aria-label\") || \"\");\n      }\n      return normalize(node.innerText || node.textContent || node.getAttribute(\"aria-label\") || \"\");\n    };\n    const form = field instanceof Element ? field.closest(\"form\") : null;\n    const scope = form || document;\n    const candidates = Array.from(scope.querySelectorAll(\"button, input[type='submit'], [role='button']\"))\n      .filter((node) => isVisible(node) && node.getAttribute(\"aria-disabled\") !== \"true\" && !node.hasAttribute(\"disabled\"));\n    const preferred = candidates.find((node) => {\n      const label = readLabel(node);\n      const isSubmitNode = (node instanceof HTMLButtonElement && node.type === \"submit\")\n        || (node instanceof HTMLInputElement && node.type === \"submit\");\n      return isSubmitNode && /continue|next|verify|submit|authorize|allow|accept/i.test(label);\n    }) || candidates.find((node) => /continue|next|verify|submit|authorize|allow|accept/i.test(readLabel(node)));\n    if (preferred instanceof HTMLElement) {\n      preferred.click();\n      return {\n        ok: true,\n        strategy: \"form-dom-click\",\n        label: readLabel(preferred) || null,\n      };\n    }\n    if (form instanceof HTMLFormElement) {\n      form.requestSubmit();\n      return {\n        ok: true,\n        strategy: \"form-request-submit\",\n        label: null,\n      };\n    }\n    return null;\n  }).catch(() => null);\n  return result;\n};\nconst attempts = [\n  async () => clickVisibleContinue(),\n  async () => {\n    await input.press(\"Enter\").catch(() => {});\n    return { strategy: \"press-enter\", label: null };\n  },\n  async () => {\n    await input.evaluate((field) => {\n      if (field instanceof HTMLElement) {\n        field.blur();\n      }\n      const form = field instanceof Element ? field.closest(\"form\") : null;\n      if (form instanceof HTMLFormElement) {\n        form.requestSubmit();\n      }\n    }).catch(() => {});\n    return { strategy: \"request-submit\", label: null };\n  },\n];\nconst transitions = [];\nfor (const attempt of attempts) {\n  const performed = await attempt();\n  if (!performed) {\n    continue;\n  }\n  await page.waitForTimeout(1200).catch(() => {});\n  const after = await detectStage();\n  transitions.push({ ...performed, ...after });\n  if (allowedStages.has(after.stage) && after.stage !== \"email_verification\") {\n    return {\n      ok: true,\n      code,\n      strategy: performed.strategy,\n      clicked_text: performed.label || null,\n      next_stage: after.stage,\n      current_url: after.current_url,\n      headline: after.headline,\n      transitions,\n    };\n  }\n}\nconst finalState = await detectStage();\nif (finalState.incorrect_code) {\n  throw new Error(\"signup-verification-code-rejected:\" + String(finalState.current_url || page.url()));\n}\nthrow new Error(\"signup-verification-submit-stuck:\" + String(finalState.stage || \"unknown\") + \":\" + String(finalState.current_url || page.url()));\n"
   - classify_after_signup_verification:
       if: "${state.steps.classify_after_signup_password_gate?.action?.existing_account_prompt !== true}"
       metadata:
@@ -2247,7 +2706,7 @@ do:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after any recovery-path security handling."
   - resend_login_verification_email:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         description: "Request a fresh replayed-login verification email before collecting the OTP from Gmail."
         mode: headless_ok
@@ -2289,12 +2748,24 @@ do:
             }
             await page.waitForTimeout(1800).catch(() => {});
             return result;
+  - wait_after_resend_login_verification_email:
+      if: "${state.steps.resend_login_verification_email?.action?.ok === true}"
+      metadata:
+        description: Allow the fresh replayed-login verification email to arrive before searching Gmail.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            await page.waitForTimeout(10000).catch(() => {});
+            return { ok: true, waited_ms: 10000 };
   - collect_login_verification_artifact:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         description: "Collect the replayed-login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:a9544a3c9d3dc1bed813a75d323d7bb6429c6aecabb0b92bb8fddca4038c6dd3
+          digest: sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2304,7 +2775,7 @@ do:
           message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
           link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
   - return_to_login_verification_page:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         description: "Return from Gmail to the active OpenAI login verification page before submitting the OTP."
         mode: headless_ok
@@ -2314,27 +2785,27 @@ do:
         body:
           url: "https://auth.openai.com/email-verification"
   - stabilize_login_verification_surface:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: wait_for_openai_surface_ready
         description: "Wait for the login verification page to render after returning from Gmail."
   - classify_login_verification_ready:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: "Confirm the OpenAI login verification page is active again after returning from Gmail."
   - clear_login_verification_return_gate:
-      if: "${(state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true) && state.steps.classify_login_verification_ready?.action?.anti_bot_gate === true}"
+      if: "${(state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification') && state.steps.classify_login_verification_ready?.action?.anti_bot_gate === true}"
       metadata:
         templateRef: clear_openai_security_gate
         description: "Clear any security gate encountered when returning to the login verification page."
   - classify_login_verification_ready_gate:
-      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true}"
+      if: "${state.steps.classify_after_prepare_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_prepare_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the login verification state after returning from Gmail."
   - submit_login_verification_code:
-      if: "${(state.steps.classify_after_prepare_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_prepare_login_recovery_choice?.action?.needs_email_verification === true || state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_gate?.action?.needs_email_verification === true || state.steps.classify_after_login_recovery_choice?.action?.needs_email_verification === true) && state.steps.classify_login_verification_ready_gate?.action?.stage === 'email_verification'}"
+      if: "${(state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification') && state.steps.classify_login_verification_ready_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: "Fill and submit the replayed-login OTP from Gmail."
         mode: headless_ok
@@ -2343,16 +2814,51 @@ do:
       with:
         body:
           script: |
+            const readSixDigitCode = (value) => {
+              const match = String(value || "").match(/(?:^|\D)(\d{6})(?:\D|$)/);
+              return match?.[1] || null;
+            };
+            const extractVerificationCode = (action) => {
+              const outputs = [
+                action?.result?.result?.output,
+                action?.result?.output,
+                action?.output,
+              ].filter((value) => value && typeof value === "object");
+              for (const output of outputs) {
+                const directCode =
+                  readSixDigitCode(output.code)
+                  || readSixDigitCode(output.verification_code)
+                  || readSixDigitCode(output.otp)
+                  || readSixDigitCode(output.one_time_code);
+                if (directCode) {
+                  return directCode;
+                }
+              }
+              for (const output of outputs) {
+                const derivedCode =
+                  readSixDigitCode(output.message_subject)
+                  || readSixDigitCode(output.message_preview)
+                  || readSixDigitCode(output.verification_link_text);
+                if (derivedCode) {
+                  return derivedCode;
+                }
+              }
+              return null;
+            };
             const code = String(
-              state.steps.collect_login_verification_artifact?.action?.result?.output?.code
-              || state.steps.collect_login_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code
+              extractVerificationCode(state.steps.collect_login_verification_artifact?.action)
               || ""
             ).replace(/\D+/g, "").slice(0, 6);
             if (code.length < 6) {
-              throw new Error("login-verification-code-missing");
+              return {
+                ok: false,
+                error: "login-verification-code-missing",
+                stage: "email_verification",
+                current_url: page.url(),
+              };
             }
 
-            const verificationSelector = 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]';
+            const verificationSelector = 'input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]';
 
             const detectStage = async () => await page.evaluate(() => {
               const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -2374,7 +2880,7 @@ do:
               const host = location.hostname;
               const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
               const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
-              const verificationInput = hasVisible('input[name*="code" i], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
               const antiBotGate = /just a moment/i.test(title)
                 || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
                 || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
@@ -2442,21 +2948,58 @@ do:
               };
             });
 
-            const input = page.locator(verificationSelector).first();
+            const inputLocator = page.locator(verificationSelector);
+            const inputCount = await inputLocator.count().catch(() => 0);
+            const inputs = [];
+            for (let index = 0; index < inputCount; index += 1) {
+              const candidate = inputLocator.nth(index);
+              if (await candidate.isVisible().catch(() => false)) {
+                inputs.push(candidate);
+              }
+            }
+            const input = inputs[0] || inputLocator.first();
             await input.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
             if ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {
               const before = await detectStage();
               throw new Error("login-verification-input-not-ready:" + String(before.stage || "unknown") + ":" + String(before.current_url || page.url()));
             }
-
-            await input.click().catch(() => {});
-            await input.press("Meta+A").catch(() => {});
-            await input.press("Control+A").catch(() => {});
-            await input.press("Backspace").catch(() => {});
-            await input.pressSequentially(code, { delay: 45 }).catch(() => {});
+            const fillField = async (locator, value) => {
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await locator.fill("").catch(() => {});
+              const filled = await locator.fill(value).then(() => true).catch(() => false);
+              if (!filled) {
+                await locator.press("Meta+A").catch(() => {});
+                await locator.press("Control+A").catch(() => {});
+                await locator.press("Backspace").catch(() => {});
+                await locator.pressSequentially(value, { delay: 45 }).catch(() => {});
+              }
+            };
+            const readCombinedValue = async () => {
+              const parts = [];
+              for (const locator of inputs.length ? inputs : [input]) {
+                parts.push(String(await locator.inputValue().catch(() => "")).replace(/\D+/g, ""));
+              }
+              return parts.join("").slice(0, code.length);
+            };
+            if (inputs.length > 1) {
+              for (let index = 0; index < inputs.length && index < code.length; index += 1) {
+                await fillField(inputs[index], code[index]);
+              }
+            } else {
+              await fillField(input, code);
+            }
             await page.waitForTimeout(150).catch(() => {});
-
-            const value = String(await input.inputValue().catch(() => "")).replace(/\D+/g, "").slice(0, 6);
+            let value = await readCombinedValue();
+            if (value !== code && inputs.length > 1) {
+              await input.click({ timeout: 1500 }).catch(() => {});
+              await input.press("Meta+A").catch(() => {});
+              await input.press("Control+A").catch(() => {});
+              await input.press("Backspace").catch(() => {});
+              await input.pressSequentially(code, { delay: 45 }).catch(() => {});
+              await page.waitForTimeout(150).catch(() => {});
+              value = await readCombinedValue();
+            }
             if (value.length < 6 || value !== code) {
               throw new Error("login-verification-input-mismatch:" + (value || "empty"));
             }
@@ -2546,14 +3089,29 @@ do:
               },
             ];
 
+            const waitForTransition = async (sameStage, timeoutMs = 8000) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                if (latest.incorrect_code) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
             const transitions = [];
             for (const attempt of attempts) {
               const performed = await attempt();
               if (!performed) {
                 continue;
               }
-              await page.waitForTimeout(1200).catch(() => {});
-              const after = await detectStage();
+              const after = await waitForTransition("email_verification");
               transitions.push({ ...performed, ...after });
               if (allowedStages.has(after.stage) && after.stage !== "email_verification") {
                 return {
@@ -2566,6 +3124,9 @@ do:
                   headline: after.headline,
                   transitions,
                 };
+              }
+              if (after.incorrect_code) {
+                throw new Error("login-verification-code-rejected:" + String(after.current_url || page.url()));
               }
             }
 
@@ -2780,30 +3341,33 @@ do:
               errorMessage = rateLimitExceeded
                 ? "OpenAI rate-limited the Codex login."
                 : "OpenAI timed out before completing the Codex login.";
-            } else if (needsEmailVerification || followUpStep || addPhonePrompt || authPrompt) {
+            } else if (addPhonePrompt) {
               if (prepareDeviceAuth) {
                 nextAction = "fail_terminal";
-                errorMessage = addPhonePrompt
-                  ? "OpenAI still requires phone setup before device authorization can start."
-                  : (needsEmailVerification
-                      ? "OpenAI still requires email verification before device authorization can start."
-                      : (followUpStep
-                          ? "OpenAI still requires account setup before device authorization can start."
-                          : "OpenAI remained on an auth prompt instead of reaching an authenticated session for device authorization."));
+                errorMessage = "OpenAI still requires phone setup before device authorization can start.";
+              } else {
+                nextAction = "skip_account";
+                replayReason = "add_phone";
+                errorMessage = "OpenAI still requires phone setup before the Codex callback can complete.";
+              }
+            } else if (needsEmailVerification || followUpStep || authPrompt) {
+              if (prepareDeviceAuth) {
+                nextAction = "fail_terminal";
+                errorMessage = needsEmailVerification
+                  ? "OpenAI still requires email verification before device authorization can start."
+                  : (followUpStep
+                      ? "OpenAI still requires account setup before device authorization can start."
+                      : "OpenAI remained on an auth prompt instead of reaching an authenticated session for device authorization.");
               } else {
                 nextAction = "replay_auth_url";
-                replayReason = addPhonePrompt
-                  ? "add_phone"
-                  : (needsEmailVerification
-                      ? "email_verification"
-                      : (followUpStep ? "about_you" : "auth_prompt"));
-                errorMessage = addPhonePrompt
-                  ? "OpenAI still requires phone setup before the Codex callback can complete."
-                  : (needsEmailVerification
-                      ? "OpenAI still requires email verification before the Codex callback can complete."
-                      : (followUpStep
-                          ? "OpenAI still requires account setup before the Codex callback can complete."
-                          : "OpenAI remained on an auth prompt instead of reaching the Codex callback."));
+                replayReason = needsEmailVerification
+                  ? "email_verification"
+                  : (followUpStep ? "about_you" : "auth_prompt");
+                errorMessage = needsEmailVerification
+                  ? "OpenAI still requires email verification before the Codex callback can complete."
+                  : (followUpStep
+                      ? "OpenAI still requires account setup before the Codex callback can complete."
+                      : "OpenAI remained on an auth prompt instead of reaching the Codex callback.");
               }
             } else if (existingAccountPrompt) {
               if (prepareDeviceAuth) {
@@ -2837,6 +3401,11 @@ do:
               stage,
               current_url: currentUrl,
               headline,
+              next_action: nextAction,
+              replay_reason: replayReason,
+              retry_reason: retryReason,
+              error_message: errorMessage,
+              verified_account_email: success ? (String(args.email || "").trim().toLowerCase() || null) : null,
               callback_complete: callbackComplete,
               success,
               account_ready: accountReady,
@@ -2851,10 +3420,6 @@ do:
               rate_limit_exceeded: rateLimitExceeded,
               anti_bot_gate: antiBotGate,
               auth_prompt: authPrompt,
-              next_action: nextAction,
-              replay_reason: replayReason,
-              retry_reason: retryReason,
-              error_message: errorMessage,
               codex_session: {
                 auth_url: session.auth_url || null,
                 callback_url: session.callback_url || null,

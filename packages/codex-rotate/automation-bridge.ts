@@ -51,6 +51,8 @@ type BridgeResponse =
   | { ok: true; result: unknown }
   | { ok: false; error: { message: string } };
 
+const BRIDGE_RESPONSE_PREFIX = "__CODEX_ROTATE_BRIDGE__";
+
 function readStdin(): string {
   return readFileSync(process.stdin.fd, "utf8");
 }
@@ -69,8 +71,19 @@ function readRequestRaw(): string {
   return readStdin();
 }
 
-function respond(response: BridgeResponse): never {
-  process.stdout.write(`${JSON.stringify(response)}\n`);
+async function respond(response: BridgeResponse): Promise<never> {
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(
+      `${BRIDGE_RESPONSE_PREFIX}${JSON.stringify(response)}\n`,
+      (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      },
+    );
+  });
   process.exit(response.ok ? 0 : 1);
 }
 
@@ -122,10 +135,10 @@ async function main(): Promise<void> {
     }
     const request = JSON.parse(raw) as BridgeRequest;
     const result = await handleRequest(request);
-    respond({ ok: true, result });
+    await respond({ ok: true, result });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    respond({
+    await respond({
       ok: false,
       error: { message },
     });

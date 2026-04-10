@@ -217,6 +217,9 @@ export interface FastBrowserRunResult {
   status?: string;
   state?: FastBrowserState;
   output?: Record<string, unknown> | null;
+  recent_events?: Array<Record<string, unknown>> | null;
+  page?: Record<string, unknown> | null;
+  current?: Record<string, unknown> | null;
   error?: {
     message?: string | null;
   } | null;
@@ -227,6 +230,10 @@ export interface FastBrowserRunResult {
     runPath?: string | null;
     statusPath?: string | null;
     eventsPath?: string | null;
+    run_id?: string | null;
+    run_path?: string | null;
+    status_path?: string | null;
+    events_path?: string | null;
   } | null;
 }
 
@@ -238,7 +245,9 @@ interface FastBrowserDaemonRunResponse {
   };
 }
 
-const FAST_BROWSER_STARTUP_SILENCE_TIMEOUT_MS = 15_000;
+const FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS = Number(
+  process.env.CODEX_ROTATE_FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS || 60_000,
+);
 const FAST_BROWSER_EVENT_PREFIX = "__FAST_BROWSER_EVENT__";
 
 export interface CodexRotateAuthFlowSession {
@@ -864,24 +873,247 @@ function parseFastBrowserJson<T>(
     throw new Error(`${actionLabel} did not return JSON output.`);
   }
 
-  return parseJson<T>(stdout, `${actionLabel} returned invalid JSON.`);
+  return parseJsonFromMixedStdout<T>(
+    stdout,
+    `${actionLabel} returned invalid JSON.`,
+  );
+}
+
+function parseJsonFromMixedStdout<T>(
+  stdout: string,
+  fallbackMessage: string,
+): T {
+  try {
+    return JSON.parse(stdout) as T;
+  } catch {}
+
+  const lines = stdout
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      return JSON.parse(lines[index]) as T;
+    } catch {}
+  }
+
+  for (const marker of ['{"ok":', '{"result":', '{"status":', '{"error":']) {
+    const candidate = extractTrailingJsonObject(stdout, marker);
+    if (!candidate) {
+      continue;
+    }
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {}
+  }
+
+  throw new Error(fallbackMessage);
+}
+
+function extractTrailingJsonObject(
+  stdout: string,
+  marker: string,
+): string | null {
+  const start = stdout.lastIndexOf(marker);
+  if (start === -1) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < stdout.length; index += 1) {
+    const char = stdout[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char !== "}") {
+      continue;
+    }
+    depth -= 1;
+    if (depth === 0) {
+      return stdout.slice(start, index + 1);
+    }
+  }
+  return null;
+}
+
+export function hydrateFastBrowserRunResultFromObservability(
+  result: FastBrowserRunResult,
+): FastBrowserRunResult {
+  const observability =
+    result.observability &&
+    typeof result.observability === "object" &&
+    !Array.isArray(result.observability)
+      ? result.observability
+      : null;
+  const runPathCandidates = [
+    observability?.runPath,
+    observability?.statusPath,
+    observability?.run_path,
+    observability?.status_path,
+  ]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+
+  for (const runPath of runPathCandidates) {
+    try {
+      if (!existsSync(runPath)) {
+        continue;
+      }
+      const snapshot = parseJson<Record<string, unknown>>(
+        readFileSync(runPath, "utf8"),
+        `fast-browser run artifact ${runPath} returned invalid JSON.`,
+      );
+      if (
+        !snapshot ||
+        typeof snapshot !== "object" ||
+        Array.isArray(snapshot)
+      ) {
+        continue;
+      }
+      const snapshotPage =
+        snapshot.page &&
+        typeof snapshot.page === "object" &&
+        !Array.isArray(snapshot.page)
+          ? (snapshot.page as Record<string, unknown>)
+          : null;
+      const snapshotCurrent =
+        snapshot.current &&
+        typeof snapshot.current === "object" &&
+        !Array.isArray(snapshot.current)
+          ? (snapshot.current as Record<string, unknown>)
+          : null;
+      const snapshotOutput =
+        snapshot.output &&
+        typeof snapshot.output === "object" &&
+        !Array.isArray(snapshot.output)
+          ? (snapshot.output as Record<string, unknown>)
+          : null;
+      const snapshotRecentEvents = Array.isArray(snapshot.recent_events)
+        ? (snapshot.recent_events as Array<Record<string, unknown>>)
+        : Array.isArray(snapshot.recentEvents)
+          ? (snapshot.recentEvents as Array<Record<string, unknown>>)
+          : Array.isArray(snapshot.events)
+            ? (snapshot.events as Array<Record<string, unknown>>)
+            : null;
+
+      return {
+        ...result,
+        finalUrl:
+          result.finalUrl ||
+          (typeof snapshot.finalUrl === "string" ? snapshot.finalUrl : null) ||
+          (typeof snapshot.final_url === "string"
+            ? snapshot.final_url
+            : null) ||
+          (typeof snapshotPage?.url === "string" ? snapshotPage.url : null),
+        output: result.output ?? snapshotOutput,
+        recent_events: result.recent_events ?? snapshotRecentEvents,
+        page: result.page ?? snapshotPage,
+        current: result.current ?? snapshotCurrent,
+      };
+    } catch {}
+  }
+
+  return result;
+}
+
+function maybeLogFastBrowserRunResultDebug(
+  workflowRef: string,
+  result: FastBrowserRunResult,
+): void {
+  if (process.env.CODEX_ROTATE_DEBUG_AUTH_FLOW_RESULT !== "1") {
+    return;
+  }
+  const pageUrl =
+    result.page && typeof result.page.url === "string" ? result.page.url : null;
+  const pageTitle =
+    result.page && typeof result.page.title === "string"
+      ? result.page.title
+      : null;
+  const currentUrl =
+    result.current &&
+    typeof result.current === "object" &&
+    result.current &&
+    "details" in result.current &&
+    result.current.details &&
+    typeof result.current.details === "object" &&
+    "current_url" in result.current.details &&
+    typeof result.current.details.current_url === "string"
+      ? result.current.details.current_url
+      : null;
+  const callbackInspectAction =
+    result.state?.steps?.["inspect_device_authorization_after_callback_code"]
+      ?.action ?? null;
+  console.error(
+    `[codex-rotate] fast-browser result debug workflow=${workflowRef} finalUrl=${String(
+      result.finalUrl || "",
+    )} pageUrl=${String(pageUrl || "")} pageTitle=${JSON.stringify(
+      pageTitle || "",
+    )} currentUrl=${String(currentUrl || "")} runPath=${String(
+      result.observability?.runPath || "",
+    )} statusPath=${String(
+      result.observability?.statusPath || "",
+    )} hasState=${Boolean(
+      result.state,
+    )} hasOutput=${Boolean(result.output)} callbackInspectAction=${JSON.stringify(
+      callbackInspectAction,
+    )}`,
+  );
 }
 
 export function buildFastBrowserWorkflowError(
   workflowRef: string,
   response: FastBrowserDaemonRunResponse | null | undefined,
 ): Error {
+  const hydratedResult =
+    response?.result && typeof response.result === "object"
+      ? hydrateFastBrowserRunResultFromObservability(response.result)
+      : null;
   const error = new Error(
-    response?.result?.error?.message ||
+    hydratedResult?.error?.message ||
       response?.error?.message ||
       `fast-browser workflow ${workflowRef} failed.`,
   );
-  if (response?.result && typeof response.result === "object") {
+  if (hydratedResult) {
     (
       error as Error & { fastBrowserResult?: FastBrowserRunResult }
-    ).fastBrowserResult = response.result;
+    ).fastBrowserResult = hydratedResult;
   }
   return error;
+}
+
+export function isFastBrowserRunResultFailure(
+  result: FastBrowserRunResult | null | undefined,
+): boolean {
+  if (!result || typeof result !== "object") {
+    return false;
+  }
+  const normalizedStatus =
+    typeof result.status === "string" ? result.status.trim().toLowerCase() : "";
+  if (normalizedStatus === "failed" || normalizedStatus === "error") {
+    return true;
+  }
+  return Boolean(
+    result.error &&
+    typeof result.error === "object" &&
+    typeof result.error.message === "string" &&
+    result.error.message.trim(),
+  );
 }
 
 function readFastBrowserResultFromError(
@@ -907,6 +1139,7 @@ async function runFastBrowserDaemonWorkflow(
     retainTemporaryProfilesOnSuccess?: boolean;
     artifactMode?: "minimal" | "full";
     debugMode?: "off" | "step";
+    responseMode?: "action_only" | "full";
   },
 ): Promise<FastBrowserRunResult> {
   ensureFastBrowserPlaywright();
@@ -933,7 +1166,7 @@ async function runFastBrowserDaemonWorkflow(
       retainTemporaryProfilesOnSuccess: ${Boolean(options?.retainTemporaryProfilesOnSuccess)},
       artifactMode: ${JSON.stringify(options?.artifactMode ?? "minimal")},
       debugMode: ${JSON.stringify(options?.debugMode ?? "off")},
-      responseMode: "action_only",
+      responseMode: ${JSON.stringify(options?.responseMode ?? "full")},
       onEvent: (event) => {
         process.stderr.write(${JSON.stringify(FAST_BROWSER_EVENT_PREFIX)} + JSON.stringify(event) + "\\n");
       },
@@ -956,28 +1189,39 @@ async function runFastBrowserDaemonWorkflow(
         },
       );
       let settled = false;
-      let sawFirstProgressEvent = false;
       let stdout = "";
       let stderr = "";
       let stderrBuffer = "";
       const socketPath = join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
-      const startupSilenceTimer = setTimeout(() => {
-        if (settled || sawFirstProgressEvent) {
+      let inactivityTimer: NodeJS.Timeout | null = null;
+      const resetInactivityTimer = (): void => {
+        if (
+          settled ||
+          !Number.isFinite(FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS) ||
+          FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS <= 0
+        ) {
           return;
         }
-        settled = true;
-        child.kill("SIGKILL");
-        reject(
-          new Error(
-            `Timed out waiting for fast-browser daemon response from ${socketPath}`,
-          ),
-        );
-      }, FAST_BROWSER_STARTUP_SILENCE_TIMEOUT_MS);
+        if (inactivityTimer) {
+          clearTimeout(inactivityTimer);
+        }
+        inactivityTimer = setTimeout(() => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          child.kill("SIGKILL");
+          reject(
+            new Error(
+              `Timed out waiting for fast-browser daemon response from ${socketPath}`,
+            ),
+          );
+        }, FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS);
+      };
+      resetInactivityTimer();
 
       const flushStderrLine = (line: string): void => {
         if (line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
-          sawFirstProgressEvent = true;
-          clearTimeout(startupSilenceTimer);
           process.stderr.write(`${line}\n`);
           return;
         }
@@ -987,11 +1231,13 @@ async function runFastBrowserDaemonWorkflow(
 
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
+        resetInactivityTimer();
         stdout += chunk;
       });
 
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
+        resetInactivityTimer();
         stderrBuffer += chunk;
         while (true) {
           const newlineIndex = stderrBuffer.indexOf("\n");
@@ -1011,7 +1257,9 @@ async function runFastBrowserDaemonWorkflow(
           return;
         }
         settled = true;
-        clearTimeout(startupSilenceTimer);
+        if (inactivityTimer) {
+          clearTimeout(inactivityTimer);
+        }
         reject(error);
       });
       child.once("close", (code, signal) => {
@@ -1019,7 +1267,9 @@ async function runFastBrowserDaemonWorkflow(
           return;
         }
         settled = true;
-        clearTimeout(startupSilenceTimer);
+        if (inactivityTimer) {
+          clearTimeout(inactivityTimer);
+        }
         if (stderrBuffer.trim()) {
           flushStderrLine(stderrBuffer.trimEnd());
         }
@@ -1042,6 +1292,10 @@ async function runFastBrowserDaemonWorkflow(
     throw buildFastBrowserWorkflowError(workflowRef, response);
   }
 
+  if (isFastBrowserRunResultFailure(response.result)) {
+    throw buildFastBrowserWorkflowError(workflowRef, response);
+  }
+
   if (response.result.status === "paused") {
     const reason = response.result.pause?.reason ?? "pause";
     const relay = response.result.pause?.relay_url
@@ -1052,7 +1306,11 @@ async function runFastBrowserDaemonWorkflow(
     );
   }
 
-  return response.result;
+  const hydratedResult = hydrateFastBrowserRunResultFromObservability(
+    response.result,
+  );
+  maybeLogFastBrowserRunResultDebug(workflowRef, hydratedResult);
+  return hydratedResult;
 }
 
 function shouldResetFastBrowserSecretBrokerForBrokenCwd(
@@ -1169,6 +1427,7 @@ async function runCodexBrowserLoginWorkflow(
       retainTemporaryProfilesOnSuccess: Boolean(workflowRunStamp),
       artifactMode:
         options?.artifactMode ?? CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE,
+      responseMode: "action_only",
     },
   );
 }

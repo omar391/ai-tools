@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -35,6 +36,7 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
+const DEFAULT_CODEX_APP_BUNDLE_BIN: &str = "/Applications/Codex.app/Contents/Resources/codex";
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
 const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
@@ -114,6 +116,25 @@ enum CreateFlowAttemptFailure {
     Fatal(anyhow::Error),
     Retryable(anyhow::Error),
 }
+
+#[derive(Debug)]
+struct WorkflowSkipAccountError {
+    message: String,
+}
+
+impl WorkflowSkipAccountError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl Display for WorkflowSkipAccountError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for WorkflowSkipAccountError {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialFamily {
@@ -201,7 +222,6 @@ struct CodexRotateAuthFlowSummary {
     account_ready: Option<bool>,
     needs_email_verification: Option<bool>,
     follow_up_step: Option<bool>,
-    add_phone_prompt: Option<bool>,
     retryable_timeout: Option<bool>,
     session_ended: Option<bool>,
     existing_account_prompt: Option<bool>,
@@ -216,6 +236,7 @@ struct CodexRotateAuthFlowSummary {
     replay_reason: Option<String>,
     retry_reason: Option<String>,
     error_message: Option<String>,
+    verified_account_email: Option<String>,
     codex_session: Option<CodexRotateAuthFlowSession>,
     codex_login_exit_ok: Option<bool>,
     codex_login_exit_code: Option<i32>,
@@ -237,11 +258,30 @@ struct FastBrowserState {
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+struct FastBrowserRunObservability {
+    #[serde(default)]
+    run_path: Option<String>,
+    #[serde(default)]
+    status_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct FastBrowserRunResult {
     #[serde(default)]
     state: Option<FastBrowserState>,
     #[serde(default)]
     output: Option<Value>,
+    #[serde(default, alias = "recent_events")]
+    recent_events: Option<Vec<Value>>,
+    #[serde(default)]
+    final_url: Option<String>,
+    #[serde(default)]
+    page: Option<Value>,
+    #[serde(default)]
+    current: Option<Value>,
+    #[serde(default)]
+    observability: Option<FastBrowserRunObservability>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,13 +433,175 @@ struct BridgeCompleteLoginAttemptPayload<'a> {
     options: Option<BridgeLoginOptions<'a>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default)]
 struct BridgeLoginAttemptResult {
-    #[serde(default)]
     result: Option<FastBrowserRunResult>,
-    #[serde(default)]
     error_message: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for BridgeLoginAttemptResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        Ok(normalize_bridge_login_attempt_result(raw))
+    }
+}
+
+fn normalize_bridge_login_attempt_result(raw: Value) -> BridgeLoginAttemptResult {
+    let Value::Object(record) = raw else {
+        return BridgeLoginAttemptResult::default();
+    };
+    let wrapped_result = record.get("result").cloned();
+    let result = wrapped_result
+        .or_else(|| {
+            looks_like_fast_browser_run_result_record(&record)
+                .then(|| Value::Object(record.clone()))
+        })
+        .and_then(normalize_bridge_fast_browser_run_result);
+    let error_message = read_string_value(&record, "error_message")
+        .or_else(|| read_string_value(&record, "errorMessage"));
+    BridgeLoginAttemptResult {
+        result,
+        error_message,
+    }
+}
+
+fn looks_like_fast_browser_run_result_record(record: &Map<String, Value>) -> bool {
+    record.contains_key("state")
+        || record.contains_key("output")
+        || record.contains_key("observability")
+        || record.contains_key("finalUrl")
+        || record.contains_key("status")
+        || record.contains_key("ok")
+        || record.contains_key("page")
+        || record.contains_key("current")
+        || record.contains_key("recent_events")
+}
+fn normalize_bridge_fast_browser_run_result(raw: Value) -> Option<FastBrowserRunResult> {
+    let raw = match raw {
+        Value::String(value) => serde_json::from_str::<Value>(value.trim()).ok()?,
+        other => other,
+    };
+    let record = raw.as_object()?;
+    Some(hydrate_fast_browser_run_result_from_observability(
+        FastBrowserRunResult {
+            state: record
+                .get("state")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            output: record.get("output").cloned(),
+            recent_events: record
+                .get("recentEvents")
+                .or_else(|| record.get("recent_events"))
+                .or_else(|| record.get("events"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            final_url: read_string_value(record, "finalUrl")
+                .or_else(|| read_string_value(record, "final_url")),
+            page: record.get("page").cloned(),
+            current: record.get("current").cloned(),
+            observability: record.get("observability").and_then(|value| {
+                let observability = value.as_object()?;
+                Some(FastBrowserRunObservability {
+                    run_path: read_string_value(observability, "runPath")
+                        .or_else(|| read_string_value(observability, "run_path")),
+                    status_path: read_string_value(observability, "statusPath")
+                        .or_else(|| read_string_value(observability, "status_path")),
+                })
+            }),
+        },
+    ))
+}
+
+fn hydrate_fast_browser_run_result_from_observability(
+    mut result: FastBrowserRunResult,
+) -> FastBrowserRunResult {
+    if result.final_url.is_some() && result.output.is_some() && result.page.is_some() {
+        return result;
+    }
+
+    let run_path_candidates = [
+        result
+            .observability
+            .as_ref()
+            .and_then(|value| value.run_path.as_deref()),
+        result
+            .observability
+            .as_ref()
+            .and_then(|value| value.status_path.as_deref()),
+    ];
+
+    for run_path in run_path_candidates.into_iter().flatten() {
+        let Ok(contents) = fs::read_to_string(run_path) else {
+            continue;
+        };
+        let Ok(snapshot) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+        let Some(record) = snapshot.as_object() else {
+            continue;
+        };
+        if result.final_url.is_none() {
+            result.final_url = read_string_value(record, "finalUrl")
+                .or_else(|| read_string_value(record, "final_url"))
+                .or_else(|| {
+                    record
+                        .get("page")
+                        .and_then(Value::as_object)
+                        .and_then(|page| read_string_value(page, "url"))
+                });
+        }
+        if result.output.is_none() {
+            result.output = record.get("output").cloned();
+        }
+        if result.recent_events.is_none() {
+            result.recent_events = record
+                .get("recentEvents")
+                .or_else(|| record.get("recent_events"))
+                .or_else(|| record.get("events"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+        }
+        if result.page.is_none() {
+            result.page = record.get("page").cloned();
+        }
+        if result.current.is_none() {
+            result.current = record.get("current").cloned();
+        }
+        break;
+    }
+
+    result
+}
+
+fn normalize_codex_rotate_auth_flow_session(raw: &Value) -> Option<CodexRotateAuthFlowSession> {
+    let record = raw.as_object()?;
+    let session = CodexRotateAuthFlowSession {
+        auth_url: read_string_value(record, "auth_url"),
+        callback_url: read_string_value(record, "callback_url"),
+        callback_port: read_u16_value(record, "callback_port"),
+        device_code: read_string_value(record, "device_code"),
+        session_dir: read_string_value(record, "session_dir"),
+        codex_home_path: read_string_value(record, "codex_home_path"),
+        auth_file_path: read_string_value(record, "auth_file_path"),
+        pid: read_u32_value(record, "pid"),
+        stdout_path: read_string_value(record, "stdout_path"),
+        stderr_path: read_string_value(record, "stderr_path"),
+        exit_path: read_string_value(record, "exit_path"),
+    };
+    if session.auth_url.is_none()
+        && session.session_dir.is_none()
+        && session.codex_home_path.is_none()
+        && session.auth_file_path.is_none()
+        && session.stdout_path.is_none()
+        && session.stderr_path.is_none()
+        && session.exit_path.is_none()
+    {
+        return None;
+    }
+    Some(session)
 }
 
 #[derive(Clone, Debug)]
@@ -547,7 +749,7 @@ pub fn cmd_relogin_with_progress(
         let account_login_locator = build_openai_account_login_locator(&updated_stored.email);
 
         let previous_auth = load_codex_auth_if_exists()?;
-        let login_result = (|| -> Result<()> {
+        let login_result = (|| -> Result<CompleteCodexLoginOutcome> {
             if should_logout_before_stored_relogin(&options) {
                 let paths = resolve_paths()?;
                 if paths.codex_auth_file.exists() {
@@ -568,15 +770,22 @@ pub fn cmd_relogin_with_progress(
                 progress: progress.clone(),
             })
         })();
-        if let Err(error) = login_result {
-            restore_active_auth(previous_auth.as_ref())?;
-            return Err(error);
-        }
+        let login_outcome = match login_result {
+            Ok(value) => value,
+            Err(error) => {
+                restore_active_auth(previous_auth.as_ref())?;
+                return Err(error);
+            }
+        };
 
         let auth = load_current_auth()?;
         let logged_in_email = summarize_codex_auth(&auth).email;
         if !options.allow_email_change
             && normalize_email_key(&logged_in_email) != normalize_email_key(&expected_email)
+            && !workflow_verified_expected_email(
+                login_outcome.verified_account_email.as_deref(),
+                &expected_email,
+            )
         {
             restore_active_auth(previous_auth.as_ref())?;
             return Err(anyhow!(
@@ -740,7 +949,37 @@ fn execute_create_flow_with_progress(
         match execute_create_flow_attempt(options, progress.clone()) {
             Ok(result) => return Ok(result),
             Err(CreateFlowAttemptFailure::Retryable(error))
-            | Err(CreateFlowAttemptFailure::Fatal(error))
+                if should_retry_create_after_error(options, &error) =>
+            {
+                let workflow_skip = is_workflow_skip_account_error(&error);
+                if reusable_account_exists_for_auto_create_retry(options)? {
+                    return Err(anyhow!(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT));
+                }
+                report_progress(
+                    progress.as_ref(),
+                    format!(
+                        "{} account creation attempt {attempt} failed: {error}. Retrying in {}s.",
+                        if workflow_skip {
+                            "Workflow-skipped"
+                        } else {
+                            "Automatic"
+                        },
+                        AUTO_CREATE_RETRY_DELAY.as_secs()
+                    ),
+                );
+                eprintln!(
+                    "{YELLOW}WARN{RESET} {} account creation attempt {attempt} failed: {error}. Retrying with a fresh account in {}s.",
+                    if workflow_skip {
+                        "Workflow-skipped"
+                    } else {
+                        "Automatic"
+                    },
+                    AUTO_CREATE_RETRY_DELAY.as_secs()
+                );
+                attempt = attempt.saturating_add(1);
+                cancel::sleep_with_cancellation(AUTO_CREATE_RETRY_DELAY)?;
+            }
+            Err(CreateFlowAttemptFailure::Fatal(error))
                 if should_retry_create_until_usable(options) =>
             {
                 if reusable_account_exists_for_auto_create_retry(options)? {
@@ -778,6 +1017,10 @@ fn fatal<T>(result: Result<T>) -> std::result::Result<T, CreateFlowAttemptFailur
 
 fn should_retry_create_until_usable(options: &CreateCommandOptions) -> bool {
     options.require_usable_quota && matches!(options.source, CreateCommandSource::Next)
+}
+
+fn should_retry_create_after_error(options: &CreateCommandOptions, error: &anyhow::Error) -> bool {
+    should_retry_create_until_usable(options) || is_workflow_skip_account_error(error)
 }
 
 pub fn is_auto_create_retry_stopped_for_reusable_account(error: &anyhow::Error) -> bool {
@@ -1078,27 +1321,35 @@ fn execute_create_flow_attempt(
         birth_date: Some(&birth_date),
         progress: progress.clone(),
     });
-    if let Err(error) = login_result {
-        fatal(restore_active_auth(previous_auth.as_ref()))?;
-        if should_retry_create_until_usable(options) {
-            fatal(prepare_next_auto_create_attempt(
-                &mut store,
-                &family_key,
-                &profile_name,
-                &base_email,
-                suffix,
-                &created_email,
-                started_at.as_str(),
-            ))?;
-            return Err(CreateFlowAttemptFailure::Retryable(error));
+    let login_outcome = match login_result {
+        Ok(value) => value,
+        Err(error) => {
+            fatal(restore_active_auth(previous_auth.as_ref()))?;
+            if should_retry_create_after_error(options, &error) {
+                fatal(prepare_next_auto_create_attempt(
+                    &mut store,
+                    &family_key,
+                    &profile_name,
+                    &base_email,
+                    suffix,
+                    &created_email,
+                    started_at.as_str(),
+                ))?;
+                return Err(CreateFlowAttemptFailure::Retryable(error));
+            }
+            fatal(save_credential_store(&store))?;
+            return Err(CreateFlowAttemptFailure::Fatal(error));
         }
-        fatal(save_credential_store(&store))?;
-        return Err(CreateFlowAttemptFailure::Fatal(error));
-    }
+    };
 
     let auth = fatal(load_current_auth())?;
     let logged_in_email = summarize_codex_auth(&auth).email;
-    if normalize_email_key(&logged_in_email) != normalize_email_key(&created_email) {
+    if normalize_email_key(&logged_in_email) != normalize_email_key(&created_email)
+        && !workflow_verified_expected_email(
+            login_outcome.verified_account_email.as_deref(),
+            &created_email,
+        )
+    {
         let error = anyhow!(
             "Expected {}, but Codex logged into {}.",
             created_email,
@@ -1391,7 +1642,12 @@ struct CompleteCodexLoginArgs<'a> {
     progress: Option<AutomationProgressCallback>,
 }
 
-fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
+#[derive(Clone, Debug, Default)]
+struct CompleteCodexLoginOutcome {
+    verified_account_email: Option<String>,
+}
+
+fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<CompleteCodexLoginOutcome> {
     let CompleteCodexLoginArgs {
         profile_name,
         email,
@@ -1436,7 +1692,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
 
     let mut allow_signup_recovery = prefer_signup_recovery.unwrap_or(false);
     let mut codex_session: Option<CodexRotateAuthFlowSession> = None;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<CompleteCodexLoginOutcome> {
         'attempts: for attempt in 1..=DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
             cancel::check_canceled()?;
             report_progress(
@@ -1466,7 +1722,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                     birth_year: Some(birth_date.birth_year),
                     codex_session: codex_session.as_ref(),
                 };
-                let attempt_result: BridgeLoginAttemptResult = run_automation_bridge_with_progress(
+                let attempt_result_raw: Value = run_automation_bridge_with_progress(
                     "complete-codex-login-attempt",
                     BridgeCompleteLoginAttemptPayload {
                         profile_name,
@@ -1476,12 +1732,20 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                     },
                     progress.clone(),
                 )?;
+                maybe_debug_codex_auth_flow_raw(workflow_ref.as_str(), email, &attempt_result_raw);
+                let attempt_result = normalize_bridge_login_attempt_result(attempt_result_raw);
                 let bridge_error_message = attempt_result.error_message.clone();
                 let flow = attempt_result
                     .result
                     .as_ref()
                     .map(read_codex_rotate_auth_flow_summary)
                     .unwrap_or_default();
+                maybe_debug_codex_auth_flow_result(
+                    workflow_ref.as_str(),
+                    email,
+                    &attempt_result,
+                    &flow,
+                );
                 if let Some(session) = attempt_result
                     .result
                     .as_ref()
@@ -1535,6 +1799,20 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                     return Err(anyhow!(login_error_message(
                         error_message,
                         format!("OpenAI rejected the stored password for {email}.")
+                    )));
+                }
+
+                if next_action == Some("skip_account") {
+                    return Err(anyhow::Error::new(WorkflowSkipAccountError::new(
+                        login_error_message(
+                            error_message,
+                            format!(
+                                "The workflow requested skipping {email}{}.",
+                                current_url
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default()
+                            ),
+                        ),
                     )));
                 }
 
@@ -1708,7 +1986,9 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<()> {
                 promote_codex_auth_from_session(
                     codex_session.as_ref().or(flow.codex_session.as_ref()),
                 )?;
-                return Ok(());
+                return Ok(CompleteCodexLoginOutcome {
+                    verified_account_email: flow.verified_account_email.clone(),
+                });
             }
         }
         Err(anyhow!(
@@ -1798,95 +2078,426 @@ fn read_u32_value(record: &Map<String, Value>, field: &str) -> Option<u32> {
     }
 }
 
-fn normalize_codex_rotate_auth_flow_session(raw: &Value) -> Option<CodexRotateAuthFlowSession> {
-    let record = raw.as_object()?;
-    let session = CodexRotateAuthFlowSession {
-        auth_url: read_string_value(record, "auth_url"),
-        callback_url: read_string_value(record, "callback_url"),
-        callback_port: read_u16_value(record, "callback_port"),
-        device_code: read_string_value(record, "device_code"),
-        session_dir: read_string_value(record, "session_dir"),
-        codex_home_path: read_string_value(record, "codex_home_path"),
-        auth_file_path: read_string_value(record, "auth_file_path"),
-        pid: read_u32_value(record, "pid"),
-        stdout_path: read_string_value(record, "stdout_path"),
-        stderr_path: read_string_value(record, "stderr_path"),
-        exit_path: read_string_value(record, "exit_path"),
-    };
-    if session.auth_url.is_none()
-        && session.session_dir.is_none()
-        && session.codex_home_path.is_none()
-        && session.auth_file_path.is_none()
-        && session.stdout_path.is_none()
-        && session.stderr_path.is_none()
-        && session.exit_path.is_none()
-    {
-        return None;
+fn merge_codex_rotate_auth_flow_session(
+    primary: CodexRotateAuthFlowSession,
+    fallback: CodexRotateAuthFlowSession,
+) -> CodexRotateAuthFlowSession {
+    CodexRotateAuthFlowSession {
+        auth_url: primary.auth_url.or(fallback.auth_url),
+        callback_url: primary.callback_url.or(fallback.callback_url),
+        callback_port: primary.callback_port.or(fallback.callback_port),
+        device_code: primary.device_code.or(fallback.device_code),
+        session_dir: primary.session_dir.or(fallback.session_dir),
+        codex_home_path: primary.codex_home_path.or(fallback.codex_home_path),
+        auth_file_path: primary.auth_file_path.or(fallback.auth_file_path),
+        pid: primary.pid.or(fallback.pid),
+        stdout_path: primary.stdout_path.or(fallback.stdout_path),
+        stderr_path: primary.stderr_path.or(fallback.stderr_path),
+        exit_path: primary.exit_path.or(fallback.exit_path),
     }
-    Some(session)
 }
 
 fn read_codex_rotate_auth_flow_summary(
     result: &FastBrowserRunResult,
 ) -> CodexRotateAuthFlowSummary {
-    let Some(record) = result.output.as_ref().and_then(Value::as_object) else {
-        return CodexRotateAuthFlowSummary::default();
+    let mut summary = if let Some(record) = read_codex_rotate_auth_flow_summary_record(result) {
+        CodexRotateAuthFlowSummary {
+            stage: read_string_value(record, "stage"),
+            current_url: read_string_value(record, "current_url"),
+            headline: read_string_value(record, "headline"),
+            callback_complete: read_bool_value(record, "callback_complete"),
+            success: read_bool_value(record, "success"),
+            account_ready: read_bool_value(record, "account_ready"),
+            needs_email_verification: read_bool_value(record, "needs_email_verification"),
+            follow_up_step: read_bool_value(record, "follow_up_step"),
+            retryable_timeout: read_bool_value(record, "retryable_timeout"),
+            session_ended: read_bool_value(record, "session_ended"),
+            existing_account_prompt: read_bool_value(record, "existing_account_prompt"),
+            username_not_found: read_bool_value(record, "username_not_found"),
+            invalid_credentials: read_bool_value(record, "invalid_credentials"),
+            rate_limit_exceeded: read_bool_value(record, "rate_limit_exceeded"),
+            anti_bot_gate: read_bool_value(record, "anti_bot_gate"),
+            auth_prompt: read_bool_value(record, "auth_prompt"),
+            consent_blocked: read_bool_value(record, "consent_blocked"),
+            consent_error: read_string_value(record, "consent_error"),
+            next_action: read_string_value(record, "next_action"),
+            replay_reason: read_string_value(record, "replay_reason"),
+            retry_reason: read_string_value(record, "retry_reason"),
+            error_message: read_string_value(record, "error_message"),
+            verified_account_email: read_string_value(record, "verified_account_email"),
+            codex_session: record
+                .get("codex_session")
+                .and_then(normalize_codex_rotate_auth_flow_session),
+            codex_login_exit_ok: read_bool_value(record, "codex_login_exit_ok"),
+            codex_login_exit_code: read_i32_value(record, "codex_login_exit_code"),
+            codex_login_stdout_tail: read_string_value(record, "codex_login_stdout_tail"),
+            codex_login_stderr_tail: read_string_value(record, "codex_login_stderr_tail"),
+            saw_oauth_consent: read_bool_value(record, "saw_oauth_consent"),
+        }
+    } else {
+        CodexRotateAuthFlowSummary::default()
     };
 
-    CodexRotateAuthFlowSummary {
-        stage: read_string_value(record, "stage"),
-        current_url: read_string_value(record, "current_url"),
-        headline: read_string_value(record, "headline"),
-        callback_complete: read_bool_value(record, "callback_complete"),
-        success: read_bool_value(record, "success"),
-        account_ready: read_bool_value(record, "account_ready"),
-        needs_email_verification: read_bool_value(record, "needs_email_verification"),
-        follow_up_step: read_bool_value(record, "follow_up_step"),
-        add_phone_prompt: read_bool_value(record, "add_phone_prompt"),
-        retryable_timeout: read_bool_value(record, "retryable_timeout"),
-        session_ended: read_bool_value(record, "session_ended"),
-        existing_account_prompt: read_bool_value(record, "existing_account_prompt"),
-        username_not_found: read_bool_value(record, "username_not_found"),
-        invalid_credentials: read_bool_value(record, "invalid_credentials"),
-        rate_limit_exceeded: read_bool_value(record, "rate_limit_exceeded"),
-        anti_bot_gate: read_bool_value(record, "anti_bot_gate"),
-        auth_prompt: read_bool_value(record, "auth_prompt"),
-        consent_blocked: read_bool_value(record, "consent_blocked"),
-        consent_error: read_string_value(record, "consent_error"),
-        next_action: read_string_value(record, "next_action"),
-        replay_reason: read_string_value(record, "replay_reason"),
-        retry_reason: read_string_value(record, "retry_reason"),
-        error_message: read_string_value(record, "error_message"),
-        codex_session: record
-            .get("codex_session")
-            .and_then(normalize_codex_rotate_auth_flow_session),
-        codex_login_exit_ok: read_bool_value(record, "codex_login_exit_ok"),
-        codex_login_exit_code: read_i32_value(record, "codex_login_exit_code"),
-        codex_login_stdout_tail: read_string_value(record, "codex_login_stdout_tail"),
-        codex_login_stderr_tail: read_string_value(record, "codex_login_stderr_tail"),
-        saw_oauth_consent: read_bool_value(record, "saw_oauth_consent"),
+    if let Some(metadata) = read_codex_rotate_auth_flow_summary_from_result_metadata(result) {
+        if metadata.success == Some(true) || metadata.callback_complete == Some(true) {
+            summary.stage = metadata.stage.or(summary.stage);
+            summary.current_url = metadata.current_url.or(summary.current_url);
+            summary.headline = metadata.headline.or(summary.headline);
+            summary.callback_complete = metadata.callback_complete.or(summary.callback_complete);
+            summary.success = metadata.success.or(summary.success);
+            summary.next_action = metadata.next_action.or(summary.next_action);
+        } else {
+            summary.stage = summary.stage.or(metadata.stage);
+            summary.current_url = summary.current_url.or(metadata.current_url);
+            summary.headline = summary.headline.or(metadata.headline);
+            summary.callback_complete = summary.callback_complete.or(metadata.callback_complete);
+            summary.success = summary.success.or(metadata.success);
+            summary.next_action = summary.next_action.or(metadata.next_action);
+        }
     }
+
+    summary
+}
+
+fn read_codex_rotate_auth_flow_summary_from_result_metadata(
+    result: &FastBrowserRunResult,
+) -> Option<CodexRotateAuthFlowSummary> {
+    let step_metadata = read_codex_rotate_auth_flow_step_metadata(result);
+    let current_url = result
+        .final_url
+        .clone()
+        .or_else(|| {
+            result
+                .page
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|record| read_string_value(record, "url"))
+        })
+        .or_else(|| {
+            result
+                .current
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|record| {
+                    record
+                        .get("details")
+                        .and_then(Value::as_object)
+                        .and_then(|details| read_string_value(details, "current_url"))
+                })
+        })
+        .or_else(|| step_metadata.current_url.clone());
+    let headline = result
+        .current
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|record| {
+            record
+                .get("details")
+                .and_then(Value::as_object)
+                .and_then(|details| read_string_value(details, "headline"))
+        })
+        .or_else(|| {
+            result
+                .page
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|record| {
+                    read_string_value(record, "title").or_else(|| {
+                        read_string_value(record, "text").and_then(|text| {
+                            text.lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .map(str::to_string)
+                        })
+                    })
+                })
+        })
+        .or_else(|| step_metadata.headline.clone());
+    let page_text = result
+        .page
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|record| read_string_value(record, "text"))
+        .or_else(|| step_metadata.page_text.clone())
+        .unwrap_or_default()
+        .to_lowercase();
+    let headline_text = headline
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let callback_url = current_url
+        .as_deref()
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    let localhost_callback = callback_url.starts_with("http://localhost")
+        || callback_url.starts_with("http://127.0.0.1");
+    let device_auth_callback = callback_url.contains("auth.openai.com/deviceauth/callback")
+        && (headline_text.contains("signed in to codex")
+            || headline_text.contains("you may now close this page")
+            || page_text.contains("signed in to codex")
+            || page_text.contains("you may now close this page"));
+    let success_copy = headline_text.contains("signed in to codex")
+        || headline_text.contains("you may now close this page")
+        || page_text.contains("signed in to codex")
+        || page_text.contains("you may now close this page");
+    if current_url.is_none() && headline.is_none() {
+        return None;
+    }
+    Some(CodexRotateAuthFlowSummary {
+        stage: if localhost_callback || device_auth_callback || success_copy {
+            Some("success".to_string())
+        } else {
+            None
+        },
+        current_url,
+        headline,
+        callback_complete: (localhost_callback || device_auth_callback || success_copy)
+            .then_some(true),
+        success: (localhost_callback || device_auth_callback || success_copy).then_some(true),
+        next_action: (localhost_callback || device_auth_callback || success_copy)
+            .then_some("complete".to_string()),
+        ..CodexRotateAuthFlowSummary::default()
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct FastBrowserStepMetadata {
+    current_url: Option<String>,
+    headline: Option<String>,
+    page_text: Option<String>,
+}
+
+fn read_codex_rotate_auth_flow_step_metadata(
+    result: &FastBrowserRunResult,
+) -> FastBrowserStepMetadata {
+    let mut metadata = FastBrowserStepMetadata::default();
+    let Some(state) = result.state.as_ref() else {
+        return metadata;
+    };
+
+    for step in state.steps.values() {
+        let Some(action) = step.action.as_ref().and_then(Value::as_object) else {
+            continue;
+        };
+        let url = read_string_value(action, "url")
+            .or_else(|| read_string_value(action, "current_url"))
+            .or_else(|| {
+                action
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "current_url"))
+            })
+            .or_else(|| {
+                action
+                    .get("details")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "current_url"))
+            });
+        let headline = read_string_value(action, "headline")
+            .or_else(|| {
+                action
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "headline"))
+            })
+            .or_else(|| {
+                action
+                    .get("details")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "headline"))
+            });
+        let page_text = read_string_value(action, "text")
+            .or_else(|| {
+                action
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "text"))
+            })
+            .or_else(|| {
+                action
+                    .get("details")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_string_value(record, "text"))
+            });
+        let success = read_bool_value(action, "success")
+            .or_else(|| {
+                action
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_bool_value(record, "success"))
+            })
+            .or_else(|| {
+                action
+                    .get("details")
+                    .and_then(Value::as_object)
+                    .and_then(|record| read_bool_value(record, "success"))
+            });
+
+        let url_text = url.as_deref().map(str::to_lowercase).unwrap_or_default();
+        let headline_text = headline
+            .as_deref()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let page_text_lc = page_text
+            .as_deref()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let looks_like_callback_success = url_text.contains("auth.openai.com/deviceauth/callback")
+            && (success == Some(true)
+                || headline_text.contains("signed in to codex")
+                || headline_text.contains("you may now close this page")
+                || page_text_lc.contains("signed in to codex")
+                || page_text_lc.contains("you may now close this page"));
+
+        if looks_like_callback_success {
+            return FastBrowserStepMetadata {
+                current_url: url,
+                headline,
+                page_text,
+            };
+        }
+
+        metadata.current_url = metadata.current_url.or(url);
+        metadata.headline = metadata.headline.or(headline);
+        metadata.page_text = metadata.page_text.or(page_text);
+    }
+
+    metadata
+}
+
+fn read_codex_rotate_auth_flow_summary_record(
+    result: &FastBrowserRunResult,
+) -> Option<&Map<String, Value>> {
+    result
+        .output
+        .as_ref()
+        .and_then(Value::as_object)
+        .or_else(|| {
+            const FINAL_SUMMARY_STEP_IDS: [&str; 3] = [
+                "finalize_selected_flow",
+                "finalize_flow_summary",
+                "finalize_device_auth_tail_summary",
+            ];
+
+            let state = result.state.as_ref()?;
+            FINAL_SUMMARY_STEP_IDS.iter().find_map(|step_id| {
+                state
+                    .steps
+                    .get(*step_id)
+                    .and_then(|step| step.action.as_ref())
+                    .and_then(read_codex_rotate_auth_flow_summary_action_record)
+            })
+        })
+        .or_else(|| read_codex_rotate_auth_flow_summary_record_from_recent_events(result))
+}
+
+fn read_codex_rotate_auth_flow_summary_action_record(
+    action: &Value,
+) -> Option<&Map<String, Value>> {
+    let record = action.as_object()?;
+    record
+        .get("value")
+        .and_then(Value::as_object)
+        .filter(|value| looks_like_codex_rotate_auth_flow_summary_record(value))
+        .or_else(|| looks_like_codex_rotate_auth_flow_summary_record(record).then_some(record))
+}
+
+fn looks_like_codex_rotate_auth_flow_summary_record(record: &Map<String, Value>) -> bool {
+    record.contains_key("callback_complete")
+        || record.contains_key("success")
+        || record.contains_key("next_action")
+        || record.contains_key("retry_reason")
+        || record.contains_key("replay_reason")
+        || record.contains_key("error_message")
+        || record.contains_key("verified_account_email")
+        || record.contains_key("codex_session")
+}
+
+fn read_codex_rotate_auth_flow_summary_record_from_recent_events(
+    result: &FastBrowserRunResult,
+) -> Option<&Map<String, Value>> {
+    const FINAL_SUMMARY_STEP_IDS: [&str; 3] = [
+        "finalize_selected_flow",
+        "finalize_flow_summary",
+        "finalize_device_auth_tail_summary",
+    ];
+
+    result
+        .recent_events
+        .as_ref()?
+        .iter()
+        .rev()
+        .find_map(|event| {
+            let record = event.as_object()?;
+            let step_id = read_string_value(record, "step_id")
+                .or_else(|| read_string_value(record, "stepId"))?;
+            if !FINAL_SUMMARY_STEP_IDS.contains(&step_id.as_str()) {
+                return None;
+            }
+            let phase = read_string_value(record, "phase");
+            if phase.as_deref() != Some("action") {
+                return None;
+            }
+            let status = read_string_value(record, "status");
+            if status.as_deref() != Some("ok") {
+                return None;
+            }
+
+            record
+                .get("details")
+                .and_then(Value::as_object)
+                .and_then(|details| {
+                    details
+                        .get("result")
+                        .and_then(Value::as_object)
+                        .and_then(|result| result.get("value"))
+                        .and_then(Value::as_object)
+                        .filter(|value| looks_like_codex_rotate_auth_flow_summary_record(value))
+                        .or_else(|| {
+                            details
+                                .get("value")
+                                .and_then(Value::as_object)
+                                .filter(|value| {
+                                    looks_like_codex_rotate_auth_flow_summary_record(value)
+                                })
+                        })
+                        .or_else(|| {
+                            details
+                                .get("result")
+                                .and_then(Value::as_object)
+                                .filter(|value| {
+                                    looks_like_codex_rotate_auth_flow_summary_record(value)
+                                })
+                        })
+                })
+        })
 }
 
 fn read_codex_rotate_auth_flow_session(
     result: &FastBrowserRunResult,
 ) -> Option<CodexRotateAuthFlowSession> {
     let summary = read_codex_rotate_auth_flow_summary(result);
-    if summary.codex_session.is_some() {
-        return summary.codex_session;
-    }
     let action = result
         .state
         .as_ref()
         .and_then(|state| state.steps.get("start_codex_login_session"))
         .and_then(|step| step.action.as_ref())
-        .and_then(Value::as_object)?;
-    if let Some(value) = action.get("value") {
-        if let Some(session) = normalize_codex_rotate_auth_flow_session(value) {
-            return Some(session);
+        .and_then(Value::as_object);
+    let action_session = action.and_then(|action| {
+        action
+            .get("value")
+            .and_then(normalize_codex_rotate_auth_flow_session)
+            .or_else(|| normalize_codex_rotate_auth_flow_session(&Value::Object(action.clone())))
+    });
+
+    match (summary.codex_session, action_session) {
+        (Some(primary), Some(fallback)) => {
+            Some(merge_codex_rotate_auth_flow_session(primary, fallback))
         }
+        (Some(session), None) | (None, Some(session)) => Some(session),
+        (None, None) => None,
     }
-    normalize_codex_rotate_auth_flow_session(&Value::Object(action.clone()))
 }
 
 fn extract_fast_browser_timeout_socket_path(output: &str) -> Option<String> {
@@ -1943,6 +2554,85 @@ fn maybe_reset_managed_runtime_after_failed_attempt(
 
 fn login_error_message(error_message: Option<&str>, fallback: String) -> String {
     error_message.map(str::to_string).unwrap_or(fallback)
+}
+
+fn maybe_debug_codex_auth_flow_result(
+    workflow_ref: &str,
+    email: &str,
+    attempt_result: &BridgeLoginAttemptResult,
+    flow: &CodexRotateAuthFlowSummary,
+) {
+    if std::env::var("CODEX_ROTATE_DEBUG_AUTH_FLOW_RESULT").as_deref() != Ok("1") {
+        return;
+    }
+
+    let result = attempt_result.result.as_ref();
+    let final_url = result
+        .and_then(|value| value.final_url.as_deref())
+        .unwrap_or("");
+    let page_url = result
+        .and_then(|value| value.page.as_ref())
+        .and_then(Value::as_object)
+        .and_then(|record| read_string_value(record, "url"))
+        .unwrap_or_default();
+    let page_title = result
+        .and_then(|value| value.page.as_ref())
+        .and_then(Value::as_object)
+        .and_then(|record| read_string_value(record, "title"))
+        .unwrap_or_default();
+    let current_url = result
+        .and_then(|value| value.current.as_ref())
+        .and_then(Value::as_object)
+        .and_then(|record| record.get("details"))
+        .and_then(Value::as_object)
+        .and_then(|record| read_string_value(record, "current_url"))
+        .unwrap_or_default();
+    let run_path = result
+        .and_then(|value| value.observability.as_ref())
+        .and_then(|value| value.run_path.as_deref())
+        .unwrap_or("");
+    let status_path = result
+        .and_then(|value| value.observability.as_ref())
+        .and_then(|value| value.status_path.as_deref())
+        .unwrap_or("");
+    eprintln!(
+        "[codex-rotate-rust] auth-flow debug workflow={workflow_ref} email={email} final_url={final_url:?} page_url={page_url:?} page_title={page_title:?} current_url={current_url:?} run_path={run_path:?} status_path={status_path:?} callback_complete={:?} success={:?} next_action={:?} error_message={:?} has_output={} has_state={}",
+        flow.callback_complete,
+        flow.success,
+        flow.next_action,
+        flow.error_message,
+        result.and_then(|value| value.output.as_ref()).is_some(),
+        result.and_then(|value| value.state.as_ref()).is_some(),
+    );
+}
+
+fn maybe_debug_codex_auth_flow_raw(workflow_ref: &str, email: &str, raw: &Value) {
+    if std::env::var("CODEX_ROTATE_DEBUG_AUTH_FLOW_RESULT").as_deref() != Ok("1") {
+        return;
+    }
+
+    let raw_json = serde_json::to_string(raw).unwrap_or_else(|_| "<serialize-failed>".to_string());
+    let preview = if raw_json.len() > 4000 {
+        format!("{}...", &raw_json[..4000])
+    } else {
+        raw_json
+    };
+    eprintln!(
+        "[codex-rotate-rust] auth-flow raw workflow={workflow_ref} email={email} payload={preview}"
+    );
+}
+
+fn workflow_verified_expected_email(
+    verified_account_email: Option<&str>,
+    expected_email: &str,
+) -> bool {
+    verified_account_email
+        .map(normalize_email_key)
+        .is_some_and(|value| value == normalize_email_key(expected_email))
+}
+
+fn is_workflow_skip_account_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WorkflowSkipAccountError>().is_some()
 }
 
 fn is_retryable_codex_login_workflow_error_message(message: &str) -> bool {
@@ -2141,7 +2831,24 @@ fn run_codex_command<const N: usize>(args: [&str; N]) -> Result<()> {
 }
 
 fn codex_bin() -> String {
-    std::env::var("CODEX_ROTATE_CODEX_BIN").unwrap_or_else(|_| DEFAULT_CODEX_BIN.to_string())
+    resolve_codex_bin_with_paths(
+        std::env::var("CODEX_ROTATE_CODEX_BIN").ok().as_deref(),
+        Path::new(DEFAULT_CODEX_APP_BUNDLE_BIN),
+    )
+}
+
+fn resolve_codex_bin_with_paths(explicit: Option<&str>, app_bundle_bin: &Path) -> String {
+    let explicit = explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    if app_bundle_bin.is_file() {
+        return app_bundle_bin.to_string_lossy().into_owned();
+    }
+    DEFAULT_CODEX_BIN.to_string()
 }
 
 fn load_credential_store() -> Result<CredentialStore> {
@@ -3572,6 +4279,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_bin_uses_explicit_override_before_app_bundle() {
+        let app_root = unique_temp_dir("codex-rotate-codex-bin-override");
+        fs::create_dir_all(&app_root).expect("create app root");
+        let app_path = app_root.join("Codex");
+        fs::write(&app_path, "stub").expect("write app bundle stub");
+
+        let resolved = resolve_codex_bin_with_paths(Some("/tmp/custom-codex"), &app_path);
+        assert_eq!(resolved, "/tmp/custom-codex");
+
+        fs::remove_dir_all(&app_root).ok();
+    }
+
+    #[test]
+    fn codex_bin_prefers_app_bundle_when_present() {
+        let app_root = unique_temp_dir("codex-rotate-codex-bin-app");
+        fs::create_dir_all(&app_root).expect("create app root");
+        let app_path = app_root.join("Codex");
+        fs::write(&app_path, "stub").expect("write app bundle stub");
+
+        let resolved = resolve_codex_bin_with_paths(None, &app_path);
+        assert_eq!(resolved, app_path.to_string_lossy());
+
+        fs::remove_dir_all(&app_root).ok();
+    }
+
+    #[test]
+    fn codex_bin_falls_back_to_bare_codex_when_app_bundle_is_absent() {
+        let app_root = unique_temp_dir("codex-rotate-codex-bin-fallback");
+        let app_path = app_root.join("Codex");
+
+        let resolved = resolve_codex_bin_with_paths(None, &app_path);
+        assert_eq!(resolved, DEFAULT_CODEX_BIN);
+    }
+
+    #[test]
     fn stored_credentials_used_only_for_non_manual_relogin() {
         let stored = StoredCredential {
             email: "dev.user+1@gmail.com".to_string(),
@@ -3786,6 +4528,119 @@ input:
     }
 
     #[test]
+    fn deserializes_bridge_login_attempt_result_with_extra_fast_browser_fields() {
+        let payload = json!({
+            "result": {
+                "ok": true,
+                "workflow": {
+                    "ref": "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth"
+                },
+                "finalUrl": "https://chatgpt.com/#settings/Security",
+                "output": {
+                    "success": true,
+                    "next_action": "complete",
+                    "codex_session": {
+                        "auth_url": "https://auth.openai.com/authorize",
+                        "callback_port": "8765"
+                    }
+                },
+                "mode": "managed",
+                "steps": {},
+                "artifactMode": "full",
+                "state": {
+                    "steps": {
+                        "start_codex_login_session": {
+                            "action": {
+                                "value": {
+                                    "auth_url": "https://auth.openai.com/authorize",
+                                    "callback_port": "8765",
+                                    "pid": "4321"
+                                }
+                            }
+                        }
+                    }
+                },
+                "runtime_profiles": {
+                    "default": "dev-1"
+                },
+                "observability": {
+                    "runId": "demo"
+                }
+            },
+            "error_message": null,
+            "managed_runtime_reset_performed": false
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(payload).expect("bridge payload should deserialize");
+        let normalized = result.result.expect("normalized fast-browser result");
+        let summary = read_codex_rotate_auth_flow_summary(&normalized);
+        let session = read_codex_rotate_auth_flow_session(&normalized).expect("session payload");
+
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+        assert_eq!(session.callback_port, Some(8765));
+        assert_eq!(session.pid, Some(4321));
+    }
+
+    #[test]
+    fn deserializes_bridge_login_attempt_result_from_bare_fast_browser_result() {
+        let payload = json!({
+            "ok": true,
+            "status": "completed",
+            "output": {
+                "success": true,
+                "next_action": "complete"
+            },
+            "state": {
+                "steps": {
+                    "start_codex_login_session": {
+                        "action": {
+                            "value": {
+                                "auth_url": "https://auth.openai.com/authorize",
+                                "callback_port": "8765"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(payload).expect("bare fast-browser result should deserialize");
+        let normalized = result.result.expect("normalized fast-browser result");
+        let summary = read_codex_rotate_auth_flow_summary(&normalized);
+        let session = read_codex_rotate_auth_flow_session(&normalized).expect("session payload");
+
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+        assert_eq!(session.callback_port, Some(8765));
+    }
+
+    #[test]
+    fn deserializes_bridge_login_attempt_result_with_stringified_fast_browser_result() {
+        let payload = json!({
+            "result": serde_json::to_string(&json!({
+                "ok": true,
+                "output": {
+                    "success": true,
+                    "next_action": "complete"
+                }
+            }))
+            .expect("stringify payload"),
+            "error_message": null
+        });
+
+        let result: BridgeLoginAttemptResult = serde_json::from_value(payload)
+            .expect("stringified fast-browser result should deserialize");
+        let normalized = result.result.expect("normalized fast-browser result");
+        let summary = read_codex_rotate_auth_flow_summary(&normalized);
+
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
     fn reads_auth_flow_session_from_start_step_when_summary_omits_it() {
         let result = FastBrowserRunResult {
             state: Some(FastBrowserState {
@@ -3811,6 +4666,356 @@ input:
         assert_eq!(session.callback_port, Some(7654));
         assert_eq!(session.pid, Some(2468));
         assert_eq!(session.stdout_path.as_deref(), Some("/tmp/codex.stdout"));
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_finalize_step_when_output_is_missing() {
+        let result = FastBrowserRunResult {
+            state: Some(FastBrowserState {
+                steps: HashMap::from([(
+                    "finalize_selected_flow".to_string(),
+                    FastBrowserStepState {
+                        action: Some(json!({
+                            "ok": true,
+                            "value": {
+                                "stage": "success",
+                                "callback_complete": true,
+                                "success": true,
+                                "next_action": "complete",
+                                "verified_account_email": "dev.49@astronlab.com",
+                                "codex_session": {
+                                    "auth_url": "https://auth.openai.com/authorize",
+                                    "callback_port": "8765",
+                                    "pid": "4321"
+                                }
+                            }
+                        })),
+                    },
+                )]),
+            }),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+        let session = read_codex_rotate_auth_flow_session(&result).expect("session payload");
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+        assert_eq!(
+            summary.verified_account_email.as_deref(),
+            Some("dev.49@astronlab.com")
+        );
+        assert_eq!(session.callback_port, Some(8765));
+        assert_eq!(session.pid, Some(4321));
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_recent_events_when_output_and_state_summary_are_missing() {
+        let result = FastBrowserRunResult {
+            recent_events: Some(vec![json!({
+                "step_id": "finalize_flow_summary",
+                "phase": "action",
+                "status": "ok",
+                "details": {
+                    "result": {
+                        "value": {
+                            "stage": "add_phone",
+                            "next_action": "skip_account",
+                            "replay_reason": "add_phone",
+                            "error_message": "OpenAI still requires phone setup before the Codex callback can complete.",
+                            "callback_complete": false,
+                            "success": false
+                        }
+                    }
+                }
+            })]),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+
+        assert_eq!(summary.stage.as_deref(), Some("add_phone"));
+        assert_eq!(summary.callback_complete, Some(false));
+        assert_eq!(summary.success, Some(false));
+        assert_eq!(summary.next_action.as_deref(), Some("skip_account"));
+        assert_eq!(summary.replay_reason.as_deref(), Some("add_phone"));
+    }
+
+    #[test]
+    fn hydrates_auth_flow_recent_events_from_observability_run_path() {
+        let fixture_root = unique_temp_dir("codex-rotate-observability-recent-events");
+        fs::create_dir_all(&fixture_root).expect("create fixture root");
+        let run_path = fixture_root.join("run.json");
+        fs::write(
+            &run_path,
+            serde_json::to_string(&json!({
+                "final_url": "https://auth.openai.com/add-phone",
+                "recent_events": [
+                    {
+                        "step_id": "finalize_flow_summary",
+                        "phase": "action",
+                        "status": "ok",
+                        "details": {
+                            "result": {
+                                "value": {
+                                    "stage": "add_phone",
+                                    "next_action": "skip_account",
+                                    "replay_reason": "add_phone",
+                                    "error_message": "OpenAI still requires phone setup before the Codex callback can complete.",
+                                    "callback_complete": false,
+                                    "success": false
+                                }
+                            }
+                        }
+                    }
+                ]
+            }))
+            .expect("serialize run payload"),
+        )
+        .expect("write run payload");
+
+        let bridge_payload = json!({
+            "result": {
+                "ok": true,
+                "status": "completed",
+                "observability": {
+                    "run_path": run_path,
+                    "status_path": run_path,
+                }
+            }
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(bridge_payload).expect("bridge payload should deserialize");
+        let summary = read_codex_rotate_auth_flow_summary(
+            result.result.as_ref().expect("fast-browser result"),
+        );
+
+        assert_eq!(summary.stage.as_deref(), Some("add_phone"));
+        assert_eq!(summary.next_action.as_deref(), Some("skip_account"));
+
+        let _ = fs::remove_dir_all(&fixture_root);
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_device_auth_callback_metadata_when_output_is_missing() {
+        let result = FastBrowserRunResult {
+            final_url: Some("https://auth.openai.com/deviceauth/callback".to_string()),
+            page: Some(json!({
+                "url": "https://auth.openai.com/deviceauth/callback",
+                "title": "Signed in to Codex",
+                "text": "Signed in to Codex\nYou may now close this page"
+            })),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(
+            summary.current_url.as_deref(),
+            Some("https://auth.openai.com/deviceauth/callback")
+        );
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_camel_case_localhost_final_url_when_output_is_missing() {
+        let bridge_payload = json!({
+            "result": {
+                "ok": true,
+                "finalUrl": "http://localhost:1455/success",
+                "page": {
+                    "url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                    "title": "Signed in to Codex",
+                    "text": "Signed in to Codex\nYou may now close this page"
+                }
+            }
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(bridge_payload).expect("bridge payload should deserialize");
+        let summary = read_codex_rotate_auth_flow_summary(
+            result.result.as_ref().expect("fast-browser result"),
+        );
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(
+            summary.current_url.as_deref(),
+            Some("http://localhost:1455/success")
+        );
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn hydrates_auth_flow_summary_from_snake_case_observability_run_path() {
+        let fixture_root = unique_temp_dir("codex-rotate-observability-hydrate");
+        fs::create_dir_all(&fixture_root).expect("create fixture root");
+        let run_path = fixture_root.join("run.json");
+        fs::write(
+            &run_path,
+            serde_json::to_string(&json!({
+                "final_url": "http://localhost:1455/success",
+                "page": {
+                    "url": "http://localhost:1455/success",
+                    "title": "Signed in to Codex",
+                    "text": "Signed in to Codex\nYou may now close this page"
+                }
+            }))
+            .expect("serialize run payload"),
+        )
+        .expect("write run payload");
+
+        let bridge_payload = json!({
+            "result": {
+                "ok": true,
+                "status": "completed",
+                "observability": {
+                    "run_path": run_path,
+                    "status_path": run_path,
+                }
+            }
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(bridge_payload).expect("bridge payload should deserialize");
+        let summary = read_codex_rotate_auth_flow_summary(
+            result.result.as_ref().expect("fast-browser result"),
+        );
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(
+            summary.current_url.as_deref(),
+            Some("http://localhost:1455/success")
+        );
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+
+        let _ = fs::remove_dir_all(&fixture_root);
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_success_copy_without_callback_url() {
+        let result = FastBrowserRunResult {
+            page: Some(json!({
+                "url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "title": "Signed in to Codex",
+                "text": "Signed in to Codex\nYou may now close this page"
+            })),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(
+            summary.current_url.as_deref(),
+            Some("https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        );
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn reads_auth_flow_summary_from_action_only_step_metadata_when_output_is_missing() {
+        let result = FastBrowserRunResult {
+            state: Some(FastBrowserState {
+                steps: HashMap::from([(
+                    "inspect_device_authorization_after_callback_code".to_string(),
+                    FastBrowserStepState {
+                        action: Some(json!({
+                            "current_url": "https://auth.openai.com/deviceauth/callback?code=ac_example&state=state_example",
+                            "headline": "Signed in to Codex You may now close this page",
+                            "success": true
+                        })),
+                    },
+                )]),
+            }),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(
+            summary.current_url.as_deref(),
+            Some("https://auth.openai.com/deviceauth/callback?code=ac_example&state=state_example")
+        );
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn callback_metadata_overrides_pessimistic_output_summary() {
+        let result = FastBrowserRunResult {
+            output: Some(json!({
+                "success": false,
+                "callback_complete": false,
+                "next_action": "retry_attempt",
+                "stage": "oauth_consent"
+            })),
+            state: Some(FastBrowserState {
+                steps: HashMap::from([(
+                    "inspect_device_authorization_after_callback_code".to_string(),
+                    FastBrowserStepState {
+                        action: Some(json!({
+                            "current_url": "https://auth.openai.com/deviceauth/callback?code=ac_example&state=state_example",
+                            "headline": "Signed in to Codex You may now close this page",
+                            "success": true
+                        })),
+                    },
+                )]),
+            }),
+            ..FastBrowserRunResult::default()
+        };
+
+        let summary = read_codex_rotate_auth_flow_summary(&result);
+
+        assert_eq!(summary.stage.as_deref(), Some("success"));
+        assert_eq!(summary.callback_complete, Some(true));
+        assert_eq!(summary.success, Some(true));
+        assert_eq!(summary.next_action.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn bridge_login_attempt_result_accepts_failed_runs_without_state_or_output() {
+        let payload = json!({
+            "result": {
+                "ok": false,
+                "status": "failed",
+                "finalUrl": "https://auth.openai.com/about-you",
+                "error": {
+                    "message": "about-you-fields-not-found"
+                }
+            },
+            "error_message": "about-you-fields-not-found"
+        });
+
+        let result: BridgeLoginAttemptResult =
+            serde_json::from_value(payload).expect("bridge payload should deserialize");
+
+        assert!(result.result.is_some());
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("about-you-fields-not-found")
+        );
+        let summary = read_codex_rotate_auth_flow_summary(
+            result
+                .result
+                .as_ref()
+                .expect("normalized fast-browser result"),
+        );
+        assert_eq!(summary.next_action, None);
+        assert_eq!(summary.error_message, None);
     }
 
     #[test]
@@ -4047,6 +5252,28 @@ input:
             source: CreateCommandSource::Manual,
             ..CreateCommandOptions::default()
         }));
+    }
+
+    #[test]
+    fn workflow_skip_account_errors_are_retried_for_create() {
+        let error = anyhow::Error::new(WorkflowSkipAccountError::new(
+            "skip this account".to_string(),
+        ));
+        assert!(is_workflow_skip_account_error(&error));
+        assert!(should_retry_create_after_error(
+            &CreateCommandOptions::default(),
+            &error
+        ));
+    }
+
+    #[test]
+    fn unrelated_create_errors_do_not_trigger_policy_skip() {
+        let error = anyhow!("Codex browser login did not reach the callback.");
+        assert!(!is_workflow_skip_account_error(&error));
+        assert!(!should_retry_create_after_error(
+            &CreateCommandOptions::default(),
+            &error
+        ));
     }
 
     #[test]

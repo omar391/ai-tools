@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
@@ -14,6 +15,7 @@ use crate::cancel;
 use crate::paths::{cleanup_legacy_rotate_home_artifacts, resolve_paths};
 
 const FAST_BROWSER_EVENT_PREFIX: &str = "__FAST_BROWSER_EVENT__";
+const BRIDGE_RESPONSE_PREFIX: &str = "__CODEX_ROTATE_BRIDGE__";
 const BRIDGE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BRIDGE_TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -109,9 +111,7 @@ where
                 .stderr
                 .take()
                 .context("Automation bridge stderr was unavailable for progress streaming.")?;
-            Some(thread::spawn(move || {
-                stream_bridge_progress(stderr, progress)
-            }))
+            Some(thread::spawn(move || read_bridge_stderr(stderr, progress)))
         }
         None => None,
     };
@@ -131,17 +131,39 @@ where
     let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow!("Automation bridge stdout reader panicked."))??;
-    if let Some(reader) = stderr_reader {
-        reader
-            .join()
-            .map_err(|_| anyhow!("Automation bridge progress reader panicked."))??;
-    }
-    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
-    let response = serde_json::from_str::<BridgeResponse>(&stdout).ok();
+    let stderr = match stderr_reader {
+        Some(reader) => Some(
+            reader
+                .join()
+                .map_err(|_| anyhow!("Automation bridge progress reader panicked."))??,
+        ),
+        None => None,
+    };
+    let stdout_text = String::from_utf8_lossy(&stdout).trim().to_string();
+    let response = parse_bridge_response(&stdout);
     if let Some(response) = response {
+        if response.ok
+            && response.result.is_null()
+            && std::env::var("CODEX_ROTATE_DEBUG_AUTH_FLOW_RESULT").as_deref() == Ok("1")
+        {
+            eprintln!(
+                "[codex-rotate-rust] automation-bridge null-result command={command} status={} stdout_tail={}",
+                output.status,
+                stdout_tail_preview(&stdout_text, 1200)
+            );
+        }
         if response.ok && output.status.success() {
-            return serde_json::from_value(response.result).with_context(|| {
-                format!("Automation bridge returned an incompatible result for {command}.")
+            return serde_json::from_value(response.result).map_err(|error| {
+                let stdout_preview = stdout_tail_preview(&stdout_text, 400);
+                anyhow!(if stdout_preview.is_empty() {
+                    format!(
+                        "Automation bridge returned an incompatible result for {command}: {error}"
+                    )
+                } else {
+                    format!(
+                        "Automation bridge returned an incompatible result for {command}: {error}. stdout tail: {stdout_preview}"
+                    )
+                })
             });
         }
 
@@ -155,16 +177,27 @@ where
     }
 
     if !output.status.success() {
-        return Err(anyhow!(if !stdout.is_empty() {
-            stdout
+        return Err(anyhow!(if !stdout_text.is_empty() {
+            stdout_text
+        } else if let Some(stderr) = stderr
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            stderr.to_string()
         } else {
             format!("Automation bridge command {command} failed.")
         }));
     }
 
-    Err(anyhow!(
-        "Automation bridge returned invalid JSON for {command}."
-    ))
+    let stdout_preview = stdout_tail_preview(&stdout_text, 400);
+    Err(anyhow!(if stdout_preview.is_empty() {
+        format!("Automation bridge returned invalid JSON for {command}.")
+    } else {
+        format!(
+            "Automation bridge returned invalid JSON for {command}. stdout tail: {stdout_preview}"
+        )
+    }))
 }
 
 #[cfg(unix)]
@@ -232,22 +265,24 @@ fn read_bridge_stdout(stdout: impl Read) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-struct BridgeProcessOutput {
-    status: ExitStatus,
-}
-
-fn stream_bridge_progress(
-    stderr: impl std::io::Read,
-    progress: AutomationProgressCallback,
-) -> Result<()> {
+fn read_bridge_stderr(stderr: impl Read, progress: AutomationProgressCallback) -> Result<String> {
     let reader = BufReader::new(stderr);
+    let mut stderr_output = String::new();
     for line in reader.lines() {
         let line = line.context("Failed to read automation bridge stderr.")?;
+        if !line.starts_with(FAST_BROWSER_EVENT_PREFIX) {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+        }
         if let Some(forwarded) = bridge_progress_line_for_cli(&line) {
             progress(forwarded);
         }
     }
-    Ok(())
+    Ok(stderr_output)
+}
+
+struct BridgeProcessOutput {
+    status: ExitStatus,
 }
 
 fn bridge_progress_line_for_cli(line: &str) -> Option<String> {
@@ -394,9 +429,97 @@ fn read_string_value(record: &Map<String, Value>, field: &str) -> Option<String>
         .map(str::to_string)
 }
 
+fn parse_bridge_response(stdout: &[u8]) -> Option<BridgeResponse> {
+    parse_bridge_response_from_prefixed_line(stdout)
+        .or_else(|| serde_json::from_slice::<BridgeResponse>(stdout).ok())
+        .or_else(|| parse_bridge_response_from_last_line(stdout))
+        .or_else(|| parse_bridge_response_from_last_json_object(stdout))
+}
+
+fn parse_bridge_response_from_prefixed_line(stdout: &[u8]) -> Option<BridgeResponse> {
+    let stdout = String::from_utf8_lossy(stdout);
+    stdout.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        let payload = trimmed.strip_prefix(BRIDGE_RESPONSE_PREFIX)?;
+        serde_json::from_str::<BridgeResponse>(payload.trim()).ok()
+    })
+}
+
+fn parse_bridge_response_from_last_line(stdout: &[u8]) -> Option<BridgeResponse> {
+    let stdout = String::from_utf8_lossy(stdout);
+    stdout.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let payload = trimmed
+            .strip_prefix(BRIDGE_RESPONSE_PREFIX)
+            .map(str::trim)
+            .unwrap_or(trimmed);
+        serde_json::from_str::<BridgeResponse>(payload).ok()
+    })
+}
+
+fn parse_bridge_response_from_last_json_object(stdout: &[u8]) -> Option<BridgeResponse> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let prefixed_indices = stdout
+        .match_indices(BRIDGE_RESPONSE_PREFIX)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for start in prefixed_indices.into_iter().rev() {
+        let candidate = stdout[start..]
+            .trim_start()
+            .strip_prefix(BRIDGE_RESPONSE_PREFIX)
+            .map(str::trim_start)
+            .unwrap_or_default();
+        if candidate.is_empty() {
+            continue;
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(candidate.as_bytes());
+        if let Ok(response) = BridgeResponse::deserialize(&mut deserializer) {
+            return Some(response);
+        }
+    }
+
+    serde_json::from_str::<BridgeResponse>(&stdout)
+        .ok()
+        .or_else(|| {
+            for start in stdout.match_indices('{').map(|(index, _)| index).rev() {
+                let candidate = stdout[start..].trim_start();
+                if candidate.is_empty() {
+                    continue;
+                }
+                let mut deserializer = serde_json::Deserializer::from_slice(candidate.as_bytes());
+                if let Ok(response) = BridgeResponse::deserialize(&mut deserializer) {
+                    return Some(response);
+                }
+            }
+            None
+        })
+}
+
+fn stdout_tail_preview(stdout: &str, max_chars: usize) -> String {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tail = trimmed
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    tail.replace('\n', "\\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bridge_progress_line_for_cli, format_fast_browser_progress_event_line};
+    use super::{
+        bridge_progress_line_for_cli, format_fast_browser_progress_event_line,
+        parse_bridge_response, stdout_tail_preview,
+    };
 
     #[test]
     fn formats_fast_browser_progress_events_in_rust() {
@@ -419,5 +542,40 @@ mod tests {
     fn suppresses_raw_fast_browser_event_markers_when_event_is_invalid() {
         let line = "__FAST_BROWSER_EVENT__not-json";
         assert_eq!(bridge_progress_line_for_cli(line), None);
+    }
+
+    #[test]
+    fn parses_bridge_response_from_last_non_empty_stdout_line() {
+        let stdout = br#"noise before response
+{"ok":true,"result":{"value":"final"}}
+"#;
+        let response = parse_bridge_response(stdout).expect("response should parse");
+        assert!(response.ok);
+        assert_eq!(response.result["value"], "final");
+    }
+
+    #[test]
+    fn parses_bridge_response_when_noise_shares_the_response_line() {
+        let stdout = br#"noise before response {"ok":true,"result":{"value":"final"}}
+"#;
+        let response = parse_bridge_response(stdout).expect("response should parse");
+        assert!(response.ok);
+        assert_eq!(response.result["value"], "final");
+    }
+
+    #[test]
+    fn parses_prefixed_bridge_response_line_before_other_json_noise() {
+        let stdout = br#"{"ok":true,"result":["noise"]}
+__CODEX_ROTATE_BRIDGE__{"ok":true,"result":{"value":"final"}}
+"#;
+        let response = parse_bridge_response(stdout).expect("response should parse");
+        assert!(response.ok);
+        assert_eq!(response.result["value"], "final");
+    }
+
+    #[test]
+    fn trims_stdout_tail_preview_for_invalid_bridge_debugging() {
+        let preview = stdout_tail_preview("line-1\nline-2\nline-3", 8);
+        assert_eq!(preview, "2\\nline-3");
     }
 }
