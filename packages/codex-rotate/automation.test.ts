@@ -796,7 +796,7 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     );
   });
 
-  test("main remains pinned to the single stepwise flow while benchmarking", async () => {
+  test("main remains pinned to the selected original flow after benchmarking", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -819,8 +819,8 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
-        version: "1.1.0",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
+        version: "1.0.7",
       },
     ]);
   });
