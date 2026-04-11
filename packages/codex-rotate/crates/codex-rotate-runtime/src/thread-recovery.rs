@@ -113,6 +113,13 @@ enum RecoveryResolution {
     Blocked,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContinueStrategy {
+    Direct { cwd: Option<String> },
+    DirectThenResume { initial_cwd: Option<String> },
+    ResumeThenContinue { initial_cwd: Option<String> },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RecoveryProcessingResult {
     continued_thread_ids: Vec<String>,
@@ -308,47 +315,45 @@ fn resolve_recoverable_turn_failure_event(
         }
     }
 
-    let cwd = match thread_summary {
-        Some(thread) if thread_ready_for_continue(&thread.status.kind) => thread.cwd,
-        Some(thread) => match prepare_thread_for_continue(port, &event.thread_id, thread.cwd) {
-            Ok(cwd) => cwd,
-            Err(error) if is_terminal_thread_recovery_error(&error) => {
-                log_daemon_error(format!(
-                    "dropping recoverable thread {} after terminal resume failure: {error:#}",
-                    event.thread_id,
-                ));
-                eprintln!(
-                    "codex-rotate: dropping recoverable thread {} after terminal resume failure: {error:#}",
-                    event.thread_id,
-                );
-                return Ok(RecoveryResolution::Dropped);
+    let cwd = match continue_strategy_for_thread(thread_summary.as_ref()) {
+        ContinueStrategy::Direct { cwd } => cwd,
+        ContinueStrategy::DirectThenResume { initial_cwd } => {
+            match send_continue_turn(port, &event.thread_id, initial_cwd.clone()) {
+                Ok(()) => return Ok(RecoveryResolution::Continued),
+                Err(error) if is_terminal_thread_recovery_error(&error) => {
+                    log_daemon_error(format!(
+                        "dropping recoverable thread {} after terminal continue failure: {error:#}",
+                        event.thread_id,
+                    ));
+                    eprintln!(
+                        "codex-rotate: dropping recoverable thread {} after terminal continue failure: {error:#}",
+                        event.thread_id,
+                    );
+                    return Ok(RecoveryResolution::Dropped);
+                }
+                Err(error) => {
+                    log_daemon_error(format!(
+                        "direct continue failed for thread {}; retrying after resume: {error:#}",
+                        event.thread_id,
+                    ));
+                    eprintln!(
+                        "codex-rotate: direct continue failed for thread {}; retrying after resume: {error:#}",
+                        event.thread_id,
+                    );
+                }
             }
-            Err(error) => {
-                log_daemon_error(format!(
-                    "thread {} could not be resumed for continue: {error:#}",
-                    event.thread_id
-                ));
-                eprintln!(
-                    "codex-rotate: thread {} could not be resumed for continue: {error:#}",
-                    event.thread_id
-                );
-                return Ok(RecoveryResolution::Blocked);
+
+            match prepare_thread_for_continue(port, &event.thread_id, initial_cwd) {
+                Ok(cwd) => cwd,
+                Err(error) => return Ok(log_prepare_continue_error(&event.thread_id, &error)),
             }
-        },
-        None => match prepare_thread_for_continue(port, &event.thread_id, None) {
-            Ok(cwd) => cwd,
-            Err(error) => {
-                log_daemon_error(format!(
-                    "thread {} could not be resumed for continue: {error:#}",
-                    event.thread_id
-                ));
-                eprintln!(
-                    "codex-rotate: thread {} could not be resumed for continue: {error:#}",
-                    event.thread_id
-                );
-                return Ok(RecoveryResolution::Blocked);
+        }
+        ContinueStrategy::ResumeThenContinue { initial_cwd } => {
+            match prepare_thread_for_continue(port, &event.thread_id, initial_cwd) {
+                Ok(cwd) => cwd,
+                Err(error) => return Ok(log_prepare_continue_error(&event.thread_id, &error)),
             }
-        },
+        }
     };
 
     match send_continue_turn(port, &event.thread_id, cwd) {
@@ -953,6 +958,57 @@ fn thread_ready_for_continue(status_kind: &str) -> bool {
     matches!(status_kind, "active" | "idle")
 }
 
+fn continue_strategy_for_thread(thread_summary: Option<&ThreadSummary>) -> ContinueStrategy {
+    match thread_summary {
+        Some(thread) if thread_ready_for_continue(&thread.status.kind) => {
+            ContinueStrategy::Direct {
+                cwd: thread.cwd.clone(),
+            }
+        }
+        Some(thread) if thread.cwd.is_some() => ContinueStrategy::DirectThenResume {
+            initial_cwd: thread.cwd.clone(),
+        },
+        Some(_) => ContinueStrategy::ResumeThenContinue { initial_cwd: None },
+        None => ContinueStrategy::ResumeThenContinue { initial_cwd: None },
+    }
+}
+
+fn recovery_resolution_for_prepare_continue_error(error: &anyhow::Error) -> RecoveryResolution {
+    if is_terminal_thread_recovery_error(error) {
+        RecoveryResolution::Dropped
+    } else {
+        RecoveryResolution::Blocked
+    }
+}
+
+fn log_prepare_continue_error(thread_id: &str, error: &anyhow::Error) -> RecoveryResolution {
+    let resolution = recovery_resolution_for_prepare_continue_error(error);
+    match resolution {
+        RecoveryResolution::Dropped => {
+            log_daemon_error(format!(
+                "dropping recoverable thread {} after terminal resume failure: {error:#}",
+                thread_id,
+            ));
+            eprintln!(
+                "codex-rotate: dropping recoverable thread {} after terminal resume failure: {error:#}",
+                thread_id,
+            );
+        }
+        RecoveryResolution::Blocked => {
+            log_daemon_error(format!(
+                "thread {} could not be resumed for continue: {error:#}",
+                thread_id
+            ));
+            eprintln!(
+                "codex-rotate: thread {} could not be resumed for continue: {error:#}",
+                thread_id
+            );
+        }
+        RecoveryResolution::Continued => {}
+    }
+    resolution
+}
+
 fn prepare_thread_for_continue(
     port: u16,
     thread_id: &str,
@@ -1171,6 +1227,16 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use tempfile::NamedTempFile;
+
+    fn thread_summary(status_kind: &str, cwd: Option<&str>) -> ThreadSummary {
+        ThreadSummary {
+            id: "thread-123".to_string(),
+            cwd: cwd.map(str::to_string),
+            status: ThreadStatus {
+                kind: status_kind.to_string(),
+            },
+        }
+    }
 
     #[test]
     fn logs_connection_unavailable_when_database_is_missing() {
@@ -1886,6 +1952,48 @@ create table logs (
         );
         assert_eq!(
             recovery_resolution_for_active_thread(ThreadRecoveryKind::QuotaExhausted),
+            RecoveryResolution::Blocked
+        );
+    }
+
+    #[test]
+    fn continue_strategy_prefers_direct_continue_for_non_ready_thread_with_cwd() {
+        let thread = thread_summary("systemError", Some("/tmp/project"));
+
+        assert_eq!(
+            continue_strategy_for_thread(Some(&thread)),
+            ContinueStrategy::DirectThenResume {
+                initial_cwd: Some("/tmp/project".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn continue_strategy_requires_resume_when_non_ready_thread_has_no_cwd() {
+        let thread = thread_summary("systemError", None);
+
+        assert_eq!(
+            continue_strategy_for_thread(Some(&thread)),
+            ContinueStrategy::ResumeThenContinue { initial_cwd: None }
+        );
+        assert_eq!(
+            continue_strategy_for_thread(None),
+            ContinueStrategy::ResumeThenContinue { initial_cwd: None }
+        );
+    }
+
+    #[test]
+    fn terminal_resume_failure_resolves_to_dropped() {
+        assert_eq!(
+            recovery_resolution_for_prepare_continue_error(&anyhow!(
+                "Codex thread/resume request failed: {{\"code\":-32600,\"message\":\"no rollout found for thread id thread-123\"}}"
+            )),
+            RecoveryResolution::Dropped
+        );
+        assert_eq!(
+            recovery_resolution_for_prepare_continue_error(&anyhow!(
+                "Timed out waiting for thread/resume response from Codex."
+            )),
             RecoveryResolution::Blocked
         );
     }
