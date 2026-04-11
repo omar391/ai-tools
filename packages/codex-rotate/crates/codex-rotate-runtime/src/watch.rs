@@ -14,7 +14,7 @@ use codex_rotate_core::quota::{
 };
 use codex_rotate_core::workflow::{
     cmd_create_with_progress, is_auto_create_retry_stopped_for_reusable_account,
-    CreateCommandOptions, CreateCommandSource,
+    is_create_already_in_progress_error, CreateCommandOptions, CreateCommandSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -464,7 +464,8 @@ fn normalize_email_for_match(email: &str) -> String {
 
 fn is_retryable_watch_create_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
-    message.contains("Daemon closed the socket before sending a response")
+    is_create_already_in_progress_error(error)
+        || message.contains("Daemon closed the socket before sending a response")
         || (message.contains("fast-browser workflow ") && message.contains(" exited with status 1"))
 }
 
@@ -830,6 +831,12 @@ mod tests {
         let error = anyhow!(
             "fast-browser workflow workspace.web.auth-openai-com.codex-rotate-account-flow-main exited with status 1."
         );
+        assert!(is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn retryable_watch_create_error_matches_create_lock_contention() {
+        let error = anyhow!("Another create command is already in progress (pid 42, started 2026-04-11T00:00:00.000Z, source manual, profile dev-1).");
         assert!(is_retryable_watch_create_error(&error));
     }
 

@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use fs2::FileExt;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -52,6 +55,8 @@ const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS: &[u64] =
     &[30_000, 60_000, 120_000, 240_000, 300_000];
 const AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT: &str =
     "Automatic account creation stopped retrying because a reusable account is now available.";
+const CREATE_ALREADY_IN_PROGRESS_PREFIX: &str = "Another create command is already in progress";
+const CREATE_LOCK_WAIT_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateCommandSource {
@@ -135,6 +140,24 @@ impl Display for WorkflowSkipAccountError {
 }
 
 impl std::error::Error for WorkflowSkipAccountError {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CreateExecutionLockMetadata {
+    pid: u32,
+    started_at: String,
+    source: String,
+    profile_name: Option<String>,
+    base_email: Option<String>,
+    alias: Option<String>,
+    force: bool,
+    ignore_current: bool,
+    require_usable_quota: bool,
+}
+
+struct CreateExecutionLock {
+    _process_guard: MutexGuard<'static, ()>,
+    _file: File,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialFamily {
@@ -620,6 +643,136 @@ enum EmailFamilyMode {
     Template { prefix: String, suffix: String },
 }
 
+fn create_lock_path() -> Result<std::path::PathBuf> {
+    Ok(resolve_paths()?
+        .rotate_home
+        .join("locks")
+        .join("create.lock"))
+}
+
+fn create_execution_mutex() -> &'static Mutex<()> {
+    static CREATE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    CREATE_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn create_lock_source_label(source: CreateCommandSource) -> &'static str {
+    match source {
+        CreateCommandSource::Manual => "manual",
+        CreateCommandSource::Next => "next",
+    }
+}
+
+fn read_create_execution_lock_metadata(path: &Path) -> Option<CreateExecutionLockMetadata> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn format_create_execution_lock_error(metadata: Option<CreateExecutionLockMetadata>) -> String {
+    let Some(metadata) = metadata else {
+        return format!("{CREATE_ALREADY_IN_PROGRESS_PREFIX}.");
+    };
+    let mut details = vec![
+        format!("pid {}", metadata.pid),
+        format!("started {}", metadata.started_at),
+        format!("source {}", metadata.source),
+    ];
+    if let Some(profile_name) = metadata.profile_name.as_deref() {
+        details.push(format!("profile {}", profile_name));
+    }
+    if let Some(base_email) = metadata.base_email.as_deref() {
+        details.push(format!("base {}", base_email));
+    }
+    if let Some(alias) = metadata.alias.as_deref() {
+        details.push(format!("alias {}", alias));
+    }
+    format!(
+        "{CREATE_ALREADY_IN_PROGRESS_PREFIX} ({}).",
+        details.join(", ")
+    )
+}
+
+fn acquire_create_execution_lock(
+    options: &CreateCommandOptions,
+    progress: Option<&AutomationProgressCallback>,
+) -> Result<CreateExecutionLock> {
+    let process_guard = create_execution_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let lock_path = create_lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open {}.", lock_path.display()))?;
+    let mut reported_wait = false;
+    loop {
+        cancel::check_canceled()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if !reported_wait {
+                    report_progress(
+                        progress,
+                        format!(
+                            "{} Waiting for it to finish.",
+                            format_create_execution_lock_error(
+                                read_create_execution_lock_metadata(&lock_path)
+                            )
+                        ),
+                    );
+                    reported_wait = true;
+                }
+                cancel::sleep_with_cancellation(CREATE_LOCK_WAIT_INTERVAL)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to acquire create lock at {}.", lock_path.display())
+                });
+            }
+        }
+    }
+
+    let metadata = CreateExecutionLockMetadata {
+        pid: std::process::id(),
+        started_at: now_iso(),
+        source: create_lock_source_label(options.source).to_string(),
+        profile_name: options.profile_name.clone(),
+        base_email: options.base_email.clone(),
+        alias: options.alias.clone(),
+        force: options.force,
+        ignore_current: options.ignore_current,
+        require_usable_quota: options.require_usable_quota,
+    };
+    let serialized = serde_json::to_vec_pretty(&metadata)
+        .context("Failed to serialize create lock metadata.")?;
+    file.set_len(0)
+        .with_context(|| format!("Failed to truncate {}.", lock_path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("Failed to seek {}.", lock_path.display()))?;
+    file.write_all(&serialized)
+        .with_context(|| format!("Failed to write {}.", lock_path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("Failed to finalize {}.", lock_path.display()))?;
+    file.flush()
+        .with_context(|| format!("Failed to flush {}.", lock_path.display()))?;
+    Ok(CreateExecutionLock {
+        _process_guard: process_guard,
+        _file: file,
+    })
+}
+
+pub fn is_create_already_in_progress_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .starts_with(CREATE_ALREADY_IN_PROGRESS_PREFIX)
+}
+
 pub fn cmd_create(options: CreateCommandOptions) -> Result<String> {
     cmd_create_with_progress(options, None)
 }
@@ -628,6 +781,7 @@ pub fn cmd_create_with_progress(
     options: CreateCommandOptions,
     progress: Option<AutomationProgressCallback>,
 ) -> Result<String> {
+    let _lock = acquire_create_execution_lock(&options, progress.as_ref())?;
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
@@ -1103,6 +1257,10 @@ fn prepare_next_auto_create_attempt(
     save_credential_store(store)
 }
 
+fn prefer_signup_recovery_for_create(reusing_pending: bool) -> bool {
+    !reusing_pending
+}
+
 fn execute_create_flow_attempt(
     options: &CreateCommandOptions,
     progress: Option<AutomationProgressCallback>,
@@ -1320,7 +1478,7 @@ fn execute_create_flow_attempt(
         codex_bin: Some(codex_bin().as_str()),
         workflow_run_stamp: Some(started_at.as_str()),
         skip_locator_preflight: Some(skip_locator_preflight),
-        prefer_signup_recovery: Some(true),
+        prefer_signup_recovery: Some(prefer_signup_recovery_for_create(reusing_pending)),
         prefer_password_login: skip_locator_preflight.then_some(true),
         birth_date: Some(&birth_date),
         progress: progress.clone(),
@@ -4240,7 +4398,10 @@ mod tests {
     use crate::test_support::ENV_MUTEX;
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::Command as ProcessCommand;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -4248,6 +4409,26 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
+
+    fn with_rotate_home<T>(prefix: &str, test: impl FnOnce(&Path) -> T) -> T {
+        let rotate_home = unique_temp_dir(prefix);
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        }
+        let result = test(&rotate_home);
+        match previous_rotate_home {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_ROTATE_HOME");
+            },
+        }
+        fs::remove_dir_all(&rotate_home).ok();
+        result
     }
 
     fn make_pending(
@@ -5118,6 +5299,113 @@ input:
             .unwrap(),
             46
         );
+    }
+
+    #[test]
+    fn fresh_create_prefers_signup_recovery_but_reused_pending_does_not() {
+        assert!(prefer_signup_recovery_for_create(false));
+        assert!(!prefer_signup_recovery_for_create(true));
+    }
+
+    #[test]
+    fn create_execution_lock_blocks_other_process_and_records_metadata() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        with_rotate_home("codex-rotate-create-lock", |_| {
+            let options = CreateCommandOptions {
+                alias: Some("dev-1".to_string()),
+                profile_name: Some("dev-1".to_string()),
+                base_email: Some("dev.{n}@astronlab.com".to_string()),
+                force: true,
+                ignore_current: true,
+                require_usable_quota: true,
+                source: CreateCommandSource::Manual,
+                ..CreateCommandOptions::default()
+            };
+            let lock = acquire_create_execution_lock(&options, None).expect("acquire create lock");
+            let lock_path = create_lock_path().expect("create lock path");
+            let metadata = read_create_execution_lock_metadata(&lock_path).expect("lock metadata");
+            assert_eq!(metadata.pid, std::process::id());
+            assert_eq!(metadata.source, "manual");
+            assert_eq!(metadata.profile_name.as_deref(), Some("dev-1"));
+            assert_eq!(
+                metadata.base_email.as_deref(),
+                Some("dev.{n}@astronlab.com")
+            );
+            assert_eq!(metadata.alias.as_deref(), Some("dev-1"));
+
+            let output = ProcessCommand::new("ruby")
+                .arg("-e")
+                .arg(
+                    r#"
+path = ARGV[0]
+File.open(path, File::RDWR | File::CREAT, 0o644) do |file|
+  locked = file.flock(File::LOCK_EX | File::LOCK_NB)
+  exit(locked ? 7 : 0)
+end
+"#,
+                )
+                .arg(&lock_path)
+                .output()
+                .expect("run ruby flock probe");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "second process unexpectedly acquired create lock: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            drop(lock);
+
+            let output = ProcessCommand::new("ruby")
+                .arg("-e")
+                .arg(
+                    r#"
+path = ARGV[0]
+File.open(path, File::RDWR | File::CREAT, 0o644) do |file|
+  locked = file.flock(File::LOCK_EX | File::LOCK_NB)
+  exit(locked ? 0 : 9)
+end
+"#,
+                )
+                .arg(&lock_path)
+                .output()
+                .expect("run ruby flock release probe");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "second process could not acquire released create lock: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    }
+
+    #[test]
+    fn create_execution_lock_waits_for_same_process_release() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        with_rotate_home("codex-rotate-create-lock-wait", |_| {
+            let options = CreateCommandOptions {
+                profile_name: Some("dev-1".to_string()),
+                base_email: Some("dev.{n}@astronlab.com".to_string()),
+                force: true,
+                source: CreateCommandSource::Manual,
+                ..CreateCommandOptions::default()
+            };
+            let first_lock =
+                acquire_create_execution_lock(&options, None).expect("acquire first create lock");
+            let (tx, rx) = mpsc::channel();
+            let options_clone = options.clone();
+            let waiter = thread::spawn(move || {
+                let acquired = acquire_create_execution_lock(&options_clone, None).is_ok();
+                tx.send(acquired).expect("send wait result");
+            });
+
+            assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+            drop(first_lock);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), true);
+            waiter.join().expect("join waiter");
+        });
     }
 
     #[test]
