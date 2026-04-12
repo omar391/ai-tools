@@ -18,6 +18,7 @@ import {
   isFastBrowserRunResultFailure,
   isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
+  shouldResetFastBrowserBridgeInactivityTimer,
   shouldPromptForCodexRotateSecretUnlock,
 } from "./automation.ts";
 
@@ -607,6 +608,29 @@ describe("fast-browser daemon event visibility", () => {
       ),
     ).toBe(false);
   });
+
+  test("does not treat repeated queued daemon events as bridge progress", () => {
+    expect(
+      shouldResetFastBrowserBridgeInactivityTimer(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"heartbeat","message":"still alive"}',
+      ),
+    ).toBe(false);
+    expect(
+      shouldResetFastBrowserBridgeInactivityTimer(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"queued","message":"waiting"}',
+      ),
+    ).toBe(false);
+    expect(
+      shouldResetFastBrowserBridgeInactivityTimer(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"running","message":"starting"}',
+      ),
+    ).toBe(true);
+    expect(
+      shouldResetFastBrowserBridgeInactivityTimer(
+        "plain stderr line from the automation bridge",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("fast-browser workflow failures", () => {
@@ -883,7 +907,7 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     );
   });
 
-  test("main remains pinned to the selected original flow after benchmarking", async () => {
+  test("main remains pinned to the selected minimal flow after benchmarking", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -906,10 +930,28 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
-        version: "1.0.7",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+        version: "1.0.1",
       },
     ]);
+  });
+
+  test("minimal flow waits after replayed-login resend before searching Gmail", async () => {
+    const workflow = await loadWorkflow(minimalWorkflowPath);
+    const stepIds = (workflow.do || []).flatMap((entry) => Object.keys(entry));
+    const workflowText = readFileSync(minimalWorkflowPath, "utf8");
+
+    expect(stepIds).toEqual(
+      expect.arrayContaining([
+        "resend_login_verification_email",
+        "wait_after_resend_login_verification_email",
+        "collect_login_verification_artifact",
+      ]),
+    );
+    expect(workflowText).toContain(
+      "wait_after_resend_login_verification_email",
+    );
+    expect(workflowText).toContain("waited_ms: 10000");
   });
 
   test("original flow keeps a bounded final add-phone reentry ladder", async () => {
@@ -1542,6 +1584,81 @@ describe("minimal verification helper", () => {
       {
         steps: {
           collect_login_verification_artifact: {
+            action: {
+              result: {
+                result: {
+                  output: {
+                    ok: true,
+                    message_subject:
+                      "Your OpenAI code is 380393 - Enter this temporary verification code to continue: 380393",
+                  },
+                  state: {
+                    steps: {
+                      collect_verification_artifact: {
+                        action: {
+                          current_url:
+                            "https://mail.google.com/mail/u/0/#search/from%3Aopenai",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("380393");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
+
+  test("extracts a signup OTP from a deeply nested workflow artifact shape", async () => {
+    const result = await runMinimalStepScript(
+      "submit_signup_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const sync = () => {
+                button.disabled = readCode().length < 6;
+              };
+              inputs.forEach((input) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  sync();
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "380393") {
+                  document.body.innerHTML =
+                    '<h1>Sign in to Codex with ChatGPT</h1><button>Continue to Codex</button>';
+                }
+              });
+              sync();
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_signup_verification_artifact: {
             action: {
               result: {
                 result: {

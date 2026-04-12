@@ -368,6 +368,22 @@ else:
         Ok(())
     }
 
+    fn assert_create_lock_cleared(&self) {
+        let lock_path = self.rotate_home.join("locks").join("create.lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !lock_path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !lock_path.exists(),
+            "expected disconnected create to clear {}",
+            lock_path.display()
+        );
+    }
+
     fn expect_cancel_on_signal(&mut self, signal: &str, expected_signal: i32) -> Result<()> {
         send_signal(self.create.id(), signal)?;
 
@@ -383,6 +399,7 @@ else:
 
         wait_for_process_exit(self.bridge_child_pid, Duration::from_secs(10))?;
         self.assert_daemon_still_running()?;
+        self.assert_create_lock_cleared();
         Ok(())
     }
 }

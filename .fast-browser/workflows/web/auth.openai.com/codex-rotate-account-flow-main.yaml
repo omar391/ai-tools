@@ -2,8 +2,8 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
-  version: 1.0.10
-  summary: "Pinned codex-rotate OpenAI account flow that routes create/login through the current original non-device path."
+  version: 1.0.11
+  summary: "Pinned codex-rotate OpenAI account flow that routes create/login through the current minimal non-device path."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -54,10 +54,10 @@ input:
 do:
   - run_primary_flow:
       metadata:
-        description: "Run the current pinned original non-device OpenAI account flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
+        description: "Run the current pinned minimal non-device OpenAI account flow."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal
       with:
-        version: 1.0.7
+        version: 1.0.1
         input:
           enabled: "${inputs.enabled}"
           mode: "codex_login"
@@ -79,7 +79,7 @@ do:
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the pinned original flow outcome."
+        description: "Return the pinned minimal flow outcome."
       run:
         script:
           language: javascript
@@ -87,9 +87,9 @@ do:
             return {
               ...(state.steps.run_primary_flow?.action?.result?.output || {}),
               selected_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
               primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
               primary_completed:
                 state.steps.run_primary_flow?.action?.result?.output?.success === true
                 || state.steps.run_primary_flow?.action?.result?.output?.next_action === "complete",
@@ -97,7 +97,7 @@ do:
                 state.steps.run_primary_flow?.action?.result?.output?.next_action === "skip_account",
               fallback_attempted: false,
               fallback_selected: false,
-              selection_strategy: "pinned-original-only",
+              selection_strategy: "pinned-minimal-only",
             };
 output:
   as: "${state.steps.finalize_selected_flow?.action?.value || {}}"

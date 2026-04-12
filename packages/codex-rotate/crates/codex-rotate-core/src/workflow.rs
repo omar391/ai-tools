@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -156,8 +156,21 @@ struct CreateExecutionLockMetadata {
 }
 
 struct CreateExecutionLock {
-    _process_guard: MutexGuard<'static, ()>,
-    _file: File,
+    process_guard: Option<MutexGuard<'static, ()>>,
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl Drop for CreateExecutionLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            drop(file);
+        }
+        let _ = fs::remove_file(&self.path);
+        if let Some(process_guard) = self.process_guard.take() {
+            drop(process_guard);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -771,8 +784,9 @@ fn acquire_create_execution_lock(
     file.flush()
         .with_context(|| format!("Failed to flush {}.", lock_path.display()))?;
     Ok(CreateExecutionLock {
-        _process_guard: process_guard,
-        _file: file,
+        process_guard: Some(process_guard),
+        file: Some(file),
+        path: lock_path,
     })
 }
 
@@ -1914,7 +1928,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     birth_year: Some(birth_date.birth_year),
                     codex_session: codex_session.as_ref(),
                 };
-                let attempt_result_raw: Value = run_automation_bridge_with_progress(
+                let attempt_result_raw: Value = match run_automation_bridge_with_progress(
                     "complete-codex-login-attempt",
                     BridgeCompleteLoginAttemptPayload {
                         profile_name,
@@ -1923,7 +1937,27 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         options: Some(options),
                     },
                     progress.clone(),
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let bridge_error_message = error.to_string();
+                        if maybe_reset_managed_runtime_after_failed_attempt(
+                            profile_name,
+                            Some(bridge_error_message.as_str()),
+                        )? && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+                        {
+                            report_progress(
+                                progress.as_ref(),
+                                format!(
+                                    "The managed browser runtime for \"{profile_name}\" became unresponsive while logging in {email}. Resetting it before retrying."
+                                ),
+                            );
+                            cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
+                            continue 'attempts;
+                        }
+                        return Err(error);
+                    }
+                };
                 maybe_debug_codex_auth_flow_raw(workflow_ref.as_str(), email, &attempt_result_raw);
                 let attempt_result = normalize_bridge_login_attempt_result(attempt_result_raw);
                 let bridge_error_message = attempt_result.error_message.clone();
@@ -5519,6 +5553,11 @@ end
 
             drop(lock);
 
+            assert!(
+                !lock_path.exists(),
+                "create lock file should be removed after the holder drops"
+            );
+
             let output = ProcessCommand::new("ruby")
                 .arg("-e")
                 .arg(
@@ -5568,6 +5607,27 @@ end
             assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), true);
             waiter.join().expect("join waiter");
         });
+    }
+
+    #[test]
+    fn extracts_fast_browser_timeout_socket_path_from_bridge_errors() {
+        assert_eq!(
+            extract_fast_browser_timeout_socket_path(
+                "Timed out waiting for fast-browser daemon response from /Users/omar/.fast-browser/daemon/dev-1.sock"
+            )
+            .as_deref(),
+            Some("/Users/omar/.fast-browser/daemon/dev-1.sock")
+        );
+    }
+
+    #[test]
+    fn recognizes_socket_close_and_broken_cwd_runtime_resets() {
+        assert!(should_reset_fast_browser_daemon_for_socket_close(
+            "Daemon closed the socket before sending a response"
+        ));
+        assert!(should_reset_fast_browser_runtime_for_broken_cwd(
+            "ENOENT: process.cwd() failed because the current working directory was likely removed"
+        ));
     }
 
     #[test]

@@ -279,22 +279,41 @@ function parseJson<T>(raw: string, fallbackMessage: string): T {
 }
 
 export function isSuppressedFastBrowserEventLine(line: string): boolean {
+  const event = parseFastBrowserEventLine(line);
+  return event?.phase === "daemon" && event.status === "heartbeat";
+}
+
+function parseFastBrowserEventLine(
+  line: string,
+): { phase?: string; status?: string } | null {
   if (!line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
-    return false;
+    return null;
   }
   const raw = line.slice(FAST_BROWSER_EVENT_PREFIX.length).trim();
   if (!raw) {
-    return false;
+    return null;
   }
   try {
-    const event = JSON.parse(raw) as {
+    return JSON.parse(raw) as {
       phase?: unknown;
       status?: unknown;
     };
-    return event.phase === "daemon" && event.status === "heartbeat";
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function shouldResetFastBrowserBridgeInactivityTimer(
+  line: string,
+): boolean {
+  const event = parseFastBrowserEventLine(line);
+  if (!event) {
+    return true;
+  }
+  return !(
+    event.phase === "daemon" &&
+    (event.status === "heartbeat" || event.status === "queued")
+  );
 }
 
 function ensureRotateDir(): void {
@@ -1286,7 +1305,6 @@ async function runFastBrowserDaemonWorkflow(
 
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
-        resetInactivityTimer();
         stderrBuffer += chunk;
         while (true) {
           const newlineIndex = stderrBuffer.indexOf("\n");
@@ -1296,6 +1314,9 @@ async function runFastBrowserDaemonWorkflow(
           const line = stderrBuffer.slice(0, newlineIndex);
           stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
           if (line.trim()) {
+            if (shouldResetFastBrowserBridgeInactivityTimer(line)) {
+              resetInactivityTimer();
+            }
             flushStderrLine(line);
           }
         }
