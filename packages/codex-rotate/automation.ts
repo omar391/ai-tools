@@ -278,6 +278,25 @@ function parseJson<T>(raw: string, fallbackMessage: string): T {
   }
 }
 
+export function isSuppressedFastBrowserEventLine(line: string): boolean {
+  if (!line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
+    return false;
+  }
+  const raw = line.slice(FAST_BROWSER_EVENT_PREFIX.length).trim();
+  if (!raw) {
+    return false;
+  }
+  try {
+    const event = JSON.parse(raw) as {
+      phase?: unknown;
+      status?: unknown;
+    };
+    return event.phase === "daemon" && event.status === "heartbeat";
+  } catch {
+    return false;
+  }
+}
+
 function ensureRotateDir(): void {
   if (!existsSync(ROTATE_HOME)) {
     mkdirSync(ROTATE_HOME, { recursive: true });
@@ -1172,6 +1191,18 @@ async function runFastBrowserDaemonWorkflow(
     ),
   ).href;
   const bridgeScript = `
+    const ownerPid = ${JSON.stringify(process.pid)};
+    if (Number.isInteger(ownerPid) && ownerPid > 1) {
+      const ownerWatchdog = setInterval(() => {
+        try {
+          process.kill(ownerPid, 0);
+        } catch {
+          process.stderr.write("[codex-rotate] automation owner exited; stopping orphaned fast-browser bridge.\\n");
+          process.exit(1);
+        }
+      }, 1000);
+      ownerWatchdog.unref?.();
+    }
     import { runDaemonWorkflow } from ${JSON.stringify(clientModuleUrl)};
     const response = await runDaemonWorkflow({
       profileName: ${JSON.stringify(profileName)},
@@ -1238,7 +1269,9 @@ async function runFastBrowserDaemonWorkflow(
 
       const flushStderrLine = (line: string): void => {
         if (line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
-          process.stderr.write(`${line}\n`);
+          if (!isSuppressedFastBrowserEventLine(line)) {
+            process.stderr.write(`${line}\n`);
+          }
           return;
         }
         stderr += `${line}\n`;

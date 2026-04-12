@@ -1,6 +1,7 @@
 #!/usr/bin/env -S node --experimental-strip-types
 
 import { readFileSync } from "node:fs";
+import process from "node:process";
 import type {
   CodexRotateSecretLocator,
   CodexRotateAuthFlowSession,
@@ -52,6 +53,44 @@ type BridgeResponse =
   | { ok: false; error: { message: string } };
 
 const BRIDGE_RESPONSE_PREFIX = "__CODEX_ROTATE_BRIDGE__";
+const OWNER_WATCHDOG_INTERVAL_MS = 1_000;
+
+function parseOwnerPid(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 1) {
+    return null;
+  }
+  return parsed;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startOwnerWatchdog(ownerPid: number | null): () => void {
+  if (!ownerPid) {
+    return () => {};
+  }
+  const timer = setInterval(() => {
+    if (isProcessAlive(ownerPid)) {
+      return;
+    }
+    process.stderr.write(
+      `[codex-rotate] bridge owner ${ownerPid} exited; stopping orphaned automation bridge.\n`,
+    );
+    process.exit(1);
+  }, OWNER_WATCHDOG_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 function readStdin(): string {
   return readFileSync(process.stdin.fd, "utf8");
@@ -126,6 +165,9 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
 }
 
 async function main(): Promise<void> {
+  const stopOwnerWatchdog = startOwnerWatchdog(
+    parseOwnerPid(process.env.CODEX_ROTATE_BRIDGE_OWNER_PID) ?? process.ppid,
+  );
   try {
     const raw = readRequestRaw().trim();
     if (!raw) {
@@ -142,6 +184,8 @@ async function main(): Promise<void> {
       ok: false,
       error: { message },
     });
+  } finally {
+    stopOwnerWatchdog();
   }
 }
 
