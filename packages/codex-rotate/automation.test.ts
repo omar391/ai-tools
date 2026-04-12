@@ -1714,7 +1714,10 @@ describe("minimal verification helper", () => {
   });
 
   test("device-auth about-you submit survives a navigation race into the ChatGPT app shell", async () => {
-    const browser = await chromium.launch({ headless: true, channel: "chrome" });
+    const browser = await chromium.launch({
+      headless: true,
+      channel: "chrome",
+    });
     try {
       const page = await browser.newPage();
       await page.route("**/*", async (route) => {
@@ -1766,7 +1769,9 @@ describe("minimal verification helper", () => {
 
       expect(result.ok).toBe(true);
       expect(result.next_stage).toBe("app_shell");
-      expect(String(result.current_url || "")).toContain("https://chatgpt.com/");
+      expect(String(result.current_url || "")).toContain(
+        "https://chatgpt.com/",
+      );
     } finally {
       await browser.close();
     }
@@ -2943,7 +2948,8 @@ describe("device-auth workflow", () => {
   test("targets OTP-style inputs when refilling the replacement prepare verification code", async () => {
     const workflow = await loadWorkflow(deviceAuthWorkflowPath);
     const step = workflow.do?.find(
-      (entry) => "fill_prepare_login_verification_code_after_incorrect_code" in entry,
+      (entry) =>
+        "fill_prepare_login_verification_code_after_incorrect_code" in entry,
     )?.fill_prepare_login_verification_code_after_incorrect_code as
       | {
           call?: string;
@@ -3003,8 +3009,12 @@ describe("device-auth workflow", () => {
   test("retries the final device-auth login when OpenAI blocks consent behind add phone", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
-    expect(workflowText).toContain("surface.add_phone_prompt === true && authUrl");
-    expect(workflowText).toContain("for (const waitMs of [2000, 4000, 8000, 12000])");
+    expect(workflowText).toContain(
+      "surface.add_phone_prompt === true && authUrl",
+    );
+    expect(workflowText).toContain(
+      "for (const waitMs of [2000, 4000, 8000, 12000])",
+    );
     expect(workflowText).toContain('retryReason = "device_auth_add_phone"');
     expect(workflowText).toContain("add_phone_prompt: addPhonePrompt");
   });
@@ -3272,7 +3282,9 @@ describe("device-auth workflow", () => {
     expect(workflowText).toContain(
       "Fall back to the proven original non-device auth workflow when repeated invalid_state responses poison the device-auth prepare branch.",
     );
-    expect(workflowText).toContain("workflow.workspace.web.auth-openai-com.codex-rotate-account-flow");
+    expect(workflowText).toContain(
+      "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
+    );
     expect(workflowText).toContain(
       "state.steps.prepare_with_original_flow_fallback?.action?.result?.output || state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}",
     );
@@ -3281,7 +3293,9 @@ describe("device-auth workflow", () => {
   test("waits for the ChatGPT settings shell before the prepare logout click", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
-    expect(workflowText).toContain("wait_for_prepare_chatgpt_security_settings_shell");
+    expect(workflowText).toContain(
+      "wait_for_prepare_chatgpt_security_settings_shell",
+    );
     expect(workflowText).toContain(
       "activate_prepare_chatgpt_security_settings_tab",
     );
@@ -3444,7 +3458,8 @@ describe("device-auth workflow", () => {
         }
       | undefined;
     const classifyStep = workflow.do?.find(
-      (entry) => "classify_prepare_signup_recovery_after_login_timeout" in entry,
+      (entry) =>
+        "classify_prepare_signup_recovery_after_login_timeout" in entry,
     )?.classify_prepare_signup_recovery_after_login_timeout as
       | { if?: string }
       | undefined;
@@ -3507,18 +3522,21 @@ describe("device-auth workflow", () => {
       | { if?: string }
       | undefined;
     const classifyRetryStep = workflow.do?.find(
-      (entry) => "classify_prepare_after_forced_signup_email_timeout_retry" in entry,
+      (entry) =>
+        "classify_prepare_after_forced_signup_email_timeout_retry" in entry,
     )?.classify_prepare_after_forced_signup_email_timeout_retry as
       | { if?: string }
       | undefined;
     const refillRetryStep = workflow.do?.find(
-      (entry) => "refill_prepare_email_after_forced_signup_email_timeout_retry" in entry,
+      (entry) =>
+        "refill_prepare_email_after_forced_signup_email_timeout_retry" in entry,
     )?.refill_prepare_email_after_forced_signup_email_timeout_retry as
       | { if?: string }
       | undefined;
     const submitRetryStep = workflow.do?.find(
       (entry) =>
-        "submit_prepare_signup_email_after_forced_signup_email_timeout_retry" in entry,
+        "submit_prepare_signup_email_after_forced_signup_email_timeout_retry" in
+        entry,
     )?.submit_prepare_signup_email_after_forced_signup_email_timeout_retry as
       | { if?: string }
       | undefined;
@@ -3585,7 +3603,8 @@ describe("device-auth workflow", () => {
   test("falls back to direct login after the signup password step reports an existing account", async () => {
     const workflow = await loadWorkflow(deviceAuthWorkflowPath);
     const fallbackStep = workflow.do?.find(
-      (entry) => "fallback_prepare_login_after_existing_account_prompt" in entry,
+      (entry) =>
+        "fallback_prepare_login_after_existing_account_prompt" in entry,
     )?.fallback_prepare_login_after_existing_account_prompt as
       | { if?: string; with?: { body?: { url?: string } } }
       | undefined;
@@ -3632,9 +3651,9 @@ describe("device-auth workflow", () => {
     );
 
     expect(result.prepare_flow_ready).toBe(true);
-    expect(
-      (result.prepare_flow_output as Record<string, unknown>)?.stage,
-    ).toBe("oauth_consent");
+    expect((result.prepare_flow_output as Record<string, unknown>)?.stage).toBe(
+      "oauth_consent",
+    );
   });
 
   test("treats add_phone as a successful authenticated prepare state for device auth", async () => {
@@ -3659,9 +3678,9 @@ describe("device-auth workflow", () => {
     );
 
     expect(result.prepare_flow_ready).toBe(true);
-    expect(
-      (result.prepare_flow_output as Record<string, unknown>)?.stage,
-    ).toBe("add_phone");
+    expect((result.prepare_flow_output as Record<string, unknown>)?.stage).toBe(
+      "add_phone",
+    );
   });
 
   test("captures an explicit device-auth challenge without requiring the settings shortcut first", async () => {
@@ -3717,8 +3736,7 @@ describe("device-auth workflow", () => {
           },
           inspect_device_authorization_surface: {
             action: {
-              current_url:
-                "https://auth.openai.com/codex/deviceauth/callback",
+              current_url: "https://auth.openai.com/codex/deviceauth/callback",
               success: true,
               headline: "Signed in to Codex",
             },
@@ -3962,9 +3980,9 @@ describe("device-auth workflow", () => {
     );
 
     expect(result.prepare_flow_ready).toBe(false);
-    expect(
-      (result.prepare_flow_output as Record<string, unknown>)?.stage,
-    ).toBe("public_chatgpt");
+    expect((result.prepare_flow_output as Record<string, unknown>)?.stage).toBe(
+      "public_chatgpt",
+    );
   });
 
   test("prefers the latest authenticated prepare result over older login-stage candidates for device auth", async () => {
@@ -4000,9 +4018,9 @@ describe("device-auth workflow", () => {
     );
 
     expect(result.prepare_flow_ready).toBe(true);
-    expect(
-      (result.prepare_flow_output as Record<string, unknown>)?.stage,
-    ).toBe("app_shell");
+    expect((result.prepare_flow_output as Record<string, unknown>)?.stage).toBe(
+      "app_shell",
+    );
     expect(
       (result.prepare_flow_output as Record<string, unknown>)?.current_url,
     ).toBe("https://chatgpt.com/");
@@ -4321,7 +4339,9 @@ describe("device-auth workflow", () => {
         }
       | undefined;
     const retryReturnStep = workflow.do?.find(
-      (entry) => "return_to_prepare_login_verification_page_after_incorrect_code" in entry,
+      (entry) =>
+        "return_to_prepare_login_verification_page_after_incorrect_code" in
+        entry,
     )?.return_to_prepare_login_verification_page_after_incorrect_code as
       | {
           with?: {
