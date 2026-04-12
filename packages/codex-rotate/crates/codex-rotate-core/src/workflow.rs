@@ -53,6 +53,7 @@ const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS: &[u64] =
     &[8_000, 15_000, 30_000, 60_000, 120_000];
 const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS: &[u64] =
     &[30_000, 60_000, 120_000, 240_000, 300_000];
+const DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY: u32 = 10;
 const AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT: &str =
     "Automatic account creation stopped retrying because a reusable account is now available.";
 const CREATE_ALREADY_IN_PROGRESS_PREFIX: &str = "Another create command is already in progress";
@@ -164,9 +165,15 @@ pub struct CredentialFamily {
     pub profile_name: String,
     pub base_email: String,
     pub next_suffix: u32,
+    #[serde(default = "default_max_skipped_slots_per_family")]
+    pub max_skipped_slots: u32,
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
+}
+
+fn default_max_skipped_slots_per_family() -> u32 {
+    DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +320,7 @@ pub struct CredentialStore {
     pub default_create_base_email: String,
     pub families: HashMap<String, CredentialFamily>,
     pub pending: HashMap<String, PendingCredential>,
+    pub skipped: HashSet<String>,
 }
 
 impl Default for CredentialStore {
@@ -322,6 +330,7 @@ impl Default for CredentialStore {
             default_create_base_email: DEFAULT_CREATE_BASE_EMAIL.to_string(),
             families: HashMap::new(),
             pending: HashMap::new(),
+            skipped: HashSet::new(),
         }
     }
 }
@@ -1235,6 +1244,7 @@ fn prepare_next_auto_create_attempt(
     }
 
     store.pending.remove(&normalized_email);
+    store.skipped.insert(normalized_email);
     let updated_at = now_iso();
     let next_suffix = suffix.saturating_add(1);
     if let Some(family) = store.families.get_mut(family_key) {
@@ -1247,6 +1257,7 @@ fn prepare_next_auto_create_attempt(
                 profile_name: profile_name.to_string(),
                 base_email: base_email.to_string(),
                 next_suffix,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: started_at.to_string(),
                 updated_at,
                 last_created_email: None,
@@ -1289,6 +1300,8 @@ fn execute_create_flow_attempt(
     let family = store.families.get(&family_key).cloned();
     let started_at = now_iso();
     let known_emails = collect_known_account_emails(&pool, &store);
+    let skipped_emails =
+        collect_skipped_account_emails_for_family(&store, &profile_name, &base_email);
     let existing_pending = select_pending_credential_for_family(
         &store,
         &profile_name,
@@ -1298,9 +1311,11 @@ fn execute_create_flow_attempt(
     let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
         Some(entry) => entry.stored.suffix,
-        None => fatal(compute_next_account_family_suffix(
+        None => fatal(compute_next_account_family_suffix_with_skips(
             &base_email,
             known_emails,
+            skipped_emails,
+            max_skipped_slots_for_family(family.as_ref()),
         ))?,
     };
     let created_email = existing_pending
@@ -1633,6 +1648,7 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
 
     let updated_at = now_iso();
     store.pending.remove(&normalize_email_key(&created_email));
+    store.skipped.remove(&normalize_email_key(&created_email));
     upsert_family_for_account(
         store,
         &StoredCredential {
@@ -1661,6 +1677,9 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
             next_suffix: family
                 .map(|entry| entry.next_suffix.max(suffix + 1))
                 .unwrap_or(suffix + 1),
+            max_skipped_slots: family
+                .map(|entry| entry.max_skipped_slots)
+                .unwrap_or(DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY),
             created_at: family
                 .map(|entry| entry.created_at.clone())
                 .unwrap_or_else(|| started_at.to_string()),
@@ -3060,6 +3079,11 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
     } else if let Some(pending) = credential_state.get("pending").cloned() {
         object.insert("pending".to_string(), pending);
     }
+    if store.skipped.is_empty() {
+        object.remove("skipped");
+    } else if let Some(skipped) = credential_state.get("skipped").cloned() {
+        object.insert("skipped".to_string(), skipped);
+    }
     write_rotate_state_json(&state)?;
     cleanup_dropped_non_dev_pending_secrets(&dropped_non_dev_pending);
     Ok(())
@@ -3134,12 +3158,17 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
             )
         });
     }
+    let skipped = normalize_email_set(raw.get("skipped"))
+        .into_iter()
+        .filter(|email| !inventory_emails.contains(email) && !pending.contains_key(email))
+        .collect::<HashSet<_>>();
 
     CredentialStore {
         version: ROTATE_STATE_VERSION,
         default_create_base_email,
         families,
         pending,
+        skipped,
     }
 }
 
@@ -3213,6 +3242,18 @@ fn normalize_pending_credential_map(raw: Option<&Value>) -> HashMap<String, Pend
         .unwrap_or_default()
 }
 
+fn normalize_email_set(raw: Option<&Value>) -> HashSet<String> {
+    raw.and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(normalize_email_key)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn normalize_stored_credential(raw: &Value) -> Option<StoredCredential> {
     serde_json::from_value::<StoredCredential>(raw.clone()).ok()
 }
@@ -3234,11 +3275,14 @@ fn serialize_credential_store(store: &CredentialStore) -> Value {
         .iter()
         .map(|(email, record)| (email.clone(), serialize_pending_credential(record)))
         .collect::<Map<String, Value>>();
+    let mut skipped = store.skipped.iter().cloned().collect::<Vec<_>>();
+    skipped.sort();
     json!({
         "version": ROTATE_STATE_VERSION,
         "default_create_base_email": store.default_create_base_email,
         "families": store.families,
         "pending": pending,
+        "skipped": skipped,
     })
 }
 
@@ -3726,14 +3770,35 @@ fn extract_account_family_suffix(candidate_email: &str, base_email: &str) -> Res
 }
 
 fn compute_next_account_family_suffix(base_email: &str, known_emails: Vec<String>) -> Result<u32> {
+    compute_next_account_family_suffix_with_skips(
+        base_email,
+        known_emails,
+        Vec::new(),
+        DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+    )
+}
+
+fn compute_next_account_family_suffix_with_skips(
+    base_email: &str,
+    known_emails: Vec<String>,
+    skipped_emails: Vec<String>,
+    max_skipped_slots: u32,
+) -> Result<u32> {
     let mut used = HashSet::new();
     for email in known_emails {
         if let Some(suffix) = extract_account_family_suffix(&email, base_email)? {
             used.insert(suffix);
         }
     }
+    let mut skipped = HashSet::new();
+    for email in skipped_emails {
+        if let Some(suffix) = extract_account_family_suffix(&email, base_email)? {
+            skipped.insert(suffix);
+        }
+    }
     let mut candidate = 1;
-    while used.contains(&candidate) {
+    let should_reserve_skipped = (skipped.len() as u32) < max_skipped_slots;
+    while used.contains(&candidate) || (should_reserve_skipped && skipped.contains(&candidate)) {
         candidate += 1;
     }
     Ok(candidate)
@@ -3747,6 +3812,36 @@ fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<Str
         .collect::<Vec<_>>();
     emails.extend(store.pending.keys().cloned());
     emails
+}
+
+fn collect_skipped_account_emails_for_family(
+    store: &CredentialStore,
+    profile_name: &str,
+    base_email: &str,
+) -> Vec<String> {
+    let Ok(family_key) = make_credential_family_key(profile_name, base_email) else {
+        return Vec::new();
+    };
+    store
+        .skipped
+        .iter()
+        .filter(|email| {
+            select_family_for_account_email(store, email)
+                .map(|matched| matched.key == family_key)
+                .unwrap_or_else(|| {
+                    extract_account_family_suffix(email, base_email)
+                        .map(|suffix| suffix.is_some())
+                        .unwrap_or(false)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn max_skipped_slots_for_family(family: Option<&CredentialFamily>) -> u32 {
+    family
+        .map(|entry| entry.max_skipped_slots)
+        .unwrap_or(DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY)
 }
 
 fn select_pending_credential_for_family(
@@ -4264,6 +4359,7 @@ fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCreden
                     profile_name: account.profile_name.clone(),
                     base_email: account.base_email.clone(),
                     next_suffix,
+                    max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                     created_at: next_created_at,
                     updated_at: next_updated_at,
                     last_created_email: next_last_created_email,
@@ -4304,6 +4400,7 @@ fn merge_legacy_account_into_families(
                     profile_name: account.profile_name.clone(),
                     base_email: account.base_email.clone(),
                     next_suffix: account.suffix.saturating_add(1),
+                    max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                     created_at: account.created_at.clone(),
                     updated_at: account.updated_at.clone(),
                     last_created_email: Some(account.email.clone()),
@@ -5274,6 +5371,62 @@ input:
     }
 
     #[test]
+    fn compute_next_account_family_suffix_ignores_failed_skipped_slots() {
+        assert_eq!(
+            compute_next_account_family_suffix(
+                "dev.{N}@astronlab.com",
+                vec![
+                    "dev.1@astronlab.com".to_string(),
+                    "dev.3@astronlab.com".to_string(),
+                ],
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn compute_next_account_family_suffix_can_reserve_skipped_slots_under_cap() {
+        assert_eq!(
+            compute_next_account_family_suffix_with_skips(
+                "dev.{N}@astronlab.com",
+                vec![
+                    "dev.1@astronlab.com".to_string(),
+                    "dev.2@astronlab.com".to_string(),
+                    "dev.3@astronlab.com".to_string(),
+                ],
+                vec![
+                    "dev.4@astronlab.com".to_string(),
+                    "dev.5@astronlab.com".to_string(),
+                ],
+                10,
+            )
+            .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn compute_next_account_family_suffix_recycles_missing_slot_at_skip_cap() {
+        assert_eq!(
+            compute_next_account_family_suffix_with_skips(
+                "dev.{N}@astronlab.com",
+                vec![
+                    "dev.1@astronlab.com".to_string(),
+                    "dev.2@astronlab.com".to_string(),
+                    "dev.3@astronlab.com".to_string(),
+                ],
+                (4..=13)
+                    .map(|suffix| format!("dev.{suffix}@astronlab.com"))
+                    .collect(),
+                10,
+            )
+            .unwrap(),
+            4
+        );
+    }
+
+    #[test]
     fn compute_next_account_family_suffix_fills_missing_dev_slots_before_frontier() {
         assert_eq!(
             compute_next_account_family_suffix(
@@ -5596,6 +5749,43 @@ end
     }
 
     #[test]
+    fn normalize_credential_store_reads_skipped_emails() {
+        let store = normalize_credential_store(json!({
+            "skipped": [
+                "dev.91@astronlab.com",
+                "dev.92@astronlab.com"
+            ]
+        }));
+
+        assert!(store.skipped.contains("dev.91@astronlab.com"));
+        assert!(store.skipped.contains("dev.92@astronlab.com"));
+    }
+
+    #[test]
+    fn normalize_credential_store_defaults_family_skip_cap() {
+        let store = normalize_credential_store(json!({
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "next_suffix": 23,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z",
+                    "last_created_email": "dev.22@astronlab.com"
+                }
+            }
+        }));
+
+        assert_eq!(
+            store
+                .families
+                .get("dev-1::dev.{n}@astronlab.com")
+                .map(|family| family.max_skipped_slots),
+            Some(DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY)
+        );
+    }
+
+    #[test]
     fn select_pending_base_email_hint_prefers_dev_template_family() {
         let mut store = CredentialStore::default();
         store.pending.insert(
@@ -5729,6 +5919,7 @@ end
                 profile_name: "dev-1".to_string(),
                 base_email: "qa.{n}@astronlab.com".to_string(),
                 next_suffix: 300,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: "2026-04-06T16:00:00.000Z".to_string(),
                 updated_at: "2026-04-06T16:00:00.000Z".to_string(),
                 last_created_email: Some("qa.299@astronlab.com".to_string()),
@@ -6166,6 +6357,7 @@ end
                 profile_name: "dev-1".to_string(),
                 base_email: "dev.user@gmail.com".to_string(),
                 next_suffix: 4,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
@@ -6177,6 +6369,7 @@ end
                 profile_name: "dev-2".to_string(),
                 base_email: "dev.user@gmail.com".to_string(),
                 next_suffix: 5,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+2@gmail.com".to_string()),
@@ -6198,6 +6391,7 @@ end
                 profile_name: "dev-1".to_string(),
                 base_email: "dev.user@gmail.com".to_string(),
                 next_suffix: 4,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
@@ -6209,6 +6403,7 @@ end
                 profile_name: "dev-2".to_string(),
                 base_email: "dev.user@gmail.com".to_string(),
                 next_suffix: 5,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+4@gmail.com".to_string()),
