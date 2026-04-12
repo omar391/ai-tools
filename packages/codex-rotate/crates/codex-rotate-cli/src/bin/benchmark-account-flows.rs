@@ -12,7 +12,7 @@ use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 const DEFAULT_PROFILE: &str = "dev-1";
 const DEFAULT_RUNS: u32 = 1;
@@ -56,12 +56,6 @@ struct Snapshot {
 }
 
 #[derive(Clone, Debug)]
-enum RotateStateSnapshot {
-    Missing,
-    Present(String),
-}
-
-#[derive(Clone, Debug)]
 struct CommandResult {
     exit_status: Option<i32>,
     stdout: String,
@@ -84,6 +78,13 @@ struct BenchmarkRecord {
     failure_mode: Option<String>,
     created_emails: Vec<String>,
     new_pending_emails: Vec<String>,
+    intended_target_email: Option<String>,
+    displayed_created_label: Option<String>,
+    displayed_created_email: Option<String>,
+    used_top_level_fallback: bool,
+    top_level_fallback_workflows: Vec<String>,
+    selection_eligible: bool,
+    selection_invalid_reasons: Vec<String>,
     auth_before: Option<String>,
     auth_after: Option<String>,
     auth_restored: bool,
@@ -106,6 +107,11 @@ struct GroupSummary {
     success_rate: f64,
     median_latency_ms: Option<u128>,
     best_latency_ms: Option<u128>,
+    eligible_runs: usize,
+    eligible_successes: usize,
+    eligible_success_rate: f64,
+    eligible_median_latency_ms: Option<u128>,
+    eligible_best_latency_ms: Option<u128>,
     failure_modes: BTreeMap<String, usize>,
     latest_run_label: Option<String>,
 }
@@ -377,7 +383,6 @@ fn benchmark_candidate(
     codex_home: &Path,
 ) -> Result<BenchmarkRecord> {
     let before = read_snapshot(rotate_state_path, codex_home);
-    let rotate_state_snapshot = snapshot_rotate_state_file(rotate_state_path)?;
     let run_label = format!("{}-{}", candidate.id, iso_now());
     let command = vec![
         cli_binary.to_path_buf(),
@@ -408,13 +413,6 @@ fn benchmark_candidate(
     let started = Instant::now();
     let run_result = run_command_with_capture(&command, repo_root, &command_env, candidate.id);
     let after = read_snapshot(rotate_state_path, codex_home);
-    restore_rotate_state_file(
-        rotate_state_path,
-        rotate_state_snapshot,
-        profile_name,
-        base_email,
-        &collect_reserved_emails(&before, &after, base_email),
-    )?;
     let result = run_result?;
     let latency_ms = started.elapsed().as_millis();
     let created_emails = difference(&after.account_emails, &before.account_emails);
@@ -427,6 +425,22 @@ fn benchmark_candidate(
     } else {
         format!("{}\n{}", result.stdout, result.stderr)
     };
+    let intended_target_email = extract_intended_target_email(&combined_output);
+    let displayed_created_label = extract_displayed_created_label(&combined_output);
+    let displayed_created_email = displayed_created_label
+        .as_deref()
+        .and_then(extract_email_from_label);
+    let top_level_fallback_workflows =
+        detect_top_level_fallback_workflows(&combined_output, candidate.workflow_ref);
+    let selection_invalid_reasons = classify_selection_invalid_reasons(
+        success,
+        intended_target_email.as_deref(),
+        &created_emails,
+        displayed_created_label.as_deref(),
+        displayed_created_email.as_deref(),
+        &top_level_fallback_workflows,
+    );
+    let selection_eligible = success && selection_invalid_reasons.is_empty();
 
     Ok(BenchmarkRecord {
         competitor: candidate.id.to_string(),
@@ -450,6 +464,13 @@ fn benchmark_candidate(
         },
         created_emails: created_emails.clone(),
         new_pending_emails: new_pending_emails.clone(),
+        intended_target_email: intended_target_email.clone(),
+        displayed_created_label,
+        displayed_created_email,
+        used_top_level_fallback: !top_level_fallback_workflows.is_empty(),
+        top_level_fallback_workflows: top_level_fallback_workflows.clone(),
+        selection_eligible,
+        selection_invalid_reasons: selection_invalid_reasons.clone(),
         auth_before: before.auth_email.clone(),
         auth_after: after.auth_email.clone(),
         auth_restored: before.auth_email == after.auth_email,
@@ -460,6 +481,9 @@ fn benchmark_candidate(
             &new_pending_emails,
             &before,
             &after,
+            intended_target_email.as_deref(),
+            &top_level_fallback_workflows,
+            &selection_invalid_reasons,
         ),
         stdout_tail: tail_text(&result.stdout, 12),
         stderr_tail: tail_text(&result.stderr, 12),
@@ -587,126 +611,6 @@ fn read_rotate_state(path: &Path) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn snapshot_rotate_state_file(path: &Path) -> Result<RotateStateSnapshot> {
-    Ok(if path.exists() {
-        RotateStateSnapshot::Present(fs::read_to_string(path)?)
-    } else {
-        RotateStateSnapshot::Missing
-    })
-}
-
-fn restore_rotate_state_file(
-    path: &Path,
-    snapshot: RotateStateSnapshot,
-    profile_name: &str,
-    base_email: &str,
-    reserved_emails: &[String],
-) -> Result<()> {
-    let mut restored_state = match snapshot {
-        RotateStateSnapshot::Present(content) => {
-            fs::write(path, &content)?;
-            serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}))
-        }
-        RotateStateSnapshot::Missing => {
-            if path.exists() {
-                fs::remove_file(path).ok();
-            }
-            json!({})
-        }
-    };
-
-    if reserved_emails.is_empty() {
-        return Ok(());
-    }
-    let Some(normalized_profile_name) = normalize_text(profile_name) else {
-        return Ok(());
-    };
-    let Some(normalized_base_email) = normalize_base_email(base_email) else {
-        return Ok(());
-    };
-    if !normalized_base_email.contains("{n}") {
-        return Ok(());
-    }
-
-    let mut highest_suffix = None::<u32>;
-    let mut highest_email = None::<String>;
-    for email in reserved_emails {
-        if let Some(suffix) = extract_template_suffix(email, &normalized_base_email) {
-            if highest_suffix.map(|value| suffix > value).unwrap_or(true) {
-                highest_suffix = Some(suffix);
-                highest_email = Some(email.clone());
-            }
-        }
-    }
-    let Some(highest_suffix) = highest_suffix else {
-        return Ok(());
-    };
-    let Some(highest_email) = highest_email else {
-        return Ok(());
-    };
-
-    if !restored_state.is_object() {
-        restored_state = json!({});
-    }
-    let now = iso_now();
-    let family_key = format!("{normalized_profile_name}::{normalized_base_email}");
-    let object = restored_state.as_object_mut().expect("state object");
-    let families = object
-        .entry("families")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .expect("families object");
-    let (created_at, existing_next) = {
-        let existing = families.get(&family_key).and_then(Value::as_object);
-        let created_at = existing
-            .and_then(|value| value.get("created_at"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&now)
-            .to_string();
-        let existing_next = existing
-            .and_then(|value| value.get("next_suffix"))
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as u32;
-        (created_at, existing_next)
-    };
-    families.insert(
-        family_key,
-        json!({
-            "profile_name": normalized_profile_name,
-            "base_email": normalized_base_email,
-            "next_suffix": existing_next.max(highest_suffix.saturating_add(1)),
-            "created_at": created_at,
-            "updated_at": now,
-            "last_created_email": highest_email,
-        }),
-    );
-    write_json(path, &restored_state)
-}
-
-fn collect_reserved_emails(before: &Snapshot, after: &Snapshot, base_email: &str) -> Vec<String> {
-    let mut reserved = HashSet::new();
-    for candidate in after
-        .account_emails
-        .iter()
-        .chain(after.pending_emails.iter())
-        .chain(after.auth_email.iter())
-    {
-        let Some(email) = normalize_email(Some(candidate.as_str())) else {
-            continue;
-        };
-        if before.account_emails.contains(&email) || before.pending_emails.contains(&email) {
-            continue;
-        }
-        if extract_template_suffix(&email, base_email).is_some() {
-            reserved.insert(email);
-        }
-    }
-    let mut values = reserved.into_iter().collect::<Vec<_>>();
-    values.sort();
-    values
-}
-
 fn read_auth_email(codex_home: &Path) -> Option<String> {
     let auth_path = codex_home.join("auth.json");
     let raw = fs::read_to_string(auth_path).ok()?;
@@ -758,15 +662,35 @@ fn build_notes(
     new_pending_emails: &[String],
     before: &Snapshot,
     after: &Snapshot,
+    intended_target_email: Option<&str>,
+    top_level_fallback_workflows: &[String],
+    selection_invalid_reasons: &[String],
 ) -> Option<String> {
     let mut parts = Vec::new();
     if success && created_emails.is_empty() {
         parts.push("create exited successfully but no new pooled account was detected".to_string());
     }
+    if success {
+        if let Some(intended_target_email) = intended_target_email {
+            parts.push(format!("targeted {intended_target_email}"));
+        }
+        if !selection_invalid_reasons.is_empty() {
+            parts.push(format!(
+                "selection-invalid: {}",
+                selection_invalid_reasons.join(", ")
+            ));
+        }
+    }
     if !success && !new_pending_emails.is_empty() {
         parts.push(format!(
             "left pending reservation(s): {}",
             new_pending_emails.join(", ")
+        ));
+    }
+    if !top_level_fallback_workflows.is_empty() {
+        parts.push(format!(
+            "used top-level fallback: {}",
+            top_level_fallback_workflows.join(", ")
         ));
     }
     if before.auth_email != after.auth_email {
@@ -852,6 +776,12 @@ fn build_summary(records: &[BenchmarkRecord]) -> SummaryOutput {
             .map(|record| record.latency_ms)
             .collect::<Vec<_>>();
         latencies.sort_unstable();
+        let mut eligible_latencies = bucket
+            .iter()
+            .filter(|record| record.selection_eligible)
+            .map(|record| record.latency_ms)
+            .collect::<Vec<_>>();
+        eligible_latencies.sort_unstable();
         let mut failure_modes = BTreeMap::new();
         for record in &bucket {
             if !record.success {
@@ -866,6 +796,14 @@ fn build_summary(records: &[BenchmarkRecord]) -> SummaryOutput {
             }
         }
         let successes = bucket.iter().filter(|record| record.success).count();
+        let eligible_runs = bucket
+            .iter()
+            .filter(|record| record.selection_eligible)
+            .count();
+        let eligible_successes = bucket
+            .iter()
+            .filter(|record| record.selection_eligible && record.success)
+            .count();
         let first = bucket[0];
         groups.insert(
             key,
@@ -887,6 +825,19 @@ fn build_summary(records: &[BenchmarkRecord]) -> SummaryOutput {
                     Some(latencies[(latencies.len() - 1) / 2])
                 },
                 best_latency_ms: latencies.first().copied(),
+                eligible_runs,
+                eligible_successes,
+                eligible_success_rate: if bucket.is_empty() {
+                    0.0
+                } else {
+                    eligible_successes as f64 / bucket.len() as f64
+                },
+                eligible_median_latency_ms: if eligible_latencies.is_empty() {
+                    None
+                } else {
+                    Some(eligible_latencies[(eligible_latencies.len() - 1) / 2])
+                },
+                eligible_best_latency_ms: eligible_latencies.first().copied(),
                 failure_modes,
                 latest_run_label: bucket.last().map(|record| record.run_label.clone()),
             },
@@ -911,20 +862,23 @@ fn choose_winner(summary: &SummaryOutput, track: Track) -> Option<SelectionEntry
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         right
-            .success_rate
-            .partial_cmp(&left.success_rate)
+            .eligible_success_rate
+            .partial_cmp(&left.eligible_success_rate)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.median_latency_ms.cmp(&right.median_latency_ms))
+            .then_with(|| {
+                left.eligible_median_latency_ms
+                    .cmp(&right.eligible_median_latency_ms)
+            })
     });
     let winner = candidates
         .into_iter()
-        .find(|group| group.success_rate > 0.0)?;
+        .find(|group| group.eligible_successes > 0)?;
     Some(SelectionEntry {
         workflow_id: winner.workflow_id,
         workflow_ref: winner.workflow_ref,
         workflow_file: winner.workflow_file,
-        median_latency_ms: winner.median_latency_ms,
-        success_rate: winner.success_rate,
+        median_latency_ms: winner.eligible_median_latency_ms,
+        success_rate: winner.eligible_success_rate,
     })
 }
 
@@ -936,22 +890,29 @@ fn build_report(
     selection: &SelectionOutput,
 ) -> String {
     let rows = if records.is_empty() {
-        "| - | - | - | - | - | - |".to_string()
+        "| - | - | - | - | - | - | - | - |".to_string()
     } else {
         records
             .iter()
             .map(|record| {
                 format!(
-                    "| {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     record.workflow_id,
                     track_key(record.track),
                     if record.success { "yes" } else { "no" },
+                    if record.selection_eligible {
+                        "yes"
+                    } else {
+                        "no"
+                    },
                     record.latency_ms,
+                    record.intended_target_email.as_deref().unwrap_or("-"),
                     if record.created_emails.is_empty() {
                         "-".to_string()
                     } else {
                         record.created_emails.join(", ")
                     },
+                    record.displayed_created_label.as_deref().unwrap_or("-"),
                     record.failure_mode.as_deref().unwrap_or("-"),
                 )
             })
@@ -959,7 +920,7 @@ fn build_report(
             .join("\n")
     };
     let group_rows = if summary.groups.is_empty() {
-        "| - | - | - | - | - | - |".to_string()
+        "| - | - | - | - | - | - | - |".to_string()
     } else {
         summary
             .groups
@@ -976,14 +937,20 @@ fn build_report(
                         .join(", ")
                 };
                 format!(
-                    "| {} | {} | {}/{} | {} | {} | {} |",
+                    "| {} | {} | {}/{} | {}/{} | {} | {} | {} | {} |",
                     group.workflow_id,
                     track_key(group.track),
                     group.successes,
                     group.runs,
-                    group.success_rate,
+                    group.eligible_successes,
+                    group.eligible_runs,
+                    group.eligible_success_rate,
                     group
-                        .median_latency_ms
+                        .eligible_median_latency_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    group
+                        .eligible_best_latency_ms
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     failure_modes,
@@ -1000,12 +967,12 @@ fn build_report(
          - runs per workflow: `{}`\n\
          - managed profile: `{}`\n\n\
          ## Raw Runs\n\n\
-         | workflow | track | success | latency_ms | created emails | failure |\n\
-         | --- | --- | --- | ---: | --- | --- |\n\
+         | workflow | track | success | eligible | latency_ms | target | created emails | displayed label | failure |\n\
+         | --- | --- | --- | --- | ---: | --- | --- | --- | --- |\n\
          {rows}\n\n\
          ## Summary\n\n\
-         | workflow | track | successes | success rate | median latency_ms | failure modes |\n\
-         | --- | --- | --- | ---: | ---: | --- |\n\
+         | workflow | track | successes | eligible successes | eligible success rate | eligible median latency_ms | eligible best latency_ms | failure modes |\n\
+         | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n\
          {group_rows}\n\n\
          ## Selection\n\n\
          - selected non-device: {}\n\
@@ -1049,28 +1016,28 @@ fn benchmark_candidates(workflow_root: &Path) -> Vec<BenchmarkCandidate> {
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow",
-            base_email: "dev.{n}@astronlab.com",
+            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "stepwise",
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow-stepwise.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
-            base_email: "dev.{n}@astronlab.com",
+            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "minimal",
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow-minimal.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-            base_email: "dev.{n}@astronlab.com",
+            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "device-auth",
             track: Track::DeviceAuth,
             file_path: workflow_root.join("codex-rotate-account-flow-device-auth.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
-            base_email: "dev.{n}@astronlab.com",
+            base_email: "devbench.{n}@astronlab.com",
         },
     ]
 }
@@ -1118,6 +1085,7 @@ fn normalize_text(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
     let trimmed = value.as_ref().trim().to_lowercase();
     if trimmed.is_empty() {
@@ -1127,6 +1095,7 @@ fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
     let normalized_email = normalize_email(Some(email))?;
     let normalized_base_email = normalize_base_email(base_email)?;
@@ -1141,6 +1110,157 @@ fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
     }
     let numeric = &normalized_email[prefix.len()..normalized_email.len() - suffix.len()];
     numeric.parse::<u32>().ok()
+}
+
+fn extract_intended_target_email(output: &str) -> Option<String> {
+    let mut last_match = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(value) = extract_between(line, "Creating ", " via ") {
+            last_match = normalize_email(Some(value));
+        }
+        if let Some(value) = extract_between(line, "Reusing pending account ", " via ") {
+            last_match = normalize_email(Some(value));
+        }
+        if let Some(value) = extract_between(line, "Managed login finished for ", ". Finalizing.") {
+            last_match = normalize_email(Some(value));
+        }
+        if let Some(value) = extract_between(line, "Adding ", " to the account pool.") {
+            last_match = normalize_email(Some(value));
+        }
+    }
+    last_match
+}
+
+fn extract_displayed_created_label(output: &str) -> Option<String> {
+    let mut last_match = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(value) = extract_between(line, "Created ", " with usable quota.") {
+            last_match = normalize_text(value);
+        }
+        if let Some(value) = extract_between(line, "Created ", " via \"") {
+            last_match = normalize_text(value);
+        }
+    }
+    last_match
+}
+
+fn extract_email_from_label(label: &str) -> Option<String> {
+    let normalized_label = normalize_text(label)?;
+    if let Some((email, _plan)) = normalized_label.rsplit_once('_') {
+        return normalize_email(Some(email));
+    }
+    normalize_email(Some(normalized_label.as_str()))
+}
+
+fn detect_top_level_fallback_workflows(output: &str, candidate_workflow_ref: &str) -> Vec<String> {
+    let mut fallbacks = top_level_workflow_refs()
+        .into_iter()
+        .filter(|workflow_ref| {
+            *workflow_ref != candidate_workflow_ref
+                && contains_workflow_ref_token(output, workflow_ref)
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fallbacks.sort();
+    fallbacks.dedup();
+    fallbacks
+}
+
+fn contains_workflow_ref_token(output: &str, workflow_ref: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_index) = output[search_start..].find(workflow_ref) {
+        let start = search_start + relative_index;
+        let end = start + workflow_ref.len();
+        let before_ok = output[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_workflow_ref_token_char(ch));
+        let after_ok = output[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_workflow_ref_token_char(ch));
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = end;
+    }
+    false
+}
+
+fn is_workflow_ref_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
+}
+
+fn classify_selection_invalid_reasons(
+    success: bool,
+    intended_target_email: Option<&str>,
+    created_emails: &[String],
+    displayed_created_label: Option<&str>,
+    displayed_created_email: Option<&str>,
+    top_level_fallback_workflows: &[String],
+) -> Vec<String> {
+    if !success {
+        return Vec::new();
+    }
+
+    let mut reasons = Vec::new();
+    let normalized_target = intended_target_email.and_then(|value| normalize_email(Some(value)));
+    if normalized_target.is_none() {
+        reasons.push("missing_target_email".to_string());
+    }
+    if created_emails.len() != 1 {
+        reasons.push(format!(
+            "expected_single_pooled_email_found_{}",
+            created_emails.len()
+        ));
+    }
+    if displayed_created_label.is_none() {
+        reasons.push("missing_displayed_created_label".to_string());
+    }
+    if displayed_created_email.is_none() {
+        reasons.push("missing_displayed_created_email".to_string());
+    }
+    if let (Some(target), Some(created)) = (normalized_target.as_deref(), created_emails.first()) {
+        if target != created {
+            reasons.push(format!("target_pool_mismatch:{target}!={created}"));
+        }
+    }
+    if let (Some(target), Some(displayed)) = (normalized_target.as_deref(), displayed_created_email)
+    {
+        if target != displayed {
+            reasons.push(format!("target_display_mismatch:{target}!={displayed}"));
+        }
+    }
+    if let (Some(created), Some(displayed)) = (created_emails.first(), displayed_created_email) {
+        if created != displayed {
+            reasons.push(format!("pool_display_mismatch:{created}!={displayed}"));
+        }
+    }
+    if !top_level_fallback_workflows.is_empty() {
+        reasons.push(format!(
+            "top_level_fallback:{}",
+            top_level_fallback_workflows.join(",")
+        ));
+    }
+    reasons
+}
+
+fn extract_between<'a>(value: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let start = value.find(prefix)?;
+    let remainder = &value[start + prefix.len()..];
+    let end = remainder.find(suffix)?;
+    Some(remainder[..end].trim())
+}
+
+fn top_level_workflow_refs() -> [&'static str; 4] {
+    [
+        "workspace.web.auth-openai-com.codex-rotate-account-flow",
+        "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+        "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+        "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+    ]
 }
 
 fn normalize_email(value: Option<&str>) -> Option<String> {
@@ -1198,6 +1318,80 @@ fn resolve_home_override(env_name: &str, default_suffix: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    fn fresh_temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "codex-rotate-benchmark-tests-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn make_record(
+        workflow_id: &str,
+        track: Track,
+        success: bool,
+        latency_ms: u128,
+        selection_eligible: bool,
+    ) -> BenchmarkRecord {
+        BenchmarkRecord {
+            competitor: workflow_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            workflow_ref: match workflow_id {
+                "original" => "workspace.web.auth-openai-com.codex-rotate-account-flow",
+                "stepwise" => "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+                "minimal" => "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+                _ => "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+            }
+            .to_string(),
+            workflow_file: format!("{workflow_id}.yaml"),
+            track,
+            task: match track {
+                Track::NonDevice => "openai-account-create-non-device".to_string(),
+                Track::DeviceAuth => "openai-account-create-device-auth".to_string(),
+            },
+            run_label: format!("{workflow_id}-run"),
+            cold: true,
+            success,
+            latency_ms,
+            exit_status: Some(if success { 0 } else { 1 }),
+            failure_mode: (!success).then(|| "unknown".to_string()),
+            created_emails: Vec::new(),
+            new_pending_emails: Vec::new(),
+            intended_target_email: None,
+            displayed_created_label: None,
+            displayed_created_email: None,
+            used_top_level_fallback: false,
+            top_level_fallback_workflows: Vec::new(),
+            selection_eligible,
+            selection_invalid_reasons: if selection_eligible {
+                Vec::new()
+            } else {
+                vec!["invalid".to_string()]
+            },
+            auth_before: None,
+            auth_after: None,
+            auth_restored: true,
+            base_email: "devbench.{n}@astronlab.com".to_string(),
+            notes: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            measured_at: iso_now(),
+        }
+    }
 
     #[test]
     fn parse_args_supports_mode_runs_profile_and_overrides() {
@@ -1233,5 +1427,150 @@ mod tests {
             extract_template_suffix("other@astronlab.com", "dev.{n}@astronlab.com"),
             None
         );
+    }
+
+    #[test]
+    fn benchmark_candidates_default_to_devbench_family() {
+        let workflow_root = Path::new("/tmp/auth-workflows");
+        let candidates = benchmark_candidates(workflow_root);
+
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.base_email == "devbench.{n}@astronlab.com"));
+    }
+
+    #[test]
+    fn benchmark_candidate_leaves_real_created_devbench_account_in_shared_state() {
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = fresh_temp_path("persist");
+        fs::create_dir_all(&tempdir).expect("create tempdir");
+        let rotate_home = tempdir.join("rotate-home");
+        let codex_home = tempdir.join("codex-home");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::write(rotate_home.join("accounts.json"), "{\"accounts\":[]}\n").expect("write state");
+        fs::write(codex_home.join("auth.json"), "{\"tokens\":{}}\n").expect("write auth");
+
+        let cli_binary = tempdir.join("fake-cli.sh");
+        fs::write(
+            &cli_binary,
+            concat!(
+                "#!/bin/sh\n",
+                "mkdir -p \"$CODEX_ROTATE_HOME\"\n",
+                "cat > \"$CODEX_ROTATE_HOME/accounts.json\" <<'EOF'\n",
+                "{\"accounts\":[{\"email\":\"devbench.1@astronlab.com\"}]}\n",
+                "EOF\n",
+                "echo 'Creating devbench.1@astronlab.com via dev-1 from devbench.{n}@astronlab.com.' 1>&2\n",
+                "echo 'Managed login finished for devbench.1@astronlab.com. Finalizing.' 1>&2\n",
+                "echo 'Adding devbench.1@astronlab.com to the account pool.' 1>&2\n",
+                "echo 'Created devbench.1@astronlab.com_free with usable quota.' 1>&2\n",
+                "echo '\\033[32mOK\\033[0m Created devbench.1@astronlab.com_free via \"dev-1\" from devbench.{n}@astronlab.com.'\n",
+            ),
+        )
+        .expect("write fake cli");
+        #[cfg(unix)]
+        fs::set_permissions(&cli_binary, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake cli");
+
+        let previous_rotate_home = env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = env::var_os("CODEX_HOME");
+        unsafe {
+            env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let candidate = BenchmarkCandidate {
+            id: "original",
+            track: Track::NonDevice,
+            file_path: tempdir.join("flow.yaml"),
+            workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow",
+            base_email: "devbench.{n}@astronlab.com",
+        };
+
+        let result = benchmark_candidate(
+            &candidate,
+            1,
+            "dev-1",
+            "devbench.{n}@astronlab.com",
+            &tempdir,
+            &cli_binary,
+            &rotate_home.join("accounts.json"),
+            &codex_home,
+        );
+
+        match previous_codex_home {
+            Some(value) => unsafe { env::set_var("CODEX_HOME", value) },
+            None => unsafe { env::remove_var("CODEX_HOME") },
+        }
+        match previous_rotate_home {
+            Some(value) => unsafe { env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { env::remove_var("CODEX_ROTATE_HOME") },
+        }
+
+        let record = result.expect("benchmark candidate should succeed");
+        assert_eq!(record.created_emails, vec!["devbench.1@astronlab.com"]);
+
+        let state = read_rotate_state(&rotate_home.join("accounts.json"));
+        let account_emails = state
+            .get("accounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| normalize_email(entry.get("email").and_then(Value::as_str)))
+            .collect::<Vec<_>>();
+        assert_eq!(account_emails, vec!["devbench.1@astronlab.com"]);
+
+        fs::remove_dir_all(&tempdir).ok();
+    }
+
+    #[test]
+    fn classify_selection_invalid_reasons_flags_email_mismatch_and_top_level_fallback() {
+        let reasons = classify_selection_invalid_reasons(
+            true,
+            Some("devbench.8@astronlab.com"),
+            &[String::from("devbench.8@astronlab.com")],
+            Some("1.dev.astronlab@gmail.com_free"),
+            Some("1.dev.astronlab@gmail.com"),
+            &[String::from(
+                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+            )],
+        );
+
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.starts_with("target_display_mismatch:")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.starts_with("pool_display_mismatch:")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.starts_with("top_level_fallback:")));
+    }
+
+    #[test]
+    fn detect_top_level_fallback_workflows_ignores_prefix_matches() {
+        let output =
+            "workflow_ref=workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise";
+        let fallbacks = detect_top_level_fallback_workflows(
+            output,
+            "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+        );
+        assert!(fallbacks.is_empty());
+    }
+
+    #[test]
+    fn build_selection_ignores_successful_runs_that_are_not_selection_eligible() {
+        let summary = build_summary(&[
+            make_record("original", Track::NonDevice, true, 40, false),
+            make_record("stepwise", Track::NonDevice, true, 55, true),
+        ]);
+
+        let winner = build_selection(&summary)
+            .selected_non_device
+            .expect("winner");
+        assert_eq!(winner.workflow_id, "stepwise");
     }
 }
