@@ -27,8 +27,8 @@ use crate::cancel;
 use crate::managed_browser::ensure_managed_browser_wrapper;
 use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::pool::{
-    cmd_add, find_next_usable_account, format_account_summary_for_display, inspect_account,
-    load_pool, normalize_pool_entries, resolve_account_selector, save_pool,
+    cmd_add_expected_email, find_next_usable_account, format_account_summary_for_display,
+    inspect_account, load_pool, normalize_pool_entries, resolve_account_selector, save_pool,
     sync_pool_active_account_from_codex, AccountEntry, AccountInspection, Pool,
     ReusableAccountProbeMode,
 };
@@ -975,7 +975,7 @@ pub fn cmd_relogin_with_progress(
             ));
         }
 
-        let _ = cmd_add(existing.alias.as_deref())?;
+        let _ = cmd_add_expected_email(&expected_email, existing.alias.as_deref())?;
         if let Some(inspected) =
             inspect_pool_entry_by_account_id(&extract_account_id_from_auth(&auth))?
         {
@@ -1044,7 +1044,7 @@ pub fn cmd_relogin_with_progress(
         ));
     }
 
-    cmd_add(existing.alias.as_deref())
+    cmd_add_expected_email(&expected_email, existing.alias.as_deref())
 }
 
 pub fn should_use_stored_credential_relogin(
@@ -1655,7 +1655,7 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
         progress.as_ref(),
         format!("Adding {} to the account pool.", created_email),
     );
-    let _ = cmd_add(options.alias.as_deref())?;
+    let _ = cmd_add_expected_email(&created_email, options.alias.as_deref())?;
     report_progress(
         progress.as_ref(),
         format!("Inspecting quota for {}.", created_email),

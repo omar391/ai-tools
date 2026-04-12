@@ -295,6 +295,55 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
     ))
 }
 
+pub fn cmd_add_expected_email(expected_email: &str, alias: Option<&str>) -> Result<String> {
+    let _ = cmd_add(alias)?;
+
+    let normalized_expected_email = expected_email.trim().to_lowercase();
+    if normalized_expected_email.is_empty() {
+        return Err(anyhow!("Expected email for pool add cannot be empty."));
+    }
+
+    let paths = resolve_paths()?;
+    let auth = load_codex_auth(&paths.codex_auth_file)?;
+    let account_id = extract_account_id_from_auth(&auth);
+    let plan_type = extract_plan_from_auth(&auth);
+    let expected_label = build_account_label(&normalized_expected_email, &plan_type);
+    let next_alias = normalize_alias(alias).filter(|value| value != &expected_label);
+
+    let mut pool = load_pool()?;
+    let index = find_pool_account_index_by_identity(&pool, &account_id, &normalized_expected_email)
+        .ok_or_else(|| {
+            anyhow!(
+                "Added auth for {}, but could not find the corresponding pool entry.",
+                normalized_expected_email
+            )
+        })?;
+
+    let entry = &mut pool.accounts[index];
+    let changed = entry.email != normalized_expected_email
+        || entry.label != expected_label
+        || entry.alias != next_alias;
+    entry.email = normalized_expected_email.clone();
+    entry.label = expected_label.clone();
+    entry.alias = next_alias;
+    pool.active_index = index;
+    if changed {
+        save_pool(&pool)?;
+    }
+    let _ = reconcile_added_account_credential_state(&pool.accounts[index])?;
+
+    Ok(format!(
+        "{GREEN}OK{RESET} Updated account \"{}\" ({}){}",
+        pool.accounts[index].label,
+        pool.accounts[index].email,
+        pool.accounts[index]
+            .alias
+            .as_ref()
+            .map(|value| format!(", alias {value}"))
+            .unwrap_or_default()
+    ))
+}
+
 pub fn cmd_next() -> Result<String> {
     cmd_next_with_progress(None)
 }
@@ -1214,6 +1263,16 @@ fn build_account_label(email: &str, plan_type: &str) -> String {
     )
 }
 
+fn should_preserve_expected_email(existing_email: &str, auth_email: &str) -> bool {
+    let normalized_existing = existing_email.trim().to_lowercase();
+    let normalized_auth = auth_email.trim().to_lowercase();
+    !normalized_existing.is_empty()
+        && normalized_existing != "unknown"
+        && normalized_existing != normalized_auth
+        && !normalized_existing.ends_with("@gmail.com")
+        && normalized_auth.ends_with("@gmail.com")
+}
+
 fn normalize_alias(alias: Option<&str>) -> Option<String> {
     alias.and_then(|value| {
         let trimmed = value.trim();
@@ -1314,13 +1373,23 @@ fn find_pool_account_index_by_identity(
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
     let mut changed = false;
     for entry in &mut pool.accounts {
-        let next_label = build_account_label(&entry.email, &entry.plan_type);
+        let auth_email = extract_email_from_auth(&entry.auth);
+        let next_email = if should_preserve_expected_email(&entry.email, &auth_email) {
+            entry.email.clone()
+        } else {
+            auth_email
+        };
+        let next_label = build_account_label(&next_email, &entry.plan_type);
         let current_alias = normalize_alias(entry.alias.as_deref());
         if entry.label != next_label {
             if current_alias.is_none() && !entry.label.is_empty() {
                 entry.alias = Some(entry.label.clone());
             }
             entry.label = next_label.clone();
+            changed = true;
+        }
+        if entry.email != next_email {
+            entry.email = next_email;
             changed = true;
         }
 
@@ -1363,7 +1432,12 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
 }
 
 fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -> bool {
-    let next_email = extract_email_from_auth(&auth);
+    let auth_email = extract_email_from_auth(&auth);
+    let next_email = if should_preserve_expected_email(&entry.email, &auth_email) {
+        entry.email.clone()
+    } else {
+        auth_email
+    };
     let next_plan = extract_plan_from_auth(&auth);
     let next_account_id = extract_account_id_from_auth(&auth);
     let next_label = build_account_label(&next_email, &next_plan);
@@ -1395,6 +1469,8 @@ fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -> bool {
 
 fn apply_usage_to_account(entry: &mut AccountEntry, usage: &UsageResponse) -> bool {
     let next_email = if usage.email.is_empty() {
+        entry.email.clone()
+    } else if should_preserve_expected_email(&entry.email, &usage.email) {
         entry.email.clone()
     } else {
         usage.email.clone()
@@ -2738,6 +2814,80 @@ mod tests {
         assert!(!changed);
         assert_eq!(pool.accounts.len(), 1);
         assert_eq!(pool.active_index, 0);
+    }
+
+    #[test]
+    fn normalize_pool_entries_preserves_non_gmail_target_when_auth_is_gmail() {
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![AccountEntry {
+                label: "devbench.12@astronlab.com_free".to_string(),
+                alias: None,
+                email: "devbench.12@astronlab.com".to_string(),
+                account_id: "acct-12".to_string(),
+                plan_type: "free".to_string(),
+                auth: make_auth("1.dev.astronlab@gmail.com", "acct-12", "free"),
+                added_at: "2026-04-12T00:00:00.000Z".to_string(),
+                last_quota_usable: None,
+                last_quota_summary: None,
+                last_quota_blocker: None,
+                last_quota_checked_at: None,
+                last_quota_primary_left_percent: None,
+                last_quota_next_refresh_at: None,
+            }],
+        };
+
+        let changed = normalize_pool_entries(&mut pool);
+
+        assert!(!changed);
+        assert_eq!(pool.accounts[0].email, "devbench.12@astronlab.com");
+        assert_eq!(pool.accounts[0].label, "devbench.12@astronlab.com_free");
+    }
+
+    #[test]
+    fn cmd_add_expected_email_preserves_target_email_against_provider_gmail_auth() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            if let Some(parent) = paths.codex_auth_file.parent() {
+                std::fs::create_dir_all(parent).expect("create auth parent");
+            }
+            write_codex_auth(
+                &paths.codex_auth_file,
+                &make_auth("1.dev.astronlab@gmail.com", "acct-devbench-12", "free"),
+            )?;
+
+            let output = cmd_add_expected_email("devbench.12@astronlab.com", None)?;
+            let pool = load_pool()?;
+
+            assert!(strip_ansi(&output).contains("devbench.12@astronlab.com_free"));
+            assert_eq!(pool.accounts.len(), 1);
+            assert_eq!(pool.active_index, 0);
+            assert_eq!(pool.accounts[0].email, "devbench.12@astronlab.com");
+            assert_eq!(pool.accounts[0].label, "devbench.12@astronlab.com_free");
+            assert_eq!(pool.accounts[0].account_id, "acct-devbench-12");
+            assert_eq!(
+                extract_email_from_auth(&pool.accounts[0].auth),
+                "1.dev.astronlab@gmail.com"
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("cmd_add_expected_email should preserve the target email");
     }
 
     #[test]

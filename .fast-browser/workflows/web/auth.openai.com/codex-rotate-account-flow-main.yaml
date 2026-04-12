@@ -2,8 +2,8 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
-  version: 1.0.11
-  summary: "Pinned codex-rotate OpenAI account flow that routes create/login through the current minimal non-device path."
+  version: 1.0.13
+  summary: "Benchmark-ordered codex-rotate OpenAI account flow that runs the current original non-device control first and falls back to device auth when needed."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -52,12 +52,12 @@ input:
       required:
         - email
 do:
-  - run_primary_flow:
+  - run_primary_non_device_flow:
       metadata:
-        description: "Run the current pinned minimal non-device OpenAI account flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal
+        description: "Run the current pinned original non-device OpenAI account flow."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
       with:
-        version: 1.0.1
+        version: 1.0.8
         input:
           enabled: "${inputs.enabled}"
           mode: "codex_login"
@@ -77,27 +77,65 @@ do:
           birth_day: "${inputs.birth_day}"
           birth_year: "${inputs.birth_year}"
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+  - run_device_auth_fallback:
+      if: "${state.steps.run_primary_non_device_flow?.action?.result?.output?.success !== true && state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'complete'}"
+      metadata:
+        description: Fallback to the current device-auth workflow when the primary original non-device flow does not complete.
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth
+      with:
+        version: 1.3.13
+        input:
+          enabled: "${inputs.enabled}"
+          mode: device_auth
+          codex_bin: "${inputs.codex_bin}"
+          auth_url: "${inputs.auth_url}"
+          device_code: "${inputs.device_code}"
+          callback_url: "${inputs.callback_url}"
+          callback_port: "${inputs.callback_port}"
+          codex_session_dir: "${inputs.codex_session_dir}"
+          codex_login_pid: "${inputs.codex_login_pid}"
+          codex_login_stdout_path: "${inputs.codex_login_stdout_path}"
+          codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
+          codex_login_exit_path: "${inputs.codex_login_exit_path}"
+          email: "${inputs.email}"
+          account_login_locator: "${inputs.account_login_locator}"
+          full_name: "${inputs.full_name}"
+          birth_month: "${inputs.birth_month}"
+          birth_day: "${inputs.birth_day}"
+          birth_year: "${inputs.birth_year}"
+          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the pinned minimal flow outcome."
+        description: "Return the primary original outcome when it completed, otherwise return the device-auth fallback outcome."
       run:
         script:
           language: javascript
           code: |
+            const primary =
+              state.steps.run_primary_non_device_flow?.action?.result?.output || {};
+            const fallback =
+              state.steps.run_device_auth_fallback?.action?.result?.output || null;
+            const primaryComplete =
+              primary.success === true || primary.next_action === "complete";
+            const selected = primaryComplete || !fallback ? primary : fallback;
+
             return {
-              ...(state.steps.run_primary_flow?.action?.result?.output || {}),
+              ...(selected && typeof selected === "object" ? selected : {}),
               selected_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+                primaryComplete || !fallback
+                  ? "workspace.web.auth-openai-com.codex-rotate-account-flow"
+                  : "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
               primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-              primary_completed:
-                state.steps.run_primary_flow?.action?.result?.output?.success === true
-                || state.steps.run_primary_flow?.action?.result?.output?.next_action === "complete",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+              fallback_flow:
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+              primary_completed: primaryComplete,
               primary_skipped_by_policy:
-                state.steps.run_primary_flow?.action?.result?.output?.next_action === "skip_account",
-              fallback_attempted: false,
-              fallback_selected: false,
-              selection_strategy: "pinned-minimal-only",
+                primary.next_action === "skip_account",
+              fallback_attempted: Boolean(fallback),
+              fallback_selected: !primaryComplete && Boolean(fallback),
+              selection_strategy:
+                "benchmark-ordered-original-then-device-auth-fallback",
             };
 output:
   as: "${state.steps.finalize_selected_flow?.action?.value || {}}"

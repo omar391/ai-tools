@@ -907,7 +907,7 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     );
   });
 
-  test("main remains pinned to the selected minimal flow after benchmarking", async () => {
+  test("main remains ordered original-first with device-auth fallback after benchmarking", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -930,8 +930,12 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-        version: "1.0.1",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
+        version: "1.0.8",
+      },
+      {
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+        version: "1.3.13",
       },
     ]);
   });
@@ -3115,6 +3119,23 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("waits and recollects the first prepare verification code when Gmail loads late", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "wait_for_prepare_login_verification_email_delivery",
+    );
+    expect(workflowText).toContain(
+      "recollect_prepare_login_verification_artifact_after_missing_code",
+    );
+    expect(workflowText).toContain(
+      "cache_prepare_login_verification_artifact_after_missing_code",
+    );
+    expect(workflowText).toContain(
+      "state.vars.prepare_login_verification_code",
+    );
+  });
+
   test("keeps prepare add-phone as an authenticated-ready state instead of blocking device-auth preparation", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
@@ -3184,6 +3205,12 @@ describe("device-auth workflow", () => {
 
     expect(step?.call).toBe("afn.driver.browser.exec_script");
     expect(step?.with?.body?.script).toContain("pressSequentially(code");
+    expect(step?.with?.body?.script).toContain(
+      "state.vars.prepare_login_verification_code",
+    );
+    expect(step?.with?.body?.script).toContain(
+      "recollect_prepare_login_verification_artifact_after_missing_code",
+    );
     expect(step?.with?.body?.script).toContain(
       "collect_prepare_login_verification_artifact",
     );
@@ -3504,19 +3531,20 @@ describe("device-auth workflow", () => {
     expect(result.clicked_text).toBe("Log out");
   });
 
-  test("falls back to the proven original non-device flow when device-auth prepare is poisoned by invalid_state", () => {
+  test("device-auth keeps the legacy fallback step disabled and recovers through its own pre-security login branch", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
     expect(workflowText).toContain("prepare_with_original_flow_fallback");
     expect(workflowText).toContain(
-      "Fall back to the proven original non-device auth workflow when repeated invalid_state responses poison the device-auth prepare branch.",
+      "Legacy no-op kept only for step-id stability; device-auth must recover through its own pre-security login branch instead of borrowing the original non-device flow.",
     );
     expect(workflowText).toContain(
+      'prepare_with_original_flow_fallback:\n      if: "${false}"',
+    );
+    expect(workflowText).not.toContain(
       "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
     );
-    expect(workflowText).toContain(
-      "state.steps.prepare_with_original_flow_fallback?.action?.result?.output || state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}",
-    );
+    expect(workflowText).toContain("prepare_security_login_recovery_required");
   });
 
   test("waits for the ChatGPT settings shell before the prepare logout click", () => {
@@ -4009,6 +4037,46 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("device-auth opens the pre-security ChatGPT recovery branch when prepare invalid_state poisoned the local login path", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openWarmupStep = workflow.do?.find(
+      (entry) =>
+        "open_authenticated_chatgpt_shell_before_security_settings" in entry,
+    )?.open_authenticated_chatgpt_shell_before_security_settings as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_prepare_flow_result" in entry,
+    )?.cache_prepare_flow_result as
+      | {
+          set?: Record<string, string>;
+        }
+      | undefined;
+
+    expect(cacheStep?.set?.prepare_security_login_recovery_required).toContain(
+      "prepare_flow_output?.next_action === 'skip_account'",
+    );
+    expect(cacheStep?.set?.prepare_security_login_recovery_required).toContain(
+      "prepare_flow_output?.retry_reason === 'prepare_invalid_state'",
+    );
+    expect(openWarmupStep?.if).toContain(
+      "state.vars.prepare_security_login_recovery_required === true",
+    );
+  });
+
+  test("device-auth promotes prepare_flow_ready only after its own pre-security login branch proves an authenticated ChatGPT shell", async () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "promote_prepare_flow_ready_after_security_login_recovery",
+    );
+    expect(workflowText).toContain(
+      "state.vars.prepare_flow_ready !== true && state.steps.cache_effective_authenticated_chatgpt_shell_before_security_settings?.action?.value?.authenticated_chatgpt_shell_before_security_settings?.ready === true",
+    );
+  });
+
   test("submits device-auth verification using the OTP already present in the DOM when workflow state is empty", async () => {
     const result = await runWorkflowStepScript(
       deviceAuthWorkflowPath,
@@ -4093,6 +4161,59 @@ describe("device-auth workflow", () => {
     expect(result.code).toBe("654321");
     expect(result.next_stage).toBe("email_verification");
     expect(result.strategy).toBe("email-verification-still-open");
+  });
+
+  test("submit_prepare_login_verification_code uses the cached prepare OTP when the first Gmail collection loaded late", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_prepare_login_verification_code",
+      `
+        <html>
+          <head>
+            <title>Continue to Codex</title>
+          </head>
+          <body>
+            <form onsubmit="return false;">
+              <label>
+                Code
+                <input autocomplete="one-time-code" />
+              </label>
+              <button
+                type="submit"
+                onclick="document.body.innerHTML = '<div>Continue to Codex</div><button>Continue to Codex</button>';"
+              >
+                Continue
+              </button>
+            </form>
+          </body>
+        </html>
+      `,
+      {
+        vars: {
+          prepare_login_verification_code: "654321",
+        },
+        steps: {
+          recollect_prepare_login_verification_artifact_after_missing_code: {
+            action: {
+              ok: true,
+            },
+          },
+          collect_prepare_login_verification_artifact: {
+            action: {
+              result: {
+                output: {},
+              },
+            },
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("654321");
+    expect(result.next_stage).toBe("oauth_consent");
   });
 
   test("keeps device-auth verification on the recoverable email-verification path when OpenAI does not advance immediately after submit", async () => {
@@ -4589,6 +4710,62 @@ describe("device-auth workflow", () => {
     );
     expect(retryReturnStep?.with?.body?.url).toBe(
       "https://auth.openai.com/email-verification",
+    );
+  });
+
+  test("device-auth retries the prepare Gmail-return invalid_state shell before falling back", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const recoverStep = workflow.do?.find(
+      (entry) => "recover_prepare_login_verification_return_timeout" in entry,
+    )?.recover_prepare_login_verification_return_timeout as
+      | {
+          if?: string;
+          metadata?: {
+            templateRef?: string;
+          };
+        }
+      | undefined;
+    const classifyAfterRecoverStep = workflow.do?.find(
+      (entry) =>
+        "classify_prepare_login_verification_ready_after_return_timeout" in
+        entry,
+    )?.classify_prepare_login_verification_ready_after_return_timeout as
+      | {
+          if?: string;
+          metadata?: {
+            templateRef?: string;
+          };
+        }
+      | undefined;
+
+    expect(recoverStep?.metadata?.templateRef).toBe(
+      "click_retryable_try_again",
+    );
+    expect(recoverStep?.if).toContain(
+      "classify_prepare_login_verification_ready?.action?.retryable_timeout === true",
+    );
+    expect(classifyAfterRecoverStep?.metadata?.templateRef).toBe(
+      "classify_openai_auth_surface",
+    );
+    expect(classifyAfterRecoverStep?.if).toContain(
+      "recover_prepare_login_verification_return_timeout?.action?.ok === true",
+    );
+  });
+
+  test("device-auth reuses the recovered prepare Gmail-return classification in downstream recovery", async () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_email'",
+    );
+    expect(workflowText).toContain(
+      "classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_password'",
+    );
+    expect(workflowText).toContain(
+      "classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'email_verification'",
+    );
+    expect(workflowText).toContain(
+      "state.steps?.classify_prepare_login_verification_ready_after_return_timeout?.action",
     );
   });
 

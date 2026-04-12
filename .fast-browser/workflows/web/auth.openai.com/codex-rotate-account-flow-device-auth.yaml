@@ -2,7 +2,7 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-device-auth
-  version: 1.3.10
+  version: 1.3.13
   summary: "Managed-profile OpenAI device-auth flow that first reaches a normal authenticated ChatGPT session, then completes Codex device authorization inside the same workflow."
   metadata:
     preferredProfile: dev-1
@@ -4968,7 +4968,7 @@ do:
       metadata:
         description: "Collect the prepare-branch OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -4977,8 +4977,42 @@ do:
           search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
           message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
           link_host_regex: auth\.openai\.com|chatgpt\.com
-  - return_to_prepare_login_verification_page:
+  - cache_prepare_login_verification_artifact:
       if: "${state.steps.collect_prepare_login_verification_artifact?.action?.result != null}"
+      metadata:
+        description: Cache the first prepare-branch OTP into simple workflow state.
+      set:
+        prepare_login_verification_code: "${(String(state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.verification_code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.verification_code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.otp || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.otp || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.one_time_code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.one_time_code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.vars.prepare_login_verification_code || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+        prepare_login_verification_url: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.verification_url || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.verification_url || state.steps.collect_prepare_login_verification_artifact?.action?.output?.verification_url || state.vars.prepare_login_verification_url || null}"
+  - wait_for_prepare_login_verification_email_delivery:
+      if: "${state.steps.collect_prepare_login_verification_artifact?.action?.ok === true && state.steps.collect_prepare_login_verification_artifact?.action?.skipped !== true && String(state.vars.prepare_login_verification_code || '').length < 6}"
+      metadata:
+        description: Give Gmail one more chance to finish loading the first prepare-branch OTP before returning to OpenAI.
+      wait:
+        milliseconds: 4000
+  - recollect_prepare_login_verification_artifact_after_missing_code:
+      if: "${state.steps.wait_for_prepare_login_verification_email_delivery?.action?.ok === true && state.steps.wait_for_prepare_login_verification_email_delivery?.action?.skipped !== true && String(state.vars.prepare_login_verification_code || '').length < 6}"
+      metadata:
+        description: Re-collect the first prepare-branch OTP once more when Gmail has not surfaced a usable code yet.
+        ref:
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: auth\.openai\.com|chatgpt\.com
+  - cache_prepare_login_verification_artifact_after_missing_code:
+      if: "${state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result != null}"
+      metadata:
+        description: Overwrite the first prepare-branch OTP with the delayed Gmail recollection result when needed.
+      set:
+        prepare_login_verification_code: "${(String(state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.output?.code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.verification_code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.verification_code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.otp || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.otp || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.one_time_code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.one_time_code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.vars.prepare_login_verification_code || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+        prepare_login_verification_url: "${state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.result?.output?.verification_url || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.verification_url || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.output?.verification_url || state.vars.prepare_login_verification_url || null}"
+  - return_to_prepare_login_verification_page:
+      if: "${(state.steps.collect_prepare_login_verification_artifact?.action?.ok === true && state.steps.collect_prepare_login_verification_artifact?.action?.skipped !== true) || (state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.ok === true && state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.skipped !== true)}"
       metadata:
         description: "Return from Gmail to the active OpenAI email-verification page in the local device-auth prepare branch."
         mode: headless_ok
@@ -4999,13 +5033,25 @@ do:
         description: "Confirm the OpenAI verification surface after returning from Gmail during local device-auth prepare."
         browser:
           screenshot: true
+  - recover_prepare_login_verification_return_timeout:
+      if: "${state.steps.classify_prepare_login_verification_ready?.action?.retryable_timeout === true}"
+      metadata:
+        templateRef: click_retryable_try_again
+        description: Retry the prepare verification return path when Gmail lands back on OpenAI's invalid_state shell instead of the verification form.
+  - classify_prepare_login_verification_ready_after_return_timeout:
+      if: "${state.steps.recover_prepare_login_verification_return_timeout?.action?.ok === true && state.steps.recover_prepare_login_verification_return_timeout?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the prepare verification surface after retrying the Gmail return invalid_state shell.
+        browser:
+          screenshot: true
   - refill_prepare_login_email_after_return:
-      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready?.action?.email_input_editable !== false}"
+      if: "${(state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready?.action?.email_input_editable !== false) || (state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.email_input_editable !== false)}"
       metadata:
         templateRef: fill_openai_email_field
         description: "Re-enter the email when Gmail return resets the local prepare branch to the email step."
   - continue_prepare_login_email_after_return:
-      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready?.action?.email_input_editable === false && state.steps.classify_prepare_login_verification_ready?.action?.email_prefilled === true && state.steps.classify_prepare_login_verification_ready?.action?.continue_button_visible === true}"
+      if: "${(state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready?.action?.email_input_editable === false && state.steps.classify_prepare_login_verification_ready?.action?.email_prefilled === true && state.steps.classify_prepare_login_verification_ready?.action?.continue_button_visible === true) || (state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_email' && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.email_input_editable === false && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.email_prefilled === true && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.continue_button_visible === true)}"
       metadata:
         templateRef: click_primary_continue
         description: "Continue from the locked prefilled email step when Gmail return restores the local prepare branch to Welcome back."
@@ -5026,7 +5072,7 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Classify the local prepare login surface after restoring the email step from the Gmail return path."
   - reopen_prepare_one_time_code_after_return:
-      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready?.action?.password_input === true) || state.steps.classify_prepare_login_after_return?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_after_return?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_after_return?.action?.password_input === true)}"
+      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready?.action?.password_input === true) || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.password_input === true) || state.steps.classify_prepare_login_after_return?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_after_return?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_after_return?.action?.password_input === true)}"
       metadata:
         templateRef: click_one_time_code_button
         description: "Reopen one-time-code recovery when the Gmail return path lands back on the password prompt during local device-auth prepare."
@@ -5036,14 +5082,14 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after rebuilding one-time-code recovery from the Gmail return path."
   - fill_prepare_login_verification_code:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.email_verification === true || state.steps.classify_prepare_login_verification_ready?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_return_recovery?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_timeout_reopen?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_signup_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email?.action?.stage === 'email_verification'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.email_verification === true || state.steps.classify_prepare_login_verification_ready?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_return_recovery?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_timeout_reopen?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_signup_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email?.action?.stage === 'email_verification'}"
       metadata:
         description: "Fill the Gmail OTP into the OpenAI email-verification form during local device-auth prepare."
       call: afn.driver.browser.type
       with:
         body:
           selector: input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]
-          text: "${String(state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '').replace(/\\D+/g, '').slice(0, 6)}"
+          text: "${String(state.vars.prepare_login_verification_code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.output?.code || state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '').replace(/\\D+/g, '').slice(0, 6)}"
           dispatch_events_after_fill: true
           blur_after_fill: true
           settle_ms: 250
@@ -5093,7 +5139,9 @@ do:
               );
             };
             const code = String(
-              extractVerificationCode(state.steps.collect_prepare_login_verification_artifact?.action)
+              state.vars.prepare_login_verification_code
+              || extractVerificationCode(state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action)
+              || extractVerificationCode(state.steps.collect_prepare_login_verification_artifact?.action)
               || ""
             ).replace(/\D+/g, "").slice(0, 6);
             if (code.length < 6) {
@@ -5330,7 +5378,7 @@ do:
       metadata:
         description: "Re-collect the prepare-branch OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5357,7 +5405,7 @@ do:
       metadata:
         description: Re-collect the replacement prepare-branch OTP once more when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5722,6 +5770,7 @@ do:
               state.steps?.classify_prepare_after_signup_about_you?.action,
               state.steps?.classify_prepare_after_login_verification_retry?.action,
               state.steps?.classify_prepare_after_login_verification_submit?.action,
+              state.steps?.classify_prepare_login_verification_ready_after_return_timeout?.action,
               state.steps?.classify_prepare_after_return_recovery?.action,
               state.steps?.classify_prepare_login_after_return?.action,
               state.steps?.classify_prepare_login_verification_ready_after_incorrect_code?.action,
@@ -5806,37 +5855,18 @@ do:
               stale_authenticated_shell_only: staleAuthenticatedShellOnly,
             };
   - prepare_with_original_flow_fallback:
-      if: "${state.vars.reuse_device_auth_session !== true && state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output?.next_action === 'skip_account' && state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output?.retry_reason === 'prepare_invalid_state'}"
+      if: "${false}"
       metadata:
-        description: Fall back to the proven original non-device auth workflow when repeated invalid_state responses poison the device-auth prepare branch.
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
-      with:
-        version: 1.0.7
-        input:
-          enabled: true
-          mode: codex_login
-          codex_bin: "${inputs.codex_bin}"
-          auth_url: "${inputs.auth_url}"
-          callback_url: "${inputs.callback_url}"
-          callback_port: "${inputs.callback_port}"
-          codex_session_dir: "${inputs.codex_session_dir}"
-          codex_login_pid: "${inputs.codex_login_pid}"
-          codex_login_stdout_path: "${inputs.codex_login_stdout_path}"
-          codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
-          codex_login_exit_path: "${inputs.codex_login_exit_path}"
-          email: "${inputs.email}"
-          account_login_locator: "${inputs.account_login_locator}"
-          full_name: "${inputs.full_name}"
-          birth_month: "${inputs.birth_month}"
-          birth_day: "${inputs.birth_day}"
-          birth_year: "${inputs.birth_year}"
-          prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
+        description: Legacy no-op kept only for step-id stability; device-auth must recover through its own pre-security login branch instead of borrowing the original non-device flow.
+      set:
+        skipped: true
   - cache_prepare_flow_result:
       metadata:
         description: "Cache the local device-auth prepare result before opening ChatGPT Security."
       set:
-        prepare_flow_output: "${state.steps.prepare_with_original_flow_fallback?.action?.result?.output || state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}}"
-        prepare_flow_ready: "${(state.steps.prepare_with_original_flow_fallback?.action?.result?.output?.success === true || state.steps.prepare_with_original_flow_fallback?.action?.result?.output?.next_action === 'complete') || state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_ready === true}"
+        prepare_flow_output: "${state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}}"
+        prepare_flow_ready: "${state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_ready === true}"
+        prepare_security_login_recovery_required: "${state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output?.next_action === 'skip_account' && state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output?.retry_reason === 'prepare_invalid_state'}"
   - open_chatgpt_shell:
       if: "${false}"
       metadata:
@@ -5858,7 +5888,7 @@ do:
       set:
         skipped: true
   - open_authenticated_chatgpt_shell_before_security_settings:
-      if: "${state.vars.reuse_device_auth_session !== true && state.vars.prepare_flow_ready === true}"
+      if: "${state.vars.reuse_device_auth_session !== true && (state.vars.prepare_flow_ready === true || state.vars.prepare_security_login_recovery_required === true)}"
       metadata:
         description: Warm the authenticated ChatGPT app shell before opening the Security settings so the Security controls load in a logged-in state.
       call: afn.driver.browser.navigate
@@ -6049,7 +6079,7 @@ do:
       metadata:
         description: Collect the explicit ChatGPT login OTP from Gmail on the same managed profile before opening Security settings.
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -6075,7 +6105,7 @@ do:
       metadata:
         description: Re-collect the explicit ChatGPT login OTP once when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -6221,6 +6251,12 @@ do:
                 stage: effective.stage || null,
               },
             };
+  - promote_prepare_flow_ready_after_security_login_recovery:
+      if: "${state.vars.reuse_device_auth_session !== true && state.vars.prepare_flow_ready !== true && state.steps.cache_effective_authenticated_chatgpt_shell_before_security_settings?.action?.value?.authenticated_chatgpt_shell_before_security_settings?.ready === true}"
+      metadata:
+        description: Promote the local device-auth prepare state to ready once the workflow's own pre-security login branch proves an authenticated ChatGPT shell.
+      set:
+        prepare_flow_ready: true
   - open_chatgpt_security_settings:
       if: "${state.vars.reuse_device_auth_session !== true && state.steps.cache_effective_authenticated_chatgpt_shell_before_security_settings?.action?.value?.authenticated_chatgpt_shell_before_security_settings?.ready === true}"
       metadata:
@@ -7201,7 +7237,7 @@ do:
       metadata:
         description: "Collect the device-auth login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7228,7 +7264,7 @@ do:
       metadata:
         description: Re-collect the device-auth login OTP once when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7683,7 +7719,7 @@ do:
       metadata:
         description: "Re-collect the device-auth login OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7710,7 +7746,7 @@ do:
       metadata:
         description: Re-collect the replacement device-auth login OTP once when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
