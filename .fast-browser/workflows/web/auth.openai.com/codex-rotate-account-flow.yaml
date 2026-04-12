@@ -1022,7 +1022,7 @@ use:
                 return result;
               } catch (error) {
                 const message = String(error?.message || error || "");
-                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message)) {
+                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached|Timeout \d+ms exceeded/i.test(message)) {
                   return {
                     ok: true,
                     strategy: "form-dom-click-navigation",
@@ -1543,7 +1543,7 @@ do:
       metadata:
         description: "Collect the signup OTP from Gmail on the same managed profile."
         ref:
-          digest: "sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824"
+          digest: "sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76"
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -1796,7 +1796,7 @@ do:
       metadata:
         description: "Collect the replayed-login OTP from Gmail on the same managed profile."
         ref:
-          digest: "sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824"
+          digest: "sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76"
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2220,8 +2220,121 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Classify the final OpenAI/Codex callback state before any consent click."
+  - wait_before_consent_add_phone_retry_1:
+      if: "${state.steps.classify_before_consent?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Give OpenAI time to clear a transient final add-phone prompt before replaying the captured auth URL.
+      wait:
+        milliseconds: 2000
+  - reopen_auth_url_before_consent_retry_1:
+      if: "${state.steps.wait_before_consent_add_phone_retry_1?.action != null && state.steps.wait_before_consent_add_phone_retry_1?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the first final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_1:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_1?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_1?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the first add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_1:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_1?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_1?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the first add-phone retry.
+  - wait_before_consent_add_phone_retry_2:
+      if: "${state.steps.classify_before_consent_retry_1?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply a longer wait before replaying the captured auth URL again when final add-phone persists.
+      wait:
+        milliseconds: 4000
+  - reopen_auth_url_before_consent_retry_2:
+      if: "${state.steps.wait_before_consent_add_phone_retry_2?.action != null && state.steps.wait_before_consent_add_phone_retry_2?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the second final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_2:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_2?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_2?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the second add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_2:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_2?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_2?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the second add-phone retry.
+  - wait_before_consent_add_phone_retry_3:
+      if: "${state.steps.classify_before_consent_retry_2?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply an extended wait before replaying the captured auth URL for a third final add-phone retry.
+      wait:
+        milliseconds: 8000
+  - reopen_auth_url_before_consent_retry_3:
+      if: "${state.steps.wait_before_consent_add_phone_retry_3?.action != null && state.steps.wait_before_consent_add_phone_retry_3?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the third final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_3:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_3?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_3?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the third add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_3:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_3?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_3?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the third add-phone retry.
+  - wait_before_consent_add_phone_retry_4:
+      if: "${state.steps.classify_before_consent_retry_3?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the last long wait before one final replay of the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 12000
+  - reopen_auth_url_before_consent_retry_4:
+      if: "${state.steps.wait_before_consent_add_phone_retry_4?.action != null && state.steps.wait_before_consent_add_phone_retry_4?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the fourth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_4:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_4?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_4?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the fourth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_4:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_4?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_4?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the fourth add-phone retry.
+  - cache_effective_before_consent_surface:
+      metadata:
+        description: Cache the latest final OpenAI/Codex state after any bounded add-phone retries.
+      set:
+        effective_before_consent_surface: "${state.steps.classify_before_consent_retry_4?.action?.current_url ? state.steps.classify_before_consent_retry_4?.action : (state.steps.classify_before_consent_retry_3?.action?.current_url ? state.steps.classify_before_consent_retry_3?.action : (state.steps.classify_before_consent_retry_2?.action?.current_url ? state.steps.classify_before_consent_retry_2?.action : (state.steps.classify_before_consent_retry_1?.action?.current_url ? state.steps.classify_before_consent_retry_1?.action : (state.steps.classify_before_consent?.action || {}))))}"
   - accept_oauth_consent:
-      if: "${state.steps.classify_before_consent?.action?.oauth_continue_visible === true && state.steps.classify_before_consent?.action?.callback_complete !== true}"
+      if: "${state.vars.effective_before_consent_surface?.oauth_continue_visible === true && state.vars.effective_before_consent_surface?.callback_complete !== true}"
       metadata:
         templateRef: click_primary_continue
         description: "Accept the final OpenAI consent step for the Codex callback."

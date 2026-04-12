@@ -1118,7 +1118,9 @@ fn execute_create_flow_with_progress(
                 if should_retry_create_after_error(options, &error) =>
             {
                 let workflow_skip = is_workflow_skip_account_error(&error);
-                if reusable_account_exists_for_auto_create_retry(options)? {
+                if should_stop_create_retry_for_reusable_account(options)
+                    && reusable_account_exists_for_auto_create_retry(options)?
+                {
                     return Err(anyhow!(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT));
                 }
                 report_progress(
@@ -1148,7 +1150,9 @@ fn execute_create_flow_with_progress(
             Err(CreateFlowAttemptFailure::Fatal(error))
                 if should_retry_create_until_usable(options) =>
             {
-                if reusable_account_exists_for_auto_create_retry(options)? {
+                if should_stop_create_retry_for_reusable_account(options)
+                    && reusable_account_exists_for_auto_create_retry(options)?
+                {
                     return Err(anyhow!(AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT));
                 }
                 report_progress(
@@ -1187,6 +1191,10 @@ fn should_retry_create_until_usable(options: &CreateCommandOptions) -> bool {
 
 fn should_retry_create_after_error(options: &CreateCommandOptions, error: &anyhow::Error) -> bool {
     should_retry_create_until_usable(options) || is_workflow_skip_account_error(error)
+}
+
+fn should_stop_create_retry_for_reusable_account(options: &CreateCommandOptions) -> bool {
+    matches!(options.source, CreateCommandSource::Next)
 }
 
 pub fn is_auto_create_retry_stopped_for_reusable_account(error: &anyhow::Error) -> bool {
@@ -1268,8 +1276,8 @@ fn prepare_next_auto_create_attempt(
     save_credential_store(store)
 }
 
-fn prefer_signup_recovery_for_create(reusing_pending: bool) -> bool {
-    !reusing_pending
+fn prefer_signup_recovery_for_create(_reusing_pending: bool) -> bool {
+    true
 }
 
 fn execute_create_flow_attempt(
@@ -5455,9 +5463,9 @@ input:
     }
 
     #[test]
-    fn fresh_create_prefers_signup_recovery_but_reused_pending_does_not() {
+    fn create_always_prefers_signup_recovery() {
         assert!(prefer_signup_recovery_for_create(false));
-        assert!(!prefer_signup_recovery_for_create(true));
+        assert!(prefer_signup_recovery_for_create(true));
     }
 
     #[test]
@@ -5721,6 +5729,23 @@ end
         assert!(!should_retry_create_after_error(
             &CreateCommandOptions::default(),
             &error
+        ));
+    }
+
+    #[test]
+    fn reusable_account_retry_stop_only_applies_to_next_source() {
+        assert!(should_stop_create_retry_for_reusable_account(
+            &CreateCommandOptions {
+                source: CreateCommandSource::Next,
+                ..CreateCommandOptions::default()
+            }
+        ));
+        assert!(!should_stop_create_retry_for_reusable_account(
+            &CreateCommandOptions {
+                source: CreateCommandSource::Manual,
+                force: true,
+                ..CreateCommandOptions::default()
+            }
         ));
     }
 

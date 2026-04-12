@@ -83,10 +83,7 @@ where
         .current_dir(&paths.asset_root)
         .env("CODEX_ROTATE_ASSET_ROOT", paths.asset_root.as_os_str())
         .env("CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK", "1")
-        .env(
-            "CODEX_ROTATE_BRIDGE_OWNER_PID",
-            std::process::id().to_string(),
-        )
+        .env("CODEX_ROTATE_BRIDGE_OWNER_PID", std::process::id().to_string())
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(if progress.is_some() {

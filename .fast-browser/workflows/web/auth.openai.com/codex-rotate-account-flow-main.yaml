@@ -2,8 +2,8 @@ document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
-  version: 1.0.8
-  summary: "Pinned codex-rotate OpenAI account flow that routes create/login through the current lowest-latency proven non-device path."
+  version: 1.0.10
+  summary: "Pinned codex-rotate OpenAI account flow that routes create/login through the current original non-device path."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -54,7 +54,7 @@ input:
 do:
   - run_primary_flow:
       metadata:
-        description: "Run the current lowest-latency proven non-device OpenAI account flow."
+        description: "Run the current pinned original non-device OpenAI account flow."
       call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
       with:
         version: 1.0.7
@@ -79,7 +79,7 @@ do:
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the pinned non-device flow outcome."
+        description: "Return the pinned original flow outcome."
       run:
         script:
           language: javascript

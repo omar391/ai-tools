@@ -2477,7 +2477,7 @@ do:
       metadata:
         description: "Collect the signup OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824
+          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2765,7 +2765,7 @@ do:
       metadata:
         description: "Collect the replayed-login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:f61ba0453078b97793c45040e04cf07c6abab6d5fdb561f18a2c604f44000824
+          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0

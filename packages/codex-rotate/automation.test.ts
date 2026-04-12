@@ -16,6 +16,7 @@ import {
   buildFastBrowserWorkflowError,
   hydrateFastBrowserRunResultFromObservability,
   isFastBrowserRunResultFailure,
+  isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
   shouldPromptForCodexRotateSecretUnlock,
 } from "./automation.ts";
@@ -298,10 +299,11 @@ async function runDeviceAuthAboutYouHelper(
       await route.fulfill({
         status: 200,
         contentType: "text/html",
-        body: html,
+        body: "<html><body></body></html>",
       });
     });
     await page.goto(url);
+    await page.setContent(html);
     const script = await loadWorkflowStepScript(
       deviceAuthWorkflowPath,
       "fill_prepare_signup_about_you",
@@ -584,6 +586,26 @@ describe("automation bridge transport", () => {
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fast-browser daemon event visibility", () => {
+  test("suppresses only daemon heartbeats", () => {
+    expect(
+      isSuppressedFastBrowserEventLine(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"heartbeat","message":"still alive"}',
+      ),
+    ).toBe(true);
+    expect(
+      isSuppressedFastBrowserEventLine(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"queued","message":"waiting"}',
+      ),
+    ).toBe(false);
+    expect(
+      isSuppressedFastBrowserEventLine(
+        '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"running","message":"starting"}',
+      ),
+    ).toBe(false);
   });
 });
 
@@ -888,6 +910,36 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
         version: "1.0.7",
       },
     ]);
+  });
+
+  test("original flow keeps a bounded final add-phone reentry ladder", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const stepIds = (workflow.do || []).flatMap((entry) => Object.keys(entry));
+    const workflowText = readFileSync(originalWorkflowPath, "utf8");
+
+    expect(stepIds).toEqual(
+      expect.arrayContaining([
+        "wait_before_consent_add_phone_retry_1",
+        "reopen_auth_url_before_consent_retry_1",
+        "classify_before_consent_retry_1",
+        "wait_before_consent_add_phone_retry_2",
+        "reopen_auth_url_before_consent_retry_2",
+        "classify_before_consent_retry_2",
+        "wait_before_consent_add_phone_retry_3",
+        "reopen_auth_url_before_consent_retry_3",
+        "classify_before_consent_retry_3",
+        "wait_before_consent_add_phone_retry_4",
+        "reopen_auth_url_before_consent_retry_4",
+        "classify_before_consent_retry_4",
+        "cache_effective_before_consent_surface",
+      ]),
+    );
+    expect(workflowText).toContain(
+      "wait_before_consent_add_phone_retry_1?.action?.skipped !== true",
+    );
+    expect(workflowText).toContain(
+      "wait_before_consent_add_phone_retry_4?.action?.skipped !== true",
+    );
   });
 });
 
@@ -1661,6 +1713,65 @@ describe("minimal verification helper", () => {
     expect(result.age_value).toBe("36");
   });
 
+  test("device-auth about-you submit survives a navigation race into the ChatGPT app shell", async () => {
+    const browser = await chromium.launch({ headless: true, channel: "chrome" });
+    try {
+      const page = await browser.newPage();
+      await page.route("**/*", async (route) => {
+        const url = route.request().url();
+        const body = /chatgpt\.com/i.test(url)
+          ? `
+              <html>
+                <body style="min-height: 100vh;">
+                  <div>New chat</div>
+                  <div>Projects</div>
+                </body>
+              </html>
+            `
+          : `
+              <html>
+                <body style="min-height: 100vh;">
+                  <form>
+                    <h1>How old are you?</h1>
+                    <label for="full-name">Full name</label>
+                    <input id="full-name" name="name" value="Dev Astronlab" />
+                    <label for="age">Age</label>
+                    <input id="age" value="36" />
+                    <button id="submit" type="submit">Finish creating account</button>
+                  </form>
+                  <script>
+                    document.getElementById("submit").addEventListener("click", (event) => {
+                      event.preventDefault();
+                      setTimeout(() => {
+                        window.location.href = "https://chatgpt.com/";
+                      }, 0);
+                    });
+                  </script>
+                </body>
+              </html>
+            `;
+        await route.fulfill({
+          status: 200,
+          contentType: "text/html",
+          body,
+        });
+      });
+      await page.goto("https://auth.openai.com/about-you");
+      const script = await loadWorkflowStepScript(
+        deviceAuthWorkflowPath,
+        "submit_prepare_signup_about_you",
+      );
+      const execute = new AsyncFunction("page", "state", "args", script);
+      const result = (await execute(page, {}, {})) as Record<string, unknown>;
+
+      expect(result.ok).toBe(true);
+      expect(result.next_stage).toBe("app_shell");
+      expect(String(result.current_url || "")).toContain("https://chatgpt.com/");
+    } finally {
+      await browser.close();
+    }
+  });
+
   test("ignores unrelated nested six-digit strings when the workflow output has no OTP", async () => {
     const result = await runMinimalStepScript(
       "submit_login_verification_code",
@@ -2363,6 +2474,215 @@ describe("gmail verification artifact workflow", () => {
     expect(result.gmail_shell_ready).toBe(true);
   });
 
+  test("waits for the opened Gmail message body when the selected row preview has no OTP yet", async () => {
+    const result = await runWorkflowStepScript(
+      gmailVerificationWorkflowPath,
+      "collect_verification_artifact",
+      `
+        <html>
+          <head>
+            <title>Search results - 1.dev.astronlab@gmail.com - Gmail</title>
+          </head>
+          <body>
+            <input aria-label="Search mail" name="q" />
+            <table role="main">
+              <tr
+                class="zA"
+                onclick="
+                  document.body.innerHTML =
+                    '<input aria-label=&quot;Search mail&quot; name=&quot;q&quot; />' +
+                    '<div id=&quot;spinner&quot;>Loading…</div>';
+                  setTimeout(() => {
+                    document.body.innerHTML =
+                      '<input aria-label=&quot;Search mail&quot; name=&quot;q&quot; />' +
+                      '<h2>OpenAI verification</h2>' +
+                      '<div class=&quot;a3s aiL&quot;>Enter this temporary verification code to continue: 731902</div>';
+                  }, 2600);
+                "
+              >
+                <td>dev.101@astronlab.com OpenAI verification message</td>
+              </tr>
+            </table>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          ensure_gmail_shell: {
+            action: {
+              result: {
+                state: {
+                  steps: {
+                    capture_active_account: {
+                      action: {
+                        skipped: false,
+                        email: "1.dev.astronlab@gmail.com",
+                        gmail_shell_ready: true,
+                        needs_google_login: false,
+                        failure_reason: null,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        enabled: true,
+        search_query: "from:openai to:dev.101@astronlab.com newer_than:7d",
+        message_match_text: "dev.101@astronlab.com",
+      },
+      "https://mail.google.com/mail/u/0/#search/from%3Aopenai",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("731902");
+    expect(result.selected_email).toBe("1.dev.astronlab@gmail.com");
+    expect(result.gmail_shell_ready).toBe(true);
+  });
+
+  test("does not treat a loading preview pane as a ready Gmail message body", async () => {
+    const result = await runWorkflowStepScript(
+      gmailVerificationWorkflowPath,
+      "collect_verification_artifact",
+      `
+        <html>
+          <head>
+            <title>Search results - 1.dev.astronlab@gmail.com - Gmail</title>
+          </head>
+          <body>
+            <input aria-label="Search mail" name="q" />
+            <table role="main">
+              <tr
+                class="zA"
+                onclick="
+                  const preview = document.getElementById('preview-pane');
+                  if (preview) {
+                    preview.innerHTML = '<div class=&quot;a3s aiL&quot;>Loading…</div>';
+                    setTimeout(() => {
+                      preview.innerHTML =
+                        '<h2>OpenAI verification</h2>' +
+                        '<div class=&quot;a3s aiL&quot;>Enter this temporary verification code to continue: 842197</div>';
+                    }, 2600);
+                  }
+                "
+              >
+                <td>dev.101@astronlab.com OpenAI verification message</td>
+              </tr>
+            </table>
+            <div id="preview-pane"></div>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          ensure_gmail_shell: {
+            action: {
+              result: {
+                state: {
+                  steps: {
+                    capture_active_account: {
+                      action: {
+                        skipped: false,
+                        email: "1.dev.astronlab@gmail.com",
+                        gmail_shell_ready: true,
+                        needs_google_login: false,
+                        failure_reason: null,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        enabled: true,
+        search_query: "from:openai to:dev.101@astronlab.com newer_than:7d",
+        message_match_text: "dev.101@astronlab.com",
+      },
+      "https://mail.google.com/mail/u/0/#search/from%3Aopenai",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("842197");
+    expect(result.selected_email).toBe("1.dev.astronlab@gmail.com");
+    expect(result.gmail_shell_ready).toBe(true);
+  });
+
+  test("forces a full Gmail thread open when the preview pane never yields verification content", async () => {
+    const result = await runWorkflowStepScript(
+      gmailVerificationWorkflowPath,
+      "collect_verification_artifact",
+      `
+        <html>
+          <head>
+            <title>Search results - 1.dev.astronlab@gmail.com - Gmail</title>
+          </head>
+          <body>
+            <input aria-label="Search mail" name="q" />
+            <table role="main">
+              <tr
+                class="zA"
+                tabindex="0"
+                onclick="
+                  document.getElementById('preview-pane').innerHTML =
+                    '<div class=&quot;a3s aiL&quot;>Loading...</div>';
+                "
+                ondblclick="
+                  document.body.innerHTML =
+                    '<input aria-label=&quot;Search mail&quot; name=&quot;q&quot; />' +
+                    '<h2>OpenAI verification</h2>' +
+                    '<div class=&quot;a3s aiL&quot;>Enter this temporary verification code to continue: 661204</div>';
+                "
+              >
+                <td>dev.101@astronlab.com OpenAI verification message</td>
+              </tr>
+            </table>
+            <div id="preview-pane"></div>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          ensure_gmail_shell: {
+            action: {
+              result: {
+                state: {
+                  steps: {
+                    capture_active_account: {
+                      action: {
+                        skipped: false,
+                        email: "1.dev.astronlab@gmail.com",
+                        gmail_shell_ready: true,
+                        needs_google_login: false,
+                        failure_reason: null,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        enabled: true,
+        search_query: "from:openai to:dev.101@astronlab.com newer_than:7d",
+        message_match_text: "dev.101@astronlab.com",
+      },
+      "https://mail.google.com/mail/u/0/#search/from%3Aopenai",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("661204");
+    expect(result.selected_email).toBe("1.dev.astronlab@gmail.com");
+    expect(result.gmail_shell_ready).toBe(true);
+  });
+
   test("prefers the selected row preview OTP over an older code later in the opened Gmail thread", async () => {
     const result = await runWorkflowStepScript(
       gmailVerificationWorkflowPath,
@@ -2544,20 +2864,33 @@ describe("device-auth workflow", () => {
 
     expect(result.ok).toBe(true);
     expect(result.next_stage).toBe("signup_password");
-    expect(result.current_url).toBe(
+    expect(String(result.current_url || "")).toContain(
       "https://auth.openai.com/create-account/password",
     );
   });
 
-  test("does not block the prepare login-email submit behind a skipped signup click", async () => {
+  test("routes prepare auth submit by the effective OpenAI stage instead of a skipped signup click", async () => {
     const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const signupSubmitStep = workflow.do?.find(
+      (entry) => "submit_prepare_signup_email" in entry,
+    )?.submit_prepare_signup_email as { if?: string } | undefined;
     const submitStep = workflow.do?.find(
       (entry) => "submit_prepare_login_email" in entry,
     )?.submit_prepare_login_email as { if?: string } | undefined;
 
-    expect(submitStep?.if).toContain(
-      "state.steps.click_prepare_signup_button?.action?.skipped === true",
+    expect(signupSubmitStep?.if).toContain(
+      "effective_prepare_login_entry_state?.stage === 'signup_email'",
     );
+    expect(signupSubmitStep?.if).toContain(
+      "classify_prepare_after_choose_signup?.action?.stage === 'signup_email'",
+    );
+    expect(submitStep?.if).toContain(
+      "effective_prepare_login_entry_state?.stage === 'login_email'",
+    );
+    expect(submitStep?.if).toContain(
+      "classify_prepare_after_choose_signup?.action?.stage !== 'signup_email'",
+    );
+    expect(submitStep?.if).not.toContain("click_prepare_signup_button");
   });
 
   test("keeps password-first defaults aligned across device-auth guards", () => {
@@ -2607,6 +2940,303 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("targets OTP-style inputs when refilling the replacement prepare verification code", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "fill_prepare_login_verification_code_after_incorrect_code" in entry,
+    )?.fill_prepare_login_verification_code_after_incorrect_code as
+      | {
+          call?: string;
+          with?: {
+            body?: {
+              selector?: string;
+              text?: string;
+              dispatch_events_after_fill?: boolean;
+              blur_after_fill?: boolean;
+              settle_ms?: number;
+            };
+          };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.type");
+    expect(step?.with?.body?.selector).toContain(
+      'input[autocomplete="one-time-code"]',
+    );
+    expect(step?.with?.body?.selector).toContain('input[inputmode="numeric"]');
+    expect(step?.with?.body?.text).toContain(
+      "state.vars.prepare_login_verification_code",
+    );
+    expect(step?.with?.body?.text).toContain(
+      "recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code",
+    );
+    expect(step?.with?.body?.dispatch_events_after_fill).toBe(true);
+    expect(step?.with?.body?.blur_after_fill).toBe(true);
+    expect(step?.with?.body?.settle_ms).toBe(250);
+  });
+
+  test("waits and recollects the replacement prepare verification code when Gmail loads late", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "wait_for_prepare_login_verification_email_delivery_after_incorrect_code",
+    );
+    expect(workflowText).toContain(
+      "recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code",
+    );
+    expect(workflowText).toContain(
+      "cache_prepare_login_verification_artifact_after_incorrect_code_missing_code",
+    );
+    expect(workflowText).toContain(
+      "state.vars.prepare_login_verification_code",
+    );
+  });
+
+  test("keeps prepare add-phone as an authenticated-ready state instead of blocking device-auth preparation", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("latest.add_phone_prompt === true");
+    expect(workflowText).toContain('stage === "add_phone"');
+    expect(workflowText).toContain("prepare_flow_ready");
+  });
+
+  test("retries the final device-auth login when OpenAI blocks consent behind add phone", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("surface.add_phone_prompt === true && authUrl");
+    expect(workflowText).toContain("for (const waitMs of [2000, 4000, 8000, 12000])");
+    expect(workflowText).toContain('retryReason = "device_auth_add_phone"');
+    expect(workflowText).toContain("add_phone_prompt: addPhonePrompt");
+  });
+
+  test("targets OTP-style inputs when filling the device-auth verification code", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "fill_device_auth_login_verification_code" in entry,
+    )?.fill_device_auth_login_verification_code as
+      | {
+          call?: string;
+          with?: {
+            body?: {
+              selector?: string;
+              text?: string;
+              dispatch_events_after_fill?: boolean;
+              blur_after_fill?: boolean;
+              settle_ms?: number;
+            };
+          };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.type");
+    expect(step?.with?.body?.selector).toContain(
+      'input[autocomplete="one-time-code"]',
+    );
+    expect(step?.with?.body?.selector).toContain('input[inputmode="numeric"]');
+    expect(step?.with?.body?.text).toContain(
+      "collect_device_auth_login_verification_artifact",
+    );
+    expect(step?.with?.body?.text).toContain(
+      ".replace(/\\D+/g, '').slice(0, 6)",
+    );
+    expect(step?.with?.body?.dispatch_events_after_fill).toBe(true);
+    expect(step?.with?.body?.blur_after_fill).toBe(true);
+    expect(step?.with?.body?.settle_ms).toBe(250);
+  });
+
+  test("uses the robust segmented-input verification submitter during prepare", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "submit_prepare_login_verification_code" in entry,
+    )?.submit_prepare_login_verification_code as
+      | {
+          call?: string;
+          with?: { body?: { script?: string } };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.exec_script");
+    expect(step?.with?.body?.script).toContain("pressSequentially(code");
+    expect(step?.with?.body?.script).toContain(
+      "collect_prepare_login_verification_artifact",
+    );
+    expect(step?.with?.body?.script).toContain(
+      'after.stage !== "email_verification"',
+    );
+  });
+
+  test("uses the robust segmented-input verification submitter during device auth", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "submit_device_auth_login_verification_code" in entry,
+    )?.submit_device_auth_login_verification_code as
+      | {
+          call?: string;
+          with?: { body?: { script?: string } };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.exec_script");
+    expect(step?.with?.body?.script).toContain("pressSequentially(code");
+    expect(step?.with?.body?.script).toContain(
+      "collect_device_auth_login_verification_artifact",
+    );
+    expect(step?.with?.body?.script).toContain(
+      'after.stage !== "email_verification"',
+    );
+  });
+
+  test("accepts the ChatGPT settings dialog before activating Security for device auth", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "wait_for_chatgpt_settings_shell",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <div role="dialog" aria-label="Settings">
+              <div>General</div>
+              <div>Notifications</div>
+              <div>Security</div>
+              <div>Account</div>
+              <div>Data controls</div>
+            </div>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.dialog_visible).toBe(true);
+    expect(result.settings_shell).toBe(true);
+  });
+
+  test("accepts the full-page ChatGPT settings shell even when it is not rendered as a dialog", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "wait_for_chatgpt_settings_shell",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <div>General</div>
+              <div>Appearance</div>
+              <div>Data controls</div>
+              <div>Security</div>
+              <div>Account</div>
+            </main>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.dialog_visible).toBe(false);
+    expect(result.settings_shell).toBe(true);
+  });
+
+  test("activates the Security tab before enabling device auth when settings opens on General", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "activate_chatgpt_security_settings_tab",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <div role="dialog" aria-label="Settings">
+              <button type="button" id="general">General</button>
+              <button type="button" id="security">Security</button>
+              <div id="panel">General Notifications Security Account Data controls</div>
+            </div>
+            <script>
+              document.getElementById("security")?.addEventListener("click", () => {
+                document.getElementById("panel").textContent =
+                  "Security Trusted devices Enable device code authorization for Codex";
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.security_open).toBe(true);
+  });
+
+  test("activates the Security tab on the full-page ChatGPT settings shell for device auth", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "activate_chatgpt_security_settings_tab",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <button type="button" id="general">General</button>
+              <button type="button" id="security">Security</button>
+              <div id="panel">General Appearance Data controls Security Account</div>
+            </main>
+            <script>
+              document.getElementById("security")?.addEventListener("click", () => {
+                document.getElementById("panel").textContent =
+                  "Security Trusted devices Enable device code authorization for Codex";
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.dialog_visible).toBe(false);
+    expect(result.settings_shell).toBe(true);
+    expect(result.security_open).toBe(true);
+  });
+
+  test("reactivates the Security tab on the full-page ChatGPT settings shell after toggling device auth", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "reactivate_chatgpt_security_settings_tab_after_toggle",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <button type="button" id="general">General</button>
+              <button type="button" id="security">Security</button>
+              <div id="panel">General Appearance Data controls Security Account</div>
+            </main>
+            <script>
+              document.getElementById("security")?.addEventListener("click", () => {
+                document.getElementById("panel").textContent =
+                  "Security Trusted devices Enable device code authorization for Codex";
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.dialog_visible).toBe(false);
+    expect(result.settings_shell).toBe(true);
+    expect(result.security_open).toBe(true);
+  });
+
   test("logs out via the ChatGPT security settings control during device-auth prepare", async () => {
     const result = await runWorkflowStepScript(
       deviceAuthWorkflowPath,
@@ -2635,20 +3265,93 @@ describe("device-auth workflow", () => {
     expect(result.clicked_text).toBe("Log out");
   });
 
+  test("falls back to the proven original non-device flow when device-auth prepare is poisoned by invalid_state", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("prepare_with_original_flow_fallback");
+    expect(workflowText).toContain(
+      "Fall back to the proven original non-device auth workflow when repeated invalid_state responses poison the device-auth prepare branch.",
+    );
+    expect(workflowText).toContain("workflow.workspace.web.auth-openai-com.codex-rotate-account-flow");
+    expect(workflowText).toContain(
+      "state.steps.prepare_with_original_flow_fallback?.action?.result?.output || state.steps.compute_prepare_flow_result?.action?.value?.prepare_flow_output || {}",
+    );
+  });
+
   test("waits for the ChatGPT settings shell before the prepare logout click", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
     expect(workflowText).toContain("wait_for_prepare_chatgpt_security_settings_shell");
+    expect(workflowText).toContain(
+      "activate_prepare_chatgpt_security_settings_tab",
+    );
     expect(workflowText).toContain("log out of all devices");
     expect(workflowText).toContain(
       "clear_prepare_device_auth_site_state_after_ui_logout",
     );
   });
 
+  test("activates the prepare Security tab before attempting the ChatGPT logout control", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "activate_prepare_chatgpt_security_settings_tab",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <div role="dialog">
+              <button type="button" id="general">General</button>
+              <button type="button" id="security">Security</button>
+              <div id="panel">General Data controls Appearance System Language Auto-detect</div>
+            </div>
+            <script>
+              document.getElementById("security")?.addEventListener("click", () => {
+                document.getElementById("panel").textContent =
+                  "Security Secure sign in with ChatGPT Trusted devices Log out of all devices";
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.security_open).toBe(true);
+  });
+
   test("uses the direct OpenAI login surface as the existing-account fallback during device-auth prepare", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
     expect(workflowText).toContain("https://auth.openai.com/log-in");
+  });
+
+  test("classifies the logged-out ChatGPT shell with login CTAs as public, not authenticated", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "inspect_prepare_public_chatgpt_entry",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <div>New chat</div>
+            <div>Search chats</div>
+            <div>Images</div>
+            <div>See plans and pricing</div>
+            <button type="button">Log in</button>
+            <button type="button">Sign up for free</button>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/",
+    );
+
+    expect(result.stage).toBe("public_chatgpt");
+    expect(result.account_ready).toBe(false);
+    expect(result.login_cta_visible).toBe(true);
+    expect(result.signup_cta_visible).toBe(true);
   });
 
   test("forces the direct auth fallback when prepare remains on an authenticated ChatGPT shell", async () => {
@@ -2679,6 +3382,9 @@ describe("device-auth workflow", () => {
 
     expect(cacheStep?.run?.script?.code).toContain("const candidates = [");
     expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_after_choose_signup",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
       "classify_prepare_login_entry_after_security_gate",
     );
   });
@@ -2691,7 +3397,215 @@ describe("device-auth workflow", () => {
       "classify_prepare_after_login_email_timeout_retry_submit",
     );
     expect(workflowText).toContain(
+      "force_prepare_signup_recovery_after_login_timeout",
+    );
+    expect(workflowText).toContain(
+      "classify_prepare_signup_recovery_after_login_timeout",
+    );
+    expect(workflowText).toContain(
       "cache_effective_prepare_after_login_email_state",
+    );
+  });
+
+  test("opens the direct prepare auth fallback on a clean site state", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "open_prepare_direct_auth_entry_fallback" in entry,
+    )?.open_prepare_direct_auth_entry_fallback as
+      | {
+          metadata?: {
+            browser?: {
+              clearSiteDataForOrigins?: string[];
+            };
+          };
+        }
+      | undefined;
+
+    expect(step?.metadata?.browser?.clearSiteDataForOrigins).toEqual([
+      "https://auth.openai.com",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+    ]);
+  });
+
+  test("forces direct signup recovery after repeated prepare login invalid-state retries", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const forceStep = workflow.do?.find(
+      (entry) => "force_prepare_signup_recovery_after_login_timeout" in entry,
+    )?.force_prepare_signup_recovery_after_login_timeout as
+      | {
+          if?: string;
+          with?: { body?: { url?: string } };
+          metadata?: {
+            browser?: {
+              clearSiteDataForOrigins?: string[];
+            };
+          };
+        }
+      | undefined;
+    const classifyStep = workflow.do?.find(
+      (entry) => "classify_prepare_signup_recovery_after_login_timeout" in entry,
+    )?.classify_prepare_signup_recovery_after_login_timeout as
+      | { if?: string }
+      | undefined;
+    const refillStep = workflow.do?.find(
+      (entry) => "refill_prepare_email_after_forced_signup_recovery" in entry,
+    )?.refill_prepare_email_after_forced_signup_recovery as
+      | { if?: string }
+      | undefined;
+    const submitStep = workflow.do?.find(
+      (entry) =>
+        "submit_prepare_signup_email_after_forced_signup_recovery" in entry,
+    )?.submit_prepare_signup_email_after_forced_signup_recovery as
+      | { if?: string }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_prepare_after_login_email_state" in entry,
+    )?.cache_effective_prepare_after_login_email_state as
+      | {
+          run?: {
+            script?: {
+              code?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(forceStep?.if).toContain(
+      "classify_prepare_after_login_email_timeout_retry_submit?.action?.stage === 'retryable_timeout'",
+    );
+    expect(forceStep?.with?.body?.url).toBe(
+      "https://auth.openai.com/create-account",
+    );
+    expect(forceStep?.metadata?.browser?.clearSiteDataForOrigins).toEqual([
+      "https://auth.openai.com",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+    ]);
+    expect(classifyStep?.if).toContain(
+      "force_prepare_signup_recovery_after_login_timeout?.action?.ok === true",
+    );
+    expect(refillStep?.if).toContain(
+      "classify_prepare_signup_recovery_after_login_timeout?.action?.stage === 'signup_email'",
+    );
+    expect(submitStep?.if).toContain(
+      "/create-account/i.test(String(state.steps.classify_prepare_signup_recovery_after_login_timeout?.action?.current_url || ''))",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_after_forced_signup_recovery_email_submit",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_signup_recovery_after_login_timeout",
+    );
+  });
+
+  test("retries the forced direct signup recovery branch when create-account stays on invalid_state", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const retryStep = workflow.do?.find(
+      (entry) => "click_prepare_forced_signup_email_timeout_retry" in entry,
+    )?.click_prepare_forced_signup_email_timeout_retry as
+      | { if?: string }
+      | undefined;
+    const classifyRetryStep = workflow.do?.find(
+      (entry) => "classify_prepare_after_forced_signup_email_timeout_retry" in entry,
+    )?.classify_prepare_after_forced_signup_email_timeout_retry as
+      | { if?: string }
+      | undefined;
+    const refillRetryStep = workflow.do?.find(
+      (entry) => "refill_prepare_email_after_forced_signup_email_timeout_retry" in entry,
+    )?.refill_prepare_email_after_forced_signup_email_timeout_retry as
+      | { if?: string }
+      | undefined;
+    const submitRetryStep = workflow.do?.find(
+      (entry) =>
+        "submit_prepare_signup_email_after_forced_signup_email_timeout_retry" in entry,
+    )?.submit_prepare_signup_email_after_forced_signup_email_timeout_retry as
+      | { if?: string }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_prepare_after_login_email_state" in entry,
+    )?.cache_effective_prepare_after_login_email_state as
+      | {
+          run?: {
+            script?: {
+              code?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(retryStep?.if).toContain(
+      "classify_prepare_after_forced_signup_recovery_email_submit?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain(
+      "/create-account/i.test(String(state.steps.classify_prepare_after_forced_signup_recovery_email_submit?.action?.current_url || ''))",
+    );
+    expect(classifyRetryStep?.if).toContain(
+      "click_prepare_forced_signup_email_timeout_retry?.action?.ok === true",
+    );
+    expect(refillRetryStep?.if).toContain(
+      "classify_prepare_after_forced_signup_email_timeout_retry?.action?.stage === 'signup_email'",
+    );
+    expect(submitRetryStep?.if).toContain(
+      "/create-account/i.test(String(state.steps.classify_prepare_after_forced_signup_email_timeout_retry?.action?.current_url || ''))",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_after_forced_signup_email_timeout_retry_submit",
+    );
+  });
+
+  test("falls back to direct login after repeated signup invalid_state shells", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const fallbackStep = workflow.do?.find(
+      (entry) => "fallback_prepare_login_after_signup_invalid_state" in entry,
+    )?.fallback_prepare_login_after_signup_invalid_state as
+      | { if?: string; with?: { body?: { url?: string } } }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_prepare_after_login_email_state" in entry,
+    )?.cache_effective_prepare_after_login_email_state as
+      | { run?: { script?: { code?: string } } }
+      | undefined;
+
+    expect(fallbackStep?.if).toContain(
+      "classify_prepare_after_forced_signup_email_timeout_retry_submit?.action?.retryable_timeout === true",
+    );
+    expect(fallbackStep?.if).toContain("/create-account/i.test");
+    expect(fallbackStep?.with?.body?.url).toBe(
+      "https://auth.openai.com/log-in",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_after_login_email_signup_invalid_state_fallback",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_login_entry_after_signup_invalid_state_fallback",
+    );
+  });
+
+  test("falls back to direct login after the signup password step reports an existing account", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const fallbackStep = workflow.do?.find(
+      (entry) => "fallback_prepare_login_after_existing_account_prompt" in entry,
+    )?.fallback_prepare_login_after_existing_account_prompt as
+      | { if?: string; with?: { body?: { url?: string } } }
+      | undefined;
+    const recoveryStep = workflow.do?.find(
+      (entry) => "compute_prepare_one_time_code_recovery_flag" in entry,
+    )?.compute_prepare_one_time_code_recovery_flag as
+      | { run?: { script?: { code?: string } } }
+      | undefined;
+
+    expect(fallbackStep?.if).toContain(
+      "classify_prepare_after_signup_password_gate?.action?.existing_account_prompt === true",
+    );
+    expect(fallbackStep?.with?.body?.url).toBe(
+      "https://auth.openai.com/log-in",
+    );
+    expect(recoveryStep?.run?.script?.code).toContain(
+      "classify_prepare_after_login_email_existing_account_prompt",
+    );
+    expect(recoveryStep?.run?.script?.code).toContain(
+      "existingAccountFallbackActive",
     );
   });
 
@@ -2723,6 +3637,654 @@ describe("device-auth workflow", () => {
     ).toBe("oauth_consent");
   });
 
+  test("treats add_phone as a successful authenticated prepare state for device auth", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_flow_result",
+      {},
+      {
+        vars: {
+          reuse_device_auth_session: false,
+        },
+        steps: {
+          classify_prepare_after_signup_about_you: {
+            action: {
+              stage: "add_phone",
+              add_phone_prompt: true,
+              current_url: "https://auth.openai.com/add-phone",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.prepare_flow_ready).toBe(true);
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.stage,
+    ).toBe("add_phone");
+  });
+
+  test("captures an explicit device-auth challenge without requiring the settings shortcut first", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "capture_codex_login_url",
+      {
+        auth_url: "https://auth.openai.com/codex/device?user_code=ABCD-EFGHI",
+        device_code: "ABCD-EFGHI",
+      },
+      {
+        vars: {
+          prepare_flow_ready: true,
+          reuse_device_auth_session: false,
+        },
+        steps: {},
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.reused).toBe(true);
+    expect(result.auth_url).toBe(
+      "https://auth.openai.com/codex/device?user_code=ABCD-EFGHI",
+    );
+    expect(result.device_code).toBe("ABCD-EFGHI");
+  });
+
+  test("finalizes device-auth as success when the challenge completes even if settings Security was unavailable", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "finalize_device_auth_tail_summary",
+      {},
+      {
+        vars: {
+          prepare_flow_ready: true,
+          codex_login: {
+            auth_url:
+              "https://auth.openai.com/codex/device?user_code=ABCD-EFGHI",
+            device_code: "ABCD-EFGHI",
+          },
+        },
+        steps: {
+          activate_chatgpt_security_settings_tab: {
+            action: {
+              ok: false,
+            },
+          },
+          ensure_device_code_authorization_enabled: {
+            action: {
+              ok: false,
+              enabled: false,
+            },
+          },
+          inspect_device_authorization_surface: {
+            action: {
+              current_url:
+                "https://auth.openai.com/codex/deviceauth/callback",
+              success: true,
+              headline: "Signed in to Codex",
+            },
+          },
+          wait_for_codex_login_exit: {
+            action: {
+              value: {
+                ok: true,
+                exit_code: 0,
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.next_action).toBe("complete");
+    expect(result.error_message).toBeNull();
+  });
+
+  test("opens the captured device-auth challenge once preparation is ready without gating on the settings shortcut", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openStep = workflow.do?.find(
+      (entry) => "open_device_authorization_entry" in entry,
+    )?.open_device_authorization_entry as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(openStep?.if).toContain("state.vars.prepare_flow_ready === true");
+    expect(openStep?.if).not.toContain(
+      "ensure_device_code_authorization_enabled",
+    );
+    expect(openStep?.if).not.toContain(
+      "reconfirm_device_code_authorization_enabled",
+    );
+  });
+
+  test("submits device-auth verification using the OTP already present in the DOM when workflow state is empty", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_device_auth_login_verification_code",
+      `
+        <html>
+          <head>
+            <title>Verify your email</title>
+          </head>
+          <body>
+            <form onsubmit="document.body.innerHTML = '<div>Continue to Codex</div>'; return false;">
+              <label>
+                Verification code
+                <input autocomplete="one-time-code" value="654321" />
+              </label>
+              <button type="submit">Continue</button>
+            </form>
+          </body>
+        </html>
+      `,
+      {
+        vars: {
+          device_auth_login_verification_code: "",
+        },
+        steps: {
+          collect_device_auth_login_verification_artifact: {
+            action: {
+              ok: true,
+            },
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("654321");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
+
+  test("keeps prepare verification on the recoverable email-verification path when OpenAI does not advance immediately after submit", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_prepare_login_verification_code",
+      `
+        <html>
+          <head>
+            <title>Check your inbox - OpenAI</title>
+          </head>
+          <body>
+            <form onsubmit="return false;">
+              <label>
+                Code
+                <input autocomplete="one-time-code" />
+              </label>
+              <button type="submit">Continue</button>
+            </form>
+            <div>Check your inbox</div>
+            <div>Enter the verification code we just sent to dev.101@astronlab.com</div>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_prepare_login_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  code: "654321",
+                },
+              },
+            },
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("654321");
+    expect(result.next_stage).toBe("email_verification");
+    expect(result.strategy).toBe("email-verification-still-open");
+  });
+
+  test("keeps device-auth verification on the recoverable email-verification path when OpenAI does not advance immediately after submit", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_device_auth_login_verification_code",
+      `
+        <html>
+          <head>
+            <title>Check your inbox - OpenAI</title>
+          </head>
+          <body>
+            <form onsubmit="return false;">
+              <label>
+                Code
+                <input autocomplete="one-time-code" value="654321" />
+              </label>
+              <button type="submit">Continue</button>
+            </form>
+            <div>Check your inbox</div>
+            <div>Enter the verification code we just sent to dev.101@astronlab.com</div>
+          </body>
+        </html>
+      `,
+      {
+        vars: {
+          device_auth_login_verification_code: "654321",
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("654321");
+    expect(result.next_stage).toBe("email_verification");
+    expect(result.strategy).toBe("email-verification-still-open");
+  });
+
+  test("retries the prepare signup password shell when OpenAI returns a retryable invalid_auth_step page", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const retryStep = workflow.do?.find(
+      (entry) => "click_prepare_signup_password_timeout_retry" in entry,
+    )?.click_prepare_signup_password_timeout_retry as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const gateStep = workflow.do?.find(
+      (entry) => "classify_prepare_after_signup_password_gate" in entry,
+    )?.classify_prepare_after_signup_password_gate as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(retryStep?.if).toContain(
+      "classify_prepare_after_signup_password?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain("/create-account/i.test");
+    expect(gateStep?.if).toContain(
+      "click_prepare_signup_password_timeout_retry?.action?.ok === true",
+    );
+    expect(gateStep?.if).toContain(
+      "submit_prepare_signup_password_after_timeout_retry?.action?.ok === true",
+    );
+  });
+
+  test("marks repeated pending-account invalid_state as skip_account for device auth", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_flow_result",
+      {},
+      {
+        vars: {
+          reuse_device_auth_session: false,
+        },
+        steps: {
+          classify_prepare_after_login_email_signup_invalid_state_fallback: {
+            action: {
+              stage: "retryable_timeout",
+              retryable_timeout: true,
+              current_url: "https://auth.openai.com/log-in",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.prepare_flow_ready).toBe(false);
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.next_action,
+    ).toBe("skip_account");
+  });
+
+  test("does not treat a public ChatGPT shell as a successful authenticated prepare state for device auth", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_flow_result",
+      {},
+      {
+        vars: {
+          reuse_device_auth_session: false,
+        },
+        steps: {
+          inspect_prepare_public_chatgpt_entry_after_ui_logout: {
+            action: {
+              stage: "public_chatgpt",
+              chatgpt_public_shell: true,
+              chatgpt_app_shell: false,
+              account_ready: false,
+              current_url: "https://chatgpt.com/",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.prepare_flow_ready).toBe(false);
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.stage,
+    ).toBe("public_chatgpt");
+  });
+
+  test("prefers the latest authenticated prepare result over older login-stage candidates for device auth", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_flow_result",
+      {},
+      {
+        vars: {
+          reuse_device_auth_session: false,
+        },
+        steps: {
+          classify_prepare_after_signup_about_you: {
+            action: {
+              stage: "app_shell",
+              account_ready: true,
+              chatgpt_app_shell: true,
+              chatgpt_public_shell: false,
+              current_url: "https://chatgpt.com/",
+            },
+          },
+          classify_prepare_after_login_email: {
+            action: {
+              stage: "login_email",
+              account_ready: false,
+              chatgpt_app_shell: false,
+              chatgpt_public_shell: false,
+              current_url: "https://auth.openai.com/log-in",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.prepare_flow_ready).toBe(true);
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.stage,
+    ).toBe("app_shell");
+    expect(
+      (result.prepare_flow_output as Record<string, unknown>)?.current_url,
+    ).toBe("https://chatgpt.com/");
+  });
+
+  test("classifies the authenticated ChatGPT onboarding shell as app_shell, not public_chatgpt", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "classify_prepare_after_login_email",
+      `
+        <html>
+          <head>
+            <title>ChatGPT</title>
+          </head>
+          <body>
+            <div>Skip to content</div>
+            <div>What brings you to ChatGPT?</div>
+            <button type="button">School</button>
+            <button type="button">Work</button>
+            <button type="button">Next</button>
+            <button type="button">Skip</button>
+            <nav>
+              <button type="button">New chat</button>
+              <button type="button">Search chats</button>
+              <button type="button">Images</button>
+              <button type="button">Apps</button>
+              <button type="button">Projects</button>
+              <button type="button">Codex</button>
+            </nav>
+            <div>Dev Astronlab</div>
+            <div>Where should we begin?</div>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("app_shell");
+    expect(result.chatgpt_app_shell).toBe(true);
+    expect(result.chatgpt_public_shell).toBe(false);
+    expect(result.account_ready).toBe(true);
+  });
+
+  test("exposes login CTA visibility on the ChatGPT auth landing so the second-click recovery can run", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "classify_prepare_login_entry",
+      `
+        <html>
+          <head>
+            <title>ChatGPT</title>
+          </head>
+          <body>
+            <div>Get started</div>
+            <button type="button">Log in</button>
+            <button type="button">Sign up for free</button>
+            <div>Try it first</div>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/auth/login?next=%2F%3Fcodex_rotate_public_entry%3Ddirect_login",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("public_chatgpt");
+    expect(result.login_cta_visible).toBe(true);
+    expect(result.signup_cta_visible).toBe(true);
+  });
+
+  test("prefers the logged-out ChatGPT public shell over sidebar chrome when login CTAs are visible", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "classify_prepare_login_entry",
+      `
+        <html>
+          <head>
+            <title>ChatGPT</title>
+          </head>
+          <body>
+            <div>New chat</div>
+            <div>Search chats</div>
+            <div>Images</div>
+            <div>Get responses tailored to you</div>
+            <button type="button">Log in</button>
+            <button type="button">Sign up for free</button>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("public_chatgpt");
+    expect(result.chatgpt_public_shell).toBe(true);
+    expect(result.chatgpt_app_shell).toBe(false);
+    expect(result.login_cta_visible).toBe(true);
+    expect(result.signup_cta_visible).toBe(true);
+  });
+
+  test("opens a clean direct OpenAI login entry from the public ChatGPT shell before choosing signup", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "click_prepare_signup_button" in entry,
+    )?.click_prepare_signup_button as
+      | {
+          call?: string;
+          with?: { body?: { url?: string } };
+          metadata?: {
+            browser?: {
+              clearSiteDataForOrigins?: string[];
+            };
+          };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.navigate");
+    expect(step?.with?.body?.url).toBe("https://auth.openai.com/log-in");
+    expect(step?.metadata?.browser?.clearSiteDataForOrigins).toEqual([
+      "https://auth.openai.com",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+    ]);
+  });
+
+  test("opens a clean direct OpenAI login entry from the public ChatGPT shell", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const step = workflow.do?.find(
+      (entry) => "click_prepare_login_button" in entry,
+    )?.click_prepare_login_button as
+      | {
+          call?: string;
+          with?: { body?: { url?: string } };
+          metadata?: {
+            browser?: {
+              clearSiteDataForOrigins?: string[];
+            };
+          };
+        }
+      | undefined;
+
+    expect(step?.call).toBe("afn.driver.browser.navigate");
+    expect(step?.with?.body?.url).toBe("https://auth.openai.com/log-in");
+    expect(step?.metadata?.browser?.clearSiteDataForOrigins).toEqual([
+      "https://auth.openai.com",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+    ]);
+  });
+
+  test("switches the prepare branch to signup from the clean OpenAI login shell", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const chooseStep = workflow.do?.find(
+      (entry) => "choose_prepare_signup_branch" in entry,
+    )?.choose_prepare_signup_branch as
+      | { if?: string; metadata?: { templateRef?: string } }
+      | undefined;
+    const classifyStep = workflow.do?.find(
+      (entry) => "classify_prepare_after_choose_signup" in entry,
+    )?.classify_prepare_after_choose_signup as
+      | { if?: string; metadata?: { templateRef?: string } }
+      | undefined;
+
+    expect(chooseStep?.metadata?.templateRef).toBe("click_signup_button");
+    expect(chooseStep?.if).toContain(
+      "effective_prepare_login_entry_state?.stage === 'login_email'",
+    );
+    expect(chooseStep?.if).toContain(
+      "effective_prepare_login_entry_state?.signup_cta_visible === true",
+    );
+    expect(classifyStep?.metadata?.templateRef).toBe(
+      "classify_openai_auth_surface",
+    );
+    expect(classifyStep?.if).toContain(
+      "choose_prepare_signup_branch?.action?.ok === true",
+    );
+  });
+
+  test("enables the device-auth security toggle when ChatGPT renders it as a plain button in the target row", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "ensure_device_code_authorization_enabled",
+      `
+        <html>
+          <body>
+            <div role="dialog">
+              <div>Security</div>
+              <section>
+                <div>Enable device code authorization for Codex</div>
+                <div>Use device code sign-in for headless or remote environments.</div>
+                <button type="button" id="toggle"><span>toggle</span></button>
+              </section>
+            </div>
+            <script>
+              const toggle = document.getElementById("toggle");
+              toggle?.setAttribute("data-state", "off");
+              toggle?.addEventListener("click", () => {
+                toggle.setAttribute("data-state", "checked");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.enabled).toBe(true);
+  });
+
+  test("does not block device-auth start when the target security row is present but toggle state is unreadable", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "ensure_device_code_authorization_enabled",
+      `
+        <html>
+          <body>
+            <div role="dialog">
+              <div>Security</div>
+              <section>
+                <div>Enable device code authorization for Codex</div>
+                <div>Use device code sign-in for headless or remote environments.</div>
+                <button type="button" id="toggle"><span>toggle</span></button>
+              </section>
+            </div>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.enabled).toBe(true);
+    expect(result.verification_pending).toBe(true);
+    expect(result.ambiguous_enabled_state).toBe(true);
+  });
+
+  test("falls back to a row-edge click when the Codex security row is visible but exposes no semantic switch control", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "ensure_device_code_authorization_enabled",
+      `
+        <html>
+          <body>
+            <div role="dialog">
+              <section id="row" style="position: relative; width: 520px; height: 120px;">
+                <div>Enable device code authorization for Codex</div>
+                <div>Use device code sign-in for headless or remote environments.</div>
+                <div
+                  id="toggle-hitbox"
+                  style="position: absolute; right: 0; top: 36px; width: 56px; height: 28px; background: #ddd; border-radius: 999px;"
+                ></div>
+              </section>
+            </div>
+            <script>
+              document.getElementById("toggle-hitbox")?.addEventListener("click", () => {
+                document.getElementById("toggle-hitbox")?.setAttribute("data-toggled", "true");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.enabled).toBe(true);
+    expect(result.verification_pending).toBe(true);
+  });
+
   test("returns to the exact device-auth verification URL after Gmail collection", async () => {
     const workflow = await loadWorkflow(deviceAuthWorkflowPath);
     const returnStep = workflow.do?.find(
@@ -2743,6 +4305,133 @@ describe("device-auth workflow", () => {
     expect(returnStep?.with?.body?.url).not.toBe(
       "https://auth.openai.com/email-verification",
     );
+  });
+
+  test("returns to the stable prepare verification URL after Gmail collection", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const returnStep = workflow.do?.find(
+      (entry) => "return_to_prepare_login_verification_page" in entry,
+    )?.return_to_prepare_login_verification_page as
+      | {
+          with?: {
+            body?: {
+              url?: string;
+            };
+          };
+        }
+      | undefined;
+    const retryReturnStep = workflow.do?.find(
+      (entry) => "return_to_prepare_login_verification_page_after_incorrect_code" in entry,
+    )?.return_to_prepare_login_verification_page_after_incorrect_code as
+      | {
+          with?: {
+            body?: {
+              url?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(returnStep?.with?.body?.url).toBe(
+      "https://auth.openai.com/email-verification",
+    );
+    expect(retryReturnStep?.with?.body?.url).toBe(
+      "https://auth.openai.com/email-verification",
+    );
+  });
+
+  test("original signup password submit treats direct navigation to email verification as progress", async () => {
+    const result = await runWorkflowStepScript(
+      originalWorkflowPath,
+      "submit_signup_password",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <script>
+              const render = () => {
+                if (/email-verification/i.test(location.pathname)) {
+                  document.body.innerHTML = \`
+                    <main>
+                      <h1>Check your inbox</h1>
+                      <input name="code" inputmode="numeric" />
+                      <button type="button">Continue</button>
+                    </main>
+                  \`;
+                  return;
+                }
+                document.body.innerHTML = \`
+                  <form id="signup-form">
+                    <input type="password" name="new-password" autocomplete="new-password" value="super-secret-password" />
+                    <button type="submit" id="continue">Continue</button>
+                  </form>
+                \`;
+                const goNext = (event) => {
+                  event.preventDefault();
+                  location.href = "https://auth.openai.com/email-verification";
+                };
+                document.getElementById("continue")?.addEventListener("click", goNext);
+                document.getElementById("signup-form")?.addEventListener("submit", goNext);
+              };
+              render();
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/create-account/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("email_verification");
+    expect(String(result.current_url || "")).toContain("email-verification");
+  });
+
+  test("device-auth signup password submit treats direct navigation to email verification as progress", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_prepare_signup_password",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <script>
+              const render = () => {
+                if (/email-verification/i.test(location.pathname)) {
+                  document.body.innerHTML = \`
+                    <main>
+                      <h1>Check your inbox</h1>
+                      <input name="code" inputmode="numeric" />
+                      <button type="button">Continue</button>
+                    </main>
+                  \`;
+                  return;
+                }
+                document.body.innerHTML = \`
+                  <form id="signup-form">
+                    <input type="password" name="new-password" autocomplete="new-password" value="super-secret-password" />
+                    <button type="submit" id="continue">Continue</button>
+                  </form>
+                \`;
+                const goNext = (event) => {
+                  event.preventDefault();
+                  location.href = "https://auth.openai.com/email-verification";
+                };
+                document.getElementById("continue")?.addEventListener("click", goNext);
+                document.getElementById("signup-form")?.addEventListener("submit", goNext);
+              };
+              render();
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/create-account/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("email_verification");
+    expect(String(result.current_url || "")).toContain("email-verification");
   });
 
   test("classifies an authenticated ChatGPT settings shell after reused login", async () => {
@@ -2773,8 +4462,27 @@ describe("device-auth workflow", () => {
 
     expect(result.ok).toBe(true);
     expect(result.chatgpt_app_shell).toBe(true);
+    expect(result.chatgpt_security_shell).toBe(false);
     expect(result.chatgpt_public_shell).toBe(false);
     expect(result.auth_prompt).toBe(false);
+  });
+
+  test("reopens the saved device challenge when reused login lands on an authenticated ChatGPT shell", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const reopenStep = workflow.do?.find(
+      (entry) => "reopen_device_authorization_entry_after_login" in entry,
+    )?.reopen_device_authorization_entry_after_login as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(reopenStep?.if).toContain(
+      "state.steps.inspect_device_authorization_after_login?.action?.chatgpt_app_shell === true",
+    );
+    expect(reopenStep?.if).toContain(
+      "state.steps.inspect_device_authorization_after_login?.action?.chatgpt_public_shell === true",
+    );
   });
 
   test("waits through a temporary ChatGPT settings shell until the device-auth consent surface appears", async () => {
