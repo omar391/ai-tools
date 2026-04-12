@@ -3104,11 +3104,11 @@ describe("device-auth workflow", () => {
         <html>
           <body style="min-height: 100vh;">
             <div role="dialog" aria-label="Settings">
-              <div>General</div>
-              <div>Notifications</div>
-              <div>Security</div>
-              <div>Account</div>
-              <div>Data controls</div>
+              <button type="button">General</button>
+              <button type="button">Notifications</button>
+              <button type="button">Security</button>
+              <button type="button">Account</button>
+              <button type="button">Data controls</button>
             </div>
           </body>
         </html>
@@ -3123,7 +3123,33 @@ describe("device-auth workflow", () => {
     expect(result.settings_shell).toBe(true);
   });
 
-  test("accepts the full-page ChatGPT settings shell even when it is not rendered as a dialog", async () => {
+  test("warms an authenticated ChatGPT shell before opening Security settings for device auth", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "wait_for_authenticated_chatgpt_shell_before_security_settings",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <button type="button">New chat</button>
+              <button type="button">Projects</button>
+              <button type="button">Search chats</button>
+            </main>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.authenticated_chatgpt_shell).toBe(true);
+    expect(result.app_markers).toBe(true);
+    expect(result.public_shell).toBe(false);
+  });
+
+  test("rejects a generic ChatGPT settings shell that is not yet logged in for device auth", async () => {
     const result = await runWorkflowStepScript(
       deviceAuthWorkflowPath,
       "wait_for_chatgpt_settings_shell",
@@ -3132,10 +3158,37 @@ describe("device-auth workflow", () => {
           <body style="min-height: 100vh;">
             <main>
               <div>General</div>
-              <div>Appearance</div>
               <div>Data controls</div>
-              <div>Security</div>
-              <div>Account</div>
+              <div>Appearance</div>
+              <div>Language</div>
+            </main>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.logged_in_settings_shell).toBe(false);
+    expect(result.settings_shell).toBe(true);
+    expect(result.security_control_visible).toBe(false);
+  });
+
+  test("accepts the full-page ChatGPT settings shell even when it is not rendered as a dialog", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "wait_for_chatgpt_settings_shell",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <button type="button">General</button>
+              <button type="button">Appearance</button>
+              <button type="button">Data controls</button>
+              <button type="button">Security</button>
+              <button type="button">Account</button>
             </main>
           </body>
         </html>
@@ -3181,6 +3234,61 @@ describe("device-auth workflow", () => {
     expect(result.security_open).toBe(true);
   });
 
+  test("does not activate Security on a settings shell that is not logged in", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "activate_chatgpt_security_settings_tab",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <main>
+              <div>General</div>
+              <div>Data controls</div>
+              <div>Appearance</div>
+              <div>Language</div>
+            </main>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://chatgpt.com/#settings/Security",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.logged_in_settings_shell).toBe(false);
+    expect(result.security_open).toBe(false);
+  });
+
+  test("opens an explicit ChatGPT login branch before Security settings when the warmup shell is not authenticated", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openLoginStep = workflow.do?.find(
+      (entry) => "open_chatgpt_login_entry_before_security_settings" in entry,
+    )?.open_chatgpt_login_entry_before_security_settings as
+      | {
+          with?: {
+            body?: {
+              url?: string;
+            };
+          };
+        }
+      | undefined;
+    const openSecurityStep = workflow.do?.find(
+      (entry) => "open_chatgpt_security_settings" in entry,
+    )?.open_chatgpt_security_settings as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(openLoginStep?.with?.body?.url).toContain(
+      "chatgpt.com/auth/login?next=%2F%23settings%2FSecurity",
+    );
+    expect(openSecurityStep?.if).toContain(
+      "cache_effective_authenticated_chatgpt_shell_before_security_settings",
+    );
+  });
+
   test("activates the Security tab on the full-page ChatGPT settings shell for device auth", async () => {
     const result = await runWorkflowStepScript(
       deviceAuthWorkflowPath,
@@ -3189,6 +3297,8 @@ describe("device-auth workflow", () => {
         <html>
           <body style="min-height: 100vh;">
             <main>
+              <div>New chat</div>
+              <div>Projects</div>
               <button type="button" id="general">General</button>
               <button type="button" id="security">Security</button>
               <div id="panel">General Appearance Data controls Security Account</div>
@@ -3222,6 +3332,8 @@ describe("device-auth workflow", () => {
         <html>
           <body style="min-height: 100vh;">
             <main>
+              <div>New chat</div>
+              <div>Projects</div>
               <button type="button" id="general">General</button>
               <button type="button" id="security">Security</button>
               <div id="panel">General Appearance Data controls Security Account</div>
@@ -3712,7 +3824,9 @@ describe("device-auth workflow", () => {
     const result = await runWorkflowRunScript(
       deviceAuthWorkflowPath,
       "finalize_device_auth_tail_summary",
-      {},
+      {
+        email: "dev.115@astronlab.com",
+      },
       {
         vars: {
           prepare_flow_ready: true,
@@ -3756,6 +3870,7 @@ describe("device-auth workflow", () => {
     expect(result.success).toBe(true);
     expect(result.next_action).toBe("complete");
     expect(result.error_message).toBeNull();
+    expect(result.verified_account_email).toBe("dev.115@astronlab.com");
   });
 
   test("opens the captured device-auth challenge once preparation is ready without gating on the settings shortcut", async () => {

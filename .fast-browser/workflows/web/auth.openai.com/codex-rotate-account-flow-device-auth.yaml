@@ -4968,7 +4968,7 @@ do:
       metadata:
         description: "Collect the prepare-branch OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5042,7 +5042,7 @@ do:
       call: afn.driver.browser.type
       with:
         body:
-          selector: 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]'
+          selector: input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]
           text: "${String(state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.code || state.steps.collect_prepare_login_verification_artifact?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '').replace(/\\D+/g, '').slice(0, 6)}"
           dispatch_events_after_fill: true
           blur_after_fill: true
@@ -5330,7 +5330,7 @@ do:
       metadata:
         description: "Re-collect the prepare-branch OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5357,7 +5357,7 @@ do:
       metadata:
         description: Re-collect the replacement prepare-branch OTP once more when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5857,8 +5857,372 @@ do:
         targetRef: primary
       set:
         skipped: true
-  - open_chatgpt_security_settings:
+  - open_authenticated_chatgpt_shell_before_security_settings:
       if: "${state.vars.reuse_device_auth_session !== true && state.vars.prepare_flow_ready === true}"
+      metadata:
+        description: Warm the authenticated ChatGPT app shell before opening the Security settings so the Security controls load in a logged-in state.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://chatgpt.com/?codex_rotate_device_auth_warmup=1
+  - wait_for_authenticated_chatgpt_shell_before_security_settings:
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.open_authenticated_chatgpt_shell_before_security_settings?.action?.ok === true && state.steps.open_authenticated_chatgpt_shell_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        description: Require a genuinely logged-in ChatGPT shell before entering the Security settings.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const snapshot = async () => {
+              const title = await page.title().catch(() => "");
+              return await page.evaluate((titleText) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  if (node.closest("script,style,noscript,template,[hidden],[aria-hidden='true']")) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const labels = Array.from(document.querySelectorAll("button, a, [role='button'], [role='tab'], input[type='submit']"))
+                  .filter((node) => isVisible(node))
+                  .map((node) => {
+                    if (node instanceof HTMLInputElement) {
+                      return normalize(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  })
+                  .filter(Boolean)
+                  .slice(0, 40);
+                const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                const combinedText = normalize([titleText || document.title || "", bodyText, ...labels].join(" "));
+                const appMarkers = /new chat|search chats|chat history|projects|what are you working on|upgrade plan|explore gpts|ask anything/i.test(combinedText);
+                const settingsShell = /general|notifications|apps|data controls|security|account|appearance|language/i.test(combinedText);
+                const securityControlVisible = labels.some((label) => /^security$/i.test(label));
+                const authenticatedSecurityMarkers = /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(combinedText);
+                const publicSignals = /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started/i.test(combinedText);
+                const loginVisible = labels.some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
+                const signupVisible = labels.some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
+                return {
+                  current_url: location.href,
+                  headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || normalize(titleText || document.title || "") || null,
+                  app_markers: appMarkers,
+                  settings_shell: settingsShell,
+                  security_control_visible: securityControlVisible,
+                  authenticated_security_markers: authenticatedSecurityMarkers,
+                  public_shell: publicSignals || loginVisible || signupVisible,
+                };
+              }, title).catch(() => ({
+                current_url: page.url(),
+                headline: title || null,
+                app_markers: false,
+                settings_shell: false,
+                security_control_visible: false,
+                authenticated_security_markers: false,
+                public_shell: false,
+              }));
+            };
+            const deadline = Date.now() + 15000;
+            let latest = await snapshot();
+            while (Date.now() < deadline) {
+              const authenticated =
+                latest.public_shell !== true
+                && (latest.app_markers === true
+                  || latest.authenticated_security_markers === true
+                  || (latest.settings_shell === true && latest.security_control_visible === true));
+              if (authenticated) {
+                return {
+                  ok: true,
+                  authenticated_chatgpt_shell: true,
+                  ...latest,
+                };
+              }
+              await page.waitForTimeout(750).catch(() => {});
+              latest = await snapshot();
+            }
+            return {
+              ok: false,
+              authenticated_chatgpt_shell: false,
+              ...latest,
+              error: latest.public_shell === true
+                ? "chatgpt-shell-not-authenticated"
+                : "chatgpt-shell-did-not-become-authenticated",
+            };
+  - open_chatgpt_login_entry_before_security_settings:
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings?.action?.ok !== true}"
+      metadata:
+        description: Open the explicit ChatGPT auth-login entry when the warmup shell is still public so Security can be reached from a genuinely logged-in state.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://chatgpt.com/auth/login?next=%2F%23settings%2FSecurity
+  - stabilize_chatgpt_login_surface_before_security_settings:
+      if: "${state.steps.open_chatgpt_login_entry_before_security_settings?.action?.ok === true && state.steps.open_chatgpt_login_entry_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: Wait for the explicit ChatGPT login surface to render before driving the login branch for Security settings.
+  - classify_chatgpt_login_entry_before_security_settings:
+      if: "${state.steps.stabilize_chatgpt_login_surface_before_security_settings?.action?.ok === true && state.steps.stabilize_chatgpt_login_surface_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Classify the explicit ChatGPT login surface before continuing toward the authenticated Security settings.
+  - click_chatgpt_login_button_before_security_settings_from_auth_landing:
+      if: "${state.steps.classify_chatgpt_login_entry_before_security_settings?.action?.stage === 'public_chatgpt' && /chatgpt\\.com\\/auth\\/login/i.test(String(state.steps.classify_chatgpt_login_entry_before_security_settings?.action?.current_url || '')) && state.steps.classify_chatgpt_login_entry_before_security_settings?.action?.login_cta_visible === true}"
+      metadata:
+        templateRef: click_chatgpt_login_button
+        description: Click Log in again on the ChatGPT auth landing shell so the Security-settings login branch reaches the actual email form.
+  - wait_after_chatgpt_login_button_before_security_settings_from_auth_landing:
+      if: "${state.steps.click_chatgpt_login_button_before_security_settings_from_auth_landing?.action?.ok === true && state.steps.click_chatgpt_login_button_before_security_settings_from_auth_landing?.action?.skipped !== true}"
+      metadata:
+        description: Let the explicit ChatGPT auth-landing login click settle before classifying the Security-settings login surface again.
+      wait:
+        milliseconds: 900
+  - classify_chatgpt_login_entry_before_security_settings_after_auth_landing:
+      if: "${state.steps.click_chatgpt_login_button_before_security_settings_from_auth_landing?.action?.ok === true && state.steps.click_chatgpt_login_button_before_security_settings_from_auth_landing?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the explicit ChatGPT login surface after the auth landing's secondary login step.
+  - cache_effective_chatgpt_login_entry_before_security_settings:
+      if: "${state.steps.open_chatgpt_login_entry_before_security_settings?.action?.ok === true && state.steps.open_chatgpt_login_entry_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        description: Cache the effective explicit ChatGPT login-entry state before the Security-settings login branch continues.
+      set:
+        pre_settings_login_entry: "${(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action : (state.steps.classify_chatgpt_login_entry_before_security_settings?.action || {})}"
+  - fill_chatgpt_login_email_before_security_settings:
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'login_email' || (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'auth_prompt' && state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.email_input === true))}"
+      metadata:
+        templateRef: fill_openai_email_field
+        description: Fill the account email on the explicit ChatGPT login branch before opening Security settings.
+  - submit_chatgpt_login_email_before_security_settings:
+      if: "${state.steps.fill_chatgpt_login_email_before_security_settings?.action?.ok === true && state.steps.fill_chatgpt_login_email_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: submit_login_email_form
+        description: Submit the explicit ChatGPT login email step before opening Security settings.
+  - wait_after_chatgpt_login_email_before_security_settings:
+      if: "${state.steps.submit_chatgpt_login_email_before_security_settings?.action?.ok === true && state.steps.submit_chatgpt_login_email_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        description: Allow the explicit ChatGPT login email step to settle before switching to one-time-code recovery.
+      wait:
+        milliseconds: 900
+  - classify_chatgpt_login_after_email_before_security_settings:
+      if: "${state.steps.submit_chatgpt_login_email_before_security_settings?.action?.ok === true && state.steps.submit_chatgpt_login_email_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the explicit ChatGPT login surface after the email step.
+  - retry_chatgpt_login_email_submit_before_security_settings:
+      if: "${state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'login_email' || (state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'auth_prompt' && state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.email_input === true)}"
+      metadata:
+        templateRef: click_primary_continue
+        description: Retry the explicit ChatGPT login email submit when OpenAI leaves the email step unchanged.
+  - wait_after_chatgpt_login_email_retry_before_security_settings:
+      if: "${state.steps.retry_chatgpt_login_email_submit_before_security_settings?.action?.ok === true && state.steps.retry_chatgpt_login_email_submit_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        description: Allow the retried explicit ChatGPT login email submit to settle before classifying the next page.
+      wait:
+        milliseconds: 900
+  - classify_chatgpt_login_after_email_retry_before_security_settings:
+      if: "${state.steps.retry_chatgpt_login_email_submit_before_security_settings?.action?.ok === true && state.steps.retry_chatgpt_login_email_submit_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the explicit ChatGPT login surface after retrying the email submit.
+  - choose_chatgpt_one_time_code_before_security_settings:
+      if: "${state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.stage === 'login_password' || (state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.stage === 'auth_prompt' && state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.password_input === true) || state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.one_time_code_cta === true || state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'login_password' || (state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'auth_prompt' && state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.password_input === true) || state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.one_time_code_cta === true}"
+      metadata:
+        templateRef: click_one_time_code_button
+        description: Switch the explicit ChatGPT login branch to one-time-code recovery before opening Security settings.
+  - classify_chatgpt_login_after_recovery_choice_before_security_settings:
+      if: "${state.steps.choose_chatgpt_one_time_code_before_security_settings?.action?.ok === true && state.steps.choose_chatgpt_one_time_code_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the explicit ChatGPT login surface after selecting one-time-code recovery.
+  - collect_chatgpt_login_verification_artifact_before_security_settings:
+      if: "${state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_login_after_recovery_choice_before_security_settings?.action?.stage === 'email_verification'}"
+      metadata:
+        description: Collect the explicit ChatGPT login OTP from Gmail on the same managed profile before opening Security settings.
+        ref:
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: auth\.openai\.com|chatgpt\.com
+  - cache_chatgpt_login_verification_artifact_before_security_settings:
+      if: "${state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result != null}"
+      metadata:
+        description: Cache the collected explicit ChatGPT login verification artifact into workflow state.
+      set:
+        pre_settings_login_verification_code: "${(String(state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.code || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.code || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.verification_code || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.verification_code || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.otp || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.otp || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+  - wait_for_chatgpt_login_verification_email_delivery_before_security_settings:
+      if: "${state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.ok === true && state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.skipped !== true && String(state.vars.pre_settings_login_verification_code || '').length < 6}"
+      metadata:
+        description: Give Gmail one more chance to finish loading the explicit ChatGPT login OTP before leaving the mailbox.
+      wait:
+        milliseconds: 4000
+  - recollect_chatgpt_login_verification_artifact_before_security_settings:
+      if: "${state.steps.wait_for_chatgpt_login_verification_email_delivery_before_security_settings?.action?.ok === true && state.steps.wait_for_chatgpt_login_verification_email_delivery_before_security_settings?.action?.skipped !== true && String(state.vars.pre_settings_login_verification_code || '').length < 6}"
+      metadata:
+        description: Re-collect the explicit ChatGPT login OTP once when Gmail has not surfaced a usable code yet.
+        ref:
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: auth\.openai\.com|chatgpt\.com
+  - cache_recollected_chatgpt_login_verification_artifact_before_security_settings:
+      if: "${state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result != null}"
+      metadata:
+        description: Replace the explicit ChatGPT login verification artifact after waiting for Gmail to finish loading.
+      set:
+        pre_settings_login_verification_code: "${(String(state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.code || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.code || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.verification_code || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.verification_code || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.output?.otp || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.output?.otp || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.vars.pre_settings_login_verification_code || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+  - return_to_chatgpt_login_verification_page_before_security_settings:
+      if: "${(state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.ok === true && state.steps.collect_chatgpt_login_verification_artifact_before_security_settings?.action?.skipped !== true) || (state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.ok === true && state.steps.recollect_chatgpt_login_verification_artifact_before_security_settings?.action?.skipped !== true)}"
+      metadata:
+        description: Return from Gmail to the active OpenAI email-verification page on the explicit ChatGPT login branch.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_chatgpt_login_after_recovery_choice_before_security_settings?.action?.current_url || state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.current_url || state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.current_url || 'https://auth.openai.com/email-verification'}"
+  - stabilize_chatgpt_login_verification_surface_before_security_settings:
+      if: "${state.steps.return_to_chatgpt_login_verification_page_before_security_settings?.action?.ok === true && state.steps.return_to_chatgpt_login_verification_page_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: Wait for the explicit ChatGPT login verification page to render after returning from Gmail.
+  - classify_chatgpt_login_verification_ready_before_security_settings:
+      if: "${state.steps.return_to_chatgpt_login_verification_page_before_security_settings?.action?.ok === true && state.steps.return_to_chatgpt_login_verification_page_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Confirm the OpenAI email-verification surface after returning from Gmail on the explicit ChatGPT login branch.
+  - reopen_chatgpt_one_time_code_after_return_before_security_settings:
+      if: "${state.steps.classify_chatgpt_login_verification_ready_before_security_settings?.action?.stage === 'login_password' || (state.steps.classify_chatgpt_login_verification_ready_before_security_settings?.action?.stage === 'auth_prompt' && state.steps.classify_chatgpt_login_verification_ready_before_security_settings?.action?.password_input === true)}"
+      metadata:
+        templateRef: click_one_time_code_button
+        description: Reopen one-time-code recovery when the Gmail return path lands back on the password prompt before opening Security settings.
+  - classify_chatgpt_after_return_recovery_before_security_settings:
+      if: "${state.steps.reopen_chatgpt_one_time_code_after_return_before_security_settings?.action?.ok === true && state.steps.reopen_chatgpt_one_time_code_after_return_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the explicit ChatGPT login surface after rebuilding one-time-code recovery from the Gmail return path.
+  - fill_chatgpt_login_verification_code_before_security_settings:
+      if: "${state.steps.classify_chatgpt_login_verification_ready_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_after_return_recovery_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_login_after_recovery_choice_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_login_after_email_retry_before_security_settings?.action?.stage === 'email_verification' || state.steps.classify_chatgpt_login_after_email_before_security_settings?.action?.stage === 'email_verification'}"
+      metadata:
+        description: Fill the Gmail OTP into the OpenAI email-verification form before opening Security settings.
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: >-
+            input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]
+          text: "${String(state.vars.pre_settings_login_verification_code || '').replace(/\\D+/g, '').slice(0, 6)}"
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          settle_ms: 250
+  - submit_chatgpt_login_verification_code_before_security_settings:
+      if: "${state.steps.fill_chatgpt_login_verification_code_before_security_settings?.action?.ok === true && state.steps.fill_chatgpt_login_verification_code_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: Submit the OpenAI email-verification OTP before opening Security settings.
+  - wait_after_chatgpt_login_verification_submit_before_security_settings:
+      if: "${state.steps.submit_chatgpt_login_verification_code_before_security_settings?.action?.ok === true && state.steps.submit_chatgpt_login_verification_code_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        description: Allow the explicit ChatGPT login verification submission to settle before classifying the next page.
+      wait:
+        milliseconds: 900
+  - classify_chatgpt_after_login_verification_submit_before_security_settings:
+      if: "${state.steps.submit_chatgpt_login_verification_code_before_security_settings?.action?.ok === true && state.steps.submit_chatgpt_login_verification_code_before_security_settings?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Classify the explicit ChatGPT login flow after submitting the verification OTP.
+  - wait_on_chatgpt_add_phone_before_security_settings_short:
+      if: "${state.steps.classify_chatgpt_after_login_verification_submit_before_security_settings?.action?.stage === 'add_phone'}"
+      metadata:
+        description: Wait briefly when ChatGPT shows the transient add-phone blocker before Security settings.
+      wait:
+        milliseconds: 5000
+  - classify_chatgpt_after_add_phone_wait_before_security_settings_short:
+      if: "${state.steps.wait_on_chatgpt_add_phone_before_security_settings_short?.action?.ok === true && state.steps.wait_on_chatgpt_add_phone_before_security_settings_short?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the explicit ChatGPT login surface after the short add-phone wait.
+  - wait_on_chatgpt_add_phone_before_security_settings_medium:
+      if: "${state.steps.classify_chatgpt_after_add_phone_wait_before_security_settings_short?.action?.stage === 'add_phone'}"
+      metadata:
+        description: Wait longer when the transient add-phone blocker still persists before Security settings.
+      wait:
+        milliseconds: 10000
+  - classify_chatgpt_after_add_phone_wait_before_security_settings_medium:
+      if: "${state.steps.wait_on_chatgpt_add_phone_before_security_settings_medium?.action?.ok === true && state.steps.wait_on_chatgpt_add_phone_before_security_settings_medium?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the explicit ChatGPT login surface after the medium add-phone wait.
+  - wait_on_chatgpt_add_phone_before_security_settings_long:
+      if: "${state.steps.classify_chatgpt_after_add_phone_wait_before_security_settings_medium?.action?.stage === 'add_phone'}"
+      metadata:
+        description: Give the transient add-phone blocker one final long wait before declaring the pre-settings login branch blocked.
+      wait:
+        milliseconds: 20000
+  - classify_chatgpt_after_add_phone_wait_before_security_settings_long:
+      if: "${state.steps.wait_on_chatgpt_add_phone_before_security_settings_long?.action?.ok === true && state.steps.wait_on_chatgpt_add_phone_before_security_settings_long?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the explicit ChatGPT login surface after the final add-phone wait.
+  - cache_effective_authenticated_chatgpt_shell_before_security_settings:
+      if: "${state.vars.reuse_device_auth_session !== true}"
+      metadata:
+        description: Cache the effective authenticated ChatGPT shell state before opening Security settings.
+      run:
+        script:
+          language: javascript
+          code: |
+            const candidates = [
+              state.steps?.wait_for_authenticated_chatgpt_shell_before_security_settings?.action?.ok === true
+                ? {
+                    ready: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.authenticated_chatgpt_shell === true,
+                    current_url: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.current_url || null,
+                    headline: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.headline || null,
+                    stage: "app_shell",
+                  }
+                : null,
+              state.steps?.classify_chatgpt_after_add_phone_wait_before_security_settings_long?.action,
+              state.steps?.classify_chatgpt_after_add_phone_wait_before_security_settings_medium?.action,
+              state.steps?.classify_chatgpt_after_add_phone_wait_before_security_settings_short?.action,
+              state.steps?.classify_chatgpt_after_login_verification_submit_before_security_settings?.action,
+              state.steps?.classify_chatgpt_after_return_recovery_before_security_settings?.action,
+              state.steps?.classify_chatgpt_login_verification_ready_before_security_settings?.action,
+              state.steps?.classify_chatgpt_login_after_recovery_choice_before_security_settings?.action,
+              state.steps?.classify_chatgpt_login_after_email_retry_before_security_settings?.action,
+              state.steps?.classify_chatgpt_login_after_email_before_security_settings?.action,
+            ].filter(Boolean);
+            const effective = candidates.find((candidate) => {
+              return candidate
+                && typeof candidate === "object"
+                && candidate.skipped !== true
+                && (candidate.ready === true || candidate.stage === "app_shell");
+            }) || {};
+            return {
+              authenticated_chatgpt_shell_before_security_settings: {
+                ready: effective.ready === true || effective.stage === "app_shell",
+                current_url: effective.current_url || null,
+                headline: effective.headline || null,
+                stage: effective.stage || null,
+              },
+            };
+  - open_chatgpt_security_settings:
+      if: "${state.vars.reuse_device_auth_session !== true && state.steps.cache_effective_authenticated_chatgpt_shell_before_security_settings?.action?.value?.authenticated_chatgpt_shell_before_security_settings?.ready === true}"
       metadata:
         description: "Open the authenticated ChatGPT Security settings directly after prepare succeeds."
       call: afn.driver.browser.navigate
@@ -5875,51 +6239,82 @@ do:
       with:
         body:
           script: |
-            const ok = await page.waitForFunction(() => {
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
-              const root = dialog || document.body;
-              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim().toLowerCase();
-              return /general/.test(text) && /security|data controls/.test(text) && /account|appearance|notifications/.test(text);
-            }, { timeout: 10000 }).then(() => true).catch(() => false);
-            const title = await page.title().catch(() => "");
-            const shell = await page.evaluate(() => {
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
-              const root = dialog || document.body;
-              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim();
-              return {
-                dialog_visible: Boolean(dialog),
-                text,
-              };
-            }).catch(() => ({ dialog_visible: false, text: "" }));
-            const normalizedText = String(shell.text || "").replace(/\s+/g, " ").trim();
+            const inspectShell = async () => {
+              const title = await page.title().catch(() => "");
+              return await page.evaluate((titleText) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
+                const root = dialog || document.body;
+                const labels = Array.from((root || document.body).querySelectorAll("button, a, [role='button'], [role='tab'], input[type='submit']"))
+                  .filter((node) => isVisible(node))
+                  .map((node) => {
+                    if (node instanceof HTMLInputElement) {
+                      return normalize(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  })
+                  .filter(Boolean)
+                  .slice(0, 40);
+                const text = normalize(root ? (root.innerText || root.textContent || "") : "");
+                const combinedText = normalize([titleText || document.title || "", text, ...labels].join(" "));
+                const authenticatedSecurityMarkers = /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(combinedText);
+                const securityControlVisible = labels.some((label) => /^security$/i.test(label));
+                const publicSignals = /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started/i.test(combinedText);
+                const loginVisible = labels.some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
+                const signupVisible = labels.some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
+                return {
+                  current_url: location.href,
+                  headline: text.split("\n").map((value) => value.trim()).filter(Boolean)[0] || normalize(titleText || document.title || "") || null,
+                  dialog_visible: Boolean(dialog),
+                  settings_shell: /general|notifications|apps|data controls|security|account|appearance|language/i.test(combinedText),
+                  security_control_visible: securityControlVisible,
+                  authenticated_security_markers: authenticatedSecurityMarkers,
+                  public_shell: publicSignals || loginVisible || signupVisible,
+                };
+              }, title).catch(() => ({
+                current_url: page.url(),
+                headline: title || null,
+                dialog_visible: false,
+                settings_shell: false,
+                security_control_visible: false,
+                authenticated_security_markers: false,
+                public_shell: false,
+              }));
+            };
+            const deadline = Date.now() + 12000;
+            let latest = await inspectShell();
+            while (Date.now() < deadline) {
+              const ok = latest.settings_shell === true
+                && latest.public_shell !== true
+                && (latest.authenticated_security_markers === true || latest.security_control_visible === true);
+              if (ok) {
+                return {
+                  ok: true,
+                  logged_in_settings_shell: true,
+                  ...latest,
+                };
+              }
+              await page.waitForTimeout(750).catch(() => {});
+              latest = await inspectShell();
+            }
             return {
-              ok,
-              current_url: page.url(),
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              dialog_visible: shell.dialog_visible === true,
-              settings_shell: /general|notifications|apps|data controls|security|account|appearance/i.test(normalizedText),
+              ok: false,
+              logged_in_settings_shell: false,
+              ...latest,
+              error: latest.public_shell === true
+                ? "chatgpt-settings-shell-not-authenticated"
+                : "chatgpt-security-controls-not-visible",
             };
   - activate_chatgpt_security_settings_tab:
       if: "${state.vars.reuse_device_auth_session !== true && state.steps.wait_for_chatgpt_settings_shell?.action?.ok === true && state.steps.wait_for_chatgpt_settings_shell?.action?.skipped !== true}"
@@ -5958,6 +6353,7 @@ do:
                 headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
                 dialog_visible: panel.dialog_visible === true,
                 settings_shell: /general|notifications|apps|data controls|security|account|appearance/i.test(normalizedText),
+                logged_in_settings_shell: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText) || /new chat|search chats|projects|chat history/i.test(normalizedText),
                 security_open: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices/i.test(normalizedText),
               };
             };
@@ -5965,6 +6361,10 @@ do:
               const deadline = Date.now() + 10000;
               while (Date.now() < deadline) {
                 const panelBefore = await inspectPanel();
+                if (panelBefore.logged_in_settings_shell !== true && panelBefore.security_open !== true) {
+                  await page.waitForTimeout(500).catch(() => {});
+                  continue;
+                }
                 if (panelBefore.security_open === true) {
                   return { ok: true, clicked: false, panel: panelBefore };
                 }
@@ -6034,51 +6434,82 @@ do:
       with:
         body:
           script: |
-            const ok = await page.waitForFunction(() => {
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
-              const root = dialog || document.body;
-              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim().toLowerCase();
-              return /general/.test(text) && /security|data controls/.test(text) && /account|appearance|notifications/.test(text);
-            }, { timeout: 10000 }).then(() => true).catch(() => false);
-            const title = await page.title().catch(() => "");
-            const shell = await page.evaluate(() => {
-              const isVisible = (node) => {
-                if (!(node instanceof Element)) {
-                  return false;
-                }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              };
-              const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
-              const root = dialog || document.body;
-              const text = String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim();
-              return {
-                dialog_visible: Boolean(dialog),
-                text,
-              };
-            }).catch(() => ({ dialog_visible: false, text: "" }));
-            const normalizedText = String(shell.text || "").replace(/\s+/g, " ").trim();
+            const inspectShell = async () => {
+              const title = await page.title().catch(() => "");
+              return await page.evaluate((titleText) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const dialog = Array.from(document.querySelectorAll("[role='dialog']")).find((node) => isVisible(node));
+                const root = dialog || document.body;
+                const labels = Array.from((root || document.body).querySelectorAll("button, a, [role='button'], [role='tab'], input[type='submit']"))
+                  .filter((node) => isVisible(node))
+                  .map((node) => {
+                    if (node instanceof HTMLInputElement) {
+                      return normalize(node.value || node.getAttribute("aria-label") || "");
+                    }
+                    return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                  })
+                  .filter(Boolean)
+                  .slice(0, 40);
+                const text = normalize(root ? (root.innerText || root.textContent || "") : "");
+                const combinedText = normalize([titleText || document.title || "", text, ...labels].join(" "));
+                const authenticatedSecurityMarkers = /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(combinedText);
+                const securityControlVisible = labels.some((label) => /^security$/i.test(label));
+                const publicSignals = /log in to get smarter responses|get responses tailored to you|see plans and pricing|sign up for free|welcome to chatgpt|get started/i.test(combinedText);
+                const loginVisible = labels.some((label) => /^(log in|sign in)$/i.test(label) || /log in/i.test(label));
+                const signupVisible = labels.some((label) => /^sign up$/i.test(label) || /sign up for free|create account|get started/i.test(label));
+                return {
+                  current_url: location.href,
+                  headline: text.split("\n").map((value) => value.trim()).filter(Boolean)[0] || normalize(titleText || document.title || "") || null,
+                  dialog_visible: Boolean(dialog),
+                  settings_shell: /general|notifications|apps|data controls|security|account|appearance|language/i.test(combinedText),
+                  security_control_visible: securityControlVisible,
+                  authenticated_security_markers: authenticatedSecurityMarkers,
+                  public_shell: publicSignals || loginVisible || signupVisible,
+                };
+              }, title).catch(() => ({
+                current_url: page.url(),
+                headline: title || null,
+                dialog_visible: false,
+                settings_shell: false,
+                security_control_visible: false,
+                authenticated_security_markers: false,
+                public_shell: false,
+              }));
+            };
+            const deadline = Date.now() + 12000;
+            let latest = await inspectShell();
+            while (Date.now() < deadline) {
+              const ok = latest.settings_shell === true
+                && latest.public_shell !== true
+                && (latest.authenticated_security_markers === true || latest.security_control_visible === true);
+              if (ok) {
+                return {
+                  ok: true,
+                  logged_in_settings_shell: true,
+                  ...latest,
+                };
+              }
+              await page.waitForTimeout(750).catch(() => {});
+              latest = await inspectShell();
+            }
             return {
-              ok,
-              current_url: page.url(),
-              headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-              dialog_visible: shell.dialog_visible === true,
-              settings_shell: /general|notifications|apps|data controls|security|account|appearance/i.test(normalizedText),
+              ok: false,
+              logged_in_settings_shell: false,
+              ...latest,
+              error: latest.public_shell === true
+                ? "chatgpt-settings-shell-not-authenticated"
+                : "chatgpt-security-controls-not-visible",
             };
   - reactivate_chatgpt_security_settings_tab_after_toggle:
       if: "${state.vars.reuse_device_auth_session !== true && state.steps.wait_for_chatgpt_settings_shell_after_toggle?.action?.ok === true && state.steps.wait_for_chatgpt_settings_shell_after_toggle?.action?.skipped !== true}"
@@ -6119,6 +6550,7 @@ do:
                 headline: normalizedText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
                 dialog_visible: panel.dialog_visible === true,
                 settings_shell: /general|notifications|apps|data controls|security|account|appearance/i.test(normalizedText),
+                logged_in_settings_shell: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText) || /new chat|search chats|projects|chat history/i.test(normalizedText),
                 security_open: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices/i.test(normalizedText),
               };
             };
@@ -6126,6 +6558,10 @@ do:
               const deadline = Date.now() + 10000;
               while (Date.now() < deadline) {
                 const panelBefore = await inspectPanel();
+                if (panelBefore.logged_in_settings_shell !== true && panelBefore.security_open !== true) {
+                  await page.waitForTimeout(500).catch(() => {});
+                  continue;
+                }
                 if (panelBefore.security_open === true) {
                   return { ok: true, clicked: false, panel: panelBefore };
                 }
@@ -6765,7 +7201,7 @@ do:
       metadata:
         description: "Collect the device-auth login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -6792,7 +7228,7 @@ do:
       metadata:
         description: Re-collect the device-auth login OTP once when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7247,7 +7683,7 @@ do:
       metadata:
         description: "Re-collect the device-auth login OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7274,7 +7710,7 @@ do:
       metadata:
         description: Re-collect the replacement device-auth login OTP once when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:b132a628e1869edb9974cc27a967519a43b3afd9d74797bf7c3f56100c912d76
+          digest: sha256:01e032fddc23788226829689d0b2161ad4b9acb108dac83395bfbdaef5f8974d
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -8413,6 +8849,7 @@ do:
               next_action: nextAction,
               retry_reason: retryReason,
               error_message: success ? null : errorMessage,
+              verified_account_email: success ? (String(args.email || "").trim().toLowerCase() || null) : null,
               codex_session: {
                 auth_url: resolvedAuthUrl,
                 callback_url: session.callback_url || null,
