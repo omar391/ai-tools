@@ -692,14 +692,30 @@ fn build_list_quota_refresh_order(
     now: DateTime<Utc>,
     max_refreshes: usize,
 ) -> Vec<usize> {
+    let mut refreshes = pool
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.last_quota_checked_at.is_none())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    refreshes.sort_by(|left, right| {
+        let left_priority = if *left == pool.active_index { 0 } else { 1 };
+        let right_priority = if *right == pool.active_index { 0 } else { 1 };
+        left_priority
+            .cmp(&right_priority)
+            .then_with(|| left.cmp(right))
+    });
+
     if max_refreshes == 0 {
-        return Vec::new();
+        return refreshes;
     }
 
     let mut candidates = pool
         .accounts
         .iter()
         .enumerate()
+        .filter(|(_, entry)| entry.last_quota_checked_at.is_some())
         .filter(|(_, entry)| cached_quota_state_is_stale(entry, now))
         .map(|(index, entry)| {
             let priority = if index == pool.active_index {
@@ -720,11 +736,14 @@ fn build_list_quota_refresh_order(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    candidates
-        .into_iter()
-        .take(max_refreshes)
-        .map(|(index, _, _)| index)
-        .collect()
+    refreshes.extend(
+        candidates
+            .into_iter()
+            .take(max_refreshes)
+            .map(|(index, _, _)| index),
+    );
+
+    refreshes
 }
 
 fn cached_quota_state_is_stale(entry: &AccountEntry, now: DateTime<Utc>) -> bool {
@@ -2263,6 +2282,31 @@ mod tests {
         };
 
         assert_eq!(build_list_quota_refresh_order(&pool, now, 2), vec![0, 3]);
+    }
+
+    #[test]
+    fn list_quota_refresh_order_includes_unknown_entries_outside_stale_refresh_cap() {
+        let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+
+        let mut stale_active = stored_entry(Some(false), Some("2026-04-08T12:04:00.000Z"));
+        stale_active.last_quota_blocker = Some("rate limited".to_string());
+
+        let mut unknown = stored_entry(None, None);
+        unknown.label = "unknown".to_string();
+        unknown.email = "unknown@example.com".to_string();
+        unknown.account_id = "acct-unknown".to_string();
+
+        let mut stale_usable = stored_entry(Some(true), Some("2026-04-08T12:03:30.000Z"));
+        stale_usable.last_quota_primary_left_percent = Some(40);
+
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![stale_active, unknown, stale_usable],
+        };
+
+        assert_eq!(build_list_quota_refresh_order(&pool, now, 1), vec![1, 0]);
     }
 
     #[test]

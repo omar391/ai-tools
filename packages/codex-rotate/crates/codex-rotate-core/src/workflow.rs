@@ -3777,6 +3777,7 @@ fn extract_account_family_suffix(candidate_email: &str, base_email: &str) -> Res
     })
 }
 
+#[cfg(test)]
 fn compute_next_account_family_suffix(base_email: &str, known_emails: Vec<String>) -> Result<u32> {
     compute_next_account_family_suffix_with_skips(
         base_email,
