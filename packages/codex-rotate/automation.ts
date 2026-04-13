@@ -24,29 +24,16 @@ const NODE_BINARY =
   process.env.NODE_BIN?.trim() ||
   process.execPath ||
   "node";
+const MAIN_WORKTREE_ROOT = discoverMainWorktreeRoot(REPO_ROOT);
 const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
-  resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
-    "lib",
-    "daemon",
-    "client.mjs",
-  ),
+  resolveFastBrowserSkillPath(["lib", "daemon", "client.mjs"]),
 ).href;
 const FAST_BROWSER_BITWARDEN_SESSION_MODULE = pathToFileURL(
-  resolve(
-    REPO_ROOT,
-    "..",
-    "ai-rules",
-    "skills",
-    "fast-browser",
+  resolveFastBrowserSkillPath([
     "lib",
     "secret-adapters",
     "bitwarden-session.mjs",
-  ),
+  ]),
 ).href;
 const CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE: "minimal" | "full" =
   process.env.CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE === "full"
@@ -99,6 +86,59 @@ function resolveStableWorkingDirectory(): string {
   return homedir();
 }
 
+function discoverMainWorktreeRoot(repoRoot: string): string | null {
+  const result = spawnSync("git", ["worktree", "list", "--porcelain"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (!line.startsWith("worktree ")) {
+      continue;
+    }
+    const candidate = line.slice("worktree ".length).trim();
+    if (candidate && resolve(candidate) !== resolve(repoRoot)) {
+      return resolve(candidate);
+    }
+  }
+
+  return null;
+}
+
+function fastBrowserSkillPathCandidates(
+  repoRoot: string,
+  relativeParts: string[],
+  mainWorktreeRoot: string | null = MAIN_WORKTREE_ROOT,
+): string[] {
+  const roots = [resolve(repoRoot)];
+  if (mainWorktreeRoot) {
+    const normalizedMainRoot = resolve(mainWorktreeRoot);
+    if (!roots.includes(normalizedMainRoot)) {
+      roots.push(normalizedMainRoot);
+    }
+  }
+
+  return roots.map((root) =>
+    join(dirname(root), "ai-rules", "skills", "fast-browser", ...relativeParts),
+  );
+}
+
+export function resolveFastBrowserSkillPath(
+  relativeParts: string[],
+  repoRoot: string = REPO_ROOT,
+  mainWorktreeRoot: string | null = MAIN_WORKTREE_ROOT,
+): string {
+  const candidates = fastBrowserSkillPathCandidates(
+    repoRoot,
+    relativeParts,
+    mainWorktreeRoot,
+  );
+  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+}
+
 function ensureProcessWorkingDirectory(): void {
   const current = getProcessCwdSafe();
   if (current && existsSync(current)) {
@@ -122,9 +162,14 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
 function resolvePlaywrightModulePath(): string {
   const currentWorkingDirectory = getProcessCwdSafe();
   const override = process.env.CODEX_ROTATE_PLAYWRIGHT_MODULE?.trim();
+  const directRepoCandidates = [REPO_ROOT, MAIN_WORKTREE_ROOT]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => resolve(value));
   const directCandidates = [
     override ? resolve(override) : null,
-    join(REPO_ROOT, "node_modules", "playwright"),
+    ...directRepoCandidates.map((repoRoot) =>
+      join(repoRoot, "node_modules", "playwright"),
+    ),
     currentWorkingDirectory
       ? join(currentWorkingDirectory, "node_modules", "playwright")
       : null,
@@ -1197,18 +1242,6 @@ async function runFastBrowserDaemonWorkflow(
   },
 ): Promise<FastBrowserRunResult> {
   ensureFastBrowserPlaywright();
-  const clientModuleUrl = pathToFileURL(
-    resolve(
-      REPO_ROOT,
-      "..",
-      "ai-rules",
-      "skills",
-      "fast-browser",
-      "lib",
-      "daemon",
-      "client.mjs",
-    ),
-  ).href;
   const bridgeScript = `
     const ownerPid = ${JSON.stringify(process.pid)};
     if (Number.isInteger(ownerPid) && ownerPid > 1) {
@@ -1222,7 +1255,7 @@ async function runFastBrowserDaemonWorkflow(
       }, 1000);
       ownerWatchdog.unref?.();
     }
-    import { runDaemonWorkflow } from ${JSON.stringify(clientModuleUrl)};
+    import { runDaemonWorkflow } from ${JSON.stringify(FAST_BROWSER_DAEMON_CLIENT_MODULE)};
     const response = await runDaemonWorkflow({
       profileName: ${JSON.stringify(profileName)},
       workflowRef: ${JSON.stringify(workflowRef)},

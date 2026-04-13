@@ -958,7 +958,7 @@ pub fn cmd_relogin_with_progress(
             }
         };
 
-        let auth = load_current_auth()?;
+        let auth = load_auth_for_completed_login(&login_outcome)?;
         let logged_in_email = summarize_codex_auth(&auth).email;
         if !options.allow_email_change
             && normalize_email_key(&logged_in_email) != normalize_email_key(&expected_email)
@@ -1541,7 +1541,7 @@ fn execute_create_flow_attempt(
         }
     };
 
-    let auth = fatal(load_current_auth())?;
+    let auth = fatal(load_auth_for_completed_login(&login_outcome))?;
     let logged_in_email = summarize_codex_auth(&auth).email;
     if normalize_email_key(&logged_in_email) != normalize_email_key(&created_email)
         && !workflow_verified_expected_email(
@@ -1660,13 +1660,14 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
         progress.as_ref(),
         format!("Inspecting quota for {}.", created_email),
     );
-    let inspected = inspect_pool_entry_by_account_id(&extract_account_id_from_auth(auth))?
-        .ok_or_else(|| {
-            anyhow!(
-                "Created {}, but could not find the new account in the pool after login.",
-                created_email
-            )
-        })?;
+    let inspected =
+        inspect_pool_entry_for_created_email(&extract_account_id_from_auth(auth), &created_email)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Created {}, but could not find the new account in the pool after login.",
+                    created_email
+                )
+            })?;
 
     let updated_at = now_iso();
     store.pending.remove(&normalize_email_key(&created_email));
@@ -1766,12 +1767,32 @@ fn summarize_quota_for_create(result: &CreateCommandResult) -> String {
     }
 }
 
-fn inspect_pool_entry_by_account_id(account_id: &str) -> Result<Option<InspectedPoolEntry>> {
+fn find_created_pool_entry_index(
+    pool: &Pool,
+    account_id: &str,
+    expected_email: &str,
+) -> Option<usize> {
+    let normalized_expected_email = normalize_email_key(expected_email);
+    if !normalized_expected_email.is_empty() && normalized_expected_email != "unknown" {
+        if let Some(index) = pool.accounts.iter().position(|entry| {
+            normalize_email_key(entry.email.as_str()) == normalized_expected_email
+        }) {
+            return Some(index);
+        }
+    }
+
+    pool.accounts.iter().position(|entry| {
+        entry.account_id == account_id || entry.auth.tokens.account_id == account_id
+    })
+}
+
+fn inspect_pool_entry_for_created_email(
+    account_id: &str,
+    expected_email: &str,
+) -> Result<Option<InspectedPoolEntry>> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
-    let index = pool.accounts.iter().position(|entry| {
-        entry.account_id == account_id || entry.auth.tokens.account_id == account_id
-    });
+    let index = find_created_pool_entry_index(&pool, account_id, expected_email);
     let Some(index) = index else {
         return Ok(None);
     };
@@ -1789,6 +1810,10 @@ fn inspect_pool_entry_by_account_id(account_id: &str) -> Result<Option<Inspected
     }))
 }
 
+fn inspect_pool_entry_by_account_id(account_id: &str) -> Result<Option<InspectedPoolEntry>> {
+    inspect_pool_entry_for_created_email(account_id, "")
+}
+
 struct InspectedPoolEntry {
     entry: AccountEntry,
     inspection: AccountInspection,
@@ -1797,6 +1822,22 @@ struct InspectedPoolEntry {
 fn load_current_auth() -> Result<CodexAuth> {
     let paths = resolve_paths()?;
     load_codex_auth(&paths.codex_auth_file)
+}
+
+fn load_auth_for_completed_login(outcome: &CompleteCodexLoginOutcome) -> Result<CodexAuth> {
+    if let Some(auth_file_path) = outcome
+        .codex_session
+        .as_ref()
+        .and_then(|session| session.auth_file_path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let auth_path = Path::new(auth_file_path);
+        if auth_path.exists() {
+            return load_codex_auth(auth_path);
+        }
+    }
+    load_current_auth()
 }
 
 fn load_codex_auth_if_exists() -> Result<Option<CodexAuth>> {
@@ -1849,6 +1890,7 @@ struct CompleteCodexLoginArgs<'a> {
 #[derive(Clone, Debug, Default)]
 struct CompleteCodexLoginOutcome {
     verified_account_email: Option<String>,
+    codex_session: Option<CodexRotateAuthFlowSession>,
 }
 
 fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<CompleteCodexLoginOutcome> {
@@ -2214,6 +2256,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 )?;
                 return Ok(CompleteCodexLoginOutcome {
                     verified_account_email: flow.verified_account_email.clone(),
+                    codex_session: codex_session.clone().or(flow.codex_session.clone()),
                 });
             }
         }
@@ -4536,6 +4579,7 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
+    use base64::Engine;
     use std::fs;
     use std::path::Path;
     use std::process::Command as ProcessCommand;
@@ -4593,6 +4637,31 @@ mod tests {
                 updated_at: created_at.to_string(),
             },
             started_at: Some(created_at.to_string()),
+        }
+    }
+
+    fn make_jwt(payload: &str) -> String {
+        format!(
+            "{}.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(r#"{"alg":"none","typ":"JWT"}"#),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        )
+    }
+
+    fn make_auth(email: &str, account_id: &str) -> CodexAuth {
+        CodexAuth {
+            auth_mode: "chatgpt".to_string(),
+            openai_api_key: None,
+            tokens: crate::auth::AuthTokens {
+                access_token: make_jwt(&format!(
+                    r#"{{"https://api.openai.com/profile":{{"email":"{email}"}},"https://api.openai.com/auth":{{"chatgpt_account_id":"{account_id}","chatgpt_plan_type":"free"}}}}"#
+                )),
+                id_token: make_jwt(&format!(r#"{{"email":"{email}"}}"#)),
+                refresh_token: Some(format!("refresh-{account_id}")),
+                account_id: account_id.to_string(),
+            },
+            last_refresh: "2026-04-13T02:52:15.012Z".to_string(),
         }
     }
 
@@ -6571,6 +6640,124 @@ end
             Some("dev.24@astronlab.com")
         );
         assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn created_pool_lookup_prefers_expected_email_over_stale_account_id_match() {
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![
+                AccountEntry {
+                    label: "dev.98@astronlab.com_free".to_string(),
+                    alias: None,
+                    email: "dev.98@astronlab.com".to_string(),
+                    account_id: "acct-shared".to_string(),
+                    plan_type: "free".to_string(),
+                    auth: CodexAuth {
+                        auth_mode: "chatgpt".to_string(),
+                        openai_api_key: None,
+                        tokens: crate::auth::AuthTokens {
+                            id_token: "id-old".to_string(),
+                            access_token: "access-old".to_string(),
+                            refresh_token: Some("refresh-old".to_string()),
+                            account_id: "acct-shared".to_string(),
+                        },
+                        last_refresh: "2026-04-13T02:52:14.756Z".to_string(),
+                    },
+                    added_at: "2026-04-13T02:52:14.756Z".to_string(),
+                    last_quota_usable: None,
+                    last_quota_summary: None,
+                    last_quota_blocker: None,
+                    last_quota_checked_at: None,
+                    last_quota_primary_left_percent: None,
+                    last_quota_next_refresh_at: None,
+                },
+                AccountEntry {
+                    label: "devbench.17@astronlab.com_free".to_string(),
+                    alias: None,
+                    email: "devbench.17@astronlab.com".to_string(),
+                    account_id: "acct-devbench-17".to_string(),
+                    plan_type: "free".to_string(),
+                    auth: CodexAuth {
+                        auth_mode: "chatgpt".to_string(),
+                        openai_api_key: None,
+                        tokens: crate::auth::AuthTokens {
+                            id_token: "id-new".to_string(),
+                            access_token: "access-new".to_string(),
+                            refresh_token: Some("refresh-new".to_string()),
+                            account_id: "acct-devbench-17".to_string(),
+                        },
+                        last_refresh: "2026-04-13T02:52:15.012Z".to_string(),
+                    },
+                    added_at: "2026-04-13T02:52:15.012Z".to_string(),
+                    last_quota_usable: None,
+                    last_quota_summary: None,
+                    last_quota_blocker: None,
+                    last_quota_checked_at: None,
+                    last_quota_primary_left_percent: None,
+                    last_quota_next_refresh_at: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            find_created_pool_entry_index(&pool, "acct-shared", "devbench.17@astronlab.com",),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn completed_login_prefers_session_auth_file_over_default_auth_home() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        with_rotate_home("codex-rotate-session-auth-preferred", |rotate_home| {
+            let codex_home = rotate_home.join("codex-home");
+            let detached_home = rotate_home.join("detached-codex-home");
+            fs::create_dir_all(&codex_home).expect("create codex home");
+            fs::create_dir_all(&detached_home).expect("create detached codex home");
+            let previous_codex_home = std::env::var_os("CODEX_HOME");
+            unsafe {
+                std::env::set_var("CODEX_HOME", &codex_home);
+            }
+
+            let result = (|| -> Result<()> {
+                let shared_auth_path = codex_home.join("auth.json");
+                let detached_auth_path = detached_home.join("auth.json");
+                write_codex_auth(
+                    &shared_auth_path,
+                    &make_auth("dev.98@astronlab.com", "acct-98"),
+                )?;
+                write_codex_auth(
+                    &detached_auth_path,
+                    &make_auth("devbench.17@astronlab.com", "acct-devbench-17"),
+                )?;
+
+                let auth = load_auth_for_completed_login(&CompleteCodexLoginOutcome {
+                    codex_session: Some(CodexRotateAuthFlowSession {
+                        auth_file_path: Some(detached_auth_path.display().to_string()),
+                        ..CodexRotateAuthFlowSession::default()
+                    }),
+                    ..CompleteCodexLoginOutcome::default()
+                })?;
+
+                assert_eq!(
+                    summarize_codex_auth(&auth).email,
+                    "devbench.17@astronlab.com"
+                );
+                assert_eq!(extract_account_id_from_auth(&auth), "acct-devbench-17");
+                Ok(())
+            })();
+
+            match previous_codex_home {
+                Some(value) => unsafe {
+                    std::env::set_var("CODEX_HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_HOME");
+                },
+            }
+
+            result.expect("session auth should override default auth");
+        });
     }
 
     #[test]

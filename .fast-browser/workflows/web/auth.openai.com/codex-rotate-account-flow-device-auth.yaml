@@ -8342,6 +8342,28 @@ do:
             };
             let surface = await readSurface();
             const authUrl = String(state.vars?.codex_login?.auth_url || args.auth_url || "").trim();
+            if (surface.auth_prompt === true && surface.success !== true && surface.saw_oauth_consent !== true && surface.device_code_prompt !== true) {
+              for (const waitMs of [1000, 1500, 2500, 4000]) {
+                await page.waitForTimeout(waitMs).catch(() => {});
+                if (authUrl && waitMs >= 2500) {
+                  await page.goto(authUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+                  await page.waitForTimeout(1200).catch(() => {});
+                }
+                surface = await readSurface();
+                if (
+                  surface.auth_prompt !== true
+                  || surface.success === true
+                  || surface.saw_oauth_consent === true
+                  || surface.device_code_prompt === true
+                  || surface.state_mismatch === true
+                  || surface.retryable_timeout === true
+                  || surface.rate_limit_exceeded === true
+                  || surface.email_verification === true
+                ) {
+                  break;
+                }
+              }
+            }
             if (surface.add_phone_prompt === true && authUrl) {
               for (const waitMs of [2000, 4000, 8000, 12000]) {
                 await page.waitForTimeout(waitMs).catch(() => {});
