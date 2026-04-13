@@ -45,6 +45,7 @@ const ROTATE_STATE_VERSION: u8 = 4;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS: usize = 6;
+const FINAL_ADD_PHONE_CODEX_LOGIN_MAX_ATTEMPTS: usize = 10;
 const DEFAULT_CODEX_LOGIN_MAX_REPLAY_PASSES: usize = 5;
 const DEFAULT_CODEX_LOGIN_RETRY_DELAYS_MS: &[u64] = &[15_000, 30_000, 60_000, 120_000, 240_000];
 const DEFAULT_CODEX_LOGIN_VERIFICATION_RETRY_DELAYS_MS: &[u64] =
@@ -1958,7 +1959,9 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
     let mut allow_signup_recovery = prefer_signup_recovery.unwrap_or(false);
     let mut codex_session: Option<CodexRotateAuthFlowSession> = None;
     let result = (|| -> Result<CompleteCodexLoginOutcome> {
-        'attempts: for attempt in 1..=DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+        let mut max_attempts = DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS;
+        let mut attempt = 1usize;
+        'attempts: while attempt <= max_attempts {
             cancel::check_canceled()?;
             report_progress(
                 progress.as_ref(),
@@ -1966,7 +1969,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     format!("Completing Codex login in managed profile \"{profile_name}\".")
                 } else {
                     format!(
-                        "Retrying Codex login in managed profile \"{profile_name}\" (attempt {attempt}/{DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS})."
+                        "Retrying Codex login in managed profile \"{profile_name}\" (attempt {attempt}/{max_attempts})."
                     )
                 },
             );
@@ -2004,7 +2007,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         if maybe_reset_managed_runtime_after_failed_attempt(
                             profile_name,
                             Some(bridge_error_message.as_str()),
-                        )? && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+                        )? && attempt < max_attempts
                         {
                             report_progress(
                                 progress.as_ref(),
@@ -2013,6 +2016,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                                 ),
                             );
                             cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
+                            attempt += 1;
                             continue 'attempts;
                         }
                         return Err(error);
@@ -2123,7 +2127,8 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 }
 
                 if next_action == Some("retry_attempt") {
-                    if attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                    max_attempts = max_attempts.max(codex_login_max_attempts(retry_reason));
+                    if attempt < max_attempts {
                         let delay_ms = codex_login_retry_delay_ms(retry_reason, attempt);
                         let reset_session =
                             should_reset_codex_login_session_for_retry(retry_reason, attempt);
@@ -2148,6 +2153,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                             ),
                         );
                         cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
+                        attempt += 1;
                         continue 'attempts;
                     }
                     return Err(anyhow!(login_error_message(
@@ -2157,7 +2163,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 }
 
                 if state_mismatch_in_login_flow(&flow, error_message) {
-                    if attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                    if attempt < max_attempts {
                         let delay_ms = codex_login_retry_delay_ms(Some("state_mismatch"), attempt);
                         codex_session = None;
                         report_progress(
@@ -2171,6 +2177,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                             ),
                         );
                         cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
+                        attempt += 1;
                         continue 'attempts;
                     }
                     return Err(anyhow!(login_error_message(
@@ -2186,7 +2193,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
 
                 if let Some(message) = error_message {
                     if is_retryable_codex_login_workflow_error_message(message)
-                        && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+                        && attempt < max_attempts
                     {
                         let delay_ms = codex_login_retry_delay_ms(
                             Some("verification_artifact_pending"),
@@ -2200,11 +2207,10 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                             ),
                         );
                         cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
+                        attempt += 1;
                         continue 'attempts;
                     }
-                    if is_device_auth_rate_limited(message)
-                        && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
-                    {
+                    if is_device_auth_rate_limited(message) && attempt < max_attempts {
                         let delay_ms =
                             codex_login_retry_delay_ms(Some("device_auth_rate_limit"), attempt);
                         let reset_session = should_reset_device_auth_session_for_rate_limit(
@@ -2227,11 +2233,12 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                             ),
                         );
                         cancel::sleep_with_cancellation(Duration::from_millis(delay_ms))?;
+                        attempt += 1;
                         continue 'attempts;
                     }
                 }
 
-                if managed_runtime_reset_performed && attempt < DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS {
+                if managed_runtime_reset_performed && attempt < max_attempts {
                     report_progress(
                         progress.as_ref(),
                         format!(
@@ -2239,6 +2246,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         ),
                     );
                     cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
+                    attempt += 1;
                     continue 'attempts;
                 }
 
@@ -2277,6 +2285,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     codex_session: codex_session.clone().or(flow.codex_session.clone()),
                 });
             }
+            attempt += 1;
         }
         Err(anyhow!(
             "Codex browser login exhausted all retry attempts for {email}."
@@ -2957,6 +2966,14 @@ fn should_reset_codex_login_session_for_retry(retry_reason: Option<&str>, attemp
     retry_reason == Some("state_mismatch")
         || retry_reason == Some("final_add_phone")
         || (retry_reason == Some("retryable_timeout") && attempt >= 2)
+}
+
+fn codex_login_max_attempts(retry_reason: Option<&str>) -> usize {
+    if retry_reason == Some("final_add_phone") {
+        FINAL_ADD_PHONE_CODEX_LOGIN_MAX_ATTEMPTS
+    } else {
+        DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+    }
 }
 
 fn should_reset_device_auth_session_for_rate_limit(
@@ -6661,6 +6678,22 @@ end
             Some("final_add_phone"),
             1
         ));
+    }
+
+    #[test]
+    fn codex_login_retry_policy_extends_final_add_phone_budget() {
+        assert_eq!(
+            codex_login_max_attempts(None),
+            DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            codex_login_max_attempts(Some("retryable_timeout")),
+            DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            codex_login_max_attempts(Some("final_add_phone")),
+            FINAL_ADD_PHONE_CODEX_LOGIN_MAX_ATTEMPTS
+        );
     }
 
     #[test]

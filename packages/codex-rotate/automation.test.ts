@@ -1114,6 +1114,21 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
       "state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true",
     );
   });
+
+  test("minimal replacement OTP submit script reuses the proven login-stage detector literals", async () => {
+    const script = await loadMinimalStepScript(
+      "submit_login_verification_code_after_submit_failure",
+    );
+
+    expect(script).toContain("/^(localhost|127\\.0\\.0\\.1)$/i.test(host)");
+    expect(script).toContain("/\\/log-in(?:\\/|$)/i.test(path)");
+    expect(script).toContain('bodyText.split("\\n")');
+    expect(script).not.toContain(
+      "/^(localhost|127\\\\.0\\\\.0\\\\.1)$/i.test(host)",
+    );
+    expect(script).not.toContain("/\\\\/log-in(?:\\\\/|$)/i.test(path)");
+    expect(script).not.toContain('bodyText.split("\\\\n")');
+  });
 });
 
 describe("device-auth detached session seeding", () => {
