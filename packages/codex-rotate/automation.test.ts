@@ -20,8 +20,10 @@ import {
   isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
   resolveFastBrowserSkillPath,
+  shouldResetManagedProfileRuntimeForDaemonStatus,
   shouldResetFastBrowserBridgeInactivityTimer,
   shouldPromptForCodexRotateSecretUnlock,
+  terminateDaemonProcessAutonomously,
 } from "./automation.ts";
 
 setDefaultTimeout(30_000);
@@ -681,6 +683,100 @@ describe("fast-browser daemon event visibility", () => {
       ),
     ).toBe(true);
   });
+
+  test("resets a managed profile daemon stuck on a disconnected active request", () => {
+    expect(
+      shouldResetManagedProfileRuntimeForDaemonStatus({
+        ok: true,
+        lifecycle_state: "recovering",
+        mode: null,
+        request_queue: {
+          active: {
+            id: 11,
+            method: "run",
+            workflow_ref:
+              "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+            running_for_ms: 5_697_672,
+            disconnected_at: 1_776_083_443_084,
+            disconnect_reason: "socket_ended",
+          },
+          queued: [],
+          queued_count: 0,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  test("does not reset a daemon with a live active request", () => {
+    expect(
+      shouldResetManagedProfileRuntimeForDaemonStatus({
+        ok: true,
+        lifecycle_state: "warm",
+        mode: "headless",
+        request_queue: {
+          active: {
+            id: 12,
+            method: "run",
+            workflow_ref:
+              "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
+            running_for_ms: 45_000,
+            disconnected_at: null,
+            disconnect_reason: null,
+          },
+          queued: [],
+          queued_count: 0,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("does not reset a daemon whose disconnected request is still fresh", () => {
+    expect(
+      shouldResetManagedProfileRuntimeForDaemonStatus({
+        ok: true,
+        lifecycle_state: "recovering",
+        mode: null,
+        request_queue: {
+          active: {
+            id: 13,
+            method: "run",
+            workflow_ref:
+              "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
+            running_for_ms: 5_000,
+            disconnected_at: 1_776_083_443_084,
+            disconnect_reason: "socket_ended",
+          },
+          queued: [],
+          queued_count: 0,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test("autonomously terminates a stale daemon process from its pid file", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-daemon-"));
+    const pidPath = join(fixtureRoot, "daemon.pid");
+    const child = spawnSync("sh", ["-c", "sleep 30 & echo $!"], {
+      encoding: "utf8",
+    });
+    expect(child.status).toBe(0);
+    const pid = Number.parseInt((child.stdout || "").trim(), 10);
+    expect(Number.isInteger(pid) && pid > 0).toBe(true);
+    writeFileSync(pidPath, `${pid}\n`);
+
+    try {
+      expect(await terminateDaemonProcessAutonomously(pidPath, 2_000)).toBe(
+        true,
+      );
+      const probe = spawnSync("kill", ["-0", String(pid)], {
+        stdio: "ignore",
+      });
+      expect(probe.status).not.toBe(0);
+    } finally {
+      spawnSync("kill", ["-9", String(pid)], { stdio: "ignore" });
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("fast-browser workflow failures", () => {
@@ -1057,6 +1153,7 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
         expect.arrayContaining([
           "https://auth.openai.com",
           "https://chatgpt.com",
+          "https://chat.openai.com",
         ]),
       );
     }
@@ -1090,6 +1187,7 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
           expect.arrayContaining([
             "https://auth.openai.com",
             "https://chatgpt.com",
+            "https://chat.openai.com",
           ]),
         );
       }
@@ -1187,6 +1285,141 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     expect(returnStep?.with?.body?.url || "").toContain(
       "classify_after_login_verification_retry_gate",
     );
+  });
+
+  test("minimal flow deletes used OTP emails after successful signup and replayed-login submits", async () => {
+    const workflow = await loadWorkflow(minimalWorkflowPath);
+    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
+      [
+        "delete_signup_verification_artifact",
+        "collect_signup_verification_artifact",
+        "return_to_signup_after_delete_signup_verification_artifact",
+        "classify_after_signup_verification_gate",
+      ],
+      [
+        "delete_login_verification_artifact",
+        "collect_login_verification_artifact",
+        "return_to_login_after_delete_login_verification_artifact",
+        "classify_after_login_verification_gate",
+      ],
+      [
+        "delete_login_verification_artifact_after_submit_failure",
+        "recollect_login_verification_artifact_after_submit_failure",
+        "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
+        "classify_after_login_verification_retry_gate",
+      ],
+    ] as const) {
+      const deleteStep = findWorkflowStep<{
+        call?: string;
+        with?: { input?: Record<string, string> };
+      }>(workflow, deleteStepId);
+      const returnStep = findWorkflowStep<{
+        with?: { body?: { url?: string } };
+      }>(workflow, returnStepId);
+
+      expect(deleteStep?.call).toBe(
+        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+      );
+      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+        sourceStepId,
+      );
+      expect(deleteStep?.with?.input?.search_query || "").toContain(
+        "from:openai to:",
+      );
+      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+    }
+  });
+
+  test("stepwise flow deletes used OTP emails after successful signup and replayed-login submits", async () => {
+    const workflow = await loadWorkflow(stepwiseWorkflowPath);
+    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
+      [
+        "delete_signup_verification_artifact",
+        "collect_signup_verification_artifact",
+        "return_to_signup_after_delete_signup_verification_artifact",
+        "classify_after_signup_verification_gate",
+      ],
+      [
+        "delete_login_verification_artifact",
+        "collect_login_verification_artifact",
+        "return_to_login_after_delete_login_verification_artifact",
+        "classify_after_login_verification_gate",
+      ],
+      [
+        "delete_login_verification_artifact_after_submit_failure",
+        "recollect_login_verification_artifact_after_submit_failure",
+        "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
+        "classify_after_login_verification_retry_gate",
+      ],
+    ] as const) {
+      const deleteStep = findWorkflowStep<{
+        call?: string;
+        with?: { input?: Record<string, string> };
+      }>(workflow, deleteStepId);
+      const returnStep = findWorkflowStep<{
+        with?: { body?: { url?: string } };
+      }>(workflow, returnStepId);
+
+      expect(deleteStep?.call).toBe(
+        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+      );
+      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+        sourceStepId,
+      );
+      expect(deleteStep?.with?.input?.search_query || "").toContain(
+        "from:openai to:",
+      );
+      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+    }
+  });
+
+  test("device-auth flow deletes used OTP emails after successful prepare and final verification submits", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
+      [
+        "delete_prepare_login_verification_artifact",
+        "collect_prepare_login_verification_artifact",
+        "return_to_prepare_after_delete_prepare_login_verification_artifact",
+        "classify_prepare_after_login_verification_submit",
+      ],
+      [
+        "delete_prepare_login_verification_artifact_after_incorrect_code",
+        "recollect_prepare_login_verification_artifact_after_incorrect_code",
+        "return_to_prepare_after_delete_prepare_login_verification_artifact_after_incorrect_code",
+        "classify_prepare_after_login_verification_retry",
+      ],
+      [
+        "delete_device_auth_login_verification_artifact",
+        "collect_device_auth_login_verification_artifact",
+        "return_to_device_auth_after_delete_login_verification_artifact",
+        "classify_device_auth_after_login_verification_submit",
+      ],
+      [
+        "delete_device_auth_login_verification_artifact_after_incorrect_code",
+        "recollect_device_auth_login_verification_artifact_after_incorrect_code",
+        "return_to_device_auth_after_delete_login_verification_artifact_after_incorrect_code",
+        "classify_device_auth_after_login_verification_retry",
+      ],
+    ] as const) {
+      const deleteStep = findWorkflowStep<{
+        call?: string;
+        with?: { input?: Record<string, string> };
+      }>(workflow, deleteStepId);
+      const returnStep = findWorkflowStep<{
+        with?: { body?: { url?: string } };
+      }>(workflow, returnStepId);
+
+      expect(deleteStep?.call).toBe(
+        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+      );
+      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+        sourceStepId,
+      );
+      expect(deleteStep?.with?.input?.search_query || "").toContain(
+        "from:openai to:",
+      );
+      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+    }
   });
 
   test("minimal keeps an in-workflow replayed-login OTP recollection path", async () => {
@@ -2572,6 +2805,70 @@ describe("original workflow verification helper", () => {
     expect(result.code).toBe("111222");
     expect(result.next_stage).toBe("oauth_consent");
   });
+
+  test("fills otp-named segmented replayed-login OTP inputs and advances the flow", async () => {
+    const result = await runOriginalStepScript(
+      "submit_login_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input name="otp-1" maxlength="1" />
+              <input name="otp-2" maxlength="1" />
+              <input name="otp-3" maxlength="1" />
+              <input name="otp-4" maxlength="1" />
+              <input name="otp-5" maxlength="1" />
+              <input name="otp-6" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const sync = () => {
+                button.disabled = readCode().length < 6;
+              };
+              inputs.forEach((input, index) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  sync();
+                  if (input.value && index + 1 < inputs.length) {
+                    inputs[index + 1].focus();
+                  }
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "111222") {
+                  document.body.innerHTML =
+                    '<h1>Sign in to Codex with ChatGPT</h1><button>Continue to Codex</button>';
+                }
+              });
+              sync();
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_login_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  code: "111222",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("111222");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
 });
 
 describe("stepwise workflow verification helper", () => {
@@ -3787,6 +4084,34 @@ describe("device-auth workflow", () => {
     );
     expect(workflowText).toContain(
       "state.vars.prepare_login_verification_code",
+    );
+  });
+
+  test("waits after resending the first device-auth login verification email before opening Gmail", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "wait_after_resend_device_auth_login_verification_email",
+    );
+    expect(workflowText).toContain(
+      "Allow Gmail to settle after resending the device-auth login verification email before collecting the OTP.",
+    );
+    expect(workflowText).toContain(
+      "state.steps.resend_device_auth_login_verification_email?.action?.ok === true",
+    );
+  });
+
+  test("waits after resending the replacement device-auth verification email before reopening Gmail", () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "wait_after_resend_device_auth_login_verification_email_after_incorrect_code",
+    );
+    expect(workflowText).toContain(
+      "Allow Gmail to settle after resending the replacement device-auth verification email before recollecting the OTP.",
+    );
+    expect(workflowText).toContain(
+      "state.steps.resend_device_auth_login_verification_email_after_incorrect_code?.action?.ok === true",
     );
   });
 
@@ -5470,6 +5795,26 @@ describe("device-auth workflow", () => {
     expect(String(result.current_url || "")).toContain("email-verification");
   });
 
+  test("original signup password helper matches the strict stepwise navigation guard", async () => {
+    const originalWorkflow = await loadWorkflow(originalWorkflowPath);
+    const stepwiseWorkflow = await loadWorkflow(stepwiseWorkflowPath);
+
+    const originalScript =
+      originalWorkflow.use?.functions?.submit_openai_password_form?.with?.body
+        ?.script;
+    const stepwiseScript =
+      stepwiseWorkflow.use?.functions?.submit_openai_password_form?.with?.body
+        ?.script;
+
+    expect(String(originalScript || "")).toContain(
+      "Execution context was destroyed|Cannot find context|Target closed|Frame was detached",
+    );
+    expect(String(originalScript || "")).not.toContain(
+      "Timeout \\\\d+ms exceeded",
+    );
+    expect(originalScript).toBe(stepwiseScript);
+  });
+
   test("device-auth signup password submit treats direct navigation to email verification as progress", async () => {
     const result = await runWorkflowStepScript(
       deviceAuthWorkflowPath,
@@ -5515,6 +5860,48 @@ describe("device-auth workflow", () => {
     expect(result.ok).toBe(true);
     expect(result.next_stage).toBe("email_verification");
     expect(String(result.current_url || "")).toContain("email-verification");
+  });
+
+  test("device-auth prepare verification submit reuses the code already present in the page when workflow state lost it", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_prepare_login_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent to devbench.23@astronlab.com</p>
+            <input inputmode="numeric" aria-label="Code" value="654321" />
+            <button id="continue" type="button">Continue</button>
+            <script>
+              const input = document.querySelector("input");
+              document.getElementById("continue").addEventListener("click", () => {
+                if (String(input.value || "") === "654321") {
+                  document.body.innerHTML =
+                    '<h1>Phone number required</h1><p>To continue, please add a phone number.</p>';
+                  history.replaceState({}, "", "https://auth.openai.com/add-phone");
+                }
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          fill_prepare_login_verification_code: {
+            action: {
+              ok: true,
+            },
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("add_phone");
+    expect(String(result.current_url || "")).toContain("add-phone");
   });
 
   test("classifies an authenticated ChatGPT settings shell after reused login", async () => {

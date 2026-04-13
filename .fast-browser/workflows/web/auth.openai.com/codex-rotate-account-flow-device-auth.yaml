@@ -5138,15 +5138,6 @@ do:
                 || ""
               );
             };
-            const code = String(
-              state.vars.prepare_login_verification_code
-              || extractVerificationCode(state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action)
-              || extractVerificationCode(state.steps.collect_prepare_login_verification_artifact?.action)
-              || ""
-            ).replace(/\D+/g, "").slice(0, 6);
-            if (code.length < 6) {
-              throw new Error("prepare-verification-code-missing");
-            }
             const verificationSelector = 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]';
             const detectStage = async () => await page.evaluate((selector) => {
               const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -5223,13 +5214,24 @@ do:
                 await locator.pressSequentially(value, { delay: 45 }).catch(() => {});
               }
             };
-            const readCombinedValue = async () => {
+            const readCombinedValue = async (maxLength = 6) => {
               const parts = [];
               for (const locator of inputs.length ? inputs : [input]) {
                 parts.push(String(await locator.inputValue().catch(() => "")).replace(/\D+/g, ""));
               }
-              return parts.join("").slice(0, code.length);
+              return parts.join("").slice(0, maxLength);
             };
+            const pageCode = String(await readCombinedValue(6).catch(() => "")).replace(/\D+/g, "").slice(0, 6);
+            const code = String(
+              state.vars?.prepare_login_verification_code
+              || extractVerificationCode(state.steps.recollect_prepare_login_verification_artifact_after_missing_code?.action)
+              || extractVerificationCode(state.steps.collect_prepare_login_verification_artifact?.action)
+              || pageCode
+              || ""
+            ).replace(/\D+/g, "").slice(0, 6);
+            if (code.length < 6) {
+              throw new Error("prepare-verification-code-missing");
+            }
             if (inputs.length > 1) {
               for (let index = 0; index < inputs.length && index < code.length; index += 1) {
                 await fillField(inputs[index], code[index]);
@@ -5238,7 +5240,7 @@ do:
               await fillField(input, code);
             }
             await page.waitForTimeout(150).catch(() => {});
-            let value = await readCombinedValue();
+            let value = await readCombinedValue(code.length);
             if (value !== code && inputs.length > 1) {
               await input.click({ timeout: 1500 }).catch(() => {});
               await input.press("Meta+A").catch(() => {});
@@ -5246,7 +5248,7 @@ do:
               await input.press("Backspace").catch(() => {});
               await input.pressSequentially(code, { delay: 45 }).catch(() => {});
               await page.waitForTimeout(150).catch(() => {});
-              value = await readCombinedValue();
+              value = await readCombinedValue(code.length);
             }
             if (value.length < 6 || value !== code) {
               throw new Error("prepare-verification-input-mismatch:" + (value || "empty"));
@@ -5373,6 +5375,34 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after submitting the verification OTP."
+  - delete_prepare_login_verification_artifact:
+      if: "${state.steps.collect_prepare_login_verification_artifact?.action?.ok === true && state.steps.collect_prepare_login_verification_artifact?.action?.skipped !== true && state.steps.submit_prepare_login_verification_code?.action?.ok === true && state.steps.classify_prepare_after_login_verification_submit?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the used prepare-branch OTP email from Gmail after the verification step succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_message_url || null}"
+  - return_to_prepare_after_delete_prepare_login_verification_artifact:
+      if: "${state.steps.delete_prepare_login_verification_artifact?.action?.ok === true && state.steps.delete_prepare_login_verification_artifact?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active prepare verification page after deleting the used OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_prepare_after_login_verification_submit?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recollect_prepare_login_verification_artifact_after_incorrect_code:
       if: "${state.steps.classify_prepare_after_login_verification_submit?.action?.stage === 'email_verification'}"
       metadata:
@@ -5720,6 +5750,34 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after retrying the verification OTP."
+  - delete_prepare_login_verification_artifact_after_incorrect_code:
+      if: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.skipped !== true && state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.classify_prepare_after_login_verification_retry?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the replacement prepare-branch OTP email from Gmail after the retry succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_url || null}"
+  - return_to_prepare_after_delete_prepare_login_verification_artifact_after_incorrect_code:
+      if: "${state.steps.delete_prepare_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.delete_prepare_login_verification_artifact_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active prepare verification page after deleting the replacement OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_prepare_after_login_verification_retry?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - fill_prepare_signup_about_you:
       if: "${state.steps.classify_prepare_after_signup_password_gate?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_submit?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_retry?.action?.follow_up_step === true}"
       metadata:
@@ -7232,6 +7290,18 @@ do:
             }
             await page.waitForTimeout(1800).catch(() => {});
             return result;
+  - wait_after_resend_device_auth_login_verification_email:
+      if: "${state.steps.resend_device_auth_login_verification_email?.action?.ok === true && state.steps.resend_device_auth_login_verification_email?.action?.skipped !== true}"
+      metadata:
+        description: Allow Gmail to settle after resending the device-auth login verification email before collecting the OTP.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            await page.waitForTimeout(10000).catch(() => {});
+            return { ok: true, waited_ms: 10000 };
   - collect_device_auth_login_verification_artifact:
       if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email?.action?.email_verification === true || state.steps.classify_device_auth_after_login_email_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_login_password_gate?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_choice?.action?.email_verification === true || state.steps.classify_device_auth_after_recovery_timeout_retry?.action?.email_verification === true || state.steps.classify_device_auth_after_timeout_reopen?.action?.email_verification === true)}"
       metadata:
@@ -7651,6 +7721,34 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login flow after submitting the verification OTP."
+  - delete_device_auth_login_verification_artifact:
+      if: "${state.steps.collect_device_auth_login_verification_artifact?.action?.ok === true && state.steps.collect_device_auth_login_verification_artifact?.action?.skipped !== true && state.steps.submit_device_auth_login_verification_code?.action?.ok === true && state.steps.classify_device_auth_after_login_verification_submit?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the used device-auth login OTP email from Gmail after the verification step succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_message_url || null}"
+  - return_to_device_auth_after_delete_login_verification_artifact:
+      if: "${state.steps.delete_device_auth_login_verification_artifact?.action?.ok === true && state.steps.delete_device_auth_login_verification_artifact?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active device-auth verification page after deleting the used OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_device_auth_after_login_verification_submit?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recover_device_auth_login_verification_timeout:
       if: "${state.steps.classify_device_auth_after_login_verification_submit?.action?.retryable_timeout === true}"
       metadata:
@@ -7714,6 +7812,18 @@ do:
             }
             await page.waitForTimeout(1800).catch(() => {});
             return result;
+  - wait_after_resend_device_auth_login_verification_email_after_incorrect_code:
+      if: "${state.steps.resend_device_auth_login_verification_email_after_incorrect_code?.action?.ok === true && state.steps.resend_device_auth_login_verification_email_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        description: Allow Gmail to settle after resending the replacement device-auth verification email before recollecting the OTP.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            await page.waitForTimeout(10000).catch(() => {});
+            return { ok: true, waited_ms: 10000 };
   - recollect_device_auth_login_verification_artifact_after_incorrect_code:
       if: "${state.steps.resend_device_auth_login_verification_email_after_incorrect_code?.action?.ok === true && state.steps.resend_device_auth_login_verification_email_after_incorrect_code?.action?.skipped !== true}"
       metadata:
@@ -8084,6 +8194,34 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login flow after retrying the verification OTP."
+  - delete_device_auth_login_verification_artifact_after_incorrect_code:
+      if: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.skipped !== true && state.steps.submit_device_auth_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.classify_device_auth_after_login_verification_retry?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the replacement device-auth login OTP email from Gmail after the retry succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_url || null}"
+  - return_to_device_auth_after_delete_login_verification_artifact_after_incorrect_code:
+      if: "${state.steps.delete_device_auth_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.delete_device_auth_login_verification_artifact_after_incorrect_code?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active device-auth verification page after deleting the replacement OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_device_auth_after_login_verification_retry?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recover_device_auth_login_verification_retry_timeout:
       if: "${state.steps.classify_device_auth_after_login_verification_retry?.action?.retryable_timeout === true}"
       metadata:

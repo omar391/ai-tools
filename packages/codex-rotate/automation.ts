@@ -290,10 +290,32 @@ interface FastBrowserDaemonRunResponse {
   };
 }
 
+export interface FastBrowserProfileDaemonStatus {
+  ok?: boolean;
+  lifecycle_state?: string | null;
+  mode?: string | null;
+  request_queue?: {
+    active?: {
+      id?: number | null;
+      method?: string | null;
+      workflow_ref?: string | null;
+      started_at?: number | null;
+      running_for_ms?: number | null;
+      disconnected_at?: number | null;
+      disconnect_reason?: string | null;
+    } | null;
+    queued?: Array<Record<string, unknown>> | null;
+    queued_count?: number | null;
+  } | null;
+}
+
 const FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS = Number(
   process.env.CODEX_ROTATE_FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS || 60_000,
 );
 const FAST_BROWSER_EVENT_PREFIX = "__FAST_BROWSER_EVENT__";
+const STALE_FAST_BROWSER_DISCONNECTED_REQUEST_MS = Number(
+  process.env.CODEX_ROTATE_FAST_BROWSER_STALE_REQUEST_MS || 15_000,
+);
 
 export interface CodexRotateAuthFlowSession {
   auth_url?: string | null;
@@ -359,6 +381,68 @@ export function shouldResetFastBrowserBridgeInactivityTimer(
     event.phase === "daemon" &&
     (event.status === "heartbeat" || event.status === "queued")
   );
+}
+
+export function shouldResetManagedProfileRuntimeForDaemonStatus(
+  status: FastBrowserProfileDaemonStatus | null | undefined,
+): boolean {
+  if (!status?.ok) {
+    return false;
+  }
+  const activeRequest = status.request_queue?.active;
+  if (!activeRequest?.disconnected_at) {
+    return false;
+  }
+  const runningForMs =
+    typeof activeRequest.running_for_ms === "number"
+      ? activeRequest.running_for_ms
+      : null;
+  if (
+    !Number.isFinite(runningForMs) ||
+    (runningForMs ?? 0) < STALE_FAST_BROWSER_DISCONNECTED_REQUEST_MS
+  ) {
+    return false;
+  }
+  const lifecycleState =
+    typeof status.lifecycle_state === "string"
+      ? status.lifecycle_state.trim().toLowerCase()
+      : "";
+  return (
+    lifecycleState === "recovering" ||
+    lifecycleState === "warming" ||
+    !String(status.mode || "").trim()
+  );
+}
+
+async function maybeResetManagedProfileRuntimeForDaemonStatus(
+  profileName: string,
+): Promise<boolean> {
+  try {
+    const { getProfileDaemonStatus } = await import(
+      FAST_BROWSER_DAEMON_CLIENT_MODULE
+    );
+    const status = (await getProfileDaemonStatus({
+      profileName,
+    })) as FastBrowserProfileDaemonStatus | null;
+    if (!shouldResetManagedProfileRuntimeForDaemonStatus(status)) {
+      return false;
+    }
+    process.stderr.write(
+      `[codex-rotate] resetting stale fast-browser managed profile daemon for "${profileName}".\n`,
+    );
+    await resetManagedProfileRuntime(profileName);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /did not accept a fast-browser shutdown request|still running after/i.test(
+        error.message,
+      )
+    ) {
+      throw error;
+    }
+    return false;
+  }
 }
 
 function ensureRotateDir(): void {
@@ -824,6 +908,19 @@ function requestDaemonProcessTermination(pidPath: string): boolean {
   }
 }
 
+function forceKillDaemonProcess(pidPath: string): boolean {
+  const pid = readPidIfExists(pidPath);
+  if (!pid || !isProcessAlive(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForManagedProfileShutdown(
   pidPath: string,
   timeoutMs: number,
@@ -842,6 +939,22 @@ async function waitForManagedProfileShutdown(
   }
 
   return !isProcessAlive(pid);
+}
+
+export async function terminateDaemonProcessAutonomously(
+  pidPath: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const pid = readPidIfExists(pidPath);
+  if (!pid || !isProcessAlive(pid)) {
+    return true;
+  }
+  requestDaemonProcessTermination(pidPath);
+  if (await waitForManagedProfileShutdown(pidPath, timeoutMs)) {
+    return true;
+  }
+  forceKillDaemonProcess(pidPath);
+  return await waitForManagedProfileShutdown(pidPath, timeoutMs);
 }
 
 async function resetFastBrowserSecretBroker(): Promise<void> {
@@ -918,19 +1031,16 @@ export async function resetManagedProfileRuntime(
 
   if (!shutdownAccepted) {
     await requestManagedChromeShutdown(profileName);
-    if (!requestDaemonProcessTermination(pidPath) && hadPid) {
-      throw new Error(
-        `Managed profile "${profileName}" did not accept a fast-browser shutdown request. ` +
-          "Quit the managed browser normally and retry.",
-      );
-    }
   }
 
-  const exitedCleanly = await waitForManagedProfileShutdown(pidPath, 20_000);
+  const exitedCleanly = await terminateDaemonProcessAutonomously(
+    pidPath,
+    10_000,
+  );
   if (!exitedCleanly) {
     throw new Error(
-      `Managed profile "${profileName}" is still running after a normal shutdown request. ` +
-        "Quit the managed browser normally and retry.",
+      `Managed profile "${profileName}" is still running after autonomous shutdown escalation. ` +
+        "Inspect the managed daemon and browser processes for that profile.",
     );
   }
 
@@ -1242,6 +1352,7 @@ async function runFastBrowserDaemonWorkflow(
   },
 ): Promise<FastBrowserRunResult> {
   ensureFastBrowserPlaywright();
+  await maybeResetManagedProfileRuntimeForDaemonStatus(profileName);
   const bridgeScript = `
     const ownerPid = ${JSON.stringify(process.pid)};
     if (Number.isInteger(ownerPid) && ownerPid > 1) {
