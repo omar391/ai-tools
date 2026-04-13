@@ -2156,6 +2156,19 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         attempt += 1;
                         continue 'attempts;
                     }
+                    if should_skip_account_after_retry_exhaustion(retry_reason) {
+                        return Err(anyhow::Error::new(WorkflowSkipAccountError::new(
+                            login_error_message(
+                                error_message,
+                                format!(
+                                    "The workflow requested skipping {email} after exhausting final add-phone retries{}.",
+                                    current_url
+                                        .map(|value| format!(" ({value})"))
+                                        .unwrap_or_default()
+                                ),
+                            ),
+                        )));
+                    }
                     return Err(anyhow!(login_error_message(
                         error_message,
                         format!("OpenAI could not complete the Codex login for {email}.")
@@ -2974,6 +2987,10 @@ fn codex_login_max_attempts(retry_reason: Option<&str>) -> usize {
     } else {
         DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS
     }
+}
+
+fn should_skip_account_after_retry_exhaustion(retry_reason: Option<&str>) -> bool {
+    retry_reason == Some("final_add_phone")
 }
 
 fn should_reset_device_auth_session_for_rate_limit(
@@ -6694,6 +6711,17 @@ end
             codex_login_max_attempts(Some("final_add_phone")),
             FINAL_ADD_PHONE_CODEX_LOGIN_MAX_ATTEMPTS
         );
+    }
+
+    #[test]
+    fn codex_login_retry_policy_skips_account_after_final_add_phone_budget() {
+        assert!(!should_skip_account_after_retry_exhaustion(None));
+        assert!(!should_skip_account_after_retry_exhaustion(Some(
+            "retryable_timeout"
+        )));
+        assert!(should_skip_account_after_retry_exhaustion(Some(
+            "final_add_phone"
+        )));
     }
 
     #[test]
