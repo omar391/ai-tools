@@ -6,7 +6,7 @@ mod tray_service;
 pub use build::{
     daemon_socket_is_older_than_binary, local_refresh_disabled,
     maybe_start_background_release_build, preferred_release_binary, rebuild_local_binary,
-    sources_newer_than_binary,
+    resolve_rebuilt_local_binary, sources_newer_than_binary, supports_live_local_refresh,
 };
 pub use process::{
     spawn_detached_process, stop_other_local_daemons, stop_running_daemons, stop_running_trays,

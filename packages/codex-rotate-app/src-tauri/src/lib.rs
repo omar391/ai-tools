@@ -2,7 +2,7 @@ use codex_rotate_refresh::{
     current_process_local_build, daemon_socket_is_older_than_binary, detect_local_build,
     local_refresh_disabled, maybe_start_background_release_build, preferred_release_binary,
     rebuild_local_binary, schedule_tray_relaunch_process, sources_newer_than_binary,
-    spawn_detached_process, stop_running_daemons, TargetKind,
+    spawn_detached_process, stop_running_daemons, supports_live_local_refresh, TargetKind,
 };
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, subscribe, SnapshotMessageKind, StatusSnapshot,
@@ -234,6 +234,9 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
     let Some(build) = current_process_local_build(TargetKind::Tray) else {
         return Ok(false);
     };
+    if !supports_live_local_refresh(&build) {
+        return Ok(false);
+    }
     let sources_newer_than_binary = sources_newer_than_binary(&build)
         .map_err(|error| format!("Failed to inspect local tray freshness: {error}"))?;
     if sources_newer_than_binary {

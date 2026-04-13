@@ -8,7 +8,8 @@ use codex_rotate_core::paths::resolve_paths;
 
 use crate::process::{process_is_running, spawn_detached_command};
 use crate::targets::{
-    manifest_path, package_name, tracked_source_paths, BuildProfile, LocalBinaryBuild,
+    detect_local_build, manifest_path, package_name, tracked_source_paths, BuildProfile,
+    LocalBinaryBuild, TargetKind,
 };
 
 const FRESHNESS_TOLERANCE: Duration = Duration::from_secs(1);
@@ -59,6 +60,29 @@ pub fn rebuild_local_binary(build: &LocalBinaryBuild) -> Result<()> {
         package_name(build.target),
         build.repo_root.display()
     ))
+}
+
+pub fn resolve_rebuilt_local_binary(
+    current_binary: &Path,
+    target: TargetKind,
+) -> Result<Option<PathBuf>> {
+    if local_refresh_disabled() {
+        return Ok(None);
+    }
+
+    let Some(build) = detect_local_build(current_binary, target) else {
+        return Ok(None);
+    };
+    if !sources_newer_than_binary(&build)? {
+        return Ok(None);
+    }
+
+    rebuild_local_binary(&build)?;
+    Ok(Some(build.binary_path.clone()))
+}
+
+pub fn supports_live_local_refresh(build: &LocalBinaryBuild) -> bool {
+    build.profile == BuildProfile::Debug
 }
 
 pub fn maybe_start_background_release_build(build: &LocalBinaryBuild) -> Result<bool> {
@@ -277,7 +301,7 @@ fn is_meaningfully_newer(left: SystemTime, right: SystemTime) -> bool {
 mod tests {
     use super::*;
     use crate::targets::{detect_local_build, TargetKind};
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, OnceLock};
     use std::thread;
 
@@ -293,12 +317,143 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_refresh_is_only_enabled_for_debug_builds() {
+        let repo_root = PathBuf::from("/tmp/codex-rotate-live-refresh");
+        let debug_build = LocalBinaryBuild {
+            repo_root: repo_root.clone(),
+            profile: BuildProfile::Debug,
+            binary_path: repo_root.join("target/debug/codex-rotate"),
+            target: TargetKind::Cli,
+        };
+        let release_build = LocalBinaryBuild {
+            repo_root,
+            profile: BuildProfile::Release,
+            binary_path: PathBuf::from(
+                "/tmp/codex-rotate-live-refresh/target/release/codex-rotate",
+            ),
+            target: TargetKind::Cli,
+        };
+
+        assert!(supports_live_local_refresh(&debug_build));
+        assert!(!supports_live_local_refresh(&release_build));
+    }
+
+    fn with_env_var<T>(
+        name: &str,
+        value: Option<&OsStr>,
+        test: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = std::env::var_os(name);
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        let result = test();
+        restore_var(name, previous);
+        result
+    }
+
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
+
+    struct LocalCliBuildFixture {
+        repo_root: PathBuf,
+        binary_path: PathBuf,
+        tracked_source_path: PathBuf,
+    }
+
+    impl LocalCliBuildFixture {
+        fn new(prefix: &str) -> Self {
+            let repo_root = unique_temp_dir(prefix);
+            let binary_path = repo_root.join("target").join("debug").join("codex-rotate");
+            let tracked_source_path = repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-core")
+                .join("src")
+                .join("lib.rs");
+
+            fs::create_dir_all(binary_path.parent().expect("binary parent"))
+                .expect("create target dir");
+            fs::create_dir_all(tracked_source_path.parent().expect("source parent"))
+                .expect("create source dir");
+            fs::create_dir_all(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-runtime")
+                    .join("src"),
+            )
+            .expect("create runtime src");
+            fs::create_dir_all(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli")
+                    .join("src"),
+            )
+            .expect("create cli src");
+            fs::write(repo_root.join("Cargo.toml"), "").expect("write root cargo");
+            fs::write(repo_root.join("Cargo.lock"), "").expect("write lock");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-core")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write core cargo");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-runtime")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write runtime cargo");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write cli cargo");
+            fs::write(&binary_path, "").expect("write binary");
+
+            Self {
+                repo_root,
+                binary_path,
+                tracked_source_path,
+            }
+        }
+
+        fn mark_sources_stale(&self) {
+            thread::sleep(FRESHNESS_TOLERANCE + Duration::from_millis(50));
+            fs::write(&self.tracked_source_path, "pub fn changed() {}")
+                .expect("write stale source");
+        }
+    }
+
+    impl Drop for LocalCliBuildFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.repo_root).ok();
+        }
     }
 
     #[test]
@@ -486,6 +641,109 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_rebuilt_local_binary_returns_none_when_binary_is_current() {
+        let fixture = LocalCliBuildFixture::new("codex-rotate-current-local-binary");
+        let resolved =
+            resolve_rebuilt_local_binary(&fixture.binary_path, TargetKind::Cli).expect("resolve");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_rebuilt_local_binary_respects_disable_env() {
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-disabled-local-binary");
+        fixture.mark_sources_stale();
+
+        with_env_var(
+            "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
+            Some(OsStr::new("1")),
+            || {
+                let resolved = resolve_rebuilt_local_binary(&fixture.binary_path, TargetKind::Cli)
+                    .expect("resolve");
+                assert!(resolved.is_none());
+                Ok(())
+            },
+        )
+        .expect("disable refresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rebuilt_local_binary_rebuilds_stale_cli_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-rebuilt-local-binary");
+        let cargo_script = fixture.repo_root.join("fake-cargo.sh");
+        let cargo_log = fixture.repo_root.join("cargo.log");
+        fixture.mark_sources_stale();
+        fs::write(
+            &cargo_script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ntouch \"{}\"\n",
+                cargo_log.display(),
+                fixture.binary_path.display()
+            ),
+        )
+        .expect("write cargo script");
+        let mut permissions = fs::metadata(&cargo_script)
+            .expect("cargo script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cargo_script, permissions).expect("chmod cargo script");
+
+        with_env_var(
+            "CODEX_ROTATE_CARGO_BIN",
+            Some(cargo_script.as_os_str()),
+            || {
+                let resolved = resolve_rebuilt_local_binary(&fixture.binary_path, TargetKind::Cli)
+                    .expect("resolve");
+                assert_eq!(resolved.as_deref(), Some(fixture.binary_path.as_path()));
+                let cargo_args = fs::read_to_string(&cargo_log).expect("read cargo log");
+                assert!(cargo_args.contains("build"));
+                assert!(cargo_args.contains("codex-rotate-cli/Cargo.toml"));
+                Ok(())
+            },
+        )
+        .expect("rebuild stale binary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rebuilt_local_binary_propagates_rebuild_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-failed-local-binary");
+        let cargo_script = fixture.repo_root.join("fake-cargo-fail.sh");
+        fixture.mark_sources_stale();
+        fs::write(&cargo_script, "#!/bin/sh\nexit 23\n").expect("write cargo script");
+        let mut permissions = fs::metadata(&cargo_script)
+            .expect("cargo script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cargo_script, permissions).expect("chmod cargo script");
+
+        with_env_var(
+            "CODEX_ROTATE_CARGO_BIN",
+            Some(cargo_script.as_os_str()),
+            || {
+                let error = resolve_rebuilt_local_binary(&fixture.binary_path, TargetKind::Cli)
+                    .expect_err("expected rebuild failure");
+                assert!(error.to_string().contains("build exited with status"));
+                Ok(())
+            },
+        )
+        .expect("failure assertion");
     }
 
     #[test]

@@ -40,7 +40,7 @@ use codex_rotate_refresh::{
     current_process_local_build, daemon_socket_is_older_than_binary,
     ensure_tray_process_registered, local_refresh_disabled, maybe_start_background_release_build,
     preferred_release_binary, rebuild_local_binary, sources_newer_than_binary,
-    stop_other_local_daemons, TargetKind, INSTANCE_HOME_ARG,
+    stop_other_local_daemons, supports_live_local_refresh, TargetKind, INSTANCE_HOME_ARG,
 };
 
 const DEFAULT_PORT: u16 = 9333;
@@ -521,6 +521,9 @@ fn maybe_refresh_local_daemon_process(
     let Some(build) = current_process_local_build(TargetKind::Cli) else {
         return Ok(false);
     };
+    if !supports_live_local_refresh(&build) {
+        return Ok(false);
+    }
     let instance_home = resolve_paths()?.rotate_home;
     let daemon_socket = crate::ipc::daemon_socket_path()?;
     let sources_newer_than_binary = sources_newer_than_binary(&build)?;

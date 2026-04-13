@@ -10,7 +10,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::pool::{
     cmd_add, cmd_list_stream, cmd_next_with_progress, cmd_prev, cmd_remove, cmd_status_stream,
 };
@@ -22,8 +22,8 @@ use codex_rotate_core::workflow::{
 use codex_rotate_refresh::stop_running_trays;
 use codex_rotate_refresh::{
     clear_tray_service_registration, detect_local_build, launch_tray_process,
-    preferred_release_binary, rebuild_local_binary, sources_newer_than_binary, tray_service_pid,
-    TargetKind,
+    preferred_release_binary, rebuild_local_binary, resolve_rebuilt_local_binary,
+    sources_newer_than_binary, tray_service_pid, TargetKind,
 };
 use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
 use codex_rotate_runtime::ipc::{
@@ -44,51 +44,45 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
+    run_with_args(&args, &mut stdout)
+}
+
+fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
+    refresh_local_cli_if_needed(args)?;
+    let command = args.first().map(String::as_str);
 
     if let Some(output) = try_run_via_daemon(command, &args[1..])? {
-        write_output(&mut stdout, &output)?;
+        write_output(writer, &output)?;
         return Ok(());
     }
 
     match command {
-        None | Some("help") | Some("--help") | Some("-h") => {
-            write_output(&mut stdout, &help_text())?
-        }
-        Some("daemon") => run_daemon_command(&mut stdout, &args[1..])?,
+        None | Some("help") | Some("--help") | Some("-h") => write_output(writer, &help_text())?,
+        Some("daemon") => run_daemon_command(writer, &args[1..])?,
         Some("internal") => run_internal_command(&args[1..])?,
-        Some("tray") => run_tray_command(&mut stdout, &args[1..])?,
-        Some("add") => write_output(
-            &mut stdout,
-            &cmd_add(parse_add_alias(&args[1..])?.as_deref())?,
-        )?,
+        Some("tray") => run_tray_command(writer, &args[1..])?,
+        Some("add") => write_output(writer, &cmd_add(parse_add_alias(&args[1..])?.as_deref())?)?,
         Some("create") => write_output(
-            &mut stdout,
+            writer,
             &cmd_create_with_progress(
                 parse_public_create_options(&args[1..])?,
                 cli_progress_callback(),
             )?,
         )?,
-        Some("next") => write_output(
-            &mut stdout,
-            &cmd_next_with_progress(cli_progress_callback())?,
-        )?,
-        Some("prev") => write_output(&mut stdout, &cmd_prev()?)?,
-        Some("list") => cmd_list_stream(&mut stdout)?,
-        Some("status") => cmd_status_stream(&mut stdout)?,
+        Some("next") => write_output(writer, &cmd_next_with_progress(cli_progress_callback())?)?,
+        Some("prev") => write_output(writer, &cmd_prev()?)?,
+        Some("list") => cmd_list_stream(writer)?,
+        Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
             let (selector, options) = parse_public_relogin_options(&args[1..])?;
             write_output(
-                &mut stdout,
+                writer,
                 &cmd_relogin_with_progress(&selector, options, cli_progress_callback())?,
             )?
         }
-        Some("remove") => write_output(
-            &mut stdout,
-            &cmd_remove(parse_remove_selector(&args[1..])?)?,
-        )?,
+        Some("remove") => write_output(writer, &cmd_remove(parse_remove_selector(&args[1..])?)?)?,
         Some(other) => {
             return Err(anyhow!(
                 "Unknown command: \"{other}\". Run \"codex-rotate help\" for usage."
@@ -96,6 +90,42 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn refresh_local_cli_if_needed(args: &[String]) -> Result<()> {
+    let current_binary =
+        env::current_exe().context("Failed to resolve the codex-rotate CLI binary.")?;
+    let Some(relaunch_binary) = resolve_stale_local_cli_binary(&current_binary)? else {
+        return Ok(());
+    };
+    reexec_cli_binary(&relaunch_binary, args)
+}
+
+fn resolve_stale_local_cli_binary(current_binary: &Path) -> Result<Option<PathBuf>> {
+    resolve_rebuilt_local_binary(current_binary, TargetKind::Cli)
+}
+
+#[cfg(unix)]
+fn reexec_cli_binary(binary: &Path, args: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let error = Command::new(binary).args(args).exec();
+    Err(anyhow!(
+        "Failed to re-exec {} after rebuilding the local CLI: {}",
+        binary.display(),
+        error
+    ))
+}
+
+#[cfg(not(unix))]
+fn reexec_cli_binary(binary: &Path, args: &[String]) -> Result<()> {
+    let status = Command::new(binary).args(args).status().with_context(|| {
+        format!(
+            "Failed to relaunch {} after rebuilding the local CLI.",
+            binary.display()
+        )
+    })?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<String>> {
@@ -936,6 +966,7 @@ fn help_text() -> String {
 mod tests {
     use super::*;
     use anyhow::Context;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::BufReader;
     #[cfg(unix)]
@@ -984,6 +1015,151 @@ mod tests {
         }
         fs::remove_dir_all(&rotate_home).ok();
         result
+    }
+
+    fn restore_var(name: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(name);
+            },
+        }
+    }
+
+    fn with_env_var<T>(
+        name: &str,
+        value: Option<&OsStr>,
+        test: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = std::env::var_os(name);
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        let result = test();
+        restore_var(name, previous);
+        result
+    }
+
+    struct LocalCliBuildFixture {
+        repo_root: PathBuf,
+        binary_path: PathBuf,
+        release_binary_path: PathBuf,
+        tracked_source_path: PathBuf,
+    }
+
+    impl LocalCliBuildFixture {
+        fn new(prefix: &str) -> Self {
+            let repo_root = unique_temp_dir(prefix);
+            let binary_path = repo_root.join("target").join("debug").join("codex-rotate");
+            let release_binary_path = repo_root
+                .join("target")
+                .join("release")
+                .join("codex-rotate");
+            let tracked_source_path = repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-core")
+                .join("src")
+                .join("lib.rs");
+
+            fs::create_dir_all(binary_path.parent().expect("binary parent"))
+                .expect("create debug target dir");
+            fs::create_dir_all(release_binary_path.parent().expect("release binary parent"))
+                .expect("create release target dir");
+            fs::create_dir_all(
+                tracked_source_path
+                    .parent()
+                    .expect("tracked source parent")
+                    .to_path_buf(),
+            )
+            .expect("create core src");
+            fs::create_dir_all(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-runtime")
+                    .join("src"),
+            )
+            .expect("create runtime src");
+            fs::create_dir_all(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli")
+                    .join("src"),
+            )
+            .expect("create cli src");
+            fs::write(repo_root.join("Cargo.toml"), "").expect("write root cargo");
+            fs::write(repo_root.join("Cargo.lock"), "").expect("write lock");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-core")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write core cargo");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-runtime")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write runtime cargo");
+            fs::write(
+                repo_root
+                    .join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write cli cargo");
+            fs::write(&binary_path, "").expect("write debug binary");
+
+            Self {
+                repo_root,
+                binary_path,
+                release_binary_path,
+                tracked_source_path,
+            }
+        }
+
+        fn mark_sources_stale(&self) {
+            thread::sleep(Duration::from_secs(1) + Duration::from_millis(50));
+            fs::write(&self.tracked_source_path, "pub fn changed() {}")
+                .expect("write newer source");
+        }
+
+        fn write_release_binary(&self) {
+            fs::write(&self.release_binary_path, "").expect("write release binary");
+        }
+    }
+
+    impl Drop for LocalCliBuildFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.repo_root).ok();
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write script");
+        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("set script permissions");
     }
 
     #[cfg(unix)]
@@ -1143,6 +1319,132 @@ mod tests {
             binary
         ));
         assert!(!command_matches_binary("/tmp/other-tray", binary));
+    }
+
+    #[test]
+    fn stale_local_cli_binary_resolution_ignores_non_local_paths() {
+        let binary = unique_temp_dir("codex-rotate-non-local").join("codex-rotate");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("create binary dir");
+        fs::write(&binary, "").expect("write binary");
+
+        let resolved = resolve_stale_local_cli_binary(&binary).expect("resolve stale binary");
+        assert!(resolved.is_none());
+
+        fs::remove_file(&binary).ok();
+        if let Some(parent) = binary.parent() {
+            fs::remove_dir_all(parent).ok();
+        }
+    }
+
+    #[test]
+    fn stale_local_cli_binary_resolution_returns_none_when_current() {
+        let fixture = LocalCliBuildFixture::new("codex-rotate-current-cli");
+        let resolved =
+            resolve_stale_local_cli_binary(&fixture.binary_path).expect("resolve current binary");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn stale_local_cli_binary_resolution_obeys_disable_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-disabled-cli");
+        fixture.mark_sources_stale();
+
+        with_env_var(
+            "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
+            Some(OsStr::new("1")),
+            || {
+                let resolved = resolve_stale_local_cli_binary(&fixture.binary_path)
+                    .expect("resolve disabled binary");
+                assert!(resolved.is_none());
+                Ok(())
+            },
+        )
+        .expect("disable env should short-circuit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_local_cli_binary_resolution_rebuilds_and_requests_reexec() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-stale-cli");
+        let cargo_script = fixture.repo_root.join("fake-cargo.sh");
+        let cargo_log = fixture.repo_root.join("cargo.log");
+        fixture.mark_sources_stale();
+        write_executable_script(
+            &cargo_script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ntouch \"{}\"\n",
+                cargo_log.display(),
+                fixture.binary_path.display()
+            ),
+        );
+
+        with_env_var(
+            "CODEX_ROTATE_CARGO_BIN",
+            Some(cargo_script.as_os_str()),
+            || {
+                let resolved = resolve_stale_local_cli_binary(&fixture.binary_path)
+                    .expect("resolve stale binary");
+                assert_eq!(resolved.as_deref(), Some(fixture.binary_path.as_path()));
+                let cargo_args = fs::read_to_string(&cargo_log).expect("read cargo log");
+                assert!(cargo_args.contains("build"));
+                assert!(cargo_args.contains("--manifest-path"));
+                assert!(cargo_args.contains("codex-rotate-cli/Cargo.toml"));
+                assert!(cargo_args.contains("-p"));
+                assert!(cargo_args.contains("codex-rotate-cli"));
+                Ok(())
+            },
+        )
+        .expect("stale binary should rebuild");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_local_cli_binary_resolution_surfaces_rebuild_failures() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-failing-cli");
+        let cargo_script = fixture.repo_root.join("fake-cargo-fail.sh");
+        fixture.mark_sources_stale();
+        write_executable_script(&cargo_script, "#!/bin/sh\nexit 23\n");
+
+        with_env_var(
+            "CODEX_ROTATE_CARGO_BIN",
+            Some(cargo_script.as_os_str()),
+            || {
+                let error = resolve_stale_local_cli_binary(&fixture.binary_path)
+                    .expect_err("rebuild failure should bubble up");
+                assert!(error.to_string().contains("build exited with status"));
+                Ok(())
+            },
+        )
+        .expect("failure assertion");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_local_cli_binary_resolution_keeps_debug_path_when_release_exists() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let fixture = LocalCliBuildFixture::new("codex-rotate-release-pref-cli");
+        let cargo_script = fixture.repo_root.join("fake-cargo-release.sh");
+        fixture.write_release_binary();
+        fixture.mark_sources_stale();
+        write_executable_script(
+            &cargo_script,
+            &format!("#!/bin/sh\ntouch \"{}\"\n", fixture.binary_path.display()),
+        );
+
+        with_env_var(
+            "CODEX_ROTATE_CARGO_BIN",
+            Some(cargo_script.as_os_str()),
+            || {
+                let resolved = resolve_stale_local_cli_binary(&fixture.binary_path)
+                    .expect("resolve stale binary");
+                assert_eq!(resolved.as_deref(), Some(fixture.binary_path.as_path()));
+                Ok(())
+            },
+        )
+        .expect("debug path should remain canonical");
     }
 
     #[cfg(unix)]
@@ -1359,5 +1661,50 @@ mod tests {
             Ok(())
         })
         .expect("read-only commands should stay local");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_command_still_proxies_through_daemon_after_startup_preflight() {
+        with_rotate_home(|| {
+            with_env_var(
+                "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
+                Some(OsStr::new("1")),
+                || {
+                    let args = vec![
+                        "create".to_string(),
+                        "bench".to_string(),
+                        "--force".to_string(),
+                        "--profile".to_string(),
+                        "dev-1".to_string(),
+                        "--base-email".to_string(),
+                        "dev.{n}@astronlab.com".to_string(),
+                    ];
+                    let handle = spawn_proxy_server("daemon-ok");
+                    let mut output = Vec::new();
+                    run_with_args(&args, &mut output)?;
+                    let request = handle.join().expect("proxy thread")?;
+                    assert_eq!(String::from_utf8(output).expect("utf8").trim(), "daemon-ok");
+                    assert_eq!(
+                        request,
+                        ClientRequest::Invoke {
+                            action: InvokeAction::Create {
+                                options: CreateInvocation {
+                                    alias: Some("bench".to_string()),
+                                    profile_name: Some("dev-1".to_string()),
+                                    base_email: Some("dev.{n}@astronlab.com".to_string()),
+                                    force: true,
+                                    ignore_current: false,
+                                    restore_previous_auth_after_create: false,
+                                    require_usable_quota: false,
+                                }
+                            }
+                        }
+                    );
+                    Ok(())
+                },
+            )
+        })
+        .expect("create should still proxy after startup preflight");
     }
 }
