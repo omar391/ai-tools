@@ -1096,6 +1096,99 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     }
   });
 
+  test("original flow deletes the collected signup OTP after a successful verification submit", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const deleteStep = findWorkflowStep<{
+      call?: string;
+      with?: {
+        input?: Record<string, string>;
+      };
+    }>(workflow, "delete_signup_verification_artifact");
+    const returnStep = findWorkflowStep<{
+      with?: {
+        body?: {
+          url?: string;
+        };
+      };
+    }>(workflow, "return_to_signup_after_delete_signup_verification_artifact");
+
+    expect(deleteStep?.call).toBe(
+      "workflow.sys.web.mail-google-com.delete-verification-artifact",
+    );
+    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+      "collect_signup_verification_artifact",
+    );
+    expect(deleteStep?.with?.input?.search_query || "").toContain(
+      "from:openai to:",
+    );
+    expect(returnStep?.with?.body?.url || "").toContain(
+      "classify_after_signup_verification_gate",
+    );
+  });
+
+  test("original flow deletes the collected replayed-login OTP after a successful submit", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const deleteStep = findWorkflowStep<{
+      call?: string;
+      with?: {
+        input?: Record<string, string>;
+      };
+    }>(workflow, "delete_login_verification_artifact");
+    const returnStep = findWorkflowStep<{
+      with?: {
+        body?: {
+          url?: string;
+        };
+      };
+    }>(workflow, "return_to_login_after_delete_login_verification_artifact");
+
+    expect(deleteStep?.call).toBe(
+      "workflow.sys.web.mail-google-com.delete-verification-artifact",
+    );
+    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+      "collect_login_verification_artifact",
+    );
+    expect(deleteStep?.with?.input?.search_query || "").toContain(
+      "from:openai to:",
+    );
+    expect(returnStep?.with?.body?.url || "").toContain(
+      "classify_after_login_verification_gate",
+    );
+  });
+
+  test("original flow deletes the replacement replayed-login OTP after a successful retry submit", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const deleteStep = findWorkflowStep<{
+      call?: string;
+      with?: {
+        input?: Record<string, string>;
+      };
+    }>(workflow, "delete_login_verification_artifact_after_submit_failure");
+    const returnStep = findWorkflowStep<{
+      with?: {
+        body?: {
+          url?: string;
+        };
+      };
+    }>(
+      workflow,
+      "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
+    );
+
+    expect(deleteStep?.call).toBe(
+      "workflow.sys.web.mail-google-com.delete-verification-artifact",
+    );
+    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
+      "recollect_login_verification_artifact_after_submit_failure",
+    );
+    expect(deleteStep?.with?.input?.search_query || "").toContain(
+      "from:openai to:",
+    );
+    expect(returnStep?.with?.body?.url || "").toContain(
+      "classify_after_login_verification_retry_gate",
+    );
+  });
+
   test("minimal keeps an in-workflow replayed-login OTP recollection path", async () => {
     const workflow = await loadWorkflow(minimalWorkflowPath);
     const stepIds = (workflow.do || []).flatMap((entry) => Object.keys(entry));

@@ -452,6 +452,34 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the signup state after verification-step security handling."
+  - delete_signup_verification_artifact:
+      if: "${state.steps.collect_signup_verification_artifact?.action?.ok === true && state.steps.collect_signup_verification_artifact?.action?.skipped !== true && state.steps.submit_signup_verification_code?.action?.ok === true && state.steps.classify_after_signup_verification_gate?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the used signup OTP email from Gmail after the verification step succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.collect_signup_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_signup_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_signup_verification_artifact?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.collect_signup_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_signup_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_signup_verification_artifact?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.collect_signup_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_signup_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_signup_verification_artifact?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.collect_signup_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_signup_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_signup_verification_artifact?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.collect_signup_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_signup_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_signup_verification_artifact?.action?.output?.gmail_message_url || null}"
+  - return_to_signup_after_delete_signup_verification_artifact:
+      if: "${state.steps.delete_signup_verification_artifact?.action?.ok === true && state.steps.delete_signup_verification_artifact?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active OpenAI signup surface after deleting the used signup OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_after_signup_verification_gate?.action?.current_url || state.steps.classify_after_signup_verification?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - fill_signup_about_you:
       if: "${state.steps.classify_after_signup_password_gate?.action?.existing_account_prompt !== true && state.steps.classify_after_signup_verification_gate?.action?.follow_up_step === true}"
       metadata:
@@ -710,6 +738,34 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: Refresh the replayed login state after verification-step security handling.
+  - delete_login_verification_artifact:
+      if: "${state.steps.collect_login_verification_artifact?.action?.ok === true && state.steps.collect_login_verification_artifact?.action?.skipped !== true && state.steps.submit_login_verification_code?.action?.ok === true && state.steps.classify_after_login_verification_gate?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the used replayed-login OTP email from Gmail after the verification step succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.collect_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_login_verification_artifact?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.collect_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_login_verification_artifact?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.collect_login_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_login_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_login_verification_artifact?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.collect_login_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_login_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_login_verification_artifact?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.collect_login_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_login_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_login_verification_artifact?.action?.output?.gmail_message_url || null}"
+  - return_to_login_after_delete_login_verification_artifact:
+      if: "${state.steps.delete_login_verification_artifact?.action?.ok === true && state.steps.delete_login_verification_artifact?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active OpenAI login surface after deleting the used replayed-login OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_after_login_verification_gate?.action?.current_url || state.steps.classify_after_login_verification?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - resend_login_verification_email_after_submit_failure:
       if: "${state.steps.classify_after_login_verification_gate?.action?.stage === 'email_verification' && state.steps.submit_login_verification_code?.action?.ok !== true}"
       metadata:
@@ -1220,6 +1276,34 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: Refresh the replayed login state after the replacement OTP submission.
+  - delete_login_verification_artifact_after_submit_failure:
+      if: "${state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.ok === true && state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.skipped !== true && state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true && state.steps.classify_after_login_verification_retry_gate?.action?.stage !== 'email_verification'}"
+      metadata:
+        description: Delete the replacement replayed-login OTP email from Gmail after the retry succeeds.
+        ref:
+          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+      call: workflow.sys.web.mail-google-com.delete-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          message_subject: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.message_subject || null}"
+          message_preview: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.message_preview || null}"
+          gmail_message_id: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.gmail_message_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.gmail_message_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.gmail_message_id || null}"
+          gmail_thread_id: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.gmail_thread_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.gmail_thread_id || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.gmail_thread_id || null}"
+          gmail_message_url: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.gmail_message_url || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.gmail_message_url || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.gmail_message_url || null}"
+  - return_to_login_after_delete_login_verification_artifact_after_submit_failure:
+      if: "${state.steps.delete_login_verification_artifact_after_submit_failure?.action?.ok === true && state.steps.delete_login_verification_artifact_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        description: Return from Gmail to the active OpenAI login surface after deleting the replacement replayed-login OTP email.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.steps.classify_after_login_verification_retry_gate?.action?.current_url || state.steps.classify_after_login_verification_retry?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - cache_effective_login_verification_surface:
       metadata:
         description: Cache the latest replayed-login verification surface after any in-workflow OTP retry.
