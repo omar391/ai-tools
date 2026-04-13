@@ -44,17 +44,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
         .join("web")
         .join("auth.openai.com")
         .join("codex-rotate-account-flow-main.yaml");
-    let default_fast_browser_script = repo_root
-        .parent()
-        .map(|parent| {
-            parent
-                .join("ai-rules")
-                .join("skills")
-                .join("fast-browser")
-                .join("scripts")
-                .join("fast-browser.mjs")
-        })
-        .unwrap_or_else(|| repo_root.join("fast-browser.mjs"));
+    let default_fast_browser_script = resolve_default_fast_browser_script(&repo_root);
     let asset_root = std::env::var_os("CODEX_ROTATE_ASSET_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo_root.join("packages").join("codex-rotate"));
@@ -89,6 +79,71 @@ pub fn resolve_paths() -> Result<CorePaths> {
         asset_root,
         automation_bridge_entrypoint,
         node_bin: resolve_node_binary(),
+    })
+}
+
+fn resolve_default_fast_browser_script(repo_root: &Path) -> PathBuf {
+    fast_browser_script_candidates(repo_root, discover_main_worktree_root(repo_root))
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            repo_root
+                .parent()
+                .map(|parent| {
+                    parent
+                        .join("ai-rules")
+                        .join("skills")
+                        .join("fast-browser")
+                        .join("scripts")
+                        .join("fast-browser.mjs")
+                })
+                .unwrap_or_else(|| repo_root.join("fast-browser.mjs"))
+        })
+}
+
+fn fast_browser_script_candidates(
+    repo_root: &Path,
+    main_worktree_root: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = vec![fast_browser_script_under(repo_root)];
+    if let Some(main_worktree_root) = main_worktree_root {
+        if main_worktree_root != repo_root {
+            candidates.push(fast_browser_script_under(&main_worktree_root));
+        }
+    }
+    candidates
+}
+
+fn fast_browser_script_under(repo_root: &Path) -> PathBuf {
+    repo_root
+        .parent()
+        .map(|parent| {
+            parent
+                .join("ai-rules")
+                .join("skills")
+                .join("fast-browser")
+                .join("scripts")
+                .join("fast-browser.mjs")
+        })
+        .unwrap_or_else(|| repo_root.join("fast-browser.mjs"))
+}
+
+fn discover_main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.lines().find_map(|line| {
+        let path = line.strip_prefix("worktree ")?;
+        let candidate = PathBuf::from(path);
+        (candidate != repo_root).then_some(candidate)
     })
 }
 
@@ -305,12 +360,13 @@ fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_legacy_rotate_home_artifacts, resolve_codex_logs_db_file,
-        resolve_codex_state_db_file, resolve_node_binary, DEFAULT_CODEX_LOGS_DB_FILE,
-        DEFAULT_CODEX_STATE_DB_FILE,
+        cleanup_legacy_rotate_home_artifacts, fast_browser_script_candidates,
+        resolve_codex_logs_db_file, resolve_codex_state_db_file, resolve_node_binary,
+        DEFAULT_CODEX_LOGS_DB_FILE, DEFAULT_CODEX_STATE_DB_FILE,
     };
     use crate::test_support::ENV_MUTEX;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn resolve_node_binary_prefers_override() {
@@ -458,5 +514,60 @@ mod tests {
         assert!(!root.join("codex-login-browser-shim-123").exists());
         assert!(!bin_dir.join("codex-login-managed-dev-1-deadbeef").exists());
         assert!(!bin_dir.join("codex-login-dev-1-deadbeefcafe").exists());
+    }
+
+    #[test]
+    fn fast_browser_script_candidates_include_main_worktree_fallback() {
+        let repo_root = Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools");
+        let main_root = PathBuf::from("/Volumes/Projects/business/AstronLab/omar391/ai-tools");
+
+        let candidates = fast_browser_script_candidates(repo_root, Some(main_root.clone()));
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(
+                "/Users/omar/.codex/worktrees/e7ac/ai-rules/skills/fast-browser/scripts/fast-browser.mjs"
+            )
+        );
+        assert_eq!(
+            candidates[1],
+            main_root
+                .parent()
+                .expect("main root parent")
+                .join("ai-rules")
+                .join("skills")
+                .join("fast-browser")
+                .join("scripts")
+                .join("fast-browser.mjs")
+        );
+    }
+
+    #[test]
+    fn resolve_default_fast_browser_script_prefers_existing_main_worktree_fallback() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tempdir.path();
+        let main_root = workspace_root.join("ai-tools");
+        let worktree_root = workspace_root
+            .join("worktrees")
+            .join("e7ac")
+            .join("ai-tools");
+        let main_script = workspace_root
+            .join("ai-rules")
+            .join("skills")
+            .join("fast-browser")
+            .join("scripts")
+            .join("fast-browser.mjs");
+        fs::create_dir_all(main_script.parent().expect("script parent")).expect("mkdir script");
+        fs::create_dir_all(&main_root).expect("mkdir main root");
+        fs::create_dir_all(&worktree_root).expect("mkdir worktree root");
+        fs::write(&main_script, "export {}").expect("write script");
+
+        let resolved = fast_browser_script_candidates(&worktree_root, Some(main_root))
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .expect("existing fallback");
+
+        assert_eq!(resolved, main_script);
     }
 }

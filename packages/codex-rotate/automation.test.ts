@@ -2,6 +2,7 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -18,6 +19,7 @@ import {
   isFastBrowserRunResultFailure,
   isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
+  resolveFastBrowserSkillPath,
   shouldResetFastBrowserBridgeInactivityTimer,
   shouldPromptForCodexRotateSecretUnlock,
 } from "./automation.ts";
@@ -456,6 +458,37 @@ console.log(typeof automation.completeCodexLoginViaWorkflowAttempt);
 
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("function");
+  });
+
+  test("resolves fast-browser skill files from the main worktree when the current worktree has no ai-rules sibling", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-worktree-"));
+    const worktreeRepoRoot = join(fixtureRoot, "worktrees", "e7ac", "ai-tools");
+    const mainRepoRoot = join(fixtureRoot, "ai-tools");
+    const mainSkillPath = join(
+      fixtureRoot,
+      "ai-rules",
+      "skills",
+      "fast-browser",
+      "lib",
+      "daemon",
+      "client.mjs",
+    );
+
+    mkdirSync(
+      join(fixtureRoot, "ai-rules", "skills", "fast-browser", "lib", "daemon"),
+      {
+        recursive: true,
+      },
+    );
+    writeFileSync(mainSkillPath, "export {}");
+
+    const resolved = resolveFastBrowserSkillPath(
+      ["lib", "daemon", "client.mjs"],
+      worktreeRepoRoot,
+      mainRepoRoot,
+    );
+
+    expect(resolved).toBe(mainSkillPath);
   });
 });
 
@@ -5139,6 +5172,46 @@ describe("device-auth workflow", () => {
     expect(result.saw_oauth_consent).toBe(true);
     expect(result.oauth_continue_visible).toBe(true);
     expect(result.chatgpt_app_shell).toBe(false);
+  });
+
+  test("waits through a temporary reopened login prompt until the device-auth consent surface appears", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "inspect_device_authorization_after_login_reopen",
+      `
+        <html>
+          <body>
+            <h1>Welcome back</h1>
+            <label>
+              Email address
+              <input type="email" autocomplete="email" />
+            </label>
+            <button>Continue</button>
+            <script>
+              setTimeout(() => {
+                document.body.innerHTML =
+                  '<h1>Sign in to Codex with ChatGPT</h1><p>Share your name, email, and profile picture with Codex</p><button>Continue to Codex</button>';
+              }, 1500);
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        vars: {
+          codex_login: {
+            auth_url:
+              "https://auth.openai.com/codex/device?user_code=ABCD-EFGHI",
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/log-in",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.saw_oauth_consent).toBe(true);
+    expect(result.oauth_continue_visible).toBe(true);
+    expect(result.auth_prompt).toBe(false);
   });
 });
 
