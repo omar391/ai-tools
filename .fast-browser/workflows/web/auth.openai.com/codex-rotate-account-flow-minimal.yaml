@@ -2336,8 +2336,8 @@ do:
         description: "Open the captured Codex auth URL on the managed browser profile."
         browser:
           clearSiteDataForOrigins:
-            - "https://auth.openai.com"
-            - "https://chatgpt.com"
+            - https://auth.openai.com
+            - https://chatgpt.com
   - stabilize_entry_surface:
       metadata:
         templateRef: wait_for_openai_surface_ready
@@ -3207,8 +3207,523 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after verification-step security handling."
+  - resend_login_verification_email_after_submit_failure:
+      if: "${state.steps.classify_after_login_verification_gate?.action?.stage === 'email_verification' && state.steps.submit_login_verification_code?.action?.ok !== true}"
+      metadata:
+        description: Request one more replayed-login verification email when the first OTP submission stays on email verification.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const result = await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const candidates = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']"))
+                .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+              const resend = candidates.find((node) => /resend email/i.test(normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""))));
+              if (!(resend instanceof HTMLElement)) {
+                return { ok: false, reason: "resend-email-button-not-found" };
+              }
+              resend.click();
+              return {
+                ok: true,
+                label: normalize(resend instanceof HTMLInputElement ? resend.value : (resend.innerText || resend.textContent || "")) || null,
+              };
+            }).catch((error) => ({
+              ok: false,
+              reason: error instanceof Error ? error.message : String(error || "resend-email-click-failed"),
+            }));
+            if (!result || result.ok !== true) {
+              throw new Error(String(result && result.reason ? result.reason : "resend-email-click-failed"));
+            }
+            await page.waitForTimeout(1800).catch(() => {});
+            return result;
+  - wait_after_resend_login_verification_email_after_submit_failure:
+      if: "${state.steps.resend_login_verification_email_after_submit_failure?.action?.ok === true && state.steps.resend_login_verification_email_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        description: Allow the replacement replayed-login verification email to arrive before searching Gmail again.
+      wait:
+        milliseconds: 10000
+  - recollect_login_verification_artifact_after_submit_failure:
+      if: "${state.steps.resend_login_verification_email_after_submit_failure?.action?.ok === true && state.steps.resend_login_verification_email_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        description: Re-collect the replayed-login OTP from Gmail once after the first submit fails.
+        ref:
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: auth\.openai\.com|chatgpt\.com
+  - cache_login_verification_artifact_after_submit_failure:
+      if: "${state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result != null}"
+      metadata:
+        description: Cache the replacement replayed-login OTP into simple workflow state.
+      set:
+        login_verification_code_retry: "${(String(state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.verification_code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.verification_code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.otp || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.otp || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.one_time_code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.one_time_code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+  - wait_for_login_verification_email_delivery_after_submit_failure:
+      if: "${state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.ok === true && state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.skipped !== true && String(state.vars.login_verification_code_retry || '').length < 6}"
+      metadata:
+        description: Give Gmail one more chance to finish loading the replacement replayed-login OTP.
+      wait:
+        milliseconds: 4000
+  - recollect_login_verification_artifact_after_submit_failure_missing_code:
+      if: "${state.steps.wait_for_login_verification_email_delivery_after_submit_failure?.action?.ok === true && state.steps.wait_for_login_verification_email_delivery_after_submit_failure?.action?.skipped !== true && String(state.vars.login_verification_code_retry || '').length < 6}"
+      metadata:
+        description: Re-collect the replayed-login OTP once more when Gmail still has not surfaced a usable replacement code.
+        ref:
+          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+      call: workflow.sys.web.mail-google-com.collect-verification-artifact
+      with:
+        version: 1.0.0
+        input:
+          enabled: true
+          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
+          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
+          link_host_regex: auth\.openai\.com|chatgpt\.com
+  - cache_login_verification_artifact_after_submit_failure_missing_code:
+      if: "${state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result != null}"
+      metadata:
+        description: Replace the retry replayed-login OTP after waiting for Gmail to finish loading.
+      set:
+        login_verification_code_retry: "${(String(state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.output?.code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.verification_code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.verification_code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.otp || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.otp || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.one_time_code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.one_time_code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.result?.state?.steps?.collect_verification_artifact?.action?.code || state.vars.login_verification_code_retry || '')).match(/(?:^|\\D)(\\d{6})(?:\\D|$)/)?.[1] || ''}"
+  - return_to_login_verification_page_after_submit_failure:
+      if: "${(state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.ok === true && state.steps.recollect_login_verification_artifact_after_submit_failure?.action?.skipped !== true) || (state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.ok === true && state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action?.skipped !== true)}"
+      metadata:
+        description: Return from Gmail to the active OpenAI login verification page after collecting a replacement OTP.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: ${state.steps.submit_login_verification_code?.action?.current_url || state.steps.classify_login_verification_ready_gate?.action?.current_url || 'https://auth.openai.com/email-verification'}
+  - stabilize_login_verification_surface_after_submit_failure:
+      if: "${state.steps.return_to_login_verification_page_after_submit_failure?.action?.ok === true && state.steps.return_to_login_verification_page_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        templateRef: wait_for_openai_surface_ready
+        description: Wait for the replayed-login verification page to settle after collecting a replacement OTP.
+  - classify_login_verification_ready_after_submit_failure:
+      if: "${state.steps.return_to_login_verification_page_after_submit_failure?.action?.ok === true && state.steps.return_to_login_verification_page_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Confirm the replayed-login verification surface after collecting a replacement OTP.
+  - clear_login_verification_return_gate_after_submit_failure:
+      if: "${state.steps.classify_login_verification_ready_after_submit_failure?.action?.anti_bot_gate === true}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any security gate encountered when returning to the replayed-login verification page for a replacement OTP.
+  - classify_login_verification_ready_after_submit_failure_gate:
+      if: "${state.steps.return_to_login_verification_page_after_submit_failure?.action?.ok === true && state.steps.return_to_login_verification_page_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Refresh the replayed-login verification surface after security handling for the replacement OTP.
+  - submit_login_verification_code_after_submit_failure:
+      if: "${state.steps.classify_login_verification_ready_after_submit_failure_gate?.action?.stage === 'email_verification'}"
+      metadata:
+        description: Fill and submit the replacement replayed-login OTP from Gmail.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const readSixDigitCode = (value) => {
+              const match = String(value || "").match(/(?:^|\D)(\d{6})(?:\D|$)/);
+              return match?.[1] || null;
+            };
+            const extractVerificationCode = (action) => {
+              const outputs = [
+                action?.result?.result?.output,
+                action?.result?.output,
+                action?.output,
+              ].filter((value) => value && typeof value === "object");
+              for (const output of outputs) {
+                const directCode =
+                  readSixDigitCode(output.code)
+                  || readSixDigitCode(output.verification_code)
+                  || readSixDigitCode(output.otp)
+                  || readSixDigitCode(output.one_time_code);
+                if (directCode) {
+                  return directCode;
+                }
+              }
+              for (const output of outputs) {
+                const derivedCode =
+                  readSixDigitCode(output.message_subject)
+                  || readSixDigitCode(output.message_preview)
+                  || readSixDigitCode(output.verification_link_text);
+                if (derivedCode) {
+                  return derivedCode;
+                }
+              }
+              return null;
+            };
+            const code = String(
+              state.vars.login_verification_code_retry
+              || extractVerificationCode(state.steps.recollect_login_verification_artifact_after_submit_failure_missing_code?.action)
+              || extractVerificationCode(state.steps.recollect_login_verification_artifact_after_submit_failure?.action)
+              || extractVerificationCode(state.steps.collect_login_verification_artifact?.action)
+              || ""
+            ).replace(/\D+/g, "").slice(0, 6);
+            if (code.length < 6) {
+              return {
+                ok: false,
+                error: "login-verification-code-missing",
+                stage: "email_verification",
+                current_url: page.url(),
+              };
+            }
+
+            const verificationSelector = 'input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]';
+
+            const detectStage = async () => await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+
+              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              const title = normalize(document.title || "");
+              const path = location.pathname;
+              const host = location.hostname;
+              const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
+              const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
+              const antiBotGate = /just a moment/i.test(title)
+                || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
+                || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
+              const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);
+              const sessionEnded = /your session has ended/i.test(bodyText);
+              const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);
+              const addPhonePrompt = /add-phone/i.test(path)
+                || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);
+              const followUpStep = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)
+                || /about-you/i.test(path);
+              const oauthConsentCopy = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(bodyText)
+                || /sign in to codex/i.test(title);
+              const oauthContinueVisible = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']")).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) {
+                  return false;
+                }
+                const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
+                return /continue to codex|continue to openai|authorize|allow|accept/i.test(text)
+                  || (oauthConsentCopy && /^continue$/i.test(text));
+              });
+              const needsEmailVerification = (!oauthConsentCopy && verificationInput)
+                || (!oauthConsentCopy && /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText))
+                || (!oauthConsentCopy && /email-verification/i.test(path));
+
+              let stage = "unknown";
+              if (/^(localhost|127\\.0\\.0\\.1)$/i.test(host)) {
+                stage = "callback_complete";
+              } else if (antiBotGate) {
+                stage = "security_verification";
+              } else if (rateLimitExceeded) {
+                stage = "rate_limit";
+              } else if (sessionEnded) {
+                stage = "session_ended";
+              } else if (retryableTimeout) {
+                stage = "retryable_timeout";
+              } else if (addPhonePrompt) {
+                stage = "add_phone";
+              } else if (oauthConsentCopy && oauthContinueVisible) {
+                stage = "oauth_consent";
+              } else if (followUpStep) {
+                stage = "about_you";
+              } else if (needsEmailVerification) {
+                stage = "email_verification";
+              } else if (/\\/log-in(?:\\/|$)/i.test(path) && passwordInput) {
+                stage = "login_password";
+              } else if (/\\/log-in(?:\\/|$)/i.test(path) && emailInput) {
+                stage = "login_email";
+              } else if (emailInput || passwordInput || verificationInput) {
+                stage = "auth_prompt";
+              }
+
+              return {
+                stage,
+                current_url: location.href,
+                headline: bodyText.split("\\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                incorrect_code: /incorrect code/i.test(bodyText),
+              };
+            });
+
+            const inputLocator = page.locator(verificationSelector);
+            const inputCount = await inputLocator.count().catch(() => 0);
+            const inputs = [];
+            for (let index = 0; index < inputCount; index += 1) {
+              const candidate = inputLocator.nth(index);
+              if (await candidate.isVisible().catch(() => false)) {
+                inputs.push(candidate);
+              }
+            }
+            const input = inputs[0] || inputLocator.first();
+            await input.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+            if ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {
+              const before = await detectStage();
+              return {
+                ok: false,
+                error: "login-verification-input-not-ready",
+                stage: before.stage || "unknown",
+                current_url: before.current_url || page.url(),
+                headline: before.headline || null,
+              };
+            }
+            const fillField = async (locator, value) => {
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await locator.fill("").catch(() => {});
+              const filled = await locator.fill(value).then(() => true).catch(() => false);
+              if (!filled) {
+                await locator.press("Meta+A").catch(() => {});
+                await locator.press("Control+A").catch(() => {});
+                await locator.press("Backspace").catch(() => {});
+                await locator.pressSequentially(value, { delay: 45 }).catch(() => {});
+              }
+            };
+            const readCombinedValue = async () => {
+              const parts = [];
+              for (const locator of inputs.length ? inputs : [input]) {
+                parts.push(String(await locator.inputValue().catch(() => "")).replace(/\D+/g, ""));
+              }
+              return parts.join("").slice(0, code.length);
+            };
+            if (inputs.length > 1) {
+              for (let index = 0; index < inputs.length && index < code.length; index += 1) {
+                await fillField(inputs[index], code[index]);
+              }
+            } else {
+              await fillField(input, code);
+            }
+            await page.waitForTimeout(150).catch(() => {});
+            let value = await readCombinedValue();
+            if (value !== code && inputs.length > 1) {
+              await input.click({ timeout: 1500 }).catch(() => {});
+              await input.press("Meta+A").catch(() => {});
+              await input.press("Control+A").catch(() => {});
+              await input.press("Backspace").catch(() => {});
+              await input.pressSequentially(code, { delay: 45 }).catch(() => {});
+              await page.waitForTimeout(150).catch(() => {});
+              value = await readCombinedValue();
+            }
+            if (value.length < 6 || value !== code) {
+              return {
+                ok: false,
+                error: "login-verification-input-mismatch",
+                stage: "email_verification",
+                current_url: page.url(),
+                typed_value: value || "",
+              };
+            }
+
+            const allowedStages = new Set([
+              "about_you",
+              "add_phone",
+              "oauth_consent",
+              "security_verification",
+              "retryable_timeout",
+              "rate_limit",
+              "session_ended",
+              "callback_complete",
+            ]);
+
+            const clickVisibleContinue = async () => {
+              const result = await input.evaluate((field) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const readLabel = (node) => {
+                  if (!(node instanceof Element)) {
+                    return "";
+                  }
+                  if (node instanceof HTMLInputElement) {
+                    return normalize(node.value || node.getAttribute("aria-label") || "");
+                  }
+                  return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                };
+                const form = field instanceof Element ? field.closest("form") : null;
+                const scope = form || document;
+                const candidates = Array.from(scope.querySelectorAll("button, input[type='submit'], [role='button']"))
+                  .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+                const preferred = candidates.find((node) => {
+                  const label = readLabel(node);
+                  const isSubmitNode = (node instanceof HTMLButtonElement && node.type === "submit")
+                    || (node instanceof HTMLInputElement && node.type === "submit");
+                  return isSubmitNode && /continue|next|verify|submit|authorize|allow|accept/i.test(label);
+                }) || candidates.find((node) => /continue|next|verify|submit|authorize|allow|accept/i.test(readLabel(node)));
+                if (preferred instanceof HTMLElement) {
+                  preferred.click();
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click",
+                    label: readLabel(preferred) || null,
+                  };
+                }
+                if (form instanceof HTMLFormElement) {
+                  form.requestSubmit();
+                  return {
+                    ok: true,
+                    strategy: "form-request-submit",
+                    label: null,
+                  };
+                }
+                return null;
+              }).catch(() => null);
+              return result;
+            };
+
+            const attempts = [
+              async () => clickVisibleContinue(),
+              async () => {
+                await input.press("Enter").catch(() => {});
+                return { strategy: "press-enter", label: null };
+              },
+              async () => {
+                await input.evaluate((field) => {
+                  if (field instanceof HTMLElement) {
+                    field.blur();
+                  }
+                  const form = field instanceof Element ? field.closest("form") : null;
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                  }
+                }).catch(() => {});
+                return { strategy: "request-submit", label: null };
+              },
+            ];
+
+            const waitForTransition = async (sameStage, timeoutMs = 8000) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                if (latest.incorrect_code) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
+            const transitions = [];
+            for (const attempt of attempts) {
+              const performed = await attempt();
+              if (!performed) {
+                continue;
+              }
+              const after = await waitForTransition("email_verification");
+              transitions.push({ ...performed, ...after });
+              if (allowedStages.has(after.stage) && after.stage !== "email_verification") {
+                return {
+                  ok: true,
+                  code,
+                  strategy: performed.strategy,
+                  clicked_text: performed.label || null,
+                  next_stage: after.stage,
+                  current_url: after.current_url,
+                  headline: after.headline,
+                  transitions,
+                };
+              }
+              if (after.incorrect_code) {
+                return {
+                  ok: false,
+                  error: "login-verification-code-rejected",
+                  stage: after.stage || "email_verification",
+                  current_url: after.current_url || page.url(),
+                  headline: after.headline || null,
+                  incorrect_code: true,
+                  transitions,
+                };
+              }
+            }
+
+            const finalState = await detectStage();
+            if (finalState.incorrect_code) {
+              return {
+                ok: false,
+                error: "login-verification-code-rejected",
+                stage: finalState.stage || "email_verification",
+                current_url: finalState.current_url || page.url(),
+                headline: finalState.headline || null,
+                incorrect_code: true,
+                transitions,
+              };
+            }
+            return {
+              ok: false,
+              error: "login-verification-submit-stuck",
+              stage: finalState.stage || "unknown",
+              current_url: finalState.current_url || page.url(),
+              headline: finalState.headline || null,
+              incorrect_code: finalState.incorrect_code === true,
+              transitions,
+            };
+  - classify_after_login_verification_retry:
+      if: "${state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true && state.steps.submit_login_verification_code_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Classify the OpenAI page after retrying the replayed-login OTP.
+  - clear_login_verification_retry_security_gate:
+      if: "${state.steps.classify_after_login_verification_retry?.action?.anti_bot_gate === true}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any security gate encountered after retrying the replayed-login OTP.
+  - classify_after_login_verification_retry_gate:
+      if: "${state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true && state.steps.submit_login_verification_code_after_submit_failure?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Refresh the replayed login state after the replacement OTP submission.
+  - cache_effective_login_verification_surface:
+      metadata:
+        description: Cache the latest replayed-login verification surface after any in-workflow OTP retry.
+      set:
+        effective_login_verification_surface: "${state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true && state.steps.submit_login_verification_code_after_submit_failure?.action?.skipped !== true && state.steps.classify_after_login_verification_retry_gate?.action?.current_url ? state.steps.classify_after_login_verification_retry_gate?.action : (state.steps.classify_after_login_verification_gate?.action || {})}"
   - fill_login_about_you:
-      if: "${state.steps.classify_after_login_verification_gate?.action?.follow_up_step === true}"
+      if: "${state.vars.effective_login_verification_surface?.follow_up_step === true}"
       metadata:
         templateRef: fill_openai_about_you_form
         description: "Fill the about-you form if OpenAI requests it again during the replayed login."
@@ -3221,7 +3736,7 @@ do:
               op: exists
               selector: 'input[name*="name" i], input[autocomplete="name"], input[placeholder*="name" i]'
   - submit_login_about_you:
-      if: "${state.steps.classify_after_login_verification_gate?.action?.follow_up_step === true && state.steps.fill_login_about_you?.action?.ok === true}"
+      if: "${state.vars.effective_login_verification_surface?.follow_up_step === true && state.steps.fill_login_about_you?.action?.ok === true}"
       metadata:
         templateRef: submit_openai_about_you_form
         description: "Submit the about-you form if it appears again during the replayed login."
@@ -3246,8 +3761,323 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Classify the final OpenAI/Codex callback state before any consent click."
+  - wait_before_consent_add_phone_retry_1:
+      if: "${state.steps.classify_before_consent?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Give OpenAI time to clear a transient final add-phone prompt before replaying the captured auth URL.
+      wait:
+        milliseconds: 2000
+  - reopen_auth_url_before_consent_retry_1:
+      if: "${state.steps.wait_before_consent_add_phone_retry_1?.action != null && state.steps.wait_before_consent_add_phone_retry_1?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the first final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_1:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_1?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_1?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the first add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_1:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_1?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_1?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the first add-phone retry.
+  - wait_before_consent_add_phone_retry_2:
+      if: "${state.steps.classify_before_consent_retry_1?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 4000
+  - reopen_auth_url_before_consent_retry_2:
+      if: "${state.steps.wait_before_consent_add_phone_retry_2?.action != null && state.steps.wait_before_consent_add_phone_retry_2?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the second final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_2:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_2?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_2?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the second add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_2:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_2?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_2?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the second add-phone retry.
+  - wait_before_consent_add_phone_retry_3:
+      if: "${state.steps.classify_before_consent_retry_2?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 8000
+  - reopen_auth_url_before_consent_retry_3:
+      if: "${state.steps.wait_before_consent_add_phone_retry_3?.action != null && state.steps.wait_before_consent_add_phone_retry_3?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the third final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_3:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_3?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_3?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the third add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_3:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_3?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_3?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the third add-phone retry.
+  - wait_before_consent_add_phone_retry_4:
+      if: "${state.steps.classify_before_consent_retry_3?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 16000
+  - reopen_auth_url_before_consent_retry_4:
+      if: "${state.steps.wait_before_consent_add_phone_retry_4?.action != null && state.steps.wait_before_consent_add_phone_retry_4?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the fourth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_4:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_4?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_4?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the fourth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_4:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_4?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_4?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the fourth add-phone retry.
+  - wait_before_consent_add_phone_retry_5:
+      if: "${state.steps.classify_before_consent_retry_4?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 32000
+  - reopen_auth_url_before_consent_retry_5:
+      if: "${state.steps.wait_before_consent_add_phone_retry_5?.action != null && state.steps.wait_before_consent_add_phone_retry_5?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the fifth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_5:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_5?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_5?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the fifth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_5:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_5?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_5?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the fifth add-phone retry.
+  - wait_before_consent_add_phone_retry_6:
+      if: "${state.steps.classify_before_consent_retry_5?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 64000
+  - reopen_auth_url_before_consent_retry_6:
+      if: "${state.steps.wait_before_consent_add_phone_retry_6?.action != null && state.steps.wait_before_consent_add_phone_retry_6?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the sixth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_6:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_6?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_6?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the sixth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_6:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_6?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_6?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the sixth add-phone retry.
+  - wait_before_consent_add_phone_retry_7:
+      if: "${state.steps.classify_before_consent_retry_6?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 128000
+  - reopen_auth_url_before_consent_retry_7:
+      if: "${state.steps.wait_before_consent_add_phone_retry_7?.action != null && state.steps.wait_before_consent_add_phone_retry_7?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the seventh final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_7:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_7?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_7?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the seventh add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_7:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_7?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_7?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the seventh add-phone retry.
+  - wait_before_consent_add_phone_retry_8:
+      if: "${state.steps.classify_before_consent_retry_7?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 256000
+  - reopen_auth_url_before_consent_retry_8:
+      if: "${state.steps.wait_before_consent_add_phone_retry_8?.action != null && state.steps.wait_before_consent_add_phone_retry_8?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the eighth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_8:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_8?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_8?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the eighth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_8:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_8?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_8?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the eighth add-phone retry.
+  - wait_before_consent_add_phone_retry_9:
+      if: "${state.steps.classify_before_consent_retry_8?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the next exponential wait before replaying the captured auth URL when add-phone still blocks consent.
+      wait:
+        milliseconds: 512000
+  - reopen_auth_url_before_consent_retry_9:
+      if: "${state.steps.wait_before_consent_add_phone_retry_9?.action != null && state.steps.wait_before_consent_add_phone_retry_9?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the ninth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_9:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_9?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_9?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the ninth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_9:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_9?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_9?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the ninth add-phone retry.
+  - wait_before_consent_add_phone_retry_10:
+      if: "${state.steps.classify_before_consent_retry_9?.action?.add_phone_prompt === true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Apply the final exponential wait before skipping the account when add-phone still blocks consent.
+      wait:
+        milliseconds: 1024000
+  - reopen_auth_url_before_consent_retry_10:
+      if: "${state.steps.wait_before_consent_add_phone_retry_10?.action != null && state.steps.wait_before_consent_add_phone_retry_10?.action?.skipped !== true && String(state.vars.codex_login?.auth_url || inputs.auth_url || '').trim() !== ''}"
+      metadata:
+        description: Replay the captured Codex auth URL after the tenth final add-phone wait.
+        mode: headless_ok
+        targetRef: primary
+        browser:
+          clearSiteDataForOrigins:
+            - https://auth.openai.com
+            - https://chatgpt.com
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: "${state.vars.codex_login?.auth_url || inputs.auth_url || ''}"
+  - settle_before_consent_add_phone_retry_10:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_10?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_10?.action?.skipped !== true}"
+      metadata:
+        description: Let the replayed final Codex auth URL settle after the tenth add-phone retry.
+      wait:
+        milliseconds: 1200
+  - classify_before_consent_retry_10:
+      if: "${state.steps.reopen_auth_url_before_consent_retry_10?.action?.ok === true && state.steps.reopen_auth_url_before_consent_retry_10?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Reclassify the final OpenAI/Codex state after the tenth add-phone retry.
+  - cache_effective_before_consent_surface:
+      metadata:
+        description: Cache the latest final OpenAI/Codex state after any bounded add-phone retries.
+      set:
+        effective_before_consent_surface: "${state.steps.classify_before_consent_retry_10?.action?.current_url ? state.steps.classify_before_consent_retry_10?.action : (state.steps.classify_before_consent_retry_9?.action?.current_url ? state.steps.classify_before_consent_retry_9?.action : (state.steps.classify_before_consent_retry_8?.action?.current_url ? state.steps.classify_before_consent_retry_8?.action : (state.steps.classify_before_consent_retry_7?.action?.current_url ? state.steps.classify_before_consent_retry_7?.action : (state.steps.classify_before_consent_retry_6?.action?.current_url ? state.steps.classify_before_consent_retry_6?.action : (state.steps.classify_before_consent_retry_5?.action?.current_url ? state.steps.classify_before_consent_retry_5?.action : (state.steps.classify_before_consent_retry_4?.action?.current_url ? state.steps.classify_before_consent_retry_4?.action : (state.steps.classify_before_consent_retry_3?.action?.current_url ? state.steps.classify_before_consent_retry_3?.action : (state.steps.classify_before_consent_retry_2?.action?.current_url ? state.steps.classify_before_consent_retry_2?.action : (state.steps.classify_before_consent_retry_1?.action?.current_url ? state.steps.classify_before_consent_retry_1?.action : (state.steps.classify_before_consent?.action || {}))))))))))}"
   - accept_oauth_consent:
-      if: "${state.steps.classify_before_consent?.action?.oauth_continue_visible === true && state.steps.classify_before_consent?.action?.callback_complete !== true}"
+      if: "${state.vars.effective_before_consent_surface?.oauth_continue_visible === true && state.vars.effective_before_consent_surface?.callback_complete !== true}"
       metadata:
         templateRef: click_primary_continue
         description: "Accept the final OpenAI consent step for the Codex callback."
@@ -3338,6 +4168,31 @@ do:
             const session = state.vars?.codex_login && typeof state.vars.codex_login === "object" && !Array.isArray(state.vars.codex_login)
               ? state.vars.codex_login
               : {};
+            const effectiveBeforeConsent = state.vars?.effective_before_consent_surface && typeof state.vars.effective_before_consent_surface === "object" && !Array.isArray(state.vars.effective_before_consent_surface)
+              ? state.vars.effective_before_consent_surface
+              : {};
+            const hadFinalAddPhonePrompt = [
+              state.steps.classify_before_consent?.action,
+              state.steps.classify_before_consent_retry_1?.action,
+              state.steps.classify_before_consent_retry_2?.action,
+              state.steps.classify_before_consent_retry_3?.action,
+              state.steps.classify_before_consent_retry_4?.action,
+              state.steps.classify_before_consent_retry_5?.action,
+              state.steps.classify_before_consent_retry_6?.action,
+              state.steps.classify_before_consent_retry_7?.action,
+              state.steps.classify_before_consent_retry_8?.action,
+              state.steps.classify_before_consent_retry_9?.action,
+              state.steps.classify_before_consent_retry_10?.action,
+              effectiveBeforeConsent,
+            ].some((surface) => {
+              if (!surface || typeof surface !== "object") {
+                return false;
+              }
+              const surfaceUrl = String(surface.current_url || "");
+              return surface.add_phone_prompt === true
+                || surface.stage === "add_phone"
+                || /\/add-phone(?:[/?#]|$)/i.test(surfaceUrl);
+            });
 
             const stage = final.stage || signupGate.stage || signupAfter.stage || signupComplete.stage || null;
             const currentUrl = final.current_url || signupGate.current_url || signupAfter.current_url || signupComplete.current_url || null;
@@ -3349,6 +4204,8 @@ do:
             const needsEmailVerification = final.needs_email_verification === true || stage === "email_verification";
             const followUpStep = final.follow_up_step === true || stage === "about_you";
             const addPhonePrompt = final.add_phone_prompt === true || stage === "add_phone" || signupComplete.stage === "add_phone";
+            const boundedFinalAddPhonePrompt = hadFinalAddPhonePrompt
+              && (stage === "auth_prompt" || stage === "login_email" || stage === "login_password");
             const retryableTimeout = final.retryable_timeout === true || stage === "retryable_timeout";
             const sessionEnded = final.session_ended === true || stage === "session_ended";
             const existingAccountPrompt = final.existing_account_prompt === true
@@ -3383,20 +4240,24 @@ do:
               errorMessage = rateLimitExceeded
                 ? "OpenAI rate-limited the Codex login."
                 : "OpenAI timed out before completing the Codex login.";
-            } else if (needsEmailVerification || followUpStep || addPhonePrompt || authPrompt) {
+            } else if (addPhonePrompt) {
+              nextAction = "skip_account";
+              replayReason = "add_phone";
+              errorMessage = "OpenAI still requires phone setup before the Codex callback can complete.";
+            } else if (boundedFinalAddPhonePrompt) {
+              nextAction = "retry_attempt";
+              retryReason = "final_add_phone";
+              errorMessage = "OpenAI still requires phone setup before the Codex callback can complete.";
+            } else if (needsEmailVerification || followUpStep || authPrompt) {
               nextAction = "replay_auth_url";
-              replayReason = addPhonePrompt
-                ? "add_phone"
-                : (needsEmailVerification
-                    ? "email_verification"
-                    : (followUpStep ? "about_you" : "auth_prompt"));
-              errorMessage = addPhonePrompt
-                ? "OpenAI still requires phone setup before the Codex callback can complete."
-                : (needsEmailVerification
-                    ? "OpenAI still requires email verification before the Codex callback can complete."
-                    : (followUpStep
-                        ? "OpenAI still requires account setup before the Codex callback can complete."
-                        : "OpenAI remained on an auth prompt instead of reaching the Codex callback."));
+              replayReason = needsEmailVerification
+                ? "email_verification"
+                : (followUpStep ? "about_you" : "auth_prompt");
+              errorMessage = needsEmailVerification
+                ? "OpenAI still requires email verification before the Codex callback can complete."
+                : (followUpStep
+                    ? "OpenAI still requires account setup before the Codex callback can complete."
+                    : "OpenAI remained on an auth prompt instead of reaching the Codex callback.");
             } else if (existingAccountPrompt) {
               nextAction = "replay_auth_url";
               replayReason = "existing_account_prompt";
@@ -3425,7 +4286,7 @@ do:
               account_ready: accountReady,
               needs_email_verification: needsEmailVerification,
               follow_up_step: followUpStep,
-              add_phone_prompt: addPhonePrompt,
+              add_phone_prompt: addPhonePrompt || boundedFinalAddPhonePrompt,
               retryable_timeout: retryableTimeout,
               session_ended: sessionEnded,
               existing_account_prompt: existingAccountPrompt,

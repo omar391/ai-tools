@@ -139,6 +139,15 @@ async function loadMinimalWorkflow() {
   return loadWorkflow(minimalWorkflowPath);
 }
 
+function findWorkflowStep<T = Record<string, unknown>>(
+  workflow: Awaited<ReturnType<typeof loadWorkflow>>,
+  stepId: string,
+): T | undefined {
+  return workflow.do?.find((entry) => stepId in entry)?.[stepId] as
+    | T
+    | undefined;
+}
+
 async function loadMinimalAboutYouHelperScript() {
   const workflow = await loadMinimalWorkflow();
   const script =
@@ -1026,6 +1035,83 @@ for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
     );
     expect(workflowText).toContain(
       "wait_before_consent_add_phone_retry_4?.action?.skipped !== true",
+    );
+  });
+
+  test("all non-device flows clear OpenAI and ChatGPT auth state at entry", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const step = findWorkflowStep<{
+        metadata?: {
+          browser?: {
+            clearSiteDataForOrigins?: string[];
+          };
+        };
+      }>(workflow, "open_codex_login_entry");
+
+      expect(step?.metadata?.browser?.clearSiteDataForOrigins).toEqual(
+        expect.arrayContaining([
+          "https://auth.openai.com",
+          "https://chatgpt.com",
+        ]),
+      );
+    }
+  });
+
+  test("all non-device flows reclear auth state before each bounded final add-phone replay", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const workflowText = readFileSync(workflowPath, "utf8");
+      const waitStepIds = Array.from(
+        workflowText.matchAll(/wait_before_consent_add_phone_retry_(\d+)/g),
+        (match) => match[0],
+      );
+
+      expect(new Set(waitStepIds).size).toBe(10);
+
+      for (let attempt = 1; attempt <= 10; attempt += 1) {
+        const reopenStep = findWorkflowStep<{
+          metadata?: {
+            browser?: {
+              clearSiteDataForOrigins?: string[];
+            };
+          };
+        }>(workflow, `reopen_auth_url_before_consent_retry_${attempt}`);
+
+        expect(reopenStep?.metadata?.browser?.clearSiteDataForOrigins).toEqual(
+          expect.arrayContaining([
+            "https://auth.openai.com",
+            "https://chatgpt.com",
+          ]),
+        );
+      }
+    }
+  });
+
+  test("minimal keeps an in-workflow replayed-login OTP recollection path", async () => {
+    const workflow = await loadWorkflow(minimalWorkflowPath);
+    const stepIds = (workflow.do || []).flatMap((entry) => Object.keys(entry));
+    const workflowText = readFileSync(minimalWorkflowPath, "utf8");
+
+    expect(stepIds).toEqual(
+      expect.arrayContaining([
+        "resend_login_verification_email_after_submit_failure",
+        "recollect_login_verification_artifact_after_submit_failure",
+        "submit_login_verification_code_after_submit_failure",
+        "cache_effective_login_verification_surface",
+      ]),
+    );
+    expect(workflowText).toContain("login-verification-code-rejected");
+    expect(workflowText).toContain(
+      "state.steps.submit_login_verification_code_after_submit_failure?.action?.ok === true",
     );
   });
 });
@@ -2162,6 +2248,112 @@ describe("original workflow verification helper", () => {
     expect(result.next_stage).toBe("oauth_consent");
   });
 
+  test("fills otp-named segmented signup OTP inputs and advances the flow", async () => {
+    const result = await runOriginalStepScript(
+      "submit_signup_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input name="otp-1" maxlength="1" />
+              <input name="otp-2" maxlength="1" />
+              <input name="otp-3" maxlength="1" />
+              <input name="otp-4" maxlength="1" />
+              <input name="otp-5" maxlength="1" />
+              <input name="otp-6" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const update = () => {
+                const code = readCode();
+                button.disabled = code.length !== 6;
+              };
+              inputs.forEach((input, index) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  update();
+                  if (input.value && index + 1 < inputs.length) {
+                    inputs[index + 1].focus();
+                  }
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "123456") {
+                  document.body.innerHTML =
+                    '<h1>Sign in to Codex with ChatGPT</h1><button>Continue to Codex</button>';
+                }
+              });
+              update();
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_signup_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  code: "123456",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("123456");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
+
+  test("remembers final add-phone across bounded retries from stage/url evidence alone", async () => {
+    const result = await runWorkflowRunScript(
+      originalWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "devbench.25@astronlab.com",
+      },
+      {
+        steps: {
+          classify_before_consent: {
+            action: {
+              stage: "add_phone",
+              current_url: "https://auth.openai.com/add-phone",
+              headline: "Phone number required",
+            },
+          },
+          classify_before_consent_retry_1: {
+            action: {
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              headline: "Welcome back",
+              auth_prompt: true,
+            },
+          },
+          complete_login_or_consent: {
+            action: {
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              headline: "Welcome back",
+              auth_prompt: true,
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("skip_account");
+    expect(result.replay_reason).toBe("add_phone");
+    expect(result.error_message).toContain("phone setup");
+  });
+
   test("fills segmented replayed-login OTP inputs and advances the flow", async () => {
     const result = await runOriginalStepScript(
       "submit_login_verification_code",
@@ -2449,7 +2641,7 @@ describe("stepwise workflow verification helper", () => {
     expect(result.next_stage).toBe("oauth_consent");
   });
 
-  test("finalizes a bounded final add-phone bounce back to login as skip_account", async () => {
+  test("stepwise retries the same account when bounded final add-phone bounces back to login", async () => {
     const result = await runWorkflowRunScript(
       stepwiseWorkflowPath,
       "finalize_flow_summary",
@@ -2476,12 +2668,12 @@ describe("stepwise workflow verification helper", () => {
       },
     );
 
-    expect(result.next_action).toBe("skip_account");
-    expect(result.replay_reason).toBe("add_phone");
+    expect(result.next_action).toBe("retry_attempt");
+    expect(result.retry_reason).toBe("final_add_phone");
     expect(result.error_message).toContain("phone setup");
   });
 
-  test("remembers final add-phone across bounded retries before replaying the auth prompt", async () => {
+  test("stepwise remembers final add-phone across bounded retries before retrying the same account", async () => {
     const result = await runWorkflowRunScript(
       stepwiseWorkflowPath,
       "finalize_flow_summary",
@@ -2517,8 +2709,72 @@ describe("stepwise workflow verification helper", () => {
       },
     );
 
-    expect(result.next_action).toBe("skip_account");
-    expect(result.replay_reason).toBe("add_phone");
+    expect(result.next_action).toBe("retry_attempt");
+    expect(result.retry_reason).toBe("final_add_phone");
+    expect(result.error_message).toContain("phone setup");
+  });
+
+  test("original retries the same account when bounded final add-phone bounces back to login", async () => {
+    const result = await runWorkflowRunScript(
+      originalWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "devbench.15@astronlab.com",
+      },
+      {
+        vars: {
+          effective_before_consent_surface: {
+            add_phone_prompt: true,
+            current_url: "https://auth.openai.com/add-phone",
+          },
+        },
+        steps: {
+          complete_login_or_consent: {
+            action: {
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              headline: "Welcome back",
+              auth_prompt: true,
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("retry_attempt");
+    expect(result.retry_reason).toBe("final_add_phone");
+    expect(result.error_message).toContain("phone setup");
+  });
+
+  test("minimal retries the same account when bounded final add-phone bounces back to login", async () => {
+    const result = await runWorkflowRunScript(
+      minimalWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "devbench.15@astronlab.com",
+      },
+      {
+        vars: {
+          effective_before_consent_surface: {
+            add_phone_prompt: true,
+            current_url: "https://auth.openai.com/add-phone",
+          },
+        },
+        steps: {
+          complete_login_or_consent: {
+            action: {
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              headline: "Welcome back",
+              auth_prompt: true,
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("retry_attempt");
+    expect(result.retry_reason).toBe("final_add_phone");
     expect(result.error_message).toContain("phone setup");
   });
 });

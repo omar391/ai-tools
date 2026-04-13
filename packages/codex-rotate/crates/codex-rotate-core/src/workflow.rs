@@ -1266,6 +1266,24 @@ fn prepare_next_auto_create_attempt(
     }
 
     store.pending.remove(&normalized_email);
+    let max_skipped_slots = max_skipped_slots_for_family(store.families.get(family_key)).max(1);
+    let mut existing_family_skips =
+        collect_skipped_account_emails_for_family(store, profile_name, base_email);
+    existing_family_skips.retain(|email| normalize_email_key(email) != normalized_email);
+    existing_family_skips.sort_by_key(|email| {
+        extract_account_family_suffix(email, base_email)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    });
+    let existing_skip_count = existing_family_skips.len() as u32;
+    if existing_skip_count >= max_skipped_slots {
+        let to_remove =
+            existing_skip_count.saturating_sub(max_skipped_slots.saturating_sub(1)) as usize;
+        for email in existing_family_skips.into_iter().take(to_remove) {
+            store.skipped.remove(&normalize_email_key(&email));
+        }
+    }
     store.skipped.insert(normalized_email);
     let updated_at = now_iso();
     let next_suffix = suffix.saturating_add(1);
@@ -1333,11 +1351,11 @@ fn execute_create_flow_attempt(
     let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
         Some(entry) => entry.stored.suffix,
-        None => fatal(compute_next_account_family_suffix_with_skips(
+        None => fatal(compute_fresh_account_family_suffix(
+            family.as_ref(),
             &base_email,
             known_emails,
             skipped_emails,
-            max_skipped_slots_for_family(family.as_ref()),
         ))?,
     };
     let created_email = existing_pending
@@ -2937,6 +2955,7 @@ fn codex_login_retry_delay_ms(reason: Option<&str>, attempt: usize) -> u64 {
 
 fn should_reset_codex_login_session_for_retry(retry_reason: Option<&str>, attempt: usize) -> bool {
     retry_reason == Some("state_mismatch")
+        || retry_reason == Some("final_add_phone")
         || (retry_reason == Some("retryable_timeout") && attempt >= 2)
 }
 
@@ -3883,11 +3902,32 @@ fn compute_next_account_family_suffix_with_skips(
         }
     }
     let mut candidate = 1;
-    let should_reserve_skipped = (skipped.len() as u32) < max_skipped_slots;
+    let should_reserve_skipped = (skipped.len() as u32) <= max_skipped_slots;
     while used.contains(&candidate) || (should_reserve_skipped && skipped.contains(&candidate)) {
         candidate += 1;
     }
     Ok(candidate)
+}
+
+fn compute_fresh_account_family_suffix(
+    family: Option<&CredentialFamily>,
+    base_email: &str,
+    known_emails: Vec<String>,
+    skipped_emails: Vec<String>,
+) -> Result<u32> {
+    let computed = compute_next_account_family_suffix_with_skips(
+        base_email,
+        known_emails,
+        skipped_emails.clone(),
+        max_skipped_slots_for_family(family),
+    )?;
+    if skipped_emails.is_empty() {
+        Ok(computed)
+    } else {
+        Ok(family
+            .map(|entry| entry.next_suffix.max(computed))
+            .unwrap_or(computed))
+    }
 }
 
 fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<String> {
@@ -5519,7 +5559,7 @@ input:
     }
 
     #[test]
-    fn compute_next_account_family_suffix_recycles_missing_slot_at_skip_cap() {
+    fn compute_next_account_family_suffix_reserves_skipped_slots_at_skip_cap() {
         assert_eq!(
             compute_next_account_family_suffix_with_skips(
                 "dev.{N}@astronlab.com",
@@ -5534,8 +5574,124 @@ input:
                 10,
             )
             .unwrap(),
-            4
+            14
         );
+    }
+
+    #[test]
+    fn compute_fresh_account_family_suffix_respects_family_frontier_when_skips_exist() {
+        let family = CredentialFamily {
+            profile_name: "dev-1".to_string(),
+            base_email: "devbench.{n}@astronlab.com".to_string(),
+            next_suffix: 16,
+            max_skipped_slots: 2,
+            created_at: "2026-04-13T05:00:00.000Z".to_string(),
+            updated_at: "2026-04-13T05:00:00.000Z".to_string(),
+            last_created_email: None,
+        };
+
+        let next_suffix = compute_fresh_account_family_suffix(
+            Some(&family),
+            "devbench.{n}@astronlab.com",
+            (1..=13)
+                .map(|suffix| format!("devbench.{suffix}@astronlab.com"))
+                .collect(),
+            vec![
+                "devbench.14@astronlab.com".to_string(),
+                "devbench.15@astronlab.com".to_string(),
+            ],
+        )
+        .expect("next suffix");
+
+        assert_eq!(next_suffix, 16);
+    }
+
+    #[test]
+    fn compute_fresh_account_family_suffix_preserves_gap_fill_without_skips() {
+        let family = CredentialFamily {
+            profile_name: "dev-1".to_string(),
+            base_email: "dev.{n}@astronlab.com".to_string(),
+            next_suffix: 99,
+            max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+            created_at: "2026-04-13T05:00:00.000Z".to_string(),
+            updated_at: "2026-04-13T05:00:00.000Z".to_string(),
+            last_created_email: None,
+        };
+
+        let next_suffix = compute_fresh_account_family_suffix(
+            Some(&family),
+            "dev.{n}@astronlab.com",
+            vec![
+                "dev.1@astronlab.com".to_string(),
+                "dev.3@astronlab.com".to_string(),
+            ],
+            Vec::new(),
+        )
+        .expect("next suffix");
+
+        assert_eq!(next_suffix, 2);
+    }
+
+    #[test]
+    fn prepare_next_auto_create_attempt_preserves_current_skip_when_budget_is_full() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "devbench.14@astronlab.com".to_string(),
+            make_pending(
+                "devbench.14@astronlab.com",
+                "dev-1",
+                "devbench.{n}@astronlab.com",
+                14,
+                "2026-04-13T06:00:00.000Z",
+            ),
+        );
+        store
+            .skipped
+            .extend(["devbench.12@astronlab.com", "devbench.13@astronlab.com"].map(str::to_string));
+        store.families.insert(
+            "dev-1::devbench.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "devbench.{n}@astronlab.com".to_string(),
+                next_suffix: 14,
+                max_skipped_slots: 2,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-13T05:00:00.000Z".to_string(),
+                last_created_email: None,
+            },
+        );
+
+        prepare_next_auto_create_attempt(
+            &mut store,
+            "dev-1::devbench.{n}@astronlab.com",
+            "dev-1",
+            "devbench.{n}@astronlab.com",
+            14,
+            "devbench.14@astronlab.com",
+            "2026-04-13T06:00:00.000Z",
+        )
+        .expect("prepare next attempt");
+
+        assert!(!store.pending.contains_key("devbench.14@astronlab.com"));
+        assert!(store.skipped.contains("devbench.14@astronlab.com"));
+        assert!(!store.skipped.contains("devbench.12@astronlab.com"));
+        assert!(store.skipped.contains("devbench.13@astronlab.com"));
+
+        let next_suffix = compute_next_account_family_suffix_with_skips(
+            "devbench.{n}@astronlab.com",
+            (1..=13)
+                .map(|suffix| format!("devbench.{suffix}@astronlab.com"))
+                .collect(),
+            collect_skipped_account_emails_for_family(
+                &store,
+                "dev-1",
+                "devbench.{n}@astronlab.com",
+            ),
+            max_skipped_slots_for_family(store.families.get("dev-1::devbench.{n}@astronlab.com")),
+        )
+        .expect("next suffix");
+
+        assert_eq!(next_suffix, 15);
     }
 
     #[test]
@@ -6500,6 +6656,10 @@ end
         assert!(should_reset_codex_login_session_for_retry(
             Some("state_mismatch"),
             2
+        ));
+        assert!(should_reset_codex_login_session_for_retry(
+            Some("final_add_phone"),
+            1
         ));
     }
 
