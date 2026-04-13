@@ -2275,6 +2275,71 @@ describe("original workflow verification helper", () => {
 });
 
 describe("stepwise workflow verification helper", () => {
+  test("submits signup OTPs from segmented otp-named inputs", async () => {
+    const result = await runWorkflowStepScriptOnContent(
+      stepwiseWorkflowPath,
+      "submit_signup_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input name="otp-1" maxlength="1" />
+              <input name="otp-2" maxlength="1" />
+              <input name="otp-3" maxlength="1" />
+              <input name="otp-4" maxlength="1" />
+              <input name="otp-5" maxlength="1" />
+              <input name="otp-6" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const sync = () => {
+                button.disabled = readCode().length < 6;
+              };
+              inputs.forEach((input, index) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  sync();
+                  if (input.value && index + 1 < inputs.length) {
+                    inputs[index + 1].focus();
+                  }
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "380393") {
+                  document.body.innerHTML =
+                    '<h1>What should we call you?</h1><label for="full-name">Full name</label><input id="full-name" name="name" aria-label="Full name" />';
+                }
+              });
+              sync();
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_signup_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  code: "380393",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("380393");
+    expect(result.next_stage).toBe("about_you");
+  });
+
   test("reports a replayed-login OTP rejection as structured workflow state", async () => {
     const result = await runWorkflowStepScriptOnContent(
       stepwiseWorkflowPath,
