@@ -32,13 +32,19 @@ enum Mode {
     DeviceAuth,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkOperation {
+    Create,
+    Relogin,
+}
+
 #[derive(Clone, Debug)]
 struct BenchmarkCandidate {
     id: &'static str,
     track: Track,
     file_path: PathBuf,
     workflow_ref: &'static str,
-    base_email: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -46,12 +52,15 @@ struct Options {
     mode: Mode,
     runs: u32,
     profile_name: String,
+    operation: BenchmarkOperation,
+    relogin_selector_override: Option<String>,
     base_email_override: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
 struct Snapshot {
     auth_email: Option<String>,
+    default_create_base_email: Option<String>,
     account_emails: HashSet<String>,
     pending_emails: HashSet<String>,
 }
@@ -70,6 +79,7 @@ struct BenchmarkRecord {
     workflow_ref: String,
     workflow_file: String,
     track: Track,
+    operation: BenchmarkOperation,
     task: String,
     run_label: String,
     cold: bool,
@@ -82,6 +92,7 @@ struct BenchmarkRecord {
     intended_target_email: Option<String>,
     displayed_created_label: Option<String>,
     displayed_created_email: Option<String>,
+    environment_blocked: bool,
     used_top_level_fallback: bool,
     top_level_fallback_workflows: Vec<String>,
     selection_eligible: bool,
@@ -204,16 +215,12 @@ fn run() -> Result<()> {
     let mut records = Vec::new();
     for candidate in &candidates {
         for iteration in 1..=options.runs {
-            let base_email = options
-                .base_email_override
-                .get(candidate.id)
-                .or_else(|| options.base_email_override.get(track_key(candidate.track)))
-                .cloned()
-                .unwrap_or_else(|| candidate.base_email.to_string());
+            let snapshot = read_snapshot(&rotate_state_path, &codex_home);
+            let base_email = resolve_benchmark_base_email(&options, candidate, &snapshot)?;
             let record = benchmark_candidate(
                 candidate,
                 iteration,
-                &options.profile_name,
+                &options,
                 &base_email,
                 &repo_root,
                 &cli_binary,
@@ -296,6 +303,8 @@ fn parse_args(args: &[String]) -> Result<Options> {
     let mut mode = Mode::All;
     let mut runs = DEFAULT_RUNS;
     let mut profile_name = DEFAULT_PROFILE.to_string();
+    let mut operation = BenchmarkOperation::Create;
+    let mut relogin_selector_override = None;
     let mut base_email_override = HashMap::new();
 
     let mut index = 0;
@@ -305,6 +314,23 @@ fn parse_args(args: &[String]) -> Result<Options> {
             "--non-device" => mode = Mode::NonDevice,
             "--device-auth" => mode = Mode::DeviceAuth,
             "--all" => mode = Mode::All,
+            "--create" => operation = BenchmarkOperation::Create,
+            "--relogin" => operation = BenchmarkOperation::Relogin,
+            "--selector" => {
+                index += 1;
+                relogin_selector_override = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("--selector requires a value"))?,
+                );
+            }
+            _ if arg.starts_with("--selector=") => {
+                relogin_selector_override = Some(arg["--selector=".len()..].to_string());
+            }
+            _ if arg.starts_with("--relogin=") => {
+                operation = BenchmarkOperation::Relogin;
+                relogin_selector_override = Some(arg["--relogin=".len()..].to_string());
+            }
             "--profile" => {
                 index += 1;
                 profile_name = args
@@ -355,6 +381,8 @@ fn parse_args(args: &[String]) -> Result<Options> {
         mode,
         runs,
         profile_name,
+        operation,
+        relogin_selector_override,
         base_email_override,
     })
 }
@@ -374,10 +402,33 @@ fn assign_base_email_override(overrides: &mut HashMap<String, String>, raw: &str
     Ok(())
 }
 
+fn resolve_benchmark_base_email(
+    options: &Options,
+    candidate: &BenchmarkCandidate,
+    snapshot: &Snapshot,
+) -> Result<String> {
+    if let Some(value) = options
+        .base_email_override
+        .get(candidate.id)
+        .or_else(|| options.base_email_override.get(track_key(candidate.track)))
+    {
+        return Ok(value.clone());
+    }
+    if let Some(value) = snapshot.default_create_base_email.as_deref() {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(anyhow!(
+        "No default_create_base_email is configured in ~/.codex-rotate/accounts.json and no --base-email override was provided."
+    ))
+}
+
 fn benchmark_candidate(
     candidate: &BenchmarkCandidate,
     iteration: u32,
-    profile_name: &str,
+    options: &Options,
     base_email: &str,
     repo_root: &Path,
     cli_binary: &Path,
@@ -386,17 +437,14 @@ fn benchmark_candidate(
 ) -> Result<BenchmarkRecord> {
     let before = read_snapshot(rotate_state_path, codex_home);
     let run_label = format!("{}-{}", candidate.id, iso_now());
-    let command = vec![
-        cli_binary.to_path_buf(),
-        PathBuf::from("internal"),
-        PathBuf::from("create"),
-        PathBuf::from("--force"),
-        PathBuf::from("--restore-auth"),
-        PathBuf::from("--profile"),
-        PathBuf::from(profile_name),
-        PathBuf::from("--base-email"),
-        PathBuf::from(base_email),
-    ];
+    let relogin_selector = match options.operation {
+        BenchmarkOperation::Create => None,
+        BenchmarkOperation::Relogin => Some(resolve_benchmark_relogin_selector(
+            options, &before, base_email,
+        )?),
+    };
+    let command =
+        build_benchmark_command(cli_binary, options, base_email, relogin_selector.as_deref());
     let mut command_env = env::vars_os().collect::<HashMap<_, _>>();
     command_env.insert(
         "CODEX_ROTATE_ACCOUNT_FLOW_FILE".into(),
@@ -419,7 +467,7 @@ fn benchmark_candidate(
     let latency_ms = started.elapsed().as_millis();
     let created_emails = difference(&after.account_emails, &before.account_emails);
     let new_pending_emails = difference(&after.pending_emails, &before.pending_emails);
-    let success = result.exit_status == Some(0);
+    let command_succeeded = result.exit_status == Some(0);
     let combined_output = if result.stderr.is_empty() {
         result.stdout.clone()
     } else if result.stdout.is_empty() {
@@ -427,14 +475,23 @@ fn benchmark_candidate(
     } else {
         format!("{}\n{}", result.stdout, result.stderr)
     };
-    let intended_target_email = extract_intended_target_email(&combined_output);
-    let displayed_created_label = extract_displayed_created_label(&combined_output);
+    let environment_blocked =
+        is_add_phone_environment_blocker(&combined_output, result.exit_status);
+    let success = command_succeeded || environment_blocked;
+    let intended_target_email = extract_intended_target_email(&combined_output).or_else(|| {
+        relogin_selector
+            .as_deref()
+            .and_then(|value| normalize_email(Some(value)))
+    });
+    let displayed_created_label = extract_displayed_account_label(&combined_output);
     let displayed_created_email = displayed_created_label
         .as_deref()
-        .and_then(extract_email_from_label);
+        .and_then(extract_email_from_label)
+        .or_else(|| extract_displayed_account_email(&combined_output));
     let top_level_fallback_workflows =
         detect_top_level_fallback_workflows(&combined_output, candidate.workflow_ref);
     let selection_invalid_reasons = classify_selection_invalid_reasons(
+        options.operation,
         success,
         intended_target_email.as_deref(),
         &created_emails,
@@ -450,9 +507,20 @@ fn benchmark_candidate(
         workflow_ref: candidate.workflow_ref.to_string(),
         workflow_file: candidate.file_path.display().to_string(),
         track: candidate.track,
-        task: match candidate.track {
-            Track::DeviceAuth => "openai-account-create-device-auth".to_string(),
-            Track::NonDevice => "openai-account-create-non-device".to_string(),
+        operation: options.operation,
+        task: match (options.operation, candidate.track) {
+            (BenchmarkOperation::Create, Track::DeviceAuth) => {
+                "openai-account-create-device-auth".to_string()
+            }
+            (BenchmarkOperation::Create, Track::NonDevice) => {
+                "openai-account-create-non-device".to_string()
+            }
+            (BenchmarkOperation::Relogin, Track::DeviceAuth) => {
+                "openai-account-relogin-device-auth".to_string()
+            }
+            (BenchmarkOperation::Relogin, Track::NonDevice) => {
+                "openai-account-relogin-non-device".to_string()
+            }
         },
         run_label,
         cold: true,
@@ -469,6 +537,7 @@ fn benchmark_candidate(
         intended_target_email: intended_target_email.clone(),
         displayed_created_label,
         displayed_created_email,
+        environment_blocked,
         used_top_level_fallback: !top_level_fallback_workflows.is_empty(),
         top_level_fallback_workflows: top_level_fallback_workflows.clone(),
         selection_eligible,
@@ -478,7 +547,9 @@ fn benchmark_candidate(
         auth_restored: before.auth_email == after.auth_email,
         base_email: base_email.to_string(),
         notes: build_notes(
+            options.operation,
             success,
+            environment_blocked,
             &created_emails,
             &new_pending_emails,
             &before,
@@ -490,6 +561,62 @@ fn benchmark_candidate(
         stdout_tail: tail_text(&result.stdout, 12),
         stderr_tail: tail_text(&result.stderr, 12),
         measured_at,
+    })
+}
+
+fn build_benchmark_command(
+    cli_binary: &Path,
+    options: &Options,
+    base_email: &str,
+    relogin_selector: Option<&str>,
+) -> Vec<PathBuf> {
+    match options.operation {
+        BenchmarkOperation::Create => vec![
+            cli_binary.to_path_buf(),
+            PathBuf::from("internal"),
+            PathBuf::from("create"),
+            PathBuf::from("--force"),
+            PathBuf::from("--restore-auth"),
+            PathBuf::from("--profile"),
+            PathBuf::from(options.profile_name.as_str()),
+            PathBuf::from("--base-email"),
+            PathBuf::from(base_email),
+        ],
+        BenchmarkOperation::Relogin => vec![
+            cli_binary.to_path_buf(),
+            PathBuf::from("internal"),
+            PathBuf::from("relogin"),
+            PathBuf::from(relogin_selector.unwrap_or_default()),
+            PathBuf::from("--logout-first"),
+        ],
+    }
+}
+
+fn resolve_benchmark_relogin_selector(
+    options: &Options,
+    snapshot: &Snapshot,
+    base_email: &str,
+) -> Result<String> {
+    if let Some(value) = options.relogin_selector_override.as_deref() {
+        return Ok(value.to_string());
+    }
+
+    let mut candidates = snapshot
+        .account_emails
+        .iter()
+        .filter(|email| email_matches_base_email(email, base_email))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        extract_template_suffix(left, base_email)
+            .cmp(&extract_template_suffix(right, base_email))
+            .then_with(|| left.cmp(right))
+    });
+    candidates.into_iter().next().ok_or_else(|| {
+        anyhow!(
+            "No pooled account matches {} for relogin benchmarking.",
+            base_email
+        )
     })
 }
 
@@ -584,6 +711,12 @@ fn stream_output<R: Read>(reader: R, label: &str, is_stderr: bool) -> Result<Str
 fn read_snapshot(rotate_state_path: &Path, codex_home: &Path) -> Snapshot {
     let state = read_rotate_state(rotate_state_path);
     let auth_email = read_auth_email(codex_home);
+    let default_create_base_email = state
+        .get("default_create_base_email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let account_emails = state
         .get("accounts")
         .and_then(Value::as_array)
@@ -600,6 +733,7 @@ fn read_snapshot(rotate_state_path: &Path, codex_home: &Path) -> Snapshot {
         .collect::<HashSet<_>>();
     Snapshot {
         auth_email,
+        default_create_base_email,
         account_emails,
         pending_emails,
     }
@@ -659,7 +793,9 @@ fn parse_jwt_payload(token: &str) -> Option<Value> {
 }
 
 fn build_notes(
+    operation: BenchmarkOperation,
     success: bool,
+    environment_blocked: bool,
     created_emails: &[String],
     new_pending_emails: &[String],
     before: &Snapshot,
@@ -669,7 +805,10 @@ fn build_notes(
     selection_invalid_reasons: &[String],
 ) -> Option<String> {
     let mut parts = Vec::new();
-    if success && created_emails.is_empty() {
+    if environment_blocked {
+        parts.push("environment-blocked at final add_phone".to_string());
+    }
+    if success && matches!(operation, BenchmarkOperation::Create) && created_emails.is_empty() {
         parts.push("create exited successfully but no new pooled account was detected".to_string());
     }
     if success {
@@ -732,6 +871,17 @@ fn classify_failure_mode(output: &str) -> String {
     } else {
         "unknown".to_string()
     }
+}
+
+fn is_add_phone_environment_blocker(output: &str, exit_status: Option<i32>) -> bool {
+    if exit_status == Some(0) {
+        return false;
+    }
+    let normalized = output.to_lowercase();
+    normalized.contains("after exhausting final add-phone retries")
+        || normalized.contains("final_add_phone")
+        || normalized.contains("the workflow requested skipping")
+            && (normalized.contains("add_phone") || normalized.contains("add-phone"))
 }
 
 fn run_summary_script(
@@ -892,16 +1042,22 @@ fn build_report(
     selection: &SelectionOutput,
 ) -> String {
     let rows = if records.is_empty() {
-        "| - | - | - | - | - | - | - | - |".to_string()
+        "| - | - | - | - | - | - | - | - | - | - |".to_string()
     } else {
         records
             .iter()
             .map(|record| {
                 format!(
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     record.workflow_id,
+                    operation_key(record.operation),
                     track_key(record.track),
                     if record.success { "yes" } else { "no" },
+                    if record.environment_blocked {
+                        "yes"
+                    } else {
+                        "no"
+                    },
                     if record.selection_eligible {
                         "yes"
                     } else {
@@ -966,11 +1122,12 @@ fn build_report(
         "# OpenAI Account Flow Benchmark\n\n\
          - run: `{benchmark_run_id}`\n\
          - mode: `{}`\n\
+         - operation: `{}`\n\
          - runs per workflow: `{}`\n\
          - managed profile: `{}`\n\n\
          ## Raw Runs\n\n\
-         | workflow | track | success | eligible | latency_ms | target | created emails | displayed label | failure |\n\
-         | --- | --- | --- | --- | ---: | --- | --- | --- | --- |\n\
+         | workflow | operation | track | success | env-blocked | eligible | latency_ms | target | created emails | displayed label | failure |\n\
+         | --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- |\n\
          {rows}\n\n\
          ## Summary\n\n\
          | workflow | track | successes | eligible successes | eligible success rate | eligible median latency_ms | eligible best latency_ms | failure modes |\n\
@@ -980,6 +1137,7 @@ fn build_report(
          - selected non-device: {}\n\
          - selected device-auth: {}\n",
         mode_key(options.mode),
+        operation_key(options.operation),
         options.runs,
         options.profile_name,
         selection
@@ -1018,28 +1176,24 @@ fn benchmark_candidates(workflow_root: &Path) -> Vec<BenchmarkCandidate> {
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow",
-            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "stepwise",
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow-stepwise.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
-            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "minimal",
             track: Track::NonDevice,
             file_path: workflow_root.join("codex-rotate-account-flow-minimal.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-            base_email: "devbench.{n}@astronlab.com",
         },
         BenchmarkCandidate {
             id: "device-auth",
             track: Track::DeviceAuth,
             file_path: workflow_root.join("codex-rotate-account-flow-device-auth.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
-            base_email: "devbench.{n}@astronlab.com",
         },
     ]
 }
@@ -1087,7 +1241,6 @@ fn normalize_text(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
-#[cfg(test)]
 fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
     let trimmed = value.as_ref().trim().to_lowercase();
     if trimmed.is_empty() {
@@ -1097,7 +1250,6 @@ fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
-#[cfg(test)]
 fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
     let normalized_email = normalize_email(Some(email))?;
     let normalized_base_email = normalize_base_email(base_email)?;
@@ -1112,6 +1264,10 @@ fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
     }
     let numeric = &normalized_email[prefix.len()..normalized_email.len() - suffix.len()];
     numeric.parse::<u32>().ok()
+}
+
+fn email_matches_base_email(email: &str, base_email: &str) -> bool {
+    extract_template_suffix(email, base_email).is_some()
 }
 
 fn extract_intended_target_email(output: &str) -> Option<String> {
@@ -1134,7 +1290,7 @@ fn extract_intended_target_email(output: &str) -> Option<String> {
     last_match
 }
 
-fn extract_displayed_created_label(output: &str) -> Option<String> {
+fn extract_displayed_account_label(output: &str) -> Option<String> {
     let mut last_match = None;
     for line in output.lines() {
         let line = line.trim();
@@ -1143,6 +1299,30 @@ fn extract_displayed_created_label(output: &str) -> Option<String> {
         }
         if let Some(value) = extract_between(line, "Created ", " via \"") {
             last_match = normalize_text(value);
+        }
+        if let Some(value) = extract_between(
+            line,
+            "Re-logged ",
+            " with stored managed-browser credentials.",
+        ) {
+            last_match = normalize_text(value);
+        }
+        if let Some(value) = extract_between(line, "Updated account \"", "\" (") {
+            last_match = normalize_text(value);
+        }
+    }
+    last_match
+}
+
+fn extract_displayed_account_email(output: &str) -> Option<String> {
+    let mut last_match = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(value) = extract_between(line, "Updated account \"", "\" (") {
+            last_match = extract_email_from_label(value);
+        }
+        if let Some(value) = extract_between(line, "\" (", ")") {
+            last_match = normalize_email(Some(value));
         }
     }
     last_match
@@ -1196,6 +1376,7 @@ fn is_workflow_ref_token_char(ch: char) -> bool {
 }
 
 fn classify_selection_invalid_reasons(
+    operation: BenchmarkOperation,
     success: bool,
     intended_target_email: Option<&str>,
     created_emails: &[String],
@@ -1212,32 +1393,37 @@ fn classify_selection_invalid_reasons(
     if normalized_target.is_none() {
         reasons.push("missing_target_email".to_string());
     }
-    if created_emails.len() != 1 {
-        reasons.push(format!(
-            "expected_single_pooled_email_found_{}",
-            created_emails.len()
-        ));
-    }
     if displayed_created_label.is_none() {
         reasons.push("missing_displayed_created_label".to_string());
     }
     if displayed_created_email.is_none() {
         reasons.push("missing_displayed_created_email".to_string());
     }
-    if let (Some(target), Some(created)) = (normalized_target.as_deref(), created_emails.first()) {
-        if target != created {
-            reasons.push(format!("target_pool_mismatch:{target}!={created}"));
+    if matches!(operation, BenchmarkOperation::Create) {
+        if created_emails.len() != 1 {
+            reasons.push(format!(
+                "expected_single_pooled_email_found_{}",
+                created_emails.len()
+            ));
+        }
+        if let (Some(target), Some(created)) =
+            (normalized_target.as_deref(), created_emails.first())
+        {
+            if target != created {
+                reasons.push(format!("target_pool_mismatch:{target}!={created}"));
+            }
+        }
+        if let (Some(created), Some(displayed)) = (created_emails.first(), displayed_created_email)
+        {
+            if created != displayed {
+                reasons.push(format!("pool_display_mismatch:{created}!={displayed}"));
+            }
         }
     }
     if let (Some(target), Some(displayed)) = (normalized_target.as_deref(), displayed_created_email)
     {
         if target != displayed {
             reasons.push(format!("target_display_mismatch:{target}!={displayed}"));
-        }
-    }
-    if let (Some(created), Some(displayed)) = (created_emails.first(), displayed_created_email) {
-        if created != displayed {
-            reasons.push(format!("pool_display_mismatch:{created}!={displayed}"));
         }
     }
     if !top_level_fallback_workflows.is_empty() {
@@ -1292,6 +1478,13 @@ fn mode_key(mode: Mode) -> &'static str {
         Mode::All => "all",
         Mode::NonDevice => "non_device",
         Mode::DeviceAuth => "device_auth",
+    }
+}
+
+fn operation_key(operation: BenchmarkOperation) -> &'static str {
+    match operation {
+        BenchmarkOperation::Create => "create",
+        BenchmarkOperation::Relogin => "relogin",
     }
 }
 
@@ -1362,6 +1555,7 @@ mod tests {
             .to_string(),
             workflow_file: format!("{workflow_id}.yaml"),
             track,
+            operation: BenchmarkOperation::Create,
             task: match track {
                 Track::NonDevice => "openai-account-create-non-device".to_string(),
                 Track::DeviceAuth => "openai-account-create-device-auth".to_string(),
@@ -1377,6 +1571,7 @@ mod tests {
             intended_target_email: None,
             displayed_created_label: None,
             displayed_created_email: None,
+            environment_blocked: false,
             used_top_level_fallback: false,
             top_level_fallback_workflows: Vec::new(),
             selection_eligible,
@@ -1388,7 +1583,7 @@ mod tests {
             auth_before: None,
             auth_after: None,
             auth_restored: true,
-            base_email: "devbench.{n}@astronlab.com".to_string(),
+            base_email: "dev3astronlab+{n}@gmail.com".to_string(),
             notes: None,
             stdout_tail: None,
             stderr_tail: None,
@@ -1409,6 +1604,7 @@ mod tests {
         .expect("parse args");
 
         assert!(matches!(options.mode, Mode::DeviceAuth));
+        assert!(matches!(options.operation, BenchmarkOperation::Create));
         assert_eq!(options.runs, 3);
         assert_eq!(options.profile_name, "dev-2");
         assert_eq!(
@@ -1418,6 +1614,23 @@ mod tests {
                 .map(String::as_str),
             Some("qa.{n}@astronlab.com")
         );
+    }
+
+    #[test]
+    fn parse_args_supports_relogin_operation_and_selector() {
+        let options = parse_args(&[
+            "--relogin=dev3astronlab+2@gmail.com".to_string(),
+            "--runs".to_string(),
+            "2".to_string(),
+        ])
+        .expect("parse args");
+
+        assert!(matches!(options.operation, BenchmarkOperation::Relogin));
+        assert_eq!(
+            options.relogin_selector_override.as_deref(),
+            Some("dev3astronlab+2@gmail.com")
+        );
+        assert_eq!(options.runs, 2);
     }
 
     #[test]
@@ -1433,18 +1646,34 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_candidates_default_to_devbench_family() {
+    fn resolve_benchmark_base_email_prefers_store_default_without_override() {
+        let options = Options {
+            mode: Mode::All,
+            runs: 1,
+            profile_name: "dev-1".to_string(),
+            operation: BenchmarkOperation::Create,
+            relogin_selector_override: None,
+            base_email_override: HashMap::new(),
+        };
         let workflow_root = Path::new("/tmp/auth-workflows");
-        let candidates = benchmark_candidates(workflow_root);
+        let candidate = benchmark_candidates(workflow_root)
+            .into_iter()
+            .find(|entry| entry.id == "original")
+            .expect("candidate");
+        let snapshot = Snapshot {
+            auth_email: None,
+            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            account_emails: HashSet::new(),
+            pending_emails: HashSet::new(),
+        };
 
-        assert!(!candidates.is_empty());
-        assert!(candidates
-            .iter()
-            .all(|candidate| candidate.base_email == "devbench.{n}@astronlab.com"));
+        let base_email =
+            resolve_benchmark_base_email(&options, &candidate, &snapshot).expect("base email");
+        assert_eq!(base_email, "dev3astronlab+{n}@gmail.com");
     }
 
     #[test]
-    fn benchmark_candidate_leaves_real_created_devbench_account_in_shared_state() {
+    fn benchmark_candidate_leaves_real_created_gmail_account_in_shared_state() {
         let _guard = env_mutex()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1464,13 +1693,13 @@ mod tests {
                 "#!/bin/sh\n",
                 "mkdir -p \"$CODEX_ROTATE_HOME\"\n",
                 "cat > \"$CODEX_ROTATE_HOME/accounts.json\" <<'EOF'\n",
-                "{\"accounts\":[{\"email\":\"devbench.1@astronlab.com\"}]}\n",
+                "{\"accounts\":[{\"email\":\"dev3astronlab+1@gmail.com\"}]}\n",
                 "EOF\n",
-                "echo 'Creating devbench.1@astronlab.com via dev-1 from devbench.{n}@astronlab.com.' 1>&2\n",
-                "echo 'Managed login finished for devbench.1@astronlab.com. Finalizing.' 1>&2\n",
-                "echo 'Adding devbench.1@astronlab.com to the account pool.' 1>&2\n",
-                "echo 'Created devbench.1@astronlab.com_free with usable quota.' 1>&2\n",
-                "echo '\\033[32mOK\\033[0m Created devbench.1@astronlab.com_free via \"dev-1\" from devbench.{n}@astronlab.com.'\n",
+                "echo 'Creating dev3astronlab+1@gmail.com via dev-1 from dev3astronlab+{n}@gmail.com.' 1>&2\n",
+                "echo 'Managed login finished for dev3astronlab+1@gmail.com. Finalizing.' 1>&2\n",
+                "echo 'Adding dev3astronlab+1@gmail.com to the account pool.' 1>&2\n",
+                "echo 'Created dev3astronlab+1@gmail.com_free with usable quota.' 1>&2\n",
+                "echo '\\033[32mOK\\033[0m Created dev3astronlab+1@gmail.com_free via \"dev-1\" from dev3astronlab+{n}@gmail.com.'\n",
             ),
         )
         .expect("write fake cli");
@@ -1490,14 +1719,21 @@ mod tests {
             track: Track::NonDevice,
             file_path: tempdir.join("flow.yaml"),
             workflow_ref: "workspace.web.auth-openai-com.codex-rotate-account-flow",
-            base_email: "devbench.{n}@astronlab.com",
+        };
+        let options = Options {
+            mode: Mode::All,
+            runs: 1,
+            profile_name: "dev-1".to_string(),
+            operation: BenchmarkOperation::Create,
+            relogin_selector_override: None,
+            base_email_override: HashMap::new(),
         };
 
         let result = benchmark_candidate(
             &candidate,
             1,
-            "dev-1",
-            "devbench.{n}@astronlab.com",
+            &options,
+            "dev3astronlab+{n}@gmail.com",
             &tempdir,
             &cli_binary,
             &rotate_home.join("accounts.json"),
@@ -1514,7 +1750,7 @@ mod tests {
         }
 
         let record = result.expect("benchmark candidate should succeed");
-        assert_eq!(record.created_emails, vec!["devbench.1@astronlab.com"]);
+        assert_eq!(record.created_emails, vec!["dev3astronlab+1@gmail.com"]);
 
         let state = read_rotate_state(&rotate_home.join("accounts.json"));
         let account_emails = state
@@ -1524,7 +1760,7 @@ mod tests {
             .flatten()
             .filter_map(|entry| normalize_email(entry.get("email").and_then(Value::as_str)))
             .collect::<Vec<_>>();
-        assert_eq!(account_emails, vec!["devbench.1@astronlab.com"]);
+        assert_eq!(account_emails, vec!["dev3astronlab+1@gmail.com"]);
 
         fs::remove_dir_all(&tempdir).ok();
     }
@@ -1532,6 +1768,7 @@ mod tests {
     #[test]
     fn classify_selection_invalid_reasons_flags_email_mismatch_and_top_level_fallback() {
         let reasons = classify_selection_invalid_reasons(
+            BenchmarkOperation::Create,
             true,
             Some("devbench.8@astronlab.com"),
             &[String::from("devbench.8@astronlab.com")],
@@ -1551,6 +1788,60 @@ mod tests {
         assert!(reasons
             .iter()
             .any(|reason| reason.starts_with("top_level_fallback:")));
+    }
+
+    #[test]
+    fn classify_selection_invalid_reasons_allows_relogin_without_created_emails() {
+        let reasons = classify_selection_invalid_reasons(
+            BenchmarkOperation::Relogin,
+            true,
+            Some("dev3astronlab+1@gmail.com"),
+            &[],
+            Some("dev3astronlab+1@gmail.com_free"),
+            Some("dev3astronlab+1@gmail.com"),
+            &[],
+        );
+
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn resolve_benchmark_relogin_selector_picks_first_matching_family_account() {
+        let options = Options {
+            mode: Mode::All,
+            runs: 1,
+            profile_name: "dev-1".to_string(),
+            operation: BenchmarkOperation::Relogin,
+            relogin_selector_override: None,
+            base_email_override: HashMap::new(),
+        };
+        let snapshot = Snapshot {
+            auth_email: None,
+            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            account_emails: HashSet::from([
+                "other@gmail.com".to_string(),
+                "dev3astronlab+2@gmail.com".to_string(),
+                "dev3astronlab+1@gmail.com".to_string(),
+            ]),
+            pending_emails: HashSet::new(),
+        };
+
+        let selector =
+            resolve_benchmark_relogin_selector(&options, &snapshot, "dev3astronlab+{n}@gmail.com")
+                .expect("selector");
+        assert_eq!(selector, "dev3astronlab+1@gmail.com");
+    }
+
+    #[test]
+    fn add_phone_environment_blocker_is_treated_as_bounded_non_red_signal() {
+        assert!(is_add_phone_environment_blocker(
+            "The workflow requested skipping dev3astronlab+1@gmail.com after exhausting final add-phone retries (https://auth.openai.com/add-phone).",
+            Some(1)
+        ));
+        assert!(!is_add_phone_environment_blocker(
+            "Created dev3astronlab+1@gmail.com_free with usable quota.",
+            Some(0)
+        ));
     }
 
     #[test]

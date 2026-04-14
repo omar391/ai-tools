@@ -1729,6 +1729,17 @@ mod tests {
             )),
         )
         .expect("read-only commands should stay allowed");
+
+        for command in ["add", "relogin", "remove", "list", "prev", "daemon", "tray"] {
+            ensure_account_creation_commands_allowed_for_repo_root(
+                Some(command),
+                Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
+                Some(Path::new(
+                    "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
+                )),
+            )
+            .unwrap_or_else(|error| panic!("{command} should stay allowed: {error}"));
+        }
     }
 
     #[cfg(unix)]
