@@ -19,7 +19,9 @@ use crate::quota::{
     describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota,
     quota_next_refresh_at, UsageCredits, UsageResponse, UsageWindow,
 };
-use crate::state::{load_rotate_state_json, write_rotate_state_json};
+#[cfg(test)]
+use crate::state::write_rotate_state_json;
+use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 use crate::workflow::{
     cmd_create, cmd_create_with_progress, create_next_fallback_options, extract_email_domain,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
@@ -1244,22 +1246,22 @@ pub fn load_pool() -> Result<Pool> {
 }
 
 pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
-    let mut state = load_rotate_state_json()?;
-    if !state.is_object() {
-        state = Value::Object(Map::new());
-    }
-    let object = state
-        .as_object_mut()
-        .expect("rotate state must be a JSON object");
-    object.insert(
-        "active_index".to_string(),
-        Value::Number(pool.active_index.into()),
-    );
-    object.insert(
-        "accounts".to_string(),
-        serde_json::to_value(&pool.accounts)?,
-    );
-    write_rotate_state_json(&state)
+    let active_index = pool.active_index;
+    let accounts = serde_json::to_value(&pool.accounts)?;
+    update_rotate_state_json(RotateStateOwner::Pool, move |state| {
+        if !state.is_object() {
+            *state = Value::Object(Map::new());
+        }
+        let object = state
+            .as_object_mut()
+            .expect("rotate state must be a JSON object");
+        object.insert(
+            "active_index".to_string(),
+            Value::Number(active_index.into()),
+        );
+        object.insert("accounts".to_string(), accounts.clone());
+        Ok(())
+    })
 }
 
 fn extract_email_from_auth(auth: &CodexAuth) -> String {
@@ -2180,7 +2182,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{RotateHomeGuard, ENV_MUTEX};
     use base64::Engine;
     use serde_json::json;
     use std::io::{Read, Write};
@@ -2383,6 +2385,73 @@ mod tests {
             }
         });
         write_rotate_state_json(&state)
+    }
+
+    #[test]
+    fn save_pool_preserves_credential_store_sections() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-save-pool-preserve");
+        write_rotate_state_json(&json!({
+            "accounts": [{ "email": "dev.1@astronlab.com", "account_id": "acct-1" }],
+            "active_index": 0,
+            "version": 7,
+            "default_create_base_email": "dev.{n}@astronlab.com",
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "next_suffix": 3,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z",
+                    "last_created_email": "dev.2@astronlab.com",
+                    "deleted": []
+                }
+            },
+            "pending": {
+                "dev.3@astronlab.com": {
+                    "email": "dev.3@astronlab.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "suffix": 3,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z",
+                    "started_at": "2026-04-05T00:00:00.000Z"
+                }
+            },
+            "skipped": ["dev.4@astronlab.com"],
+            "domain": {
+                "astronlab.com": {
+                    "rotation_enabled": false
+                }
+            }
+        }))
+        .expect("write initial state");
+
+        save_pool(&Pool {
+            active_index: 1,
+            accounts: vec![
+                configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None),
+                configured_entry("dev.2@astronlab.com", "acct-2", "free", None, None),
+            ],
+        })
+        .expect("save pool");
+
+        let state = load_rotate_state_json().expect("load rotate state");
+        assert_eq!(state["version"], json!(7));
+        assert_eq!(
+            state["default_create_base_email"],
+            json!("dev.{n}@astronlab.com")
+        );
+        assert!(state["families"].is_object());
+        assert!(state["pending"].is_object());
+        assert_eq!(state["skipped"], json!(["dev.4@astronlab.com"]));
+        assert_eq!(
+            state["domain"]["astronlab.com"]["rotation_enabled"],
+            json!(false)
+        );
+        assert_eq!(state["active_index"], json!(1));
+        assert_eq!(state["accounts"][1]["email"], json!("dev.2@astronlab.com"));
     }
 
     #[test]

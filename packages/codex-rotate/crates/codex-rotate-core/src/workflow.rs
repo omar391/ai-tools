@@ -35,7 +35,9 @@ use crate::pool::{
     ReusableAccountProbeMode,
 };
 use crate::quota::{describe_quota_blocker, format_compact_quota, has_usable_quota};
-use crate::state::{load_rotate_state_json, write_rotate_state_json};
+#[cfg(test)]
+use crate::state::write_rotate_state_json;
+use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
@@ -3146,55 +3148,57 @@ pub(crate) fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
 }
 
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
-    let mut state = load_rotate_state_json()?;
-    let dropped_non_dev_pending = normalize_pending_credential_map(state.get("pending"))
-        .into_values()
-        .filter(|record| should_drop_non_dev_pending_credential(&record.stored.base_email))
-        .filter(|record| {
-            !store
-                .pending
-                .contains_key(&normalize_email_key(&record.stored.email))
-        })
-        .collect::<Vec<_>>();
-    if !state.is_object() {
-        state = Value::Object(Map::new());
-    }
-    let object = state
-        .as_object_mut()
-        .expect("rotate state must be a JSON object");
     let credential_state = serialize_credential_store(store);
-    if let Some(version) = credential_state.get("version").cloned() {
-        object.insert("version".to_string(), version);
-    }
-    if let Some(default_create_base_email) =
-        credential_state.get("default_create_base_email").cloned()
-    {
-        object.insert(
-            "default_create_base_email".to_string(),
-            default_create_base_email,
-        );
-    }
-    if store.domain.is_empty() {
-        object.remove("domain");
-    } else if let Some(domain) = credential_state.get("domain").cloned() {
-        object.insert("domain".to_string(), domain);
-    }
-    if store.families.is_empty() {
-        object.remove("families");
-    } else if let Some(families) = credential_state.get("families").cloned() {
-        object.insert("families".to_string(), families);
-    }
-    if store.pending.is_empty() {
-        object.remove("pending");
-    } else if let Some(pending) = credential_state.get("pending").cloned() {
-        object.insert("pending".to_string(), pending);
-    }
-    if store.skipped.is_empty() {
-        object.remove("skipped");
-    } else if let Some(skipped) = credential_state.get("skipped").cloned() {
-        object.insert("skipped".to_string(), skipped);
-    }
-    write_rotate_state_json(&state)?;
+    let mut dropped_non_dev_pending = Vec::new();
+    update_rotate_state_json(RotateStateOwner::CredentialStore, |state| {
+        dropped_non_dev_pending = normalize_pending_credential_map(state.get("pending"))
+            .into_values()
+            .filter(|record| should_drop_non_dev_pending_credential(&record.stored.base_email))
+            .filter(|record| {
+                !store
+                    .pending
+                    .contains_key(&normalize_email_key(&record.stored.email))
+            })
+            .collect::<Vec<_>>();
+        if !state.is_object() {
+            *state = Value::Object(Map::new());
+        }
+        let object = state
+            .as_object_mut()
+            .expect("rotate state must be a JSON object");
+        if let Some(version) = credential_state.get("version").cloned() {
+            object.insert("version".to_string(), version);
+        }
+        if let Some(default_create_base_email) =
+            credential_state.get("default_create_base_email").cloned()
+        {
+            object.insert(
+                "default_create_base_email".to_string(),
+                default_create_base_email,
+            );
+        }
+        if store.domain.is_empty() {
+            object.remove("domain");
+        } else if let Some(domain) = credential_state.get("domain").cloned() {
+            object.insert("domain".to_string(), domain);
+        }
+        if store.families.is_empty() {
+            object.remove("families");
+        } else if let Some(families) = credential_state.get("families").cloned() {
+            object.insert("families".to_string(), families);
+        }
+        if store.pending.is_empty() {
+            object.remove("pending");
+        } else if let Some(pending) = credential_state.get("pending").cloned() {
+            object.insert("pending".to_string(), pending);
+        }
+        if store.skipped.is_empty() {
+            object.remove("skipped");
+        } else if let Some(skipped) = credential_state.get("skipped").cloned() {
+            object.insert("skipped".to_string(), skipped);
+        }
+        Ok(())
+    })?;
     cleanup_dropped_non_dev_pending_secrets(&dropped_non_dev_pending);
     Ok(())
 }
@@ -4906,12 +4910,12 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
+    use crate::test_support::{RotateHomeGuard, ENV_MUTEX};
     use base64::Engine;
     use std::fs;
     use std::path::Path;
     use std::process::Command as ProcessCommand;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -4924,23 +4928,22 @@ mod tests {
     }
 
     fn with_rotate_home<T>(prefix: &str, test: impl FnOnce(&Path) -> T) -> T {
-        let rotate_home = unique_temp_dir(prefix);
-        fs::create_dir_all(&rotate_home).expect("create rotate home");
-        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
-        unsafe {
-            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        let guard = RotateHomeGuard::enter(prefix);
+        if let Some(home) = dirs::home_dir() {
+            assert_ne!(guard.path(), home.join(".codex-rotate"));
         }
-        let result = test(&rotate_home);
-        match previous_rotate_home {
-            Some(value) => unsafe {
-                std::env::set_var("CODEX_ROTATE_HOME", value);
-            },
-            None => unsafe {
-                std::env::remove_var("CODEX_ROTATE_HOME");
-            },
-        }
-        fs::remove_dir_all(&rotate_home).ok();
-        result
+        test(guard.path())
+    }
+
+    #[test]
+    fn with_rotate_home_never_uses_live_rotate_home() {
+        with_rotate_home("codex-rotate-guarded-home", |rotate_home| {
+            let configured = std::env::var_os("CODEX_ROTATE_HOME").expect("rotate home env");
+            assert_eq!(Path::new(&configured), rotate_home);
+            if let Some(home) = dirs::home_dir() {
+                assert_ne!(rotate_home, home.join(".codex-rotate"));
+            }
+        });
     }
 
     fn make_pending(
@@ -6065,7 +6068,6 @@ input:
 
     #[test]
     fn create_execution_lock_blocks_other_process_and_records_metadata() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         with_rotate_home("codex-rotate-create-lock", |_| {
             let options = CreateCommandOptions {
                 alias: Some("dev-1".to_string()),
@@ -6144,7 +6146,6 @@ end
 
     #[test]
     fn create_execution_lock_waits_for_same_process_release() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         with_rotate_home("codex-rotate-create-lock-wait", |_| {
             let options = CreateCommandOptions {
                 profile_name: Some("dev-1".to_string()),
@@ -6429,6 +6430,130 @@ end
             assert_eq!(
                 saved["domain"]["astronlab.com"]["max_suffix_per_family"],
                 Value::from(6)
+            );
+        });
+    }
+
+    #[test]
+    fn save_credential_store_preserves_pool_sections() {
+        with_rotate_home("codex-rotate-credential-store-preserve", |_| {
+            write_rotate_state_json(&json!({
+                "accounts": [
+                    { "email": "dev.1@astronlab.com", "account_id": "acct-1" },
+                    { "email": "dev.2@astronlab.com", "account_id": "acct-2" }
+                ],
+                "active_index": 1,
+                "version": 7
+            }))
+            .expect("write initial state");
+
+            let mut store = CredentialStore::default();
+            store.default_create_base_email = "dev.{n}@astronlab.com".to_string();
+            store.families.insert(
+                "dev-1::dev.{n}@astronlab.com".to_string(),
+                CredentialFamily {
+                    profile_name: "dev-1".to_string(),
+                    base_email: "dev.{n}@astronlab.com".to_string(),
+                    next_suffix: 3,
+                    max_skipped_slots: 0,
+                    created_at: "2026-04-05T00:00:00.000Z".to_string(),
+                    updated_at: "2026-04-05T00:00:00.000Z".to_string(),
+                    last_created_email: Some("dev.2@astronlab.com".to_string()),
+                    deleted: Vec::new(),
+                },
+            );
+
+            save_credential_store(&store).expect("save credential store");
+
+            let saved = load_rotate_state_json().expect("load rotate state");
+            assert_eq!(
+                saved["accounts"][0]["email"],
+                Value::String("dev.1@astronlab.com".to_string())
+            );
+            assert_eq!(saved["active_index"], Value::from(1));
+            assert_eq!(
+                saved["default_create_base_email"],
+                Value::String("dev.{n}@astronlab.com".to_string())
+            );
+            assert!(saved["families"].is_object());
+        });
+    }
+
+    #[test]
+    fn concurrent_pool_and_credential_store_writes_preserve_valid_rotate_state() {
+        with_rotate_home("codex-rotate-concurrent-state", |_| {
+            write_rotate_state_json(&json!({
+                "accounts": [
+                    { "email": "dev.1@astronlab.com", "account_id": "acct-1", "plan_type": "free" }
+                ],
+                "active_index": 0,
+                "version": 7,
+                "families": {
+                    "dev-1::dev.{n}@astronlab.com": {
+                        "profile_name": "dev-1",
+                        "base_email": "dev.{n}@astronlab.com",
+                        "next_suffix": 2,
+                        "max_skipped_slots": 0,
+                        "created_at": "2026-04-05T00:00:00.000Z",
+                        "updated_at": "2026-04-05T00:00:00.000Z",
+                        "last_created_email": "dev.1@astronlab.com",
+                        "deleted": []
+                    }
+                }
+            }))
+            .expect("write initial state");
+
+            let barrier = Arc::new(Barrier::new(3));
+            let pool_barrier = Arc::clone(&barrier);
+            let pool_thread = thread::spawn(move || {
+                pool_barrier.wait();
+                crate::pool::save_pool(&Pool {
+                    active_index: 1,
+                    accounts: vec![
+                        make_account_entry("dev.1@astronlab.com", "acct-1"),
+                        make_account_entry("dev.2@astronlab.com", "acct-2"),
+                    ],
+                })
+            });
+
+            let store_barrier = Arc::clone(&barrier);
+            let store_thread = thread::spawn(move || {
+                store_barrier.wait();
+                let mut store = load_credential_store().expect("load credential store");
+                store.default_create_base_email = "dev.{n}@astronlab.com".to_string();
+                store.pending.insert(
+                    "dev.3@astronlab.com".to_string(),
+                    make_pending(
+                        "dev.3@astronlab.com",
+                        "dev-1",
+                        "dev.{n}@astronlab.com",
+                        3,
+                        "2026-04-05T00:00:00.000Z",
+                    ),
+                );
+                save_credential_store(&store)
+            });
+
+            barrier.wait();
+            pool_thread.join().expect("pool thread").expect("save pool");
+            store_thread
+                .join()
+                .expect("store thread")
+                .expect("save credential store");
+
+            let saved = load_rotate_state_json().expect("load rotate state");
+            assert_eq!(saved["active_index"], Value::from(1));
+            assert_eq!(
+                saved["accounts"][1]["email"],
+                Value::String("dev.2@astronlab.com".to_string())
+            );
+            assert_eq!(
+                saved["pending"]["dev.3@astronlab.com"]["email"],
+                Value::String("dev.3@astronlab.com".to_string())
+            );
+            assert_eq!(
+                saved["families"]["dev-1::dev.{n}@astronlab.com"]["last_created_email"],
+                Value::String("dev.1@astronlab.com".to_string())
             );
         });
     }
@@ -6880,7 +7005,6 @@ end
 
     #[test]
     fn cmd_relogin_rejects_disabled_domain_selector() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         with_rotate_home("codex-rotate-relogin-disabled-domain", |rotate_home| {
             let codex_home = rotate_home.join("codex-home");
             fs::create_dir_all(&codex_home).expect("create codex home");
@@ -7481,7 +7605,6 @@ end
 
     #[test]
     fn completed_login_prefers_session_auth_file_over_default_auth_home() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         with_rotate_home("codex-rotate-session-auth-preferred", |rotate_home| {
             let codex_home = rotate_home.join("codex-home");
             let detached_home = rotate_home.join("detached-codex-home");

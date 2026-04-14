@@ -1,11 +1,10 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::Path;
+use std::fs;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
+use codex_rotate_core::fs_security::write_private_string;
 use codex_rotate_core::pool::{
     load_pool, other_usable_account_exists, rotate_next_internal_with_progress, NextResult, Pool,
 };
@@ -126,12 +125,8 @@ pub fn read_watch_state() -> Result<WatchState> {
 
 pub fn write_watch_state(state: &WatchState) -> Result<()> {
     let paths = resolve_paths()?;
-    if let Some(parent) = paths.watch_state_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
     let raw = serde_json::to_string_pretty(state)?;
-    write_file_atomically(&paths.watch_state_file, &raw)
+    write_private_string(&paths.watch_state_file, &raw)
 }
 
 pub fn auto_create_enabled() -> Result<bool> {
@@ -742,75 +737,6 @@ fn should_run_thread_recovery(
         || rotated
         || previous.thread_recovery_pending
         || recoverable_turn_failure_log_advanced
-}
-
-fn write_file_atomically(path: &Path, raw: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Failed to resolve parent directory for {}.", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("state.json");
-
-    for attempt in 0..8 {
-        let temp_path = parent.join(format!(
-            ".{file_name}.tmp-{}-{}-{attempt}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let open_result = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&temp_path)
-            }
-            #[cfg(not(unix))]
-            {
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&temp_path)
-            }
-        };
-
-        match open_result {
-            Ok(mut file) => {
-                let write_result = (|| -> Result<()> {
-                    file.write_all(raw.as_bytes())?;
-                    file.sync_all()?;
-                    Ok(())
-                })();
-                if let Err(error) = write_result {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(error)
-                        .with_context(|| format!("Failed to write {}.", temp_path.display()));
-                }
-                fs::rename(&temp_path, path).with_context(|| {
-                    format!(
-                        "Failed to atomically replace {} with {}.",
-                        path.display(),
-                        temp_path.display()
-                    )
-                })?;
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to create {}.", temp_path.display()));
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "Failed to allocate a temporary watch state file for {}.",
-        path.display()
-    ))
 }
 
 fn write_watch_state_if_needed(previous: &WatchState, next: &WatchState) -> Result<()> {

@@ -12,6 +12,8 @@ pub struct CorePaths {
     pub codex_logs_db_file: PathBuf,
     pub codex_state_db_file: PathBuf,
     pub pool_file: PathBuf,
+    pub lock_dir: PathBuf,
+    pub accounts_lock_file: PathBuf,
     pub watch_state_file: PathBuf,
     pub profile_dir: PathBuf,
     pub daemon_socket: PathBuf,
@@ -38,6 +40,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
     let rotate_home = std::env::var_os("CODEX_ROTATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex-rotate"));
+    let lock_dir = rotate_home.join("locks");
     let default_account_flow_file = repo_root
         .join(".fast-browser")
         .join("workflows")
@@ -67,6 +70,8 @@ pub fn resolve_paths() -> Result<CorePaths> {
         codex_state_db_file: resolve_codex_state_db_file(&codex_home),
         repo_root: repo_root.clone(),
         pool_file: rotate_home.join("accounts.json"),
+        lock_dir: lock_dir.clone(),
+        accounts_lock_file: lock_dir.join("accounts-json.lock"),
         watch_state_file: rotate_home.join("watch-state.json"),
         profile_dir: rotate_home.join("profile"),
         daemon_socket: rotate_home.join("daemon.sock"),
