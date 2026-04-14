@@ -21,8 +21,9 @@ use crate::quota::{
 };
 use crate::state::{load_rotate_state_json, write_rotate_state_json};
 use crate::workflow::{
-    cmd_create, cmd_create_with_progress, create_next_fallback_options,
-    is_auto_create_retry_stopped_for_reusable_account, reconcile_added_account_credential_state,
+    cmd_create, cmd_create_with_progress, create_next_fallback_options, extract_email_domain,
+    is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
+    reconcile_added_account_credential_state,
 };
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -37,6 +38,44 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
+
+fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> bool {
+    extract_email_domain(email)
+        .map(|domain| !disabled_domains.contains(&domain))
+        .unwrap_or(true)
+}
+
+fn disabled_rotation_target_error(domains: &[String]) -> anyhow::Error {
+    let listed = domains.join(", ");
+    let key_hint = if domains.len() == 1 {
+        format!("domain[\"{}\"].rotation_enabled", domains[0])
+    } else {
+        "domain[\"<domain>\"].rotation_enabled".to_string()
+    };
+    anyhow!(
+        "No rotation target is available because rotation is disabled for {} account(s). Set {} to true in ~/.codex-rotate/accounts.json to re-enable them.",
+        listed,
+        key_hint
+    )
+}
+
+fn disabled_rotation_domains_for_pool(
+    pool: &Pool,
+    disabled_domains: &HashSet<String>,
+    exclude_index: Option<usize>,
+) -> Vec<String> {
+    let mut domains = pool
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != exclude_index)
+        .filter_map(|(_, entry)| extract_email_domain(&entry.email))
+        .filter(|domain| disabled_domains.contains(domain))
+        .collect::<Vec<_>>();
+    domains.sort();
+    domains.dedup();
+    domains
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Pool {
@@ -368,6 +407,7 @@ pub fn rotate_next_internal_with_progress(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<NextResult> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -379,13 +419,19 @@ pub fn rotate_next_internal_with_progress(
     let previous = pool.accounts[previous_index].clone();
     let mut cursor_index = previous_index;
     let mut inspected_later_indices = HashSet::new();
+    let mut round_robin_steps = 0usize;
 
-    loop {
+    while round_robin_steps < pool.accounts.len().saturating_sub(1) {
         let Some(candidate_index) =
             find_next_immediate_round_robin_index(cursor_index, &pool.accounts)
         else {
             break;
         };
+        round_robin_steps += 1;
+        if !account_rotation_enabled(&disabled_domains, &pool.accounts[candidate_index].email) {
+            cursor_index = candidate_index;
+            continue;
+        }
 
         let inspection = inspect_account(
             &mut pool.accounts[candidate_index],
@@ -436,6 +482,7 @@ pub fn rotate_next_internal_with_progress(
         &mut reasons,
         dirty,
         &inspected_later_indices,
+        &disabled_domains,
     )?;
     dirty = result.1;
 
@@ -488,6 +535,17 @@ pub fn rotate_next_internal_with_progress(
         });
     }
 
+    let previous_rotation_enabled =
+        account_rotation_enabled(&disabled_domains, &pool.accounts[previous_index].email);
+    let has_other_enabled_target = pool.accounts.iter().enumerate().any(|(index, entry)| {
+        index != previous_index && account_rotation_enabled(&disabled_domains, &entry.email)
+    });
+    if !previous_rotation_enabled || !has_other_enabled_target {
+        return Err(disabled_rotation_target_error(
+            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
+        ));
+    }
+
     if dirty {
         save_pool(&pool)?;
     }
@@ -511,6 +569,7 @@ pub fn rotate_next_internal_with_progress(
 
 pub fn cmd_prev() -> Result<String> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -527,7 +586,15 @@ pub fn cmd_prev() -> Result<String> {
     }
 
     let previous_index = pool.active_index;
-    pool.active_index = (pool.active_index + pool.accounts.len() - 1) % pool.accounts.len();
+    let Some(next_index) = (1..pool.accounts.len())
+        .map(|offset| (pool.active_index + pool.accounts.len() - offset) % pool.accounts.len())
+        .find(|index| account_rotation_enabled(&disabled_domains, &pool.accounts[*index].email))
+    else {
+        return Err(disabled_rotation_target_error(
+            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
+        ));
+    };
+    pool.active_index = next_index;
     let next = pool.accounts[pool.active_index].clone();
     write_codex_auth(&paths.codex_auth_file, &next.auth)?;
     save_pool(&pool)?;
@@ -1112,6 +1179,7 @@ pub fn current_auth_summary() -> Result<AuthSummary> {
 
 pub fn other_usable_account_exists() -> Result<bool> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -1132,6 +1200,7 @@ pub fn other_usable_account_exists() -> Result<bool> {
         &mut reasons,
         dirty,
         &skip_indices,
+        &disabled_domains,
     )?;
     if candidate_dirty {
         save_pool(&pool)?;
@@ -1839,6 +1908,7 @@ pub(crate) fn find_next_usable_account(
     reasons: &mut Vec<String>,
     dirty: bool,
     skip_indices: &HashSet<usize>,
+    disabled_domains: &HashSet<String>,
 ) -> Result<(Option<RotationCandidate>, bool)> {
     let mut next_dirty = dirty;
     let probe_order =
@@ -1846,6 +1916,15 @@ pub(crate) fn find_next_usable_account(
 
     for index in probe_order {
         if skip_indices.contains(&index) {
+            continue;
+        }
+        if !account_rotation_enabled(disabled_domains, &pool.accounts[index].email) {
+            if let Some(domain) = extract_email_domain(&pool.accounts[index].email) {
+                reasons.push(format!(
+                    "{}: rotation disabled for {}",
+                    pool.accounts[index].label, domain
+                ));
+            }
             continue;
         }
         let inspection = inspect_account(
@@ -2189,6 +2268,46 @@ mod tests {
             },
             last_refresh: "2026-04-07T00:00:00.000Z".to_string(),
         }
+    }
+
+    fn configured_entry(
+        email: &str,
+        account_id: &str,
+        plan_type: &str,
+        usable: Option<bool>,
+        checked_at: Option<&str>,
+    ) -> AccountEntry {
+        AccountEntry {
+            label: format!("{email}_{plan_type}"),
+            alias: None,
+            email: email.to_string(),
+            account_id: account_id.to_string(),
+            plan_type: plan_type.to_string(),
+            auth: make_auth(email, account_id, plan_type),
+            added_at: "2026-04-07T00:00:00.000Z".to_string(),
+            last_quota_usable: usable,
+            last_quota_summary: usable.map(|value| {
+                if value {
+                    "5h 90% left".to_string()
+                } else {
+                    "5h 0% left".to_string()
+                }
+            }),
+            last_quota_blocker: None,
+            last_quota_checked_at: checked_at.map(ToOwned::to_owned),
+            last_quota_primary_left_percent: usable.map(|value| if value { 90 } else { 0 }),
+            last_quota_next_refresh_at: checked_at.map(|_| "2026-04-07T01:00:00.000Z".to_string()),
+        }
+    }
+
+    fn write_disabled_domain_state() -> Result<()> {
+        write_rotate_state_json(&json!({
+            "domain": {
+                "astronlab.com": {
+                    "rotation_enabled": false
+                }
+            }
+        }))
     }
 
     #[test]
@@ -2926,5 +3045,240 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("overview should count healthy accounts");
+    }
+
+    #[test]
+    fn rotate_next_skips_disabled_domain_accounts() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            write_disabled_domain_state()?;
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![
+                    configured_entry(
+                        "dev.1@astronlab.com",
+                        "acct-1",
+                        "free",
+                        Some(false),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                    configured_entry(
+                        "dev.user@gmail.com",
+                        "acct-gmail",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                ],
+            })?;
+
+            let (usage_url, handle) = spawn_usage_server(
+                json!({
+                    "user_id": "user-gmail",
+                    "account_id": "acct-gmail",
+                    "email": "dev.user@gmail.com",
+                    "plan_type": "free",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 20.0,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 7200,
+                            "reset_at": 0
+                        },
+                        "secondary_window": null
+                    },
+                    "code_review_rate_limit": null,
+                    "additional_rate_limits": null,
+                    "credits": null,
+                    "promo": null
+                })
+                .to_string(),
+            );
+            unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &usage_url);
+            }
+
+            let output = rotate_next_internal_with_progress(None)?;
+            handle.join().expect("usage server should finish");
+
+            match output {
+                NextResult::Rotated { summary, .. } => {
+                    assert_eq!(summary.email, "dev.user@gmail.com");
+                }
+                _ => panic!("expected rotation result"),
+            }
+
+            let refreshed = load_pool()?;
+            assert_eq!(refreshed.active_index, 1);
+            assert_eq!(refreshed.accounts[1].email, "dev.user@gmail.com");
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("next should skip disabled domains");
+    }
+
+    #[test]
+    fn rotate_next_fails_when_only_disabled_targets_remain() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            write_disabled_domain_state()?;
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![
+                    configured_entry(
+                        "dev.1@astronlab.com",
+                        "acct-1",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                    configured_entry(
+                        "dev.2@astronlab.com",
+                        "acct-2",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                ],
+            })?;
+
+            let error = match rotate_next_internal_with_progress(None) {
+                Ok(_) => panic!("expected disabled-domain rotation error"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("No rotation target is available because rotation is disabled"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("next should fail when all targets are disabled");
+    }
+
+    #[test]
+    fn cmd_prev_fails_when_only_disabled_targets_remain() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            write_disabled_domain_state()?;
+            save_pool(&Pool {
+                active_index: 1,
+                accounts: vec![
+                    configured_entry(
+                        "dev.1@astronlab.com",
+                        "acct-1",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                    configured_entry(
+                        "dev.user@gmail.com",
+                        "acct-gmail",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                ],
+            })?;
+
+            let error = cmd_prev().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("No rotation target is available because rotation is disabled"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("prev should fail when all previous targets are disabled");
+    }
+
+    #[test]
+    fn other_usable_account_exists_ignores_disabled_domains() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            write_disabled_domain_state()?;
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![
+                    configured_entry(
+                        "dev.user@gmail.com",
+                        "acct-gmail",
+                        "free",
+                        Some(false),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                    configured_entry(
+                        "dev.1@astronlab.com",
+                        "acct-1",
+                        "free",
+                        Some(true),
+                        Some("2026-04-07T00:00:00.000Z"),
+                    ),
+                ],
+            })?;
+
+            assert!(!other_usable_account_exists()?);
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("disabled domains should not count as reusable accounts");
     }
 }

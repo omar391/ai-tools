@@ -41,7 +41,7 @@ const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
 const DEFAULT_CODEX_APP_BUNDLE_BIN: &str = "/Applications/Codex.app/Contents/Resources/codex";
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
-const ROTATE_STATE_VERSION: u8 = 4;
+const ROTATE_STATE_VERSION: u8 = 5;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS: usize = 6;
@@ -191,6 +191,16 @@ fn default_max_skipped_slots_per_family() -> u32 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainConfig {
+    #[serde(default = "default_rotation_enabled")]
+    pub rotation_enabled: bool,
+}
+
+fn default_rotation_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexRotateSecretRef {
     #[serde(rename = "type")]
     pub ref_type: String,
@@ -332,6 +342,7 @@ struct FastBrowserRunResult {
 pub struct CredentialStore {
     pub version: u8,
     pub default_create_base_email: String,
+    pub domain: HashMap<String, DomainConfig>,
     pub families: HashMap<String, CredentialFamily>,
     pub pending: HashMap<String, PendingCredential>,
     pub skipped: HashSet<String>,
@@ -342,6 +353,7 @@ impl Default for CredentialStore {
         Self {
             version: ROTATE_STATE_VERSION,
             default_create_base_email: DEFAULT_CREATE_BASE_EMAIL.to_string(),
+            domain: HashMap::new(),
             families: HashMap::new(),
             pending: HashMap::new(),
             skipped: HashSet::new(),
@@ -807,6 +819,7 @@ pub fn cmd_create_with_progress(
 ) -> Result<String> {
     let _lock = acquire_create_execution_lock(&options, progress.as_ref())?;
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -832,6 +845,7 @@ pub fn cmd_create_with_progress(
             &mut reasons,
             dirty,
             &skip_indices,
+            &disabled_domains,
         )?;
         dirty = candidate_dirty;
 
@@ -918,6 +932,7 @@ pub fn cmd_relogin_with_progress(
     let existing = selection.entry.clone();
     let expected_email = existing.email.clone();
     let mut store = load_credential_store()?;
+    ensure_rotation_enabled_for_email_in_store(&store, &expected_email)?;
     let stored_credential = resolve_relogin_credential(&store, &existing);
 
     if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
@@ -1220,6 +1235,7 @@ pub fn is_auto_create_retry_stopped_for_reusable_account(error: &anyhow::Error) 
 
 fn reusable_account_exists_for_auto_create_retry(options: &CreateCommandOptions) -> Result<bool> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -1245,6 +1261,7 @@ fn reusable_account_exists_for_auto_create_retry(options: &CreateCommandOptions)
         &mut reasons,
         dirty,
         &skip_indices,
+        &disabled_domains,
     )?;
     if candidate_dirty {
         save_pool(&pool)?;
@@ -1334,6 +1351,10 @@ fn execute_create_flow_attempt(
         &profile_name,
         options.base_email.as_deref(),
         options.alias.as_deref(),
+    ))?;
+    fatal(ensure_rotation_enabled_for_base_email_in_store(
+        &store,
+        &base_email,
     ))?;
 
     let pool = fatal(load_pool())?;
@@ -3178,6 +3199,14 @@ fn load_credential_store() -> Result<CredentialStore> {
     Ok(normalize_credential_store(load_rotate_state_json()?))
 }
 
+pub(crate) fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
+    Ok(load_credential_store()?
+        .domain
+        .into_iter()
+        .filter_map(|(domain, config)| (!config.rotation_enabled).then_some(domain))
+        .collect())
+}
+
 fn save_credential_store(store: &CredentialStore) -> Result<()> {
     let mut state = load_rotate_state_json()?;
     let dropped_non_dev_pending = normalize_pending_credential_map(state.get("pending"))
@@ -3206,6 +3235,11 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
             "default_create_base_email".to_string(),
             default_create_base_email,
         );
+    }
+    if store.domain.is_empty() {
+        object.remove("domain");
+    } else if let Some(domain) = credential_state.get("domain").cloned() {
+        object.insert("domain".to_string(), domain);
     }
     if store.families.is_empty() {
         object.remove("families");
@@ -3257,6 +3291,21 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
         .and_then(Value::as_str)
         .and_then(|value| normalize_base_email_family(value).ok())
         .unwrap_or_else(|| DEFAULT_CREATE_BASE_EMAIL.to_string());
+    let domain = raw
+        .get("domain")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    normalize_domain_key(key).and_then(|domain| {
+                        serde_json::from_value::<DomainConfig>(value.clone())
+                            .ok()
+                            .map(|record| (domain, record))
+                    })
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let migrate_legacy_non_default_families =
         raw_version < ROTATE_STATE_VERSION || raw.get("default_create_base_email").is_none();
     let mut families = raw
@@ -3304,6 +3353,7 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
     CredentialStore {
         version: ROTATE_STATE_VERSION,
         default_create_base_email,
+        domain,
         families,
         pending,
         skipped,
@@ -3418,6 +3468,7 @@ fn serialize_credential_store(store: &CredentialStore) -> Value {
     json!({
         "version": ROTATE_STATE_VERSION,
         "default_create_base_email": store.default_create_base_email,
+        "domain": store.domain,
         "families": store.families,
         "pending": pending,
         "skipped": skipped,
@@ -3786,6 +3837,61 @@ fn make_credential_family_key(profile_name: &str, base_email: &str) -> Result<St
         profile_name,
         normalize_base_email_family(base_email)?
     ))
+}
+
+fn disabled_rotation_error(domain: &str) -> anyhow::Error {
+    anyhow!(
+        "Rotation is disabled for {} accounts. Set domain[\"{}\"].rotation_enabled to true in ~/.codex-rotate/accounts.json to re-enable them.",
+        domain,
+        domain
+    )
+}
+
+fn disabled_rotation_domain_in_store(store: &CredentialStore, domain: &str) -> Option<String> {
+    let normalized = normalize_domain_key(domain)?;
+    store
+        .domain
+        .get(&normalized)
+        .filter(|config| !config.rotation_enabled)
+        .map(|_| normalized)
+}
+
+fn disabled_rotation_domain_for_email_in_store(
+    store: &CredentialStore,
+    email: &str,
+) -> Option<String> {
+    extract_email_domain(email).and_then(|domain| disabled_rotation_domain_in_store(store, &domain))
+}
+
+fn disabled_rotation_domain_for_base_email_in_store(
+    store: &CredentialStore,
+    base_email: &str,
+) -> Option<String> {
+    parse_email_family(base_email)
+        .ok()
+        .and_then(|family| disabled_rotation_domain_in_store(store, &family.domain_part))
+}
+
+fn ensure_rotation_enabled_for_email_in_store(store: &CredentialStore, email: &str) -> Result<()> {
+    if let Some(domain) = disabled_rotation_domain_for_email_in_store(store, email) {
+        return Err(disabled_rotation_error(&domain));
+    }
+    Ok(())
+}
+
+fn ensure_rotation_enabled_for_base_email_in_store(
+    store: &CredentialStore,
+    base_email: &str,
+) -> Result<()> {
+    if let Some(domain) = disabled_rotation_domain_for_base_email_in_store(store, base_email) {
+        return Err(disabled_rotation_error(&domain));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn is_rotation_enabled_for_email_in_store(store: &CredentialStore, email: &str) -> bool {
+    disabled_rotation_domain_for_email_in_store(store, email).is_none()
 }
 
 fn normalize_base_email_family(email: &str) -> Result<String> {
@@ -4581,6 +4687,20 @@ fn normalize_email_key(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+pub(crate) fn extract_email_domain(email: &str) -> Option<String> {
+    let normalized = normalize_email_key(email);
+    let (_, domain) = normalized.split_once('@')?;
+    normalize_domain_key(domain)
+}
+
+fn normalize_domain_key(domain: &str) -> Option<String> {
+    let normalized = domain.trim().trim_matches('.').to_lowercase();
+    if normalized.is_empty() || !normalized.contains('.') {
+        return None;
+    }
+    Some(normalized)
+}
+
 fn normalize_alias(alias: Option<&str>) -> Option<String> {
     alias
         .map(str::trim)
@@ -4736,6 +4856,24 @@ mod tests {
                 account_id: account_id.to_string(),
             },
             last_refresh: "2026-04-13T02:52:15.012Z".to_string(),
+        }
+    }
+
+    fn make_account_entry(email: &str, account_id: &str) -> AccountEntry {
+        AccountEntry {
+            label: format!("{email}_free"),
+            alias: None,
+            email: email.to_string(),
+            account_id: account_id.to_string(),
+            plan_type: "free".to_string(),
+            auth: make_auth(email, account_id),
+            added_at: "2026-04-13T02:52:15.012Z".to_string(),
+            last_quota_usable: Some(true),
+            last_quota_summary: Some("5h 90% left".to_string()),
+            last_quota_blocker: None,
+            last_quota_checked_at: Some("2026-04-13T02:52:15.012Z".to_string()),
+            last_quota_primary_left_percent: Some(90),
+            last_quota_next_refresh_at: Some("2026-04-13T03:52:15.012Z".to_string()),
         }
     }
 
@@ -6087,10 +6225,57 @@ end
     }
 
     #[test]
-    fn normalize_credential_store_sets_v4_default_create_family() {
+    fn normalize_credential_store_sets_v5_default_create_family() {
         let store = normalize_credential_store(json!({}));
-        assert_eq!(store.version, 4);
+        assert_eq!(store.version, 5);
         assert_eq!(store.default_create_base_email, "dev.{n}@astronlab.com");
+    }
+
+    #[test]
+    fn normalize_credential_store_reads_domain_rotation_config() {
+        let store = normalize_credential_store(json!({
+            "domain": {
+                "AstronLab.com": {
+                    "rotation_enabled": false
+                }
+            }
+        }));
+
+        assert_eq!(
+            store.domain.get("astronlab.com"),
+            Some(&DomainConfig {
+                rotation_enabled: false
+            })
+        );
+        assert!(!is_rotation_enabled_for_email_in_store(
+            &store,
+            "dev.1@astronlab.com"
+        ));
+        assert!(is_rotation_enabled_for_email_in_store(
+            &store,
+            "dev.user@gmail.com"
+        ));
+    }
+
+    #[test]
+    fn save_credential_store_persists_domain_rotation_config() {
+        with_rotate_home("codex-rotate-domain-config-save", |_| {
+            let mut store = CredentialStore::default();
+            store.domain.insert(
+                "astronlab.com".to_string(),
+                DomainConfig {
+                    rotation_enabled: false,
+                },
+            );
+
+            save_credential_store(&store).expect("save credential store");
+
+            let saved = load_rotate_state_json().expect("load rotate state");
+            assert_eq!(
+                saved["domain"]["astronlab.com"]["rotation_enabled"],
+                Value::Bool(false)
+            );
+        });
     }
 
     #[test]
@@ -6380,6 +6565,70 @@ end
             .unwrap(),
             "qa.{n}@astronlab.com"
         );
+    }
+
+    #[test]
+    fn create_base_email_guard_blocks_disabled_domain() {
+        let mut store = CredentialStore::default();
+        store.domain.insert(
+            "astronlab.com".to_string(),
+            DomainConfig {
+                rotation_enabled: false,
+            },
+        );
+
+        let error =
+            ensure_rotation_enabled_for_base_email_in_store(&store, "dev.{n}@astronlab.com")
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Rotation is disabled for astronlab.com accounts"));
+    }
+
+    #[test]
+    fn cmd_relogin_rejects_disabled_domain_selector() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        with_rotate_home("codex-rotate-relogin-disabled-domain", |rotate_home| {
+            let codex_home = rotate_home.join("codex-home");
+            fs::create_dir_all(&codex_home).expect("create codex home");
+            let previous_codex_home = std::env::var_os("CODEX_HOME");
+            unsafe {
+                std::env::set_var("CODEX_HOME", &codex_home);
+            }
+
+            let result = (|| -> Result<()> {
+                save_pool(&Pool {
+                    active_index: 0,
+                    accounts: vec![make_account_entry("dev.1@astronlab.com", "acct-1")],
+                })?;
+
+                let mut store = CredentialStore::default();
+                store.domain.insert(
+                    "astronlab.com".to_string(),
+                    DomainConfig {
+                        rotation_enabled: false,
+                    },
+                );
+                save_credential_store(&store)?;
+
+                let error =
+                    cmd_relogin("dev.1@astronlab.com", ReloginOptions::default()).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("Rotation is disabled for astronlab.com accounts"));
+                Ok(())
+            })();
+
+            match previous_codex_home {
+                Some(value) => unsafe {
+                    std::env::set_var("CODEX_HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_HOME");
+                },
+            }
+            result.expect("relogin should block disabled domain");
+        });
     }
 
     #[test]
