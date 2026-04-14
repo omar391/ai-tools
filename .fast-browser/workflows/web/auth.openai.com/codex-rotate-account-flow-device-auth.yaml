@@ -4968,7 +4968,7 @@ do:
       metadata:
         description: "Collect the prepare-branch OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -4995,7 +4995,7 @@ do:
       metadata:
         description: Re-collect the first prepare-branch OTP once more when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5380,7 +5380,7 @@ do:
       metadata:
         description: Delete the used prepare-branch OTP email from Gmail after the verification step succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
@@ -5408,7 +5408,7 @@ do:
       metadata:
         description: "Re-collect the prepare-branch OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5435,7 +5435,7 @@ do:
       metadata:
         description: Re-collect the replacement prepare-branch OTP once more when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -5755,7 +5755,7 @@ do:
       metadata:
         description: Delete the replacement prepare-branch OTP email from Gmail after the retry succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
@@ -6137,7 +6137,7 @@ do:
       metadata:
         description: Collect the explicit ChatGPT login OTP from Gmail on the same managed profile before opening Security settings.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -6163,7 +6163,7 @@ do:
       metadata:
         description: Re-collect the explicit ChatGPT login OTP once when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7307,7 +7307,7 @@ do:
       metadata:
         description: "Collect the device-auth login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7334,7 +7334,7 @@ do:
       metadata:
         description: Re-collect the device-auth login OTP once when Gmail has not surfaced a usable code yet.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7726,7 +7726,7 @@ do:
       metadata:
         description: Delete the used device-auth login OTP email from Gmail after the verification step succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
@@ -7829,7 +7829,7 @@ do:
       metadata:
         description: "Re-collect the device-auth login OTP from Gmail once when OpenAI rejects the first verification code."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -7856,7 +7856,7 @@ do:
       metadata:
         description: Re-collect the replacement device-auth login OTP once when Gmail still has not surfaced a usable code.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -8199,7 +8199,7 @@ do:
       metadata:
         description: Delete the replacement device-auth login OTP email from Gmail after the retry succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
