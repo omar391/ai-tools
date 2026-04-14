@@ -227,9 +227,10 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
         .accounts
         .iter()
         .position(|account| account.label == label);
-    let duplicate_index = pool.accounts.iter().position(|account| {
-        account.account_id == account_id || account.auth.tokens.account_id == account_id
-    });
+    let duplicate_index = pool
+        .accounts
+        .iter()
+        .position(|account| account_entry_matches_auth_identity(account, &auth));
 
     if let Some(existing_index) = existing_index {
         let previous_account_id = pool.accounts[existing_index].account_id.clone();
@@ -1354,6 +1355,15 @@ fn build_account_label(email: &str, plan_type: &str) -> String {
     )
 }
 
+fn normalize_identity_email(email: &str) -> Option<String> {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty() || normalized == "unknown" {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 fn should_preserve_expected_email(existing_email: &str, auth_email: &str) -> bool {
     let normalized_existing = existing_email.trim().to_lowercase();
     let normalized_auth = auth_email.trim().to_lowercase();
@@ -1362,6 +1372,44 @@ fn should_preserve_expected_email(existing_email: &str, auth_email: &str) -> boo
         && normalized_existing != normalized_auth
         && !normalized_existing.ends_with("@gmail.com")
         && normalized_auth.ends_with("@gmail.com")
+}
+
+pub(crate) fn account_entry_matches_identity(
+    entry: &AccountEntry,
+    account_id: &str,
+    email: &str,
+) -> bool {
+    let target_email = normalize_identity_email(email);
+    let entry_email = normalize_identity_email(&entry.email);
+
+    if target_email.is_some() && entry_email.as_deref() == target_email.as_deref() {
+        return true;
+    }
+
+    let normalized_account_id = account_id.trim();
+    let has_matching_account_id = !normalized_account_id.is_empty()
+        && (entry.account_id == normalized_account_id
+            || entry.auth.tokens.account_id == normalized_account_id);
+    if !has_matching_account_id {
+        return false;
+    }
+
+    match (entry_email.as_deref(), target_email.as_deref()) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(existing_email), Some(target_email)) => {
+            should_preserve_expected_email(existing_email, target_email)
+                || should_preserve_expected_email(target_email, existing_email)
+        }
+    }
+}
+
+pub(crate) fn account_entry_matches_auth_identity(entry: &AccountEntry, auth: &CodexAuth) -> bool {
+    account_entry_matches_identity(
+        entry,
+        &extract_account_id_from_auth(auth),
+        &extract_email_from_auth(auth),
+    )
 }
 
 fn normalize_alias(alias: Option<&str>) -> Option<String> {
@@ -1455,20 +1503,17 @@ fn find_pool_account_index_by_identity(
     account_id: &str,
     email: &str,
 ) -> Option<usize> {
-    if let Some(index) = pool.accounts.iter().position(|entry| {
-        entry.account_id == account_id || entry.auth.tokens.account_id == account_id
-    }) {
-        return Some(index);
-    }
-
-    let normalized_email = email.trim().to_lowercase();
-    if normalized_email.is_empty() || normalized_email == "unknown" {
-        return None;
+    if let Some(normalized_email) = normalize_identity_email(email) {
+        if let Some(index) = pool.accounts.iter().position(|entry| {
+            normalize_identity_email(&entry.email).as_deref() == Some(normalized_email.as_str())
+        }) {
+            return Some(index);
+        }
     }
 
     pool.accounts
         .iter()
-        .position(|entry| entry.email.trim().eq_ignore_ascii_case(&normalized_email))
+        .position(|entry| account_entry_matches_identity(entry, account_id, email))
 }
 
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
@@ -1604,20 +1649,16 @@ fn apply_usage_to_account(entry: &mut AccountEntry, usage: &UsageResponse) -> bo
     changed
 }
 
-fn write_codex_auth_if_current_account(
-    auth_path: &Path,
-    account_id: &str,
-    auth: &CodexAuth,
-) -> Result<bool> {
+fn write_codex_auth_if_current_account(auth_path: &Path, entry: &AccountEntry) -> Result<bool> {
     if !auth_path.exists() {
         return Ok(false);
     }
     let current_auth = load_codex_auth(auth_path)?;
-    if extract_account_id_from_auth(&current_auth) != account_id {
+    if !account_entry_matches_auth_identity(entry, &current_auth) {
         return Ok(false);
     }
-    if current_auth != *auth {
-        write_codex_auth(auth_path, auth)?;
+    if current_auth != entry.auth {
+        write_codex_auth(auth_path, &entry.auth)?;
         return Ok(true);
     }
     Ok(false)
@@ -1694,8 +1735,7 @@ pub(crate) fn inspect_account(
             };
             updated |= apply_quota_inspection_to_account(entry, &inspection, &inspected_at);
             if persist_if_current {
-                updated |=
-                    write_codex_auth_if_current_account(auth_path, &entry.account_id, &entry.auth)?;
+                updated |= write_codex_auth_if_current_account(auth_path, entry)?;
             }
             AccountInspection {
                 updated,
@@ -2382,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_identity_lookup_prefers_account_id_match() {
+    fn pool_identity_lookup_prefers_exact_email_match() {
         let mut first = stored_entry(Some(true), None);
         first.email = "dev.26@astronlab.com".to_string();
         first.account_id = "acct-26".to_string();
@@ -2398,7 +2438,7 @@ mod tests {
 
         assert_eq!(
             find_pool_account_index_by_identity(&pool, "acct-27", "dev.26@astronlab.com"),
-            Some(1)
+            Some(0)
         );
     }
 
@@ -2416,6 +2456,26 @@ mod tests {
         assert_eq!(
             find_pool_account_index_by_identity(&pool, "missing", "dev.26@astronlab.com"),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn pool_identity_lookup_ignores_shared_account_id_for_different_team_email() {
+        let mut first = stored_entry(Some(true), None);
+        first.email = "dev.2@hotspotprime.com".to_string();
+        first.label = "dev.2@hotspotprime.com_team".to_string();
+        first.plan_type = "team".to_string();
+        first.account_id = "acct-team".to_string();
+        first.auth = make_auth("dev.2@hotspotprime.com", "acct-team", "team");
+
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![first],
+        };
+
+        assert_eq!(
+            find_pool_account_index_by_identity(&pool, "acct-team", "dev.3@hotspotprime.com"),
+            None
         );
     }
 
