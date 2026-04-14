@@ -231,7 +231,7 @@ impl DaemonCreateHarness {
         let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
         write_executable(
             &fast_browser_runtime,
-            "#!/bin/sh\nset -eu\nif [ \"${2-}\" = \"inspect-profiles\" ]; then\n  printf '%s\\n' '{\"managedProfiles\":{\"default\":\"dev-1\",\"profiles\":[{\"name\":\"dev-1\"}]}}'\n  exit 0\nfi\nprintf 'unexpected fast-browser runtime args: %s\\n' \"$*\" >&2\nexit 1\n",
+            "#!/bin/sh\nset -eu\nif [ \"${2-}\" = \"profiles\" ] && [ \"${3-}\" = \"inspect\" ]; then\n  printf '%s\\n' '{\"abiVersion\":\"1.0.0\",\"command\":\"profiles.inspect\",\"ok\":true,\"result\":{\"managedProfiles\":{\"default\":\"dev-1\",\"profiles\":[{\"name\":\"dev-1\"}]}}}'\n  exit 0\nfi\nprintf 'unexpected fast-browser runtime args: %s\\n' \"$*\" >&2\nexit 1\n",
         )?;
 
         let automation_bridge = sandbox.join("automation-bridge.py");
@@ -270,8 +270,6 @@ if command == "prepare-account-secret-ref":
     )
 elif command == "delete-account-secret-ref":
     respond({"ok": True, "result": True})
-elif command == "reset-managed-runtime":
-    respond({"ok": True, "result": {"ok": True}})
 elif command == "complete-codex-login-attempt":
     pid_file = os.environ["CODEX_ROTATE_TEST_CHILD_PID_FILE"]
     subprocess.Popen(

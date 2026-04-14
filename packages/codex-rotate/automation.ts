@@ -1,40 +1,24 @@
 import { spawn, spawnSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
 const DEFAULT_ROTATE_HOME = join(homedir(), ".codex-rotate");
 let ROTATE_HOME = resolve(process.env.CODEX_ROTATE_HOME || DEFAULT_ROTATE_HOME);
-const FAST_BROWSER_HOME = join(homedir(), ".fast-browser");
-const FAST_BROWSER_PROFILES_HOME = join(FAST_BROWSER_HOME, "profiles");
-const FAST_BROWSER_DAEMON_DIR = join(FAST_BROWSER_HOME, "daemon");
 const NODE_BINARY =
   process.env.CODEX_ROTATE_NODE_BIN?.trim() ||
   process.env.NODE_BIN?.trim() ||
   process.execPath ||
   "node";
 const MAIN_WORKTREE_ROOT = discoverMainWorktreeRoot(REPO_ROOT);
-const FAST_BROWSER_DAEMON_CLIENT_MODULE = pathToFileURL(
-  resolveFastBrowserSkillPath(["lib", "daemon", "client.mjs"]),
-).href;
-const FAST_BROWSER_BITWARDEN_SESSION_MODULE = pathToFileURL(
-  resolveFastBrowserSkillPath([
-    "lib",
-    "secret-adapters",
-    "bitwarden-session.mjs",
-  ]),
-).href;
+const FAST_BROWSER_SCRIPT = resolveFastBrowserSkillPath([
+  "scripts",
+  "fast-browser.mjs",
+]);
 const CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE: "minimal" | "full" =
   process.env.CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE === "full"
     ? "full"
@@ -43,19 +27,6 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
-const BITWARDEN_BINARY = process.env.CODEX_ROTATE_BW_BIN?.trim() || "bw";
-const FAST_BROWSER_PLAYWRIGHT_MODULE = resolvePlaywrightModulePath();
-const FAST_BROWSER_NODE_PATH = dirname(FAST_BROWSER_PLAYWRIGHT_MODULE);
-const FAST_BROWSER_SECRET_BROKER_SOCKET = join(
-  FAST_BROWSER_DAEMON_DIR,
-  "secrets.sock",
-);
-const FAST_BROWSER_SECRET_BROKER_PID = join(
-  FAST_BROWSER_DAEMON_DIR,
-  "secrets.pid",
-);
-const FAST_BROWSER_SECRET_BROKEN_CWD_PATTERN =
-  /(process\.cwd failed|uv_cwd|ENOENT:\s*process\.cwd|current working directory was likely removed)/i;
 
 function getProcessCwdSafe(): string | null {
   try {
@@ -159,57 +130,6 @@ export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   );
 }
 
-function resolvePlaywrightModulePath(): string {
-  const currentWorkingDirectory = getProcessCwdSafe();
-  const override = process.env.CODEX_ROTATE_PLAYWRIGHT_MODULE?.trim();
-  const directRepoCandidates = [REPO_ROOT, MAIN_WORKTREE_ROOT]
-    .filter((value): value is string => Boolean(value))
-    .map((value) => resolve(value));
-  const directCandidates = [
-    override ? resolve(override) : null,
-    ...directRepoCandidates.map((repoRoot) =>
-      join(repoRoot, "node_modules", "playwright"),
-    ),
-    currentWorkingDirectory
-      ? join(currentWorkingDirectory, "node_modules", "playwright")
-      : null,
-  ].filter((value): value is string => Boolean(value));
-  for (const candidate of directCandidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  const siblingRepoMarker = join("packages", "codex-rotate", "package.json");
-  try {
-    for (const entry of readdirSync(dirname(REPO_ROOT), {
-      withFileTypes: true,
-    })) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-      const siblingRoot = join(dirname(REPO_ROOT), entry.name);
-      if (siblingRoot === REPO_ROOT) {
-        continue;
-      }
-      if (!existsSync(join(siblingRoot, siblingRepoMarker))) {
-        continue;
-      }
-      const candidate = join(siblingRoot, "node_modules", "playwright");
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-  } catch {}
-
-  return join(REPO_ROOT, "node_modules", "playwright");
-}
-
-function buildNodePathEnv(extraPath: string): string {
-  const entries = [extraPath, process.env.NODE_PATH || ""].filter(Boolean);
-  return entries.join(process.platform === "win32" ? ";" : ":");
-}
-
 export interface CodexRotateSecretRef {
   type: "secret_ref";
   store: "bitwarden-cli";
@@ -254,7 +174,10 @@ interface FastBrowserCommandResult {
 
 export interface FastBrowserPause {
   relay_url?: string | null;
+  relayUrl?: string | null;
   reason?: string | null;
+  sessionId?: string | null;
+  nonce?: string | null;
 }
 
 export interface FastBrowserRunResult {
@@ -290,6 +213,24 @@ interface FastBrowserDaemonRunResponse {
   };
 }
 
+interface FastBrowserCliResponse<TResult> {
+  abiVersion?: string;
+  command?: string;
+  ok: boolean;
+  result?: TResult;
+  error?: {
+    code?: string;
+    message?: string;
+    details?: unknown;
+  };
+}
+
+export function extractFastBrowserCliResult<TResult>(
+  response: FastBrowserCliResponse<TResult> | null | undefined,
+): TResult | undefined {
+  return response?.result;
+}
+
 export interface FastBrowserProfileDaemonStatus {
   ok?: boolean;
   lifecycle_state?: string | null;
@@ -313,9 +254,6 @@ const FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS = Number(
   process.env.CODEX_ROTATE_FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS || 60_000,
 );
 const FAST_BROWSER_EVENT_PREFIX = "__FAST_BROWSER_EVENT__";
-const STALE_FAST_BROWSER_DISCONNECTED_REQUEST_MS = Number(
-  process.env.CODEX_ROTATE_FAST_BROWSER_STALE_REQUEST_MS || 15_000,
-);
 
 export interface CodexRotateAuthFlowSession {
   auth_url?: string | null;
@@ -334,7 +272,6 @@ export interface CodexRotateAuthFlowSession {
 interface CodexRotateLoginWorkflowAttemptResult {
   result?: FastBrowserRunResult | null;
   error_message?: string | null;
-  managed_runtime_reset_performed?: boolean;
 }
 
 function parseJson<T>(raw: string, fallbackMessage: string): T {
@@ -377,77 +314,171 @@ export function shouldResetFastBrowserBridgeInactivityTimer(
   if (!event) {
     return true;
   }
-  return !(
-    event.phase === "daemon" &&
-    (event.status === "heartbeat" || event.status === "queued")
-  );
-}
-
-export function shouldResetManagedProfileRuntimeForDaemonStatus(
-  status: FastBrowserProfileDaemonStatus | null | undefined,
-): boolean {
-  if (!status?.ok) {
-    return false;
-  }
-  const activeRequest = status.request_queue?.active;
-  if (!activeRequest?.disconnected_at) {
-    return false;
-  }
-  const runningForMs =
-    typeof activeRequest.running_for_ms === "number"
-      ? activeRequest.running_for_ms
-      : null;
-  if (
-    !Number.isFinite(runningForMs) ||
-    (runningForMs ?? 0) < STALE_FAST_BROWSER_DISCONNECTED_REQUEST_MS
-  ) {
-    return false;
-  }
-  const lifecycleState =
-    typeof status.lifecycle_state === "string"
-      ? status.lifecycle_state.trim().toLowerCase()
-      : "";
-  return (
-    lifecycleState === "recovering" ||
-    lifecycleState === "warming" ||
-    !String(status.mode || "").trim()
-  );
-}
-
-async function maybeResetManagedProfileRuntimeForDaemonStatus(
-  profileName: string,
-): Promise<boolean> {
-  try {
-    const { getProfileDaemonStatus } = await import(
-      FAST_BROWSER_DAEMON_CLIENT_MODULE
-    );
-    const status = (await getProfileDaemonStatus({
-      profileName,
-    })) as FastBrowserProfileDaemonStatus | null;
-    if (!shouldResetManagedProfileRuntimeForDaemonStatus(status)) {
-      return false;
-    }
-    process.stderr.write(
-      `[codex-rotate] resetting stale fast-browser managed profile daemon for "${profileName}".\n`,
-    );
-    await resetManagedProfileRuntime(profileName);
-    return true;
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      /did not accept a fast-browser shutdown request|still running after/i.test(
-        error.message,
-      )
-    ) {
-      throw error;
-    }
-    return false;
-  }
+  return !(event.phase === "daemon" && event.status === "queued");
 }
 
 function ensureRotateDir(): void {
   if (!existsSync(ROTATE_HOME)) {
     mkdirSync(ROTATE_HOME, { recursive: true });
+  }
+}
+
+async function runFastBrowserCliCommand(
+  args: string[],
+  options?: {
+    stdinText?: string;
+    actionLabel?: string;
+  },
+): Promise<FastBrowserCommandResult> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(NODE_BINARY, [FAST_BROWSER_SCRIPT, ...args], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        FAST_BROWSER_WORKSPACE_ROOT: REPO_ROOT,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    let stderrBuffer = "";
+    let inactivityTimer: NodeJS.Timeout | null = null;
+    const resetInactivityTimer = (): void => {
+      if (
+        settled ||
+        !Number.isFinite(FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS) ||
+        FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS <= 0
+      ) {
+        return;
+      }
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+      }
+      inactivityTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        child.kill("SIGKILL");
+        reject(
+          new Error(
+            `Timed out waiting for fast-browser CLI response while ${options?.actionLabel || args.join(" ")}`,
+          ),
+        );
+      }, FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS);
+    };
+    resetInactivityTimer();
+
+    const flushStderrLine = (line: string): void => {
+      if (line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
+        if (!isSuppressedFastBrowserEventLine(line)) {
+          process.stderr.write(`${line}\n`);
+        }
+        return;
+      }
+      stderr += `${line}\n`;
+      process.stderr.write(`${line}\n`);
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      resetInactivityTimer();
+      stdout += chunk;
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderrBuffer += chunk;
+      while (true) {
+        const newlineIndex = stderrBuffer.indexOf("\n");
+        if (newlineIndex === -1) {
+          break;
+        }
+        const line = stderrBuffer.slice(0, newlineIndex);
+        stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
+        if (line.trim()) {
+          if (shouldResetFastBrowserBridgeInactivityTimer(line)) {
+            resetInactivityTimer();
+          }
+          flushStderrLine(line);
+        }
+      }
+    });
+
+    child.once("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+      }
+      reject(error);
+    });
+
+    child.once("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+      }
+      if (stderrBuffer.trim()) {
+        flushStderrLine(stderrBuffer.trimEnd());
+      }
+      resolve({
+        status: code,
+        signal,
+        stdout,
+        stderr,
+      });
+    });
+
+    if (typeof options?.stdinText === "string") {
+      child.stdin.end(options.stdinText);
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+async function runFastBrowserCliJsonRequest<TResult>(
+  args: string[],
+  request: Record<string, unknown>,
+  actionLabel: string,
+): Promise<FastBrowserCliResponse<TResult>> {
+  const result = await runFastBrowserCliCommand([...args, "--json"], {
+    stdinText: JSON.stringify(request),
+    actionLabel,
+  });
+  return parseFastBrowserJson<FastBrowserCliResponse<TResult>>(
+    { status: result.status, stdout: result.stdout },
+    actionLabel,
+  );
+}
+
+async function ensureFastBrowserSecretSession(
+  profileName: string,
+  store: "bitwarden-cli",
+  promptIfLocked: boolean,
+): Promise<void> {
+  void profileName;
+  const response = await runFastBrowserCliJsonRequest<Record<string, unknown>>(
+    ["secrets", "session"],
+    {
+      action: "ensure",
+      store,
+      promptIfLocked,
+    },
+    "fast-browser secrets session ensure",
+  );
+  if (!response?.ok) {
+    throw new Error(
+      response?.error?.message ||
+        "fast-browser failed to ensure the requested secret session.",
+    );
   }
 }
 
@@ -482,38 +513,41 @@ async function resolveOptionalCodexRotateSecretLocator(
   if (!locator) {
     return null;
   }
-  return await withBitwardenSecretBrokerRecovery(async () => {
-    const {
-      ensureDaemonSecretStoreReadyInteractive,
-      resolveDaemonSecretLocator,
-    } = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-    await ensureDaemonSecretStoreReadyInteractive({
-      profileName,
-      store: locator.store ?? "bitwarden-cli",
-      promptIfLocked: shouldPromptForCodexRotateSecretUnlock(),
-    });
-    try {
-      const response = await resolveDaemonSecretLocator({
-        profileName,
-        locator,
-      });
-      if (!response?.ok) {
-        throw new Error(
-          response?.error?.message ||
-            "fast-browser failed to resolve the requested secret locator.",
-        );
-      }
-      return locator;
-    } catch (error) {
-      if (isMissingOptionalSecretLocatorError(locator, error)) {
-        return null;
-      }
-      if (isUnavailableOptionalSecretLocatorError(error)) {
-        return null;
-      }
-      throw error;
+  await ensureFastBrowserSecretSession(
+    profileName,
+    locator.store ?? "bitwarden-cli",
+    shouldPromptForCodexRotateSecretUnlock(),
+  );
+  try {
+    const response = await runFastBrowserCliJsonRequest<
+      Record<string, unknown>
+    >(
+      ["secrets", "item"],
+      {
+        action: "resolve",
+        selector: {
+          kind: "locator",
+          locator: toFastBrowserCliSecretLocator(locator),
+        },
+      },
+      "fast-browser secrets item resolve",
+    );
+    if (!response?.ok) {
+      throw new Error(
+        response?.error?.message ||
+          "fast-browser failed to resolve the requested secret locator.",
+      );
     }
-  });
+    return locator;
+  } catch (error) {
+    if (isMissingOptionalSecretLocatorError(locator, error)) {
+      return null;
+    }
+    if (isUnavailableOptionalSecretLocatorError(error)) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 function normalizeBitwardenCliAccountSecretIdentity(
@@ -541,46 +575,14 @@ function normalizeBitwardenCliAccountSecretIdentity(
 async function withReadyBitwardenSecretBroker<T>(
   profileName: string,
   promptIfLocked: boolean,
-  operation: (daemon: {
-    ensureDaemonSecretStoreReadyInteractive: (options: {
-      profileName: string;
-      store: "bitwarden-cli";
-      promptIfLocked: boolean;
-    }) => Promise<unknown>;
-    findDaemonLoginSecretRef: (options: {
-      profileName: string;
-      store: "bitwarden-cli";
-      username: string;
-      uris: string[];
-    }) => Promise<{
-      ok?: boolean;
-      ref?: unknown;
-      error?: { message?: string };
-    }>;
-    ensureDaemonLoginSecretRef: (options: {
-      profileName: string;
-      store: "bitwarden-cli";
-      name: string;
-      username: string;
-      password: string;
-      notes: string;
-      uris: string[];
-    }) => Promise<{
-      ok?: boolean;
-      ref?: unknown;
-      error?: { message?: string };
-    }>;
-  }) => Promise<T>,
+  operation: () => Promise<T>,
 ): Promise<T> {
-  return await withBitwardenSecretBrokerRecovery(async () => {
-    const daemon = await import(FAST_BROWSER_DAEMON_CLIENT_MODULE);
-    await daemon.ensureDaemonSecretStoreReadyInteractive({
-      profileName,
-      store: "bitwarden-cli",
-      promptIfLocked,
-    });
-    return await operation(daemon);
-  });
+  await ensureFastBrowserSecretSession(
+    profileName,
+    "bitwarden-cli",
+    promptIfLocked,
+  );
+  return await operation();
 }
 
 export async function prepareBitwardenCliAccountSecretRef(
@@ -602,40 +604,60 @@ export async function prepareBitwardenCliAccountSecretRef(
   return await withReadyBitwardenSecretBroker(
     normalized.profileName,
     shouldPromptForCodexRotateSecretUnlock(),
-    async (daemon) => {
-      const existing = await daemon.findDaemonLoginSecretRef({
-        profileName: normalized.profileName,
-        store: "bitwarden-cli",
-        username: normalized.email,
-        uris: OPENAI_ACCOUNT_SECRET_URIS,
-      });
+    async () => {
+      const existing = await runFastBrowserCliJsonRequest<{
+        ref?: Record<string, unknown> | null;
+      }>(
+        ["secrets", "item"],
+        {
+          action: "resolve",
+          selector: {
+            kind: "login",
+            store: "bitwarden-cli",
+            username: normalized.email,
+            uris: OPENAI_ACCOUNT_SECRET_URIS,
+          },
+        },
+        `fast-browser secrets item resolve for ${normalized.email}`,
+      );
       if (!existing?.ok) {
         throw new Error(
           existing?.error?.message ||
             `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
         );
       }
-      const existingRef = normalizeCodexRotateSecretRef(existing?.ref);
+      const existingRef = normalizeCodexRotateSecretRef(
+        extractFastBrowserCliResult(existing)?.ref,
+      );
       if (existingRef) {
         return existingRef;
       }
 
-      const created = await daemon.ensureDaemonLoginSecretRef({
-        profileName: normalized.profileName,
-        store: "bitwarden-cli",
-        name: buildCodexRotateAccountSecretName(normalized.email),
-        username: normalized.email,
-        password: normalizedPassword,
-        notes: `Managed by codex-rotate for ${normalized.email}.`,
-        uris: OPENAI_ACCOUNT_SECRET_URIS,
-      });
+      const created = await runFastBrowserCliJsonRequest<{
+        ref?: Record<string, unknown> | null;
+      }>(
+        ["secrets", "item"],
+        {
+          action: "ensure",
+          kind: "login",
+          store: "bitwarden-cli",
+          name: buildCodexRotateAccountSecretName(normalized.email),
+          username: normalized.email,
+          password: normalizedPassword,
+          notes: `Managed by codex-rotate for ${normalized.email}.`,
+          uris: OPENAI_ACCOUNT_SECRET_URIS,
+        },
+        `fast-browser secrets item ensure for ${normalized.email}`,
+      );
       if (!created?.ok) {
         throw new Error(
           created?.error?.message ||
             `Fast-browser Bitwarden adapter failed while creating or reusing the vault item for ${normalized.email}.`,
         );
       }
-      const createdRef = normalizeCodexRotateSecretRef(created?.ref);
+      const createdRef = normalizeCodexRotateSecretRef(
+        extractFastBrowserCliResult(created)?.ref,
+      );
       if (!createdRef) {
         throw new Error(
           `Fast-browser Bitwarden adapter did not return a secret ref for ${normalized.email}.`,
@@ -659,20 +681,31 @@ async function findBitwardenCliAccountSecretRefWithOptions(
   return await withReadyBitwardenSecretBroker(
     normalized.profileName,
     promptIfLocked,
-    async (daemon) => {
-      const response = await daemon.findDaemonLoginSecretRef({
-        profileName: normalized.profileName,
-        store: "bitwarden-cli",
-        username: normalized.email,
-        uris: OPENAI_ACCOUNT_SECRET_URIS,
-      });
+    async () => {
+      const response = await runFastBrowserCliJsonRequest<{
+        ref?: Record<string, unknown> | null;
+      }>(
+        ["secrets", "item"],
+        {
+          action: "resolve",
+          selector: {
+            kind: "login",
+            store: "bitwarden-cli",
+            username: normalized.email,
+            uris: OPENAI_ACCOUNT_SECRET_URIS,
+          },
+        },
+        `fast-browser secrets item resolve for ${normalized.email}`,
+      );
       if (!response?.ok) {
         throw new Error(
           response?.error?.message ||
             `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
         );
       }
-      return normalizeCodexRotateSecretRef(response?.ref);
+      return normalizeCodexRotateSecretRef(
+        extractFastBrowserCliResult(response)?.ref,
+      );
     },
   );
 }
@@ -700,48 +733,50 @@ export async function deleteBitwardenCliAccountSecretRef(
   return await withReadyBitwardenSecretBroker(
     normalized.profileName,
     false,
-    async (daemon) => {
-      const response = await daemon.findDaemonLoginSecretRef({
-        profileName: normalized.profileName,
-        store: "bitwarden-cli",
-        username: normalized.email,
-        uris: OPENAI_ACCOUNT_SECRET_URIS,
-      });
+    async () => {
+      const response = await runFastBrowserCliJsonRequest<{
+        ref?: Record<string, unknown> | null;
+      }>(
+        ["secrets", "item"],
+        {
+          action: "resolve",
+          selector: {
+            kind: "login",
+            store: "bitwarden-cli",
+            username: normalized.email,
+            uris: OPENAI_ACCOUNT_SECRET_URIS,
+          },
+        },
+        `fast-browser secrets item resolve for ${normalized.email}`,
+      );
       if (!response?.ok) {
         throw new Error(
           response?.error?.message ||
             `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
         );
       }
-      const ref = normalizeCodexRotateSecretRef(response?.ref);
+      const ref = normalizeCodexRotateSecretRef(
+        extractFastBrowserCliResult(response)?.ref,
+      );
       if (!ref) {
         return false;
       }
 
-      const { buildBitwardenCliEnv } = await import(
-        FAST_BROWSER_BITWARDEN_SESSION_MODULE
-      );
-      const result = spawnSync(
-        BITWARDEN_BINARY,
-        ["delete", "item", ref.object_id],
+      const deleted = await runFastBrowserCliJsonRequest<
+        Record<string, unknown>
+      >(
+        ["secrets", "item"],
         {
-          cwd: resolveStableWorkingDirectory(),
-          env: buildBitwardenCliEnv(process.env),
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 60_000,
+          action: "delete",
+          store: "bitwarden-cli",
+          objectId: ref.object_id,
         },
+        `fast-browser secrets item delete for ${normalized.email}`,
       );
-      if (result.error) {
-        throw result.error;
-      }
-      if ((result.status ?? 1) !== 0) {
-        const detail = [result.stderr, result.stdout]
-          .map((value) => String(value || "").trim())
-          .find((value) => value.length > 0);
+      if (!deleted?.ok) {
         throw new Error(
-          detail ||
-            `Bitwarden CLI failed while deleting the vault item for ${normalized.email}.`,
+          deleted?.error?.message ||
+            `Fast-browser Bitwarden adapter failed while deleting the vault item for ${normalized.email}.`,
         );
       }
       return true;
@@ -749,336 +784,15 @@ export async function deleteBitwardenCliAccountSecretRef(
   );
 }
 
-async function sleep(milliseconds: number): Promise<void> {
-  await new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
-}
-
-function readPidIfExists(pidPath: string): number | null {
-  try {
-    if (!existsSync(pidPath)) {
-      return null;
-    }
-    const pid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(
-      error &&
-      typeof error === "object" &&
-      "code" in error &&
-      error.code === "ESRCH"
-    );
-  }
-}
-
-async function requestFastBrowserDaemonShutdown(
-  socketPath: string,
-): Promise<boolean> {
-  const protocolModuleUrl = pathToFileURL(
-    resolve(
-      REPO_ROOT,
-      "..",
-      "ai-rules",
-      "skills",
-      "fast-browser",
-      "lib",
-      "daemon",
-      "protocol.mjs",
-    ),
-  ).href;
-
-  try {
-    const { sendDaemonRequest } = await import(protocolModuleUrl);
-    const response = await sendDaemonRequest(
-      socketPath,
-      { method: "shutdown" },
-      10_000,
-    );
-    return response?.ok === true;
-  } catch {
-    return false;
-  }
-}
-
-async function requestFastBrowserSecretBrokerShutdown(): Promise<boolean> {
-  const protocolModuleUrl = pathToFileURL(
-    resolve(
-      REPO_ROOT,
-      "..",
-      "ai-rules",
-      "skills",
-      "fast-browser",
-      "lib",
-      "daemon",
-      "protocol.mjs",
-    ),
-  ).href;
-
-  try {
-    const { sendDaemonRequest } = await import(protocolModuleUrl);
-    const response = await sendDaemonRequest(
-      FAST_BROWSER_SECRET_BROKER_SOCKET,
-      { method: "shutdown" },
-      10_000,
-    );
-    return response?.ok === true;
-  } catch {
-    return false;
-  }
-}
-
-function findManagedChromeProcess(
-  profileName: string,
-): { pid: number; port: number | null } | null {
-  const userDataDir = join(FAST_BROWSER_PROFILES_HOME, profileName);
-  const result = spawnSync("ps", ["-Ao", "pid=,command="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  const output = result.stdout ?? "";
-  for (const line of output.split("\n")) {
-    if (!line.includes("Google Chrome")) {
-      continue;
-    }
-    if (!line.includes(`--user-data-dir=${userDataDir}`)) {
-      continue;
-    }
-    const pidMatch = line.trim().match(/^(\d+)\s+/);
-    if (!pidMatch) {
-      continue;
-    }
-    const portMatch = line.match(/--remote-debugging-port=(\d+)/);
-    return {
-      pid: Number.parseInt(pidMatch[1]!, 10),
-      port: portMatch ? Number.parseInt(portMatch[1]!, 10) : null,
-    };
-  }
-  return null;
-}
-
-async function requestManagedChromeShutdown(
-  profileName: string,
-): Promise<boolean> {
-  const chrome = findManagedChromeProcess(profileName);
-  if (!chrome?.port) {
-    return false;
-  }
-
-  const chromeModuleUrl = pathToFileURL(
-    resolve(
-      REPO_ROOT,
-      "..",
-      "ai-rules",
-      "skills",
-      "fast-browser",
-      "lib",
-      "backends",
-      "local-chrome-cdp.mjs",
-    ),
-  ).href;
-
-  try {
-    const { closeChromeBrowserViaCdp } = await import(chromeModuleUrl);
-    return await closeChromeBrowserViaCdp(chrome.port);
-  } catch {
-    return false;
-  }
-}
-
-function requestDaemonProcessTermination(pidPath: string): boolean {
-  const pid = readPidIfExists(pidPath);
-  if (!pid || !isProcessAlive(pid)) {
-    return false;
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function forceKillDaemonProcess(pidPath: string): boolean {
-  const pid = readPidIfExists(pidPath);
-  if (!pid || !isProcessAlive(pid)) {
-    return false;
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForManagedProfileShutdown(
-  pidPath: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  const pid = readPidIfExists(pidPath);
-  if (!pid || !isProcessAlive(pid)) {
-    return true;
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) {
-      return true;
-    }
-    await sleep(100);
-  }
-
-  return !isProcessAlive(pid);
-}
-
-export async function terminateDaemonProcessAutonomously(
-  pidPath: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  const pid = readPidIfExists(pidPath);
-  if (!pid || !isProcessAlive(pid)) {
-    return true;
-  }
-  requestDaemonProcessTermination(pidPath);
-  if (await waitForManagedProfileShutdown(pidPath, timeoutMs)) {
-    return true;
-  }
-  forceKillDaemonProcess(pidPath);
-  return await waitForManagedProfileShutdown(pidPath, timeoutMs);
-}
-
-async function resetFastBrowserSecretBroker(): Promise<void> {
-  const hadSocket = existsSync(FAST_BROWSER_SECRET_BROKER_SOCKET);
-  const hadPid = Boolean(readPidIfExists(FAST_BROWSER_SECRET_BROKER_PID));
-
-  let shutdownAccepted = !hadSocket;
-  if (hadSocket) {
-    shutdownAccepted = await requestFastBrowserSecretBrokerShutdown();
-  }
-
-  if (
-    !shutdownAccepted &&
-    !requestDaemonProcessTermination(FAST_BROWSER_SECRET_BROKER_PID) &&
-    hadPid
-  ) {
-    throw new Error(
-      "fast-browser secret broker did not accept a normal shutdown request. Stop it cleanly and retry.",
-    );
-  }
-
-  const exitedCleanly = await waitForManagedProfileShutdown(
-    FAST_BROWSER_SECRET_BROKER_PID,
-    20_000,
-  );
-  if (!exitedCleanly) {
-    throw new Error(
-      "fast-browser secret broker is still running after a normal shutdown request. Stop it cleanly and retry.",
-    );
-  }
-
-  try {
-    if (hadSocket && existsSync(FAST_BROWSER_SECRET_BROKER_SOCKET)) {
-      unlinkSync(FAST_BROWSER_SECRET_BROKER_SOCKET);
-    }
-  } catch {}
-
-  try {
-    if (hadPid && existsSync(FAST_BROWSER_SECRET_BROKER_PID)) {
-      unlinkSync(FAST_BROWSER_SECRET_BROKER_PID);
-    }
-  } catch {}
-}
-
-async function withBitwardenSecretBrokerRecovery<T>(
-  operation: () => Promise<T>,
-): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    if (!shouldResetFastBrowserSecretBrokerForBrokenCwd(error)) {
-      throw error;
-    }
-    await resetFastBrowserSecretBroker();
-    return await operation();
-  }
-}
-
-export async function resetManagedProfileRuntime(
-  profileName: string,
-  socketPath?: string | null,
-): Promise<void> {
-  const resolvedSocketPath =
-    socketPath?.trim() || join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
-  const pidPath = join(FAST_BROWSER_DAEMON_DIR, `${profileName}.pid`);
-  const hadSocket = existsSync(resolvedSocketPath);
-  const hadPid = Boolean(readPidIfExists(pidPath));
-
-  let shutdownAccepted = !hadSocket;
-  if (hadSocket) {
-    shutdownAccepted =
-      await requestFastBrowserDaemonShutdown(resolvedSocketPath);
-  }
-
-  if (!shutdownAccepted) {
-    await requestManagedChromeShutdown(profileName);
-  }
-
-  const exitedCleanly = await terminateDaemonProcessAutonomously(
-    pidPath,
-    10_000,
-  );
-  if (!exitedCleanly) {
-    throw new Error(
-      `Managed profile "${profileName}" is still running after autonomous shutdown escalation. ` +
-        "Inspect the managed daemon and browser processes for that profile.",
-    );
-  }
-
-  try {
-    if (hadSocket && existsSync(resolvedSocketPath)) {
-      unlinkSync(resolvedSocketPath);
-    }
-  } catch {}
-
-  try {
-    if (hadPid && existsSync(pidPath)) {
-      unlinkSync(pidPath);
-    }
-  } catch {}
-}
-
-function ensureFastBrowserPlaywright(): void {
-  if (!existsSync(FAST_BROWSER_PLAYWRIGHT_MODULE)) {
-    throw new Error(
-      `Playwright is not installed in ${REPO_ROOT}. ` +
-        "Install the repo dependencies before using create/relogin automation.",
-    );
-  }
-}
-
 function parseFastBrowserJson<T>(
   result: Pick<FastBrowserCommandResult, "status" | "stdout">,
   actionLabel: string,
 ): T {
-  if (typeof result.status === "number" && result.status !== 0) {
-    const summary =
-      result.stdout?.trim() ||
-      `${actionLabel} exited with status ${result.status}.`;
-    throw new Error(summary);
-  }
-
   const stdout = result.stdout?.trim();
   if (!stdout) {
+    if (typeof result.status === "number" && result.status !== 0) {
+      throw new Error(`${actionLabel} exited with status ${result.status}.`);
+    }
     throw new Error(`${actionLabel} did not return JSON output.`);
   }
 
@@ -1351,170 +1065,44 @@ async function runFastBrowserDaemonWorkflow(
     responseMode?: "action_only" | "full";
   },
 ): Promise<FastBrowserRunResult> {
-  ensureFastBrowserPlaywright();
-  await maybeResetManagedProfileRuntimeForDaemonStatus(profileName);
-  const bridgeScript = `
-    const ownerPid = ${JSON.stringify(process.pid)};
-    if (Number.isInteger(ownerPid) && ownerPid > 1) {
-      const ownerWatchdog = setInterval(() => {
-        try {
-          process.kill(ownerPid, 0);
-        } catch {
-          process.stderr.write("[codex-rotate] automation owner exited; stopping orphaned fast-browser bridge.\\n");
-          process.exit(1);
-        }
-      }, 1000);
-      ownerWatchdog.unref?.();
-    }
-    import { runDaemonWorkflow } from ${JSON.stringify(FAST_BROWSER_DAEMON_CLIENT_MODULE)};
-    const response = await runDaemonWorkflow({
-      profileName: ${JSON.stringify(profileName)},
-      workflowRef: ${JSON.stringify(workflowRef)},
-      inputs: ${JSON.stringify(inputs)},
-      headed: ${Boolean(options?.headed)},
-      workflowRunStamp: ${JSON.stringify(options?.workflowRunStamp ?? null)},
-      retainTemporaryProfilesOnSuccess: ${Boolean(options?.retainTemporaryProfilesOnSuccess)},
-      artifactMode: ${JSON.stringify(options?.artifactMode ?? "minimal")},
-      debugMode: ${JSON.stringify(options?.debugMode ?? "off")},
-      responseMode: ${JSON.stringify(options?.responseMode ?? "full")},
-      onEvent: (event) => {
-        process.stderr.write(${JSON.stringify(FAST_BROWSER_EVENT_PREFIX)} + JSON.stringify(event) + "\\n");
-      },
-    });
-    console.log(JSON.stringify(response));
-  `;
-  const executeBridge = async (): Promise<FastBrowserCommandResult> =>
-    await new Promise((resolve, reject) => {
-      const child = spawn(
-        NODE_BINARY,
-        ["--input-type=module", "-e", bridgeScript],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            FAST_BROWSER_WORKSPACE_ROOT: REPO_ROOT,
-            NODE_PATH: buildNodePathEnv(FAST_BROWSER_NODE_PATH),
-          },
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
-      let settled = false;
-      let stdout = "";
-      let stderr = "";
-      let stderrBuffer = "";
-      const socketPath = join(FAST_BROWSER_DAEMON_DIR, `${profileName}.sock`);
-      let inactivityTimer: NodeJS.Timeout | null = null;
-      const resetInactivityTimer = (): void => {
-        if (
-          settled ||
-          !Number.isFinite(FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS) ||
-          FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS <= 0
-        ) {
-          return;
-        }
-        if (inactivityTimer) {
-          clearTimeout(inactivityTimer);
-        }
-        inactivityTimer = setTimeout(() => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          child.kill("SIGKILL");
-          reject(
-            new Error(
-              `Timed out waiting for fast-browser daemon response from ${socketPath}`,
-            ),
-          );
-        }, FAST_BROWSER_BRIDGE_INACTIVITY_TIMEOUT_MS);
-      };
-      resetInactivityTimer();
-
-      const flushStderrLine = (line: string): void => {
-        if (line.startsWith(FAST_BROWSER_EVENT_PREFIX)) {
-          if (!isSuppressedFastBrowserEventLine(line)) {
-            process.stderr.write(`${line}\n`);
-          }
-          return;
-        }
-        stderr += `${line}\n`;
-        process.stderr.write(`${line}\n`);
-      };
-
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        resetInactivityTimer();
-        stdout += chunk;
-      });
-
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => {
-        stderrBuffer += chunk;
-        while (true) {
-          const newlineIndex = stderrBuffer.indexOf("\n");
-          if (newlineIndex === -1) {
-            break;
-          }
-          const line = stderrBuffer.slice(0, newlineIndex);
-          stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
-          if (line.trim()) {
-            if (shouldResetFastBrowserBridgeInactivityTimer(line)) {
-              resetInactivityTimer();
-            }
-            flushStderrLine(line);
-          }
-        }
-      });
-
-      child.once("error", (error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (inactivityTimer) {
-          clearTimeout(inactivityTimer);
-        }
-        reject(error);
-      });
-      child.once("close", (code, signal) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (inactivityTimer) {
-          clearTimeout(inactivityTimer);
-        }
-        if (stderrBuffer.trim()) {
-          flushStderrLine(stderrBuffer.trimEnd());
-        }
-        resolve({
-          status: code,
-          signal,
-          stdout,
-          stderr,
-        });
-      });
-    });
-
-  const result = await executeBridge();
-  const response = parseFastBrowserJson<FastBrowserDaemonRunResponse>(
-    { status: result.status, stdout: result.stdout },
+  const response = await runFastBrowserCliJsonRequest<FastBrowserRunResult>(
+    ["workflows", "run"],
+    {
+      workflowRef,
+      inputs,
+      profileName,
+      headed: Boolean(options?.headed),
+      workflowRunStamp: options?.workflowRunStamp ?? null,
+      retainTemporaryProfilesOnSuccess: Boolean(
+        options?.retainTemporaryProfilesOnSuccess,
+      ),
+      artifactMode: options?.artifactMode ?? "minimal",
+      debugMode: options?.debugMode ?? "off",
+      responseMode:
+        options?.responseMode === "action_only" ? "action-only" : "full",
+    },
     `fast-browser workflow ${workflowRef}`,
   );
 
   if (!response?.ok || !response.result) {
-    throw buildFastBrowserWorkflowError(workflowRef, response);
+    throw buildFastBrowserWorkflowError(
+      workflowRef,
+      response as FastBrowserDaemonRunResponse,
+    );
   }
 
   if (isFastBrowserRunResultFailure(response.result)) {
-    throw buildFastBrowserWorkflowError(workflowRef, response);
+    throw buildFastBrowserWorkflowError(
+      workflowRef,
+      response as FastBrowserDaemonRunResponse,
+    );
   }
 
   if (response.result.status === "paused") {
     const reason = response.result.pause?.reason ?? "pause";
-    const relay = response.result.pause?.relay_url
-      ? ` Open ${response.result.pause.relay_url} to continue the workflow.`
-      : "";
+    const relayUrl =
+      response.result.pause?.relayUrl || response.result.pause?.relay_url;
+    const relay = relayUrl ? ` Open ${relayUrl} to continue the workflow.` : "";
     throw new Error(
       `fast-browser workflow ${workflowRef} paused for ${reason}.${relay}`,
     );
@@ -1525,16 +1113,6 @@ async function runFastBrowserDaemonWorkflow(
   );
   maybeLogFastBrowserRunResultDebug(workflowRef, hydratedResult);
   return hydratedResult;
-}
-
-function shouldResetFastBrowserSecretBrokerForBrokenCwd(
-  output: string | null | undefined,
-): boolean {
-  const text =
-    output instanceof Error
-      ? `${output.message}\n${output.stack || ""}`
-      : String(output || "");
-  return FAST_BROWSER_SECRET_BROKEN_CWD_PATTERN.test(text);
 }
 
 function requireWorkflowInputString(
@@ -1700,7 +1278,6 @@ export async function completeCodexLoginViaWorkflowAttempt(
     return {
       result: loginResult,
       error_message: null,
-      managed_runtime_reset_performed: false,
     };
   } catch (error) {
     const failedResult = readFastBrowserResultFromError(error);
@@ -1708,7 +1285,6 @@ export async function completeCodexLoginViaWorkflowAttempt(
     return {
       result: failedResult,
       error_message: message,
-      managed_runtime_reset_performed: false,
     };
   }
 }
@@ -1721,7 +1297,11 @@ function normalizeCodexRotateSecretRef(
   }
   const record = raw as Record<string, unknown>;
   const objectId =
-    typeof record.object_id === "string" ? record.object_id.trim() : "";
+    typeof record.object_id === "string"
+      ? record.object_id.trim()
+      : typeof record.objectId === "string"
+        ? record.objectId.trim()
+        : "";
   if (!objectId) {
     return null;
   }
@@ -1733,7 +1313,7 @@ function normalizeCodexRotateSecretRef(
     return null;
   }
   const type = record.type === undefined ? "secret_ref" : record.type;
-  if (type !== "secret_ref") {
+  if (type !== "secret_ref" && type !== "secret-ref") {
     return null;
   }
   return {
@@ -1741,8 +1321,32 @@ function normalizeCodexRotateSecretRef(
     store: "bitwarden-cli",
     object_id: objectId,
     field_path:
-      typeof record.field_path === "string" ? record.field_path : null,
+      typeof record.field_path === "string"
+        ? record.field_path
+        : typeof record.fieldPath === "string"
+          ? record.fieldPath
+          : null,
     version: typeof record.version === "string" ? record.version : null,
+  };
+}
+
+function toFastBrowserCliSecretLocator(
+  locator: CodexRotateSecretLocator,
+): Record<string, unknown> {
+  if (locator.kind === "login_lookup") {
+    return {
+      kind: "login-lookup",
+      ...(locator.store ? { store: locator.store } : {}),
+      username: locator.username,
+      uris: locator.uris,
+      ...(locator.field_path ? { fieldPath: locator.field_path } : {}),
+    };
+  }
+  return {
+    kind: "named-secret",
+    ...(locator.store ? { store: locator.store } : {}),
+    name: locator.name,
+    ...(locator.field_path ? { fieldPath: locator.field_path } : {}),
   };
 }
 

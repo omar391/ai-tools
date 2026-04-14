@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct CorePaths {
@@ -83,7 +83,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
 }
 
 fn resolve_default_fast_browser_script(repo_root: &Path) -> PathBuf {
-    fast_browser_script_candidates(repo_root, discover_main_worktree_root(repo_root))
+    fast_browser_script_candidates(repo_root, resolve_main_worktree_root(repo_root))
         .into_iter()
         .find(|candidate| candidate.is_file())
         .unwrap_or_else(|| {
@@ -128,23 +128,44 @@ fn fast_browser_script_under(repo_root: &Path) -> PathBuf {
         .unwrap_or_else(|| repo_root.join("fast-browser.mjs"))
 }
 
-fn discover_main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
+pub fn resolve_main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
-        .arg("worktree")
-        .arg("list")
-        .arg("--porcelain")
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
         .current_dir(repo_root)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    stdout.lines().find_map(|line| {
-        let path = line.strip_prefix("worktree ")?;
-        let candidate = PathBuf::from(path);
-        (candidate != repo_root).then_some(candidate)
-    })
+    let common_dir = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    common_dir.parent().map(Path::to_path_buf)
+}
+
+pub fn ensure_main_worktree_operation_allowed(repo_root: &Path, operation: &str) -> Result<()> {
+    ensure_main_worktree_operation_allowed_with_root(
+        repo_root,
+        resolve_main_worktree_root(repo_root).as_deref(),
+        operation,
+    )
+}
+
+fn ensure_main_worktree_operation_allowed_with_root(
+    repo_root: &Path,
+    main_worktree_root: Option<&Path>,
+    operation: &str,
+) -> Result<()> {
+    let Some(main_worktree_root) = main_worktree_root else {
+        return Ok(());
+    };
+    if main_worktree_root == repo_root {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{operation} is disabled from linked worktrees. Run it from the main worktree {}.",
+        main_worktree_root.display()
+    ))
 }
 
 fn resolve_codex_logs_db_file(codex_home: &Path) -> PathBuf {
@@ -360,9 +381,9 @@ fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_legacy_rotate_home_artifacts, fast_browser_script_candidates,
-        resolve_codex_logs_db_file, resolve_codex_state_db_file, resolve_node_binary,
-        DEFAULT_CODEX_LOGS_DB_FILE, DEFAULT_CODEX_STATE_DB_FILE,
+        cleanup_legacy_rotate_home_artifacts, ensure_main_worktree_operation_allowed_with_root,
+        fast_browser_script_candidates, resolve_codex_logs_db_file, resolve_codex_state_db_file,
+        resolve_node_binary, DEFAULT_CODEX_LOGS_DB_FILE, DEFAULT_CODEX_STATE_DB_FILE,
     };
     use crate::test_support::ENV_MUTEX;
     use std::fs;
@@ -569,5 +590,24 @@ mod tests {
             .expect("existing fallback");
 
         assert_eq!(resolved, main_script);
+    }
+
+    #[test]
+    fn ensure_main_worktree_operation_allowed_rejects_linked_worktrees() {
+        let error = ensure_main_worktree_operation_allowed_with_root(
+            Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
+            Some(Path::new(
+                "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
+            )),
+            "Fresh account creation",
+        )
+        .expect_err("linked worktree should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Fresh account creation is disabled from linked worktrees."));
+        assert!(error
+            .to_string()
+            .contains("/Volumes/Projects/business/AstronLab/omar391/ai-tools"));
     }
 }

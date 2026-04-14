@@ -310,7 +310,8 @@ fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
     }
     let event = serde_json::from_str::<Value>(raw).ok()?;
     let record = event.as_object()?;
-    let workflow = read_string_value(record, "workflow");
+    let workflow =
+        read_string_value(record, "workflowRef").or_else(|| read_string_value(record, "workflow"));
     let step_id = read_string_value(record, "stepId");
     let phase = read_string_value(record, "phase");
     let status = read_string_value(record, "status");
@@ -328,10 +329,24 @@ fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
         .join("/");
     let state = format_fast_browser_event_state(phase.as_deref(), status.as_deref());
     let mut detail_parts = Vec::new();
+    if let Some(reason) = read_string_value(record, "reason")
+        .or_else(|| details.and_then(|details| read_string_value(details, "reason")))
+    {
+        detail_parts.push(format!("reason={reason}"));
+    }
+    if let Some(current_url) = read_string_value(record, "currentUrl")
+        .or_else(|| details.and_then(|details| read_string_value(details, "current_url")))
+    {
+        detail_parts.push(format!("url={current_url}"));
+    }
+    if let Some(run_path) = read_string_value(record, "runPath").or_else(|| {
+        details
+            .and_then(|details| read_string_value(details, "run_path"))
+            .or_else(|| details.and_then(|details| read_string_value(details, "run_status_path")))
+    }) {
+        detail_parts.push(format!("run={run_path}"));
+    }
     if let Some(details) = details {
-        if let Some(reason) = read_string_value(details, "reason") {
-            detail_parts.push(format!("reason={reason}"));
-        }
         if let Some(relay_url) = read_string_value(details, "relay_url") {
             detail_parts.push(format!("relay_url={relay_url}"));
         }
@@ -351,14 +366,6 @@ fn format_fast_browser_progress_event_line(line: &str) -> Option<String> {
         }
         if let Some(stage) = read_string_value(details, "stage") {
             detail_parts.push(format!("stage={stage}"));
-        }
-        if let Some(current_url) = read_string_value(details, "current_url") {
-            detail_parts.push(format!("url={current_url}"));
-        }
-        if let Some(run_path) = read_string_value(details, "run_path")
-            .or_else(|| read_string_value(details, "run_status_path"))
-        {
-            detail_parts.push(format!("run={run_path}"));
         }
         if let Some(screenshot_path) = read_string_value(details, "screenshot_path") {
             detail_parts.push(format!("screenshot={screenshot_path}"));
@@ -531,7 +538,7 @@ mod tests {
 
         assert_eq!(
             format_fast_browser_progress_event_line(line).as_deref(),
-            Some("[fast-browser] 2026-04-08T02:13:48.020Z collect-verification-artifact/collect_verification_artifact step: Search Gmail, open the matching message, and extract a code or matching verification link. (action=playwright, url=https://mail.google.com/mail/u/0/#inbox)")
+            Some("[fast-browser] 2026-04-08T02:13:48.020Z collect-verification-artifact/collect_verification_artifact step: Search Gmail, open the matching message, and extract a code or matching verification link. (url=https://mail.google.com/mail/u/0/#inbox, action=playwright)")
         );
     }
 

@@ -44,3 +44,4 @@ packages/codex-rotate/benchmarks/results/
 !.trunk/trunk.yaml
 !.trunk/configs/
 !.trunk/configs/**
+.worktree-target/

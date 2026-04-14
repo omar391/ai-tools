@@ -10,36 +10,23 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { chromium } from "playwright";
 
 import {
   buildFastBrowserWorkflowError,
+  extractFastBrowserCliResult,
   hydrateFastBrowserRunResultFromObservability,
   isFastBrowserRunResultFailure,
   isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
   resolveFastBrowserSkillPath,
-  shouldResetManagedProfileRuntimeForDaemonStatus,
   shouldResetFastBrowserBridgeInactivityTimer,
   shouldPromptForCodexRotateSecretUnlock,
-  terminateDaemonProcessAutonomously,
 } from "./automation.ts";
 
 setDefaultTimeout(30_000);
 
 const repoRoot = join(import.meta.dir, "..", "..");
-const workflowsModulePath = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "..",
-  "ai-rules",
-  "skills",
-  "fast-browser",
-  "lib",
-  "workflows.mjs",
-);
 const minimalWorkflowPath = join(
   repoRoot,
   ".fast-browser",
@@ -232,6 +219,18 @@ async function loadWorkflowStepScript(workflowPath: string, stepId: string) {
   return script;
 }
 
+async function loadWorkflowFunctionScript(
+  workflowPath: string,
+  functionId: string,
+) {
+  const workflow = await loadWorkflow(workflowPath);
+  const script = workflow.use?.functions?.[functionId]?.with?.body?.script;
+  if (!script) {
+    throw new Error(`${functionId} script was not found in ${workflowPath}`);
+  }
+  return script;
+}
+
 async function loadOriginalStepScript(stepId: string) {
   const workflow = await loadWorkflow(originalWorkflowPath);
   const step = workflow.do?.find((entry) => stepId in entry)?.[stepId] as
@@ -417,6 +416,26 @@ async function runWorkflowStepScriptOnContent(
   }
 }
 
+async function runWorkflowFunctionScriptOnContent(
+  workflowPath: string,
+  functionId: string,
+  html: string,
+  args: Record<string, unknown> = {},
+  url = "https://auth.openai.com/create-account",
+) {
+  const browser = await chromium.launch({ headless: true, channel: "chrome" });
+  try {
+    const page = await browser.newPage();
+    await page.goto(url);
+    await page.setContent(html);
+    const script = await loadWorkflowFunctionScript(workflowPath, functionId);
+    const execute = new AsyncFunction("page", "args", script);
+    return (await execute(page, args)) as Record<string, unknown>;
+  } finally {
+    await browser.close();
+  }
+}
+
 async function runWorkflowRunScript(
   workflowPath: string,
   stepId: string,
@@ -504,6 +523,40 @@ console.log(typeof automation.completeCodexLoginViaWorkflowAttempt);
 });
 
 describe("optional secret locator fallback", () => {
+  test("extracts result payloads from public fast-browser CLI envelopes", () => {
+    expect(
+      extractFastBrowserCliResult({
+        abiVersion: "1.0.0",
+        command: "secrets.item",
+        ok: true,
+        result: {
+          ref: {
+            type: "secret-ref",
+            store: "bitwarden-cli",
+            objectId: "abc123",
+          },
+        },
+      }),
+    ).toEqual({
+      ref: {
+        type: "secret-ref",
+        store: "bitwarden-cli",
+        objectId: "abc123",
+      },
+    });
+    expect(
+      extractFastBrowserCliResult({
+        abiVersion: "1.0.0",
+        command: "secrets.item",
+        ok: false,
+        error: {
+          code: "vault-locked",
+          message: "Bitwarden CLI is locked.",
+        },
+      }),
+    ).toBeUndefined();
+  });
+
   test("treats locked or stalled Bitwarden preflight as optional", () => {
     expect(
       isUnavailableOptionalSecretLocatorError(
@@ -661,12 +714,12 @@ describe("fast-browser daemon event visibility", () => {
     ).toBe(false);
   });
 
-  test("does not treat repeated queued daemon events as bridge progress", () => {
+  test("treats running daemon heartbeats as liveness but not queued events", () => {
     expect(
       shouldResetFastBrowserBridgeInactivityTimer(
         '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"heartbeat","message":"still alive"}',
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       shouldResetFastBrowserBridgeInactivityTimer(
         '__FAST_BROWSER_EVENT__{"phase":"daemon","status":"queued","message":"waiting"}',
@@ -684,96 +737,47 @@ describe("fast-browser daemon event visibility", () => {
     ).toBe(true);
   });
 
-  test("resets a managed profile daemon stuck on a disconnected active request", () => {
-    expect(
-      shouldResetManagedProfileRuntimeForDaemonStatus({
-        ok: true,
-        lifecycle_state: "recovering",
-        mode: null,
-        request_queue: {
-          active: {
-            id: 11,
-            method: "run",
-            workflow_ref:
-              "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
-            running_for_ms: 5_697_672,
-            disconnected_at: 1_776_083_443_084,
-            disconnect_reason: "socket_ended",
-          },
-          queued: [],
-          queued_count: 0,
-        },
-      }),
-    ).toBe(true);
-  });
+  test("rejects reset-managed-runtime bridge commands", () => {
+    const fixtureRoot = mkdtempSync(
+      join(tmpdir(), "codex-rotate-bridge-reset-"),
+    );
+    const requestPath = join(fixtureRoot, "request.json");
 
-  test("does not reset a daemon with a live active request", () => {
-    expect(
-      shouldResetManagedProfileRuntimeForDaemonStatus({
-        ok: true,
-        lifecycle_state: "warm",
-        mode: "headless",
-        request_queue: {
-          active: {
-            id: 12,
-            method: "run",
-            workflow_ref:
-              "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
-            running_for_ms: 45_000,
-            disconnected_at: null,
-            disconnect_reason: null,
-          },
-          queued: [],
-          queued_count: 0,
-        },
+    writeFileSync(
+      requestPath,
+      JSON.stringify({
+        command: "reset-managed-runtime",
+        payload: { profileName: "dev-1" },
       }),
-    ).toBe(false);
-  });
-
-  test("does not reset a daemon whose disconnected request is still fresh", () => {
-    expect(
-      shouldResetManagedProfileRuntimeForDaemonStatus({
-        ok: true,
-        lifecycle_state: "recovering",
-        mode: null,
-        request_queue: {
-          active: {
-            id: 13,
-            method: "run",
-            workflow_ref:
-              "workspace.web.auth-openai-com.codex-rotate-account-flow-main",
-            running_for_ms: 5_000,
-            disconnected_at: 1_776_083_443_084,
-            disconnect_reason: "socket_ended",
-          },
-          queued: [],
-          queued_count: 0,
-        },
-      }),
-    ).toBe(false);
-  });
-
-  test("autonomously terminates a stale daemon process from its pid file", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "codex-rotate-daemon-"));
-    const pidPath = join(fixtureRoot, "daemon.pid");
-    const child = spawnSync("sh", ["-c", "sleep 30 & echo $!"], {
-      encoding: "utf8",
-    });
-    expect(child.status).toBe(0);
-    const pid = Number.parseInt((child.stdout || "").trim(), 10);
-    expect(Number.isInteger(pid) && pid > 0).toBe(true);
-    writeFileSync(pidPath, `${pid}\n`);
+      "utf8",
+    );
 
     try {
-      expect(await terminateDaemonProcessAutonomously(pidPath, 2_000)).toBe(
-        true,
+      const result = spawnSync(
+        "bun",
+        [
+          "packages/codex-rotate/automation-bridge.ts",
+          "--request-file",
+          requestPath,
+        ],
+        {
+          cwd: join(import.meta.dir, "..", ".."),
+          encoding: "utf8",
+        },
       );
-      const probe = spawnSync("kill", ["-0", String(pid)], {
-        stdio: "ignore",
-      });
-      expect(probe.status).not.toBe(0);
+
+      expect(result.status).toBe(1);
+      const response = JSON.parse(
+        result.stdout.replace(/^__CODEX_ROTATE_BRIDGE__/u, ""),
+      ) as {
+        ok: boolean;
+        error?: { message?: string | null };
+      };
+      expect(response.ok).toBe(false);
+      expect(response.error?.message).toContain(
+        "Unsupported automation bridge command: reset-managed-runtime",
+      );
     } finally {
-      spawnSync("kill", ["-9", String(pid)], { stdio: "ignore" });
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });
@@ -964,20 +968,57 @@ describe("fast-browser workflow failures", () => {
 });
 
 describe("active auth workflows", () => {
+  test("stepwise signup email submit treats /log-in/password as signup_password", async () => {
+    const result = await runWorkflowFunctionScriptOnContent(
+      stepwiseWorkflowPath,
+      "submit_signup_email_form",
+      `
+        <form>
+          <input type="email" value="devbench.23@astronlab.com" />
+          <button
+            type="button"
+            onclick="
+              history.replaceState({}, '', '/log-in/password');
+              document.title = 'Password';
+              document.body.innerHTML = '<main><h1>Password</h1><input type=\\'password\\' name=\\'password\\' autocomplete=\\'current-password\\'></main>';
+            "
+          >
+            Continue
+          </button>
+        </form>
+      `,
+      { email: "devbench.23@astronlab.com" },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("signup_password");
+    expect(String(result.current_url || "")).toContain("/log-in/password");
+  });
+
+  test("all non-device flows normalize signup email handoff through /log-in/password", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const script = await loadWorkflowFunctionScript(
+        workflowPath,
+        "submit_signup_email_form",
+      );
+      expect(script).toContain("/log-in/password");
+      expect(script).toContain("normalizedStage");
+      expect(script).toContain("signup_password");
+      expect(() => new AsyncFunction("page", "args", script)).not.toThrow();
+    }
+  });
+
   test("validate against current fast-browser digest pins", async () => {
     const repoRoot = join(import.meta.dir, "..", "..");
-    const workflowsModulePath = join(
-      import.meta.dir,
-      "..",
-      "..",
-      "..",
-      "ai-rules",
-      "skills",
-      "fast-browser",
-      "lib",
-      "workflows.mjs",
-    );
-    expect(existsSync(workflowsModulePath)).toBe(true);
+    const fastBrowserScript = resolveFastBrowserSkillPath([
+      "scripts",
+      "fast-browser.mjs",
+    ]);
+    expect(existsSync(fastBrowserScript)).toBe(true);
     const workflowPaths = [
       join(
         repoRoot,
@@ -1013,44 +1054,69 @@ describe("active auth workflows", () => {
       ),
     ];
 
-    const result = spawnSync(
-      "node",
-      [
-        "--input-type=module",
-        "-e",
-        `
-import { pathToFileURL } from "node:url";
-const { loadWorkflowRecord, validateWorkflowRecord } = await import(${JSON.stringify(
-          pathToFileURL(workflowsModulePath).href,
-        )});
-for (const workflowPath of ${JSON.stringify(workflowPaths)}) {
-  const record = await loadWorkflowRecord(workflowPath, "project");
-  await validateWorkflowRecord(record);
-  console.log("ok\\t" + workflowPath);
-}
-`,
-      ],
-      {
-        cwd: repoRoot,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_OPTIONS: undefined,
+    for (const workflowPath of workflowPaths) {
+      const result = spawnSync(
+        "node",
+        [fastBrowserScript, "workflows", "validate", workflowPath],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            NODE_OPTIONS: undefined,
+          },
         },
-      },
-    );
-
-    if (result.status !== 0) {
-      throw new Error(
-        `workflow validation failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
       );
+      if (result.status !== 0) {
+        throw new Error(
+          `workflow validation failed for ${workflowPath}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+        );
+      }
+      expect(result.stdout).toContain('"ok": true');
+      expect(result.stdout).toContain('"command": "workflows.validate"');
+      expect(result.stdout).toContain(workflowPath);
     }
-    expect(result.stdout).toContain("codex-rotate-account-flow-main.yaml");
-    expect(result.stdout).toContain("codex-rotate-account-flow-stepwise.yaml");
-    expect(result.stdout).toContain("codex-rotate-account-flow-minimal.yaml");
-    expect(result.stdout).toContain(
-      "codex-rotate-account-flow-device-auth.yaml",
+  });
+
+  test("runtime imports only the public fast-browser script boundary", () => {
+    const automationSource = readFileSync(
+      join(import.meta.dir, "automation.ts"),
+      "utf8",
     );
+    expect(automationSource).toContain("resolveFastBrowserSkillPath([");
+    expect(automationSource).toContain('"fast-browser.mjs"');
+    expect(automationSource).not.toContain("lib/daemon/client.mjs");
+    expect(automationSource).not.toContain(
+      "lib/secret-adapters/bitwarden-session.mjs",
+    );
+    expect(automationSource).not.toContain("workflows.mjs");
+  });
+
+  test("runtime uses only canonical fast-browser CLI command names", () => {
+    const runtimeSources = [
+      readFileSync(join(import.meta.dir, "automation.ts"), "utf8"),
+      readFileSync(
+        join(
+          import.meta.dir,
+          "crates",
+          "codex-rotate-core",
+          "src",
+          "workflow.rs",
+        ),
+        "utf8",
+      ),
+      readFileSync(
+        join(import.meta.dir, "crates", "codex-rotate-cli", "src", "main.rs"),
+        "utf8",
+      ),
+    ].join("\n");
+
+    expect(runtimeSources).not.toContain('"inspect-profiles"');
+    expect(runtimeSources).not.toContain('"validate-global-workflows"');
+    expect(runtimeSources).not.toContain('"debug-snapshot"');
+    expect(runtimeSources).not.toContain('"secrets unlock"');
+    expect(runtimeSources).not.toContain('"secrets status"');
+    expect(runtimeSources).not.toContain('"secrets clear"');
   });
 
   test("main remains ordered original-first with device-auth fallback after benchmarking", async () => {
