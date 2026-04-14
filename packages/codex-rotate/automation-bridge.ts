@@ -11,7 +11,6 @@ import {
   completeCodexLoginViaWorkflowAttempt,
   deleteBitwardenCliAccountSecretRef,
   prepareBitwardenCliAccountSecretRef,
-  resetManagedProfileRuntime,
 } from "./automation.ts";
 
 type BridgeRequest =
@@ -22,10 +21,6 @@ type BridgeRequest =
   | {
       command: "delete-account-secret-ref";
       payload: { profileName: string; email: string };
-    }
-  | {
-      command: "reset-managed-runtime";
-      payload: { profileName: string; socketPath?: string | null };
     }
   | {
       command: "complete-codex-login-attempt";
@@ -139,12 +134,6 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.profileName,
         request.payload.email,
       );
-    case "reset-managed-runtime":
-      await resetManagedProfileRuntime(
-        request.payload.profileName,
-        request.payload.socketPath ?? null,
-      );
-      return { ok: true };
     case "complete-codex-login-attempt":
       return (await completeCodexLoginViaWorkflowAttempt(
         request.payload.profileName,

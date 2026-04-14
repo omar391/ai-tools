@@ -25,7 +25,9 @@ use crate::bridge::{
 };
 use crate::cancel;
 use crate::managed_browser::ensure_managed_browser_wrapper;
-use crate::paths::{legacy_credentials_file, resolve_paths};
+use crate::paths::{
+    ensure_main_worktree_operation_allowed, legacy_credentials_file, resolve_paths,
+};
 use crate::pool::{
     cmd_add_expected_email, find_next_usable_account, format_account_summary_for_display,
     inspect_account, load_pool, normalize_pool_entries, resolve_account_selector, save_pool,
@@ -402,6 +404,18 @@ struct ManagedProfilesInspection {
     managed_profiles: ManagedProfilesPayload,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct FastBrowserCliErrorPayload {
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FastBrowserCliEnvelope<T> {
+    ok: bool,
+    result: Option<T>,
+    error: Option<FastBrowserCliErrorPayload>,
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SystemChromeProfileCandidate {
@@ -433,14 +447,6 @@ struct BridgeEnsureSecretPayload<'a> {
 struct BridgeDeleteSecretPayload<'a> {
     profile_name: &'a str,
     email: &'a str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeResetManagedRuntimePayload<'a> {
-    profile_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    socket_path: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1318,6 +1324,10 @@ fn execute_create_flow_attempt(
     progress: Option<AutomationProgressCallback>,
 ) -> std::result::Result<CreateCommandResult, CreateFlowAttemptFailure> {
     let paths = fatal(resolve_paths())?;
+    fatal(ensure_main_worktree_operation_allowed(
+        &paths.repo_root,
+        "Fresh account creation",
+    ))?;
     let previous_auth = fatal(load_codex_auth_if_exists())?;
     let mut store = fatal(load_credential_store())?;
     let workflow_file = resolve_account_flow_file_for_create(&paths, options);
@@ -2002,25 +2012,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     progress.clone(),
                 ) {
                     Ok(result) => result,
-                    Err(error) => {
-                        let bridge_error_message = error.to_string();
-                        if maybe_reset_managed_runtime_after_failed_attempt(
-                            profile_name,
-                            Some(bridge_error_message.as_str()),
-                        )? && attempt < max_attempts
-                        {
-                            report_progress(
-                                progress.as_ref(),
-                                format!(
-                                    "The managed browser runtime for \"{profile_name}\" became unresponsive while logging in {email}. Resetting it before retrying."
-                                ),
-                            );
-                            cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
-                            attempt += 1;
-                            continue 'attempts;
-                        }
-                        return Err(error);
-                    }
+                    Err(error) => return Err(error),
                 };
                 maybe_debug_codex_auth_flow_raw(workflow_ref.as_str(), email, &attempt_result_raw);
                 let attempt_result = normalize_bridge_login_attempt_result(attempt_result_raw);
@@ -2075,8 +2067,6 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                     });
-                let managed_runtime_reset_performed =
-                    maybe_reset_managed_runtime_after_failed_attempt(profile_name, error_message)?;
 
                 if flow.saw_oauth_consent == Some(true)
                     || flow.existing_account_prompt == Some(true)
@@ -2249,18 +2239,6 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         attempt += 1;
                         continue 'attempts;
                     }
-                }
-
-                if managed_runtime_reset_performed && attempt < max_attempts {
-                    report_progress(
-                        progress.as_ref(),
-                        format!(
-                            "Managed profile \"{profile_name}\" hit a recoverable fast-browser runtime state for {email}. Restarting the managed runtime before retrying."
-                        ),
-                    );
-                    cancel::sleep_with_cancellation(Duration::from_millis(1_000))?;
-                    attempt += 1;
-                    continue 'attempts;
                 }
 
                 if flow.callback_complete != Some(true) && flow.success != Some(true) {
@@ -2807,58 +2785,6 @@ fn read_codex_rotate_auth_flow_session(
         (Some(session), None) | (None, Some(session)) => Some(session),
         (None, None) => None,
     }
-}
-
-fn extract_fast_browser_timeout_socket_path(output: &str) -> Option<String> {
-    let marker = "Timed out waiting for fast-browser daemon response from ";
-    let start = output.find(marker)? + marker.len();
-    let remainder = &output[start..];
-    let end = remainder.find(".sock")? + ".sock".len();
-    let candidate = remainder[..end].trim();
-    (!candidate.is_empty()).then(|| candidate.to_string())
-}
-
-fn should_reset_fast_browser_daemon_for_socket_close(output: &str) -> bool {
-    output
-        .to_ascii_lowercase()
-        .contains("daemon closed the socket before sending a response")
-}
-
-fn should_reset_fast_browser_runtime_for_broken_cwd(output: &str) -> bool {
-    let output = output.to_ascii_lowercase();
-    output.contains("process.cwd failed")
-        || output.contains("uv_cwd")
-        || output.contains("enoent: process.cwd")
-        || output.contains("current working directory was likely removed")
-}
-
-fn maybe_reset_managed_runtime_after_failed_attempt(
-    profile_name: &str,
-    error_message: Option<&str>,
-) -> Result<bool> {
-    let Some(error_message) = error_message
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(false);
-    };
-
-    let socket_path = extract_fast_browser_timeout_socket_path(error_message);
-    if socket_path.is_none()
-        && !should_reset_fast_browser_daemon_for_socket_close(error_message)
-        && !should_reset_fast_browser_runtime_for_broken_cwd(error_message)
-    {
-        return Ok(false);
-    }
-
-    let _: Value = run_automation_bridge(
-        "reset-managed-runtime",
-        BridgeResetManagedRuntimePayload {
-            profile_name,
-            socket_path: socket_path.as_deref(),
-        },
-    )?;
-    Ok(true)
 }
 
 fn login_error_message(error_message: Option<&str>, fallback: String) -> String {
@@ -3655,12 +3581,13 @@ fn inspect_managed_profiles() -> Result<ManagedProfilesInspection> {
         .unwrap_or_else(|| paths.node_bin.clone());
     let output = Command::new(&fast_browser_runtime)
         .arg(&paths.fast_browser_script)
-        .arg("inspect-profiles")
+        .arg("profiles")
+        .arg("inspect")
         .current_dir(&paths.repo_root)
         .output()
         .with_context(|| {
             format!(
-                "Failed to run {} {} inspect-profiles.",
+                "Failed to run {} {} profiles inspect.",
                 fast_browser_runtime,
                 paths.fast_browser_script.display()
             )
@@ -3671,13 +3598,26 @@ fn inspect_managed_profiles() -> Result<ManagedProfilesInspection> {
             stdout
         } else {
             format!(
-                "fast-browser inspect-profiles exited with status {}.",
+                "fast-browser profiles inspect exited with status {}.",
                 output.status
             )
         }));
     }
-    serde_json::from_slice(&output.stdout)
-        .context("fast-browser inspect-profiles returned invalid JSON.")
+    let envelope: FastBrowserCliEnvelope<ManagedProfilesInspection> =
+        serde_json::from_slice(&output.stdout)
+            .context("fast-browser profiles inspect returned invalid JSON.")?;
+    if !envelope.ok {
+        return Err(anyhow!(
+            "{}",
+            envelope
+                .error
+                .and_then(|error| error.message)
+                .unwrap_or_else(|| "fast-browser profiles inspect failed.".to_string())
+        ));
+    }
+    envelope
+        .result
+        .context("fast-browser profiles inspect did not return a result.")
 }
 
 fn resolve_managed_profile_name(
@@ -4925,41 +4865,6 @@ input:
     }
 
     #[test]
-    fn extracts_fast_browser_timeout_socket_path_from_error_output() {
-        assert_eq!(
-            extract_fast_browser_timeout_socket_path(
-                "Timed out waiting for fast-browser daemon response from /tmp/demo.sock",
-            )
-            .as_deref(),
-            Some("/tmp/demo.sock")
-        );
-        assert_eq!(
-            extract_fast_browser_timeout_socket_path("other failure"),
-            None
-        );
-    }
-
-    #[test]
-    fn detects_socket_close_failures_as_managed_runtime_resets() {
-        assert!(should_reset_fast_browser_daemon_for_socket_close(
-            "Error: Daemon closed the socket before sending a response",
-        ));
-        assert!(!should_reset_fast_browser_daemon_for_socket_close(
-            "Timed out waiting for fast-browser daemon response from /tmp/demo.sock",
-        ));
-    }
-
-    #[test]
-    fn detects_broken_cwd_failures_as_managed_runtime_resets() {
-        assert!(should_reset_fast_browser_runtime_for_broken_cwd(
-            "ENOENT: process.cwd failed with error no such file or directory, the current working directory was likely removed without changing the working directory, uv_cwd",
-        ));
-        assert!(!should_reset_fast_browser_runtime_for_broken_cwd(
-            "Bitwarden CLI is locked.",
-        ));
-    }
-
-    #[test]
     fn reads_auth_flow_summary_from_raw_fast_browser_output() {
         let result = FastBrowserRunResult {
             output: Some(json!({
@@ -5866,27 +5771,6 @@ end
             assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), true);
             waiter.join().expect("join waiter");
         });
-    }
-
-    #[test]
-    fn extracts_fast_browser_timeout_socket_path_from_bridge_errors() {
-        assert_eq!(
-            extract_fast_browser_timeout_socket_path(
-                "Timed out waiting for fast-browser daemon response from /Users/omar/.fast-browser/daemon/dev-1.sock"
-            )
-            .as_deref(),
-            Some("/Users/omar/.fast-browser/daemon/dev-1.sock")
-        );
-    }
-
-    #[test]
-    fn recognizes_socket_close_and_broken_cwd_runtime_resets() {
-        assert!(should_reset_fast_browser_daemon_for_socket_close(
-            "Daemon closed the socket before sending a response"
-        ));
-        assert!(should_reset_fast_browser_runtime_for_broken_cwd(
-            "ENOENT: process.cwd() failed because the current working directory was likely removed"
-        ));
     }
 
     #[test]

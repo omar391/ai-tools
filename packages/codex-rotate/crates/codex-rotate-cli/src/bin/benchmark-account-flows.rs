@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
+use codex_rotate_core::paths::ensure_main_worktree_operation_allowed;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -146,6 +147,7 @@ fn main() {
 fn run() -> Result<()> {
     let options = parse_args(&env::args().skip(1).collect::<Vec<_>>())?;
     let repo_root = repo_root()?;
+    ensure_main_worktree_operation_allowed(&repo_root, "Benchmark account creation")?;
     let rotate_home = resolve_home_override("CODEX_ROTATE_HOME", ".codex-rotate")?;
     let codex_home = resolve_home_override("CODEX_HOME", ".codex")?;
     let cli_binary = resolve_cli_binary(&repo_root)?;
@@ -1318,6 +1320,7 @@ fn resolve_home_override(env_name: &str, default_suffix: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_rotate_core::paths::resolve_main_worktree_root;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1572,5 +1575,24 @@ mod tests {
             .selected_non_device
             .expect("winner");
         assert_eq!(winner.workflow_id, "stepwise");
+    }
+
+    #[test]
+    fn benchmark_run_is_blocked_from_linked_worktrees() {
+        let repo_root = repo_root().expect("repo root");
+        let Some(main_worktree_root) = resolve_main_worktree_root(&repo_root) else {
+            return;
+        };
+        if main_worktree_root == repo_root {
+            return;
+        }
+
+        let error =
+            ensure_main_worktree_operation_allowed(&repo_root, "Benchmark account creation")
+                .expect_err("linked worktree should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Benchmark account creation is disabled from linked worktrees."));
     }
 }
