@@ -13,7 +13,11 @@ import { join } from "node:path";
 import { chromium } from "playwright";
 
 import {
+  applyAccountPasswordFieldPath,
+  applyLocatorFieldPathToSecretRef,
+  buildFastBrowserSecretRefResolveSelector,
   buildFastBrowserWorkflowError,
+  collectVerificationArtifactsForCleanup,
   extractFastBrowserCliResult,
   hydrateFastBrowserRunResultFromObservability,
   isFastBrowserRunResultFailure,
@@ -436,6 +440,18 @@ async function runWorkflowFunctionScriptOnContent(
   }
 }
 
+async function runWorkflowFunctionScriptWithStub(
+  workflowPath: string,
+  functionId: string,
+  page: Record<string, unknown>,
+  state: Record<string, unknown> = {},
+  args: Record<string, unknown> = {},
+) {
+  const script = await loadWorkflowFunctionScript(workflowPath, functionId);
+  const execute = new AsyncFunction("page", "state", "args", script);
+  return (await execute(page, state, args)) as Record<string, unknown>;
+}
+
 async function runWorkflowRunScript(
   workflowPath: string,
   stepId: string,
@@ -523,6 +539,67 @@ console.log(typeof automation.completeCodexLoginViaWorkflowAttempt);
 });
 
 describe("optional secret locator fallback", () => {
+  test("uses login selector lookup when resolving a secret ref from a login locator", () => {
+    expect(
+      buildFastBrowserSecretRefResolveSelector({
+        kind: "login_lookup",
+        store: "bitwarden-cli",
+        username: "dev3astronlab+5@gmail.com",
+        uris: ["https://auth.openai.com", "https://chatgpt.com"],
+      }),
+    ).toEqual({
+      kind: "login",
+      store: "bitwarden-cli",
+      username: "dev3astronlab+5@gmail.com",
+      uris: ["https://auth.openai.com", "https://chatgpt.com"],
+    });
+  });
+
+  test("carries locator field_path onto a resolved secret ref when the CLI ref omits it", () => {
+    expect(
+      applyLocatorFieldPathToSecretRef(
+        {
+          type: "secret_ref",
+          store: "bitwarden-cli",
+          object_id: "abc123",
+          field_path: null,
+          version: null,
+        },
+        {
+          kind: "login_lookup",
+          store: "bitwarden-cli",
+          username: "dev3astronlab+5@gmail.com",
+          uris: ["https://auth.openai.com", "https://chatgpt.com"],
+          field_path: "/password",
+        },
+      ),
+    ).toEqual({
+      type: "secret_ref",
+      store: "bitwarden-cli",
+      object_id: "abc123",
+      field_path: "/password",
+      version: null,
+    });
+  });
+
+  test("defaults OpenAI account secret refs to the /password field path", () => {
+    expect(
+      applyAccountPasswordFieldPath({
+        type: "secret_ref",
+        store: "bitwarden-cli",
+        object_id: "abc123",
+        field_path: null,
+        version: null,
+      }),
+    ).toEqual({
+      type: "secret_ref",
+      store: "bitwarden-cli",
+      object_id: "abc123",
+      field_path: "/password",
+      version: null,
+    });
+  });
+
   test("extracts result payloads from public fast-browser CLI envelopes", () => {
     expect(
       extractFastBrowserCliResult({
@@ -996,11 +1073,7 @@ describe("active auth workflows", () => {
   });
 
   test("all non-device flows normalize signup email handoff through /log-in/password", async () => {
-    for (const workflowPath of [
-      originalWorkflowPath,
-      minimalWorkflowPath,
-      stepwiseWorkflowPath,
-    ]) {
+    for (const workflowPath of [minimalWorkflowPath, stepwiseWorkflowPath]) {
       const script = await loadWorkflowFunctionScript(
         workflowPath,
         "submit_signup_email_form",
@@ -1010,6 +1083,136 @@ describe("active auth workflows", () => {
       expect(script).toContain("signup_password");
       expect(() => new AsyncFunction("page", "args", script)).not.toThrow();
     }
+  });
+
+  test("minimal and stepwise accept the create-branch /log-in/password handoff as signup password entry", () => {
+    const minimalText = readFileSync(minimalWorkflowPath, "utf8");
+    const stepwiseText = readFileSync(stepwiseWorkflowPath, "utf8");
+
+    for (const workflowText of [minimalText, stepwiseText]) {
+      expect(workflowText).toContain(
+        "stage === 'signup_password' || state.steps.classify_after_signup_email_gate?.action?.stage === 'login_password'",
+      );
+      expect(workflowText).toContain('input[name="password"]');
+      expect(workflowText).toContain('autocomplete="current-password"');
+      expect(workflowText).toContain("log in|sign in");
+    }
+  });
+
+  test("all non-device flows arm consent click when the final surface is already oauth_consent", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const acceptStep = workflow.do?.find(
+        (entry) => "accept_oauth_consent" in entry,
+      )?.accept_oauth_consent as
+        | {
+            if?: string;
+          }
+        | undefined;
+
+      expect(acceptStep?.if).toContain("oauth_continue_visible === true");
+      expect(acceptStep?.if).toContain("stage === 'oauth_consent'");
+      expect(acceptStep?.if).toContain("sign-in-with-chatgpt");
+      expect(acceptStep?.if).toContain("callback_complete !== true");
+    }
+  });
+
+  test("all non-device flows classify the direct consent path after the consent click", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const classifyAfterConsent = workflow.do?.find(
+        (entry) => "classify_after_oauth_consent" in entry,
+      )?.classify_after_oauth_consent as
+        | {
+            if?: string;
+          }
+        | undefined;
+      const completeLoginOrConsent = workflow.do?.find(
+        (entry) => "complete_login_or_consent" in entry,
+      )?.complete_login_or_consent as
+        | {
+            if?: string;
+          }
+        | undefined;
+
+      expect(classifyAfterConsent?.if).toContain(
+        "state.steps.accept_oauth_consent?.action?.ok === true",
+      );
+      expect(classifyAfterConsent?.if).toContain("sign-in-with-chatgpt");
+      expect(completeLoginOrConsent?.if).toContain(
+        "state.steps.classify_after_oauth_consent?.action?.current_url",
+      );
+    }
+  });
+
+  test("minimal no longer detours back through Gmail after OTP collection", async () => {
+    const workflow = await loadWorkflow(minimalWorkflowPath);
+    const returnAfterDelete = workflow.do?.find(
+      (entry) =>
+        "return_to_login_after_delete_login_verification_artifact" in entry,
+    );
+    const returnAfterRetryDelete = workflow.do?.find(
+      (entry) =>
+        "return_to_login_after_delete_login_verification_artifact_after_submit_failure" in
+        entry,
+    );
+
+    expect(returnAfterDelete).toBeUndefined();
+    expect(returnAfterRetryDelete).toBeUndefined();
+  });
+
+  test("minimal tracks the replayed-login OTP success path from the OTP submit step itself", async () => {
+    const workflow = await loadWorkflow(minimalWorkflowPath);
+    const classifyAfterVerification = workflow.do?.find(
+      (entry) => "classify_after_login_verification" in entry,
+    )?.classify_after_login_verification as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const classifyAfterVerificationGate = workflow.do?.find(
+      (entry) => "classify_after_login_verification_gate" in entry,
+    )?.classify_after_login_verification_gate as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const resendAfterSubmitFailure = workflow.do?.find(
+      (entry) =>
+        "resend_login_verification_email_after_submit_failure" in entry,
+    )?.resend_login_verification_email_after_submit_failure as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const acceptConsent = workflow.do?.find(
+      (entry) => "accept_oauth_consent" in entry,
+    )?.accept_oauth_consent as
+      | {
+          metadata?: { templateRef?: string };
+        }
+      | undefined;
+
+    expect(classifyAfterVerification?.if).toBe(
+      "${state.steps.submit_login_verification_code?.action?.ok === true}",
+    );
+    expect(classifyAfterVerificationGate?.if).toBe(
+      "${state.steps.submit_login_verification_code?.action?.ok === true}",
+    );
+    expect(resendAfterSubmitFailure?.if).toContain(
+      "state.steps.submit_login_verification_code?.action?.stage === 'email_verification'",
+    );
+    expect(acceptConsent?.metadata?.templateRef).toBe(
+      "click_oauth_consent_continue",
+    );
   });
 
   test("validate against current fast-browser digest pins", async () => {
@@ -1142,14 +1345,73 @@ describe("active auth workflows", () => {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow",
-        version: "1.0.8",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
+        version: "1.0.1",
       },
       {
         call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
         version: "1.3.13",
       },
     ]);
+  });
+
+  test("main forwards account_login_ref into both primary and fallback flows", async () => {
+    const workflow = await loadWorkflow(
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-main.yaml",
+      ),
+    );
+
+    const runPrimary = findWorkflowStep<{
+      with?: {
+        input?: Record<string, unknown>;
+      };
+    }>(workflow, "run_primary_non_device_flow");
+    const runFallback = findWorkflowStep<{
+      with?: {
+        input?: Record<string, unknown>;
+      };
+    }>(workflow, "run_device_auth_fallback");
+
+    expect(runPrimary?.with?.input?.account_login_ref).toBe(
+      "${inputs.account_login_ref}",
+    );
+    expect(runFallback?.with?.input?.account_login_ref).toBe(
+      "${inputs.account_login_ref}",
+    );
+  });
+
+  test("main keeps primary workflow-owned retry and skip outcomes on the minimal path", () => {
+    const workflowText = readFileSync(
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-main.yaml",
+      ),
+      "utf8",
+    );
+
+    expect(workflowText).toContain("output?.next_action != 'skip_account'");
+    expect(workflowText).toContain(
+      "(state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'replay_auth_url' || state.steps.run_primary_non_device_flow?.action?.result?.output?.replay_reason == 'about_you')",
+    );
+    expect(workflowText).toContain("output?.next_action != 'retry_attempt'");
+    expect(workflowText).toContain("const primarySkip =");
+    expect(workflowText).toContain("const primarySetupBlocked =");
+    expect(workflowText).toContain("const primaryRetryable =");
+    expect(workflowText).toContain(
+      "primaryComplete || primarySkip || primaryRetryable || !fallback",
+    );
+    expect(workflowText).toContain("!primarySkip");
+    expect(workflowText).toContain("!primaryRetryable");
   });
 
   test("minimal flow waits after replayed-login resend before searching Gmail", async () => {
@@ -1167,7 +1429,23 @@ describe("active auth workflows", () => {
     expect(workflowText).toContain(
       "wait_after_resend_login_verification_email",
     );
+    expect(workflowText).toContain(
+      "state.steps.resend_login_verification_email?.action?.skipped !== true",
+    );
     expect(workflowText).toContain("waited_ms: 10000");
+  });
+
+  test("non-device flows treat direct replayed-login about-you as a first-class continuation", () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflowText = readFileSync(workflowPath, "utf8");
+      expect(workflowText).toContain(
+        "state.steps.classify_after_login_password_gate?.action?.follow_up_step === true",
+      );
+    }
   });
 
   test("original flow keeps a bounded final add-phone reentry ladder", async () => {
@@ -1200,14 +1478,30 @@ describe("active auth workflows", () => {
     );
   });
 
-  test("all non-device flows clear OpenAI and ChatGPT auth state at entry", async () => {
+  test("all non-device flows clear OpenAI and ChatGPT auth state before detached codex login starts", async () => {
     for (const workflowPath of [
       originalWorkflowPath,
       minimalWorkflowPath,
       stepwiseWorkflowPath,
     ]) {
       const workflow = await loadWorkflow(workflowPath);
-      const step = findWorkflowStep<{
+      const resetStep = findWorkflowStep<{
+        call?: string;
+        with?: {
+          body?: {
+            url?: string;
+          };
+        };
+        metadata?: {
+          browser?: {
+            clearSiteDataForOrigins?: string[];
+          };
+        };
+      }>(workflow, "reset_openai_auth_state_before_codex_login");
+      const startStep = findWorkflowStep<{
+        if?: string;
+      }>(workflow, "start_codex_login_session");
+      const openStep = findWorkflowStep<{
         metadata?: {
           browser?: {
             clearSiteDataForOrigins?: string[];
@@ -1215,13 +1509,24 @@ describe("active auth workflows", () => {
         };
       }>(workflow, "open_codex_login_entry");
 
-      expect(step?.metadata?.browser?.clearSiteDataForOrigins).toEqual(
+      expect(resetStep?.call).toBe("afn.driver.browser.navigate");
+      expect(resetStep?.with?.body?.url).toBe("about:blank");
+      expect(resetStep?.metadata?.browser?.clearSiteDataForOrigins).toEqual(
         expect.arrayContaining([
           "https://auth.openai.com",
           "https://chatgpt.com",
           "https://chat.openai.com",
         ]),
       );
+      expect(startStep?.if).toContain(
+        "state.steps.reset_openai_auth_state_before_codex_login?.action?.ok === true",
+      );
+      expect(startStep?.if).toContain(
+        "state.steps.reset_openai_auth_state_before_codex_login?.action?.skipped !== true",
+      );
+      expect(
+        openStep?.metadata?.browser?.clearSiteDataForOrigins,
+      ).toBeUndefined();
     }
   });
 
@@ -1260,232 +1565,200 @@ describe("active auth workflows", () => {
     }
   });
 
-  test("original flow deletes the collected signup OTP after a successful verification submit", async () => {
-    const workflow = await loadWorkflow(originalWorkflowPath);
-    const deleteStep = findWorkflowStep<{
-      call?: string;
-      with?: {
-        input?: Record<string, string>;
+  test("all auth replay helpers tolerate OAuth navigation interrupted by a real OpenAI login redirect", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+      deviceAuthWorkflowPath,
+    ]) {
+      let currentUrl = "about:blank";
+      const fakePage = {
+        url() {
+          return currentUrl;
+        },
+        async title() {
+          return "Log in";
+        },
+        async waitForTimeout() {
+          return undefined;
+        },
+        async evaluate(_fn: unknown, url?: string) {
+          if (typeof url === "string" && /oauth\/authorize/.test(url)) {
+            return undefined;
+          }
+          return undefined;
+        },
+        async goto(url: string) {
+          currentUrl = "https://auth.openai.com/log-in";
+          throw new Error(
+            `Navigation to "${url}" is interrupted by another navigation to "https://auth.openai.com/log-in"`,
+          );
+        },
       };
-    }>(workflow, "delete_signup_verification_artifact");
-    const returnStep = findWorkflowStep<{
-      with?: {
-        body?: {
-          url?: string;
-        };
-      };
-    }>(workflow, "return_to_signup_after_delete_signup_verification_artifact");
 
-    expect(deleteStep?.call).toBe(
-      "workflow.sys.web.mail-google-com.delete-verification-artifact",
-    );
-    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-      "collect_signup_verification_artifact",
-    );
-    expect(deleteStep?.with?.input?.search_query || "").toContain(
-      "from:openai to:",
-    );
-    expect(returnStep?.with?.body?.url || "").toContain(
-      "classify_after_signup_verification_gate",
-    );
-  });
-
-  test("original flow deletes the collected replayed-login OTP after a successful submit", async () => {
-    const workflow = await loadWorkflow(originalWorkflowPath);
-    const deleteStep = findWorkflowStep<{
-      call?: string;
-      with?: {
-        input?: Record<string, string>;
-      };
-    }>(workflow, "delete_login_verification_artifact");
-    const returnStep = findWorkflowStep<{
-      with?: {
-        body?: {
-          url?: string;
-        };
-      };
-    }>(workflow, "return_to_login_after_delete_login_verification_artifact");
-
-    expect(deleteStep?.call).toBe(
-      "workflow.sys.web.mail-google-com.delete-verification-artifact",
-    );
-    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-      "collect_login_verification_artifact",
-    );
-    expect(deleteStep?.with?.input?.search_query || "").toContain(
-      "from:openai to:",
-    );
-    expect(returnStep?.with?.body?.url || "").toContain(
-      "classify_after_login_verification_gate",
-    );
-  });
-
-  test("original flow deletes the replacement replayed-login OTP after a successful retry submit", async () => {
-    const workflow = await loadWorkflow(originalWorkflowPath);
-    const deleteStep = findWorkflowStep<{
-      call?: string;
-      with?: {
-        input?: Record<string, string>;
-      };
-    }>(workflow, "delete_login_verification_artifact_after_submit_failure");
-    const returnStep = findWorkflowStep<{
-      with?: {
-        body?: {
-          url?: string;
-        };
-      };
-    }>(
-      workflow,
-      "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
-    );
-
-    expect(deleteStep?.call).toBe(
-      "workflow.sys.web.mail-google-com.delete-verification-artifact",
-    );
-    expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-      "recollect_login_verification_artifact_after_submit_failure",
-    );
-    expect(deleteStep?.with?.input?.search_query || "").toContain(
-      "from:openai to:",
-    );
-    expect(returnStep?.with?.body?.url || "").toContain(
-      "classify_after_login_verification_retry_gate",
-    );
-  });
-
-  test("minimal flow deletes used OTP emails after successful signup and replayed-login submits", async () => {
-    const workflow = await loadWorkflow(minimalWorkflowPath);
-    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
-      [
-        "delete_signup_verification_artifact",
-        "collect_signup_verification_artifact",
-        "return_to_signup_after_delete_signup_verification_artifact",
-        "classify_after_signup_verification_gate",
-      ],
-      [
-        "delete_login_verification_artifact",
-        "collect_login_verification_artifact",
-        "return_to_login_after_delete_login_verification_artifact",
-        "classify_after_login_verification_gate",
-      ],
-      [
-        "delete_login_verification_artifact_after_submit_failure",
-        "recollect_login_verification_artifact_after_submit_failure",
-        "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
-        "classify_after_login_verification_retry_gate",
-      ],
-    ] as const) {
-      const deleteStep = findWorkflowStep<{
-        call?: string;
-        with?: { input?: Record<string, string> };
-      }>(workflow, deleteStepId);
-      const returnStep = findWorkflowStep<{
-        with?: { body?: { url?: string } };
-      }>(workflow, returnStepId);
-
-      expect(deleteStep?.call).toBe(
-        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+      const result = await runWorkflowFunctionScriptWithStub(
+        workflowPath,
+        "replay_captured_auth_url",
+        fakePage,
+        {},
+        {
+          auth_url:
+            "https://auth.openai.com/oauth/authorize?client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+        },
       );
-      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-        sourceStepId,
-      );
-      expect(deleteStep?.with?.input?.search_query || "").toContain(
-        "from:openai to:",
-      );
-      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+
+      expect(result.ok).toBe(true);
+      expect(result.current_url).toBe("https://auth.openai.com/log-in");
+      expect(result.strategy).toContain("goto");
     }
   });
 
-  test("stepwise flow deletes used OTP emails after successful signup and replayed-login submits", async () => {
-    const workflow = await loadWorkflow(stepwiseWorkflowPath);
-    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
-      [
-        "delete_signup_verification_artifact",
-        "collect_signup_verification_artifact",
-        "return_to_signup_after_delete_signup_verification_artifact",
-        "classify_after_signup_verification_gate",
-      ],
-      [
-        "delete_login_verification_artifact",
-        "collect_login_verification_artifact",
-        "return_to_login_after_delete_login_verification_artifact",
-        "classify_after_login_verification_gate",
-      ],
-      [
-        "delete_login_verification_artifact_after_submit_failure",
-        "recollect_login_verification_artifact_after_submit_failure",
-        "return_to_login_after_delete_login_verification_artifact_after_submit_failure",
-        "classify_after_login_verification_retry_gate",
-      ],
-    ] as const) {
-      const deleteStep = findWorkflowStep<{
-        call?: string;
-        with?: { input?: Record<string, string> };
-      }>(workflow, deleteStepId);
-      const returnStep = findWorkflowStep<{
-        with?: { body?: { url?: string } };
-      }>(workflow, returnStepId);
+  test("all auth replay helpers tolerate interrupted OAuth replays that stay on the same OpenAI login page", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+      deviceAuthWorkflowPath,
+    ]) {
+      let currentUrl = "https://auth.openai.com/log-in";
+      const fakePage = {
+        url() {
+          return currentUrl;
+        },
+        async title() {
+          return "Log in";
+        },
+        async waitForTimeout() {
+          return undefined;
+        },
+        async evaluate(_fn: unknown, _url?: string) {
+          return undefined;
+        },
+        async goto(url: string) {
+          currentUrl = "https://auth.openai.com/log-in";
+          throw new Error(
+            `Navigation to "${url}" is interrupted by another navigation to "https://auth.openai.com/log-in"`,
+          );
+        },
+      };
 
-      expect(deleteStep?.call).toBe(
-        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+      const result = await runWorkflowFunctionScriptWithStub(
+        workflowPath,
+        "replay_captured_auth_url",
+        fakePage,
+        {},
+        {
+          auth_url:
+            "https://auth.openai.com/oauth/authorize?client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+        },
       );
-      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-        sourceStepId,
-      );
-      expect(deleteStep?.with?.input?.search_query || "").toContain(
-        "from:openai to:",
-      );
-      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+
+      expect(result.ok).toBe(true);
+      expect(result.current_url).toBe("https://auth.openai.com/log-in");
+      expect(result.strategy).toContain("goto");
     }
   });
 
-  test("device-auth flow deletes used OTP emails after successful prepare and final verification submits", async () => {
-    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
-    for (const [deleteStepId, sourceStepId, returnStepId, returnUrlRef] of [
-      [
-        "delete_prepare_login_verification_artifact",
-        "collect_prepare_login_verification_artifact",
-        "return_to_prepare_after_delete_prepare_login_verification_artifact",
-        "classify_prepare_after_login_verification_submit",
-      ],
-      [
-        "delete_prepare_login_verification_artifact_after_incorrect_code",
-        "recollect_prepare_login_verification_artifact_after_incorrect_code",
-        "return_to_prepare_after_delete_prepare_login_verification_artifact_after_incorrect_code",
-        "classify_prepare_after_login_verification_retry",
-      ],
-      [
-        "delete_device_auth_login_verification_artifact",
-        "collect_device_auth_login_verification_artifact",
-        "return_to_device_auth_after_delete_login_verification_artifact",
-        "classify_device_auth_after_login_verification_submit",
-      ],
-      [
-        "delete_device_auth_login_verification_artifact_after_incorrect_code",
-        "recollect_device_auth_login_verification_artifact_after_incorrect_code",
-        "return_to_device_auth_after_delete_login_verification_artifact_after_incorrect_code",
-        "classify_device_auth_after_login_verification_retry",
-      ],
-    ] as const) {
-      const deleteStep = findWorkflowStep<{
-        call?: string;
-        with?: { input?: Record<string, string> };
-      }>(workflow, deleteStepId);
-      const returnStep = findWorkflowStep<{
-        with?: { body?: { url?: string } };
-      }>(workflow, returnStepId);
+  test("auth workflows keep Gmail artifacts for caller-side cleanup instead of deleting them in-path", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+      deviceAuthWorkflowPath,
+    ]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const stepIds = (workflow.do || []).flatMap((entry) =>
+        Object.keys(entry),
+      );
+      const workflowText = readFileSync(workflowPath, "utf8");
 
-      expect(deleteStep?.call).toBe(
+      expect(workflowText).not.toContain(
         "workflow.sys.web.mail-google-com.delete-verification-artifact",
       );
-      expect(deleteStep?.with?.input?.gmail_message_id || "").toContain(
-        sourceStepId,
-      );
-      expect(deleteStep?.with?.input?.search_query || "").toContain(
-        "from:openai to:",
-      );
-      expect(returnStep?.with?.body?.url || "").toContain(returnUrlRef);
+      expect(
+        stepIds.filter((stepId) => stepId.includes("_after_delete_")),
+      ).toEqual([]);
     }
+  });
+
+  test("collects unique Gmail verification artifacts from workflow results for caller-side cleanup", () => {
+    const artifacts = collectVerificationArtifactsForCleanup({
+      ok: true,
+      status: "ok",
+      state: {
+        steps: {
+          collect_signup_verification_artifact: {
+            action: {
+              result: {
+                result: {
+                  output: {
+                    gmail_message_id: "msg-signup",
+                    gmail_thread_id: "thread-signup",
+                    gmail_message_url:
+                      "https://mail.google.com/mail/u/0/#inbox/msg-signup",
+                    message_subject: "Your ChatGPT code is 112233",
+                    selected_email: "1.dev.astronlab@gmail.com",
+                  },
+                },
+              },
+            },
+          },
+          collect_login_verification_artifact: {
+            action: {
+              output: {
+                gmail_message_id: "msg-login",
+                gmail_thread_id: "thread-login",
+                gmail_message_url:
+                  "https://mail.google.com/mail/u/0/#inbox/msg-login",
+                message_preview:
+                  "Enter this temporary verification code to continue",
+                selected_email: "1.dev.astronlab@gmail.com",
+              },
+            },
+          },
+          recollect_login_verification_artifact_after_submit_failure: {
+            action: {
+              result: {
+                output: {
+                  gmail_message_id: "msg-login",
+                  gmail_thread_id: "thread-login",
+                  gmail_message_url:
+                    "https://mail.google.com/mail/u/0/#inbox/msg-login",
+                  selected_email: "1.dev.astronlab@gmail.com",
+                },
+              },
+            },
+          },
+          unrelated_step: {
+            action: {
+              output: {
+                current_url: "https://auth.openai.com/log-in",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(artifacts).toEqual([
+      {
+        gmailMessageId: "msg-signup",
+        gmailThreadId: "thread-signup",
+        gmailMessageUrl: "https://mail.google.com/mail/u/0/#inbox/msg-signup",
+        messageSubject: "Your ChatGPT code is 112233",
+        messagePreview: null,
+        selectedEmail: "1.dev.astronlab@gmail.com",
+      },
+      {
+        gmailMessageId: "msg-login",
+        gmailThreadId: "thread-login",
+        gmailMessageUrl: "https://mail.google.com/mail/u/0/#inbox/msg-login",
+        messageSubject: null,
+        messagePreview: "Enter this temporary verification code to continue",
+        selectedEmail: "1.dev.astronlab@gmail.com",
+      },
+    ]);
   });
 
   test("minimal keeps an in-workflow replayed-login OTP recollection path", async () => {
@@ -1902,6 +2175,31 @@ describe("minimal about-you helper", () => {
     expect(result.submit_disabled).toBe(false);
   });
 
+  test("does not report success when the age layout keeps submit disabled", async () => {
+    await expect(
+      runMinimalAboutYouHelper(
+        `
+          <html>
+            <body style="min-height: 100vh;">
+              <h1>How old are you?</h1>
+              <label for="full-name">Full name</label>
+              <input id="full-name" name="name" aria-label="Full name" />
+              <label for="age">Age</label>
+              <input id="age" inputmode="numeric" aria-label="Age" />
+              <button id="submit" type="submit" disabled>Finish creating account</button>
+            </body>
+          </html>
+        `,
+        {
+          full_name: "Dev Astronlab",
+          birth_month: "4",
+          birth_day: "8",
+          birth_year: "1990",
+        },
+      ),
+    ).rejects.toThrow("about-you-fill-failed");
+  });
+
   test("accepts a visible birthday shell when only the name input is directly editable", async () => {
     const result = await runMinimalAboutYouHelper(
       `
@@ -2225,6 +2523,69 @@ describe("minimal verification helper", () => {
 
     expect(result.ok).toBe(true);
     expect(result.code).toBe("380393");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
+
+  test("uses the cached signup OTP when the first Gmail collection loaded late", async () => {
+    const result = await runMinimalStepScript(
+      "submit_signup_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const sync = () => {
+                button.disabled = readCode().length < 6;
+              };
+              inputs.forEach((input) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  sync();
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "654321") {
+                  document.body.innerHTML =
+                    '<h1>Sign in to Codex with ChatGPT</h1><button>Continue to Codex</button>';
+                }
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_signup_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  ok: true,
+                },
+              },
+            },
+          },
+        },
+        vars: {
+          signup_verification_code: "654321",
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("654321");
     expect(result.next_stage).toBe("oauth_consent");
   });
 
@@ -3247,6 +3608,108 @@ describe("stepwise workflow verification helper", () => {
     expect(result.next_action).toBe("retry_attempt");
     expect(result.retry_reason).toBe("final_add_phone");
     expect(result.error_message).toContain("phone setup");
+  });
+
+  test("non-device flows keep remembered final add-phone authoritative over generic retryable timeout metadata", async () => {
+    for (const workflowPath of [minimalWorkflowPath, stepwiseWorkflowPath]) {
+      const result = await runWorkflowRunScript(
+        workflowPath,
+        "finalize_flow_summary",
+        {
+          email: "dev3astronlab+6@gmail.com",
+        },
+        {
+          vars: {
+            effective_before_consent_surface: {
+              add_phone_prompt: true,
+              current_url: "https://auth.openai.com/add-phone",
+            },
+          },
+          steps: {
+            complete_login_or_consent: {
+              action: {
+                stage: "retryable_timeout",
+                retryable_timeout: true,
+                current_url: "https://auth.openai.com/log-in",
+                headline: "Oops, an error occurred!",
+                auth_prompt: true,
+              },
+            },
+          },
+        },
+      );
+
+      expect(result.next_action).toBe("retry_attempt");
+      expect(result.retry_reason).toBe("final_add_phone");
+      expect(result.error_message).toContain("phone setup");
+    }
+  });
+
+  test("non-device flows keep about-you replay authoritative over generic retryable timeout metadata", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const result = await runWorkflowRunScript(
+        workflowPath,
+        "finalize_flow_summary",
+        {
+          email: "dev3astronlab+5@gmail.com",
+        },
+        {
+          steps: {
+            classify_after_login_about_you: {
+              action: {
+                stage: "about_you",
+                follow_up_step: true,
+                current_url: "https://auth.openai.com/about-you",
+                headline: "About you",
+              },
+            },
+            complete_login_or_consent: {
+              action: {
+                stage: "retryable_timeout",
+                retryable_timeout: true,
+                current_url: "https://auth.openai.com/about-you",
+                headline: "About you",
+              },
+            },
+          },
+        },
+      );
+
+      expect(result.next_action).toBe("replay_auth_url");
+      expect(result.replay_reason).toBe("about_you");
+      expect(result.retry_reason).toBeNull();
+      expect(result.error_message).toContain("account setup");
+    }
+  });
+
+  test("non-device flows retry the replayed about-you form in-place before falling back to full auth replay", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflowText = readFileSync(workflowPath, "utf8");
+      expect(workflowText).toContain("fill_login_about_you_retry");
+      expect(workflowText).toContain("submit_login_about_you_retry");
+      expect(workflowText).toContain("classify_after_login_about_you_retry");
+      expect(workflowText).toContain("loginAboutYouRetry.current_url");
+      expect(workflowText).toContain("click_login_about_you_timeout_retry");
+      expect(workflowText).toContain(
+        "classify_after_login_about_you_timeout_retry",
+      );
+    }
+  });
+
+  test("minimal retries signup about-you in-place before replaying the auth url", () => {
+    const workflowText = readFileSync(minimalWorkflowPath, "utf8");
+    expect(workflowText).toContain("click_signup_about_you_timeout_retry");
+    expect(workflowText).toContain("fill_signup_about_you_retry");
+    expect(workflowText).toContain("submit_signup_about_you_retry");
+    expect(workflowText).toContain("classify_after_signup_about_you_retry");
   });
 });
 
@@ -4898,7 +5361,24 @@ describe("device-auth workflow", () => {
       "classify_prepare_after_login_email_signup_invalid_state_fallback",
     );
     expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_after_login_email_signup_invalid_state_fallback_retry",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
       "classify_prepare_login_entry_after_signup_invalid_state_fallback",
+    );
+  });
+
+  test("retries the prepare login email once more after the signup invalid_state fallback still lands on the email step", async () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "retry_prepare_login_email_after_signup_invalid_state_fallback",
+    );
+    expect(workflowText).toContain(
+      "classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'login_email'",
+    );
+    expect(workflowText).toContain(
+      "classify_prepare_after_login_email_signup_invalid_state_fallback_retry",
     );
   });
 
@@ -5814,6 +6294,30 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("device-auth retries the restored prepare email step once more after Gmail return before giving up on one-time-code recovery", async () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "refill_prepare_login_email_after_return_retry",
+    );
+    expect(workflowText).toContain(
+      "continue_prepare_login_email_after_return_retry",
+    );
+    expect(workflowText).toContain(
+      "submit_prepare_login_email_after_return_retry",
+    );
+    expect(workflowText).toContain("classify_prepare_login_after_return_retry");
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return?.action?.stage === 'login_email'",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return_retry?.action?.stage === 'login_password'",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return_retry?.action?.stage === 'email_verification'",
+    );
+  });
+
   test("original signup password submit treats direct navigation to email verification as progress", async () => {
     const result = await runWorkflowStepScript(
       originalWorkflowPath,
@@ -5877,6 +6381,13 @@ describe("device-auth workflow", () => {
     );
     expect(String(originalScript || "")).not.toContain(
       "Timeout \\\\d+ms exceeded",
+    );
+    expect(String(originalScript || "")).toContain("const passwordSelector =");
+    expect(String(originalScript || "")).toContain(
+      "await page.$(passwordSelector)",
+    );
+    expect(String(originalScript || "")).not.toContain(
+      'page.locator(\'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]\').first()',
     );
     expect(originalScript).toBe(stepwiseScript);
   });
@@ -5957,6 +6468,56 @@ describe("device-auth workflow", () => {
           fill_prepare_login_verification_code: {
             action: {
               ok: true,
+            },
+          },
+        },
+      },
+      {},
+      "https://auth.openai.com/email-verification",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("add_phone");
+    expect(String(result.current_url || "")).toContain("add-phone");
+  });
+
+  test("device-auth replacement prepare verification submit treats direct navigation as progress", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "submit_prepare_login_verification_code_after_incorrect_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent to devbench.23@astronlab.com</p>
+            <input inputmode="numeric" aria-label="Code" value="112233" />
+            <button id="continue" type="button">Continue</button>
+            <script>
+              const input = document.querySelector("input");
+              document.getElementById("continue").addEventListener("click", () => {
+                if (String(input.value || "") === "112233") {
+                  location.href = "https://auth.openai.com/add-phone";
+                }
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        vars: {},
+        steps: {
+          fill_prepare_login_verification_code_after_incorrect_code: {
+            action: {
+              ok: true,
+            },
+          },
+          recollect_prepare_login_verification_artifact_after_incorrect_code: {
+            action: {
+              result: {
+                output: {
+                  code: "112233",
+                },
+              },
             },
           },
         },

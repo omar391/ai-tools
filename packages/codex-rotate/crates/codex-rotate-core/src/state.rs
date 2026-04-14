@@ -14,7 +14,6 @@ use crate::paths::{resolve_paths, CorePaths};
 
 const ROTATE_STATE_BACKUP_PREFIX: &str = "accounts.json.bak.";
 const ROTATE_STATE_BACKUP_RETENTION: usize = 20;
-
 type AfterRotateStateWriteHook = dyn Fn(&Path, Option<&Path>) -> Result<()>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

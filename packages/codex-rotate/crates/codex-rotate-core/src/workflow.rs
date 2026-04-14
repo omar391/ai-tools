@@ -58,6 +58,7 @@ const DEFAULT_CODEX_LOGIN_RETRYABLE_TIMEOUT_DELAYS_MS: &[u64] =
 const DEFAULT_CODEX_LOGIN_RATE_LIMIT_RETRY_DELAYS_MS: &[u64] =
     &[30_000, 60_000, 120_000, 240_000, 300_000];
 const DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY: u32 = 10;
+const CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV: &str = "CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE";
 const AUTO_CREATE_RETRY_STOPPED_FOR_REUSABLE_ACCOUNT: &str =
     "Automatic account creation stopped retrying because a reusable account is now available.";
 const CREATE_ALREADY_IN_PROGRESS_PREFIX: &str = "Another create command is already in progress";
@@ -936,15 +937,43 @@ pub fn cmd_relogin_with_progress(
     options: ReloginOptions,
     progress: Option<AutomationProgressCallback>,
 ) -> Result<String> {
+    let mut store = load_credential_store()?;
     let selection = {
         let pool = load_pool()?;
-        resolve_account_selector(&pool, selector)?
+        resolve_relogin_target(&pool, &store, selector)?
     };
-    let existing = selection.entry.clone();
-    let expected_email = existing.email.clone();
-    let mut store = load_credential_store()?;
+    let pending = selection.pending.clone();
+    let existing = selection.as_ref().map(|selection| selection.entry.clone());
+    let expected_email = existing
+        .as_ref()
+        .map(|entry| entry.email.clone())
+        .or_else(|| pending.as_ref().map(|pending| pending.stored.email.clone()))
+        .ok_or_else(|| {
+            anyhow!(
+                "Account \"{}\" not found in pool or pending state.",
+                selector
+            )
+        })?;
+    let existing_alias = existing
+        .as_ref()
+        .and_then(|entry| entry.alias.clone())
+        .or_else(|| {
+            pending
+                .as_ref()
+                .and_then(|pending| pending.stored.alias.clone())
+        });
+    let display_summary = existing
+        .as_ref()
+        .map(format_account_summary_for_display)
+        .unwrap_or_else(|| expected_email.clone());
+    reconcile_pending_relogin_target(&mut store, pending.as_ref())?;
     ensure_rotation_enabled_for_email_in_store(&store, &expected_email)?;
-    let stored_credential = resolve_relogin_credential(&store, &existing);
+    let stored_credential = existing
+        .as_ref()
+        .and_then(|entry| resolve_relogin_credential(&store, entry))
+        .or_else(|| pending.as_ref().map(|pending| pending.stored.clone()));
+    let relogin_birth_date = relogin_birth_date_for_pending(pending.as_ref());
+    let prefer_signup_recovery = pending.as_ref().map(|_| true);
 
     if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
         let stored_credential = stored_credential.ok_or_else(|| {
@@ -971,9 +1000,9 @@ pub fn cmd_relogin_with_progress(
                 codex_bin: None,
                 workflow_run_stamp: None,
                 skip_locator_preflight: None,
-                prefer_signup_recovery: None,
+                prefer_signup_recovery,
                 prefer_password_login: None,
-                birth_date: None,
+                birth_date: relogin_birth_date.as_ref(),
                 progress: progress.clone(),
             })
         })();
@@ -981,6 +1010,32 @@ pub fn cmd_relogin_with_progress(
             Ok(value) => value,
             Err(error) => {
                 restore_active_auth(previous_auth.as_ref())?;
+                if is_workflow_skip_account_error(&error)
+                    || is_missing_account_login_ref_error(&error)
+                {
+                    if let Some(pending) = pending.as_ref() {
+                        let family_key = make_credential_family_key(
+                            &pending.stored.profile_name,
+                            &pending.stored.base_email,
+                        )?;
+                        skip_pending_account_and_advance_family(
+                            &mut store,
+                            &family_key,
+                            &pending.stored.profile_name,
+                            &pending.stored.base_email,
+                            pending.stored.suffix,
+                            &pending.stored.email,
+                            pending
+                                .started_at
+                                .as_deref()
+                                .unwrap_or(pending.stored.created_at.as_str()),
+                        )?;
+                    } else {
+                        reconcile_pending_relogin_target(&mut store, pending.as_ref())?;
+                    }
+                } else {
+                    reconcile_pending_relogin_target(&mut store, pending.as_ref())?;
+                }
                 return Err(error);
             }
         };
@@ -1002,7 +1057,7 @@ pub fn cmd_relogin_with_progress(
             ));
         }
 
-        let _ = cmd_add_expected_email(&expected_email, existing.alias.as_deref())?;
+        let _ = cmd_add_expected_email(&expected_email, existing_alias.as_deref())?;
         if let Some(inspected) =
             inspect_pool_entry_by_account_id(&extract_account_id_from_auth(&auth))?
         {
@@ -1022,7 +1077,7 @@ pub fn cmd_relogin_with_progress(
                         .entry
                         .alias
                         .clone()
-                        .or_else(|| existing.alias.clone()),
+                        .or_else(|| existing_alias.clone()),
                     updated_at: now_iso(),
                     ..updated_stored
                 },
@@ -1034,7 +1089,7 @@ pub fn cmd_relogin_with_progress(
 
         return Ok(format!(
             "{GREEN}OK{RESET} Re-logged {} with stored managed-browser credentials.",
-            format_account_summary_for_display(&existing)
+            display_summary
         ));
     }
 
@@ -1066,12 +1121,81 @@ pub fn cmd_relogin_with_progress(
         return Err(anyhow!(
             "Logged into {}, but \"{}\" expects {}. The pool was not updated. Re-run with --allow-email-change if you want to replace it.",
             logged_in_email,
-            format_account_summary_for_display(&existing),
+            display_summary,
             expected_email
         ));
     }
 
-    cmd_add_expected_email(&expected_email, existing.alias.as_deref())
+    cmd_add_expected_email(&expected_email, existing_alias.as_deref())
+}
+
+fn resolve_relogin_target(
+    pool: &Pool,
+    store: &CredentialStore,
+    selector: &str,
+) -> Result<ReloginTargetSelection> {
+    if let Ok(selection) = resolve_account_selector(pool, selector) {
+        return Ok(ReloginTargetSelection {
+            selection: Some(selection),
+            pending: None,
+        });
+    }
+
+    let pending = store
+        .pending
+        .get(&normalize_email_key(selector))
+        .cloned()
+        .or_else(|| synthesize_pending_relogin_target(store, selector))
+        .ok_or_else(|| {
+            anyhow!(
+                "Account \"{}\" not found in pool or pending state.",
+                selector
+            )
+        })?;
+
+    Ok(ReloginTargetSelection {
+        selection: None,
+        pending: Some(pending),
+    })
+}
+
+fn synthesize_pending_relogin_target(
+    store: &CredentialStore,
+    selector: &str,
+) -> Option<PendingCredential> {
+    let family_match = select_family_for_account_email(store, selector)?;
+    let birth_date = resolve_login_workflow_defaults(None)
+        .ok()
+        .map(|defaults| defaults.birth_date);
+    let now = now_iso();
+
+    Some(PendingCredential {
+        stored: StoredCredential {
+            email: normalize_email_key(selector),
+            profile_name: family_match.family.profile_name,
+            base_email: family_match.family.base_email,
+            suffix: family_match.suffix,
+            selector: None,
+            alias: None,
+            birth_month: birth_date.as_ref().map(|value| value.birth_month),
+            birth_day: birth_date.as_ref().map(|value| value.birth_day),
+            birth_year: birth_date.as_ref().map(|value| value.birth_year),
+            created_at: family_match.family.created_at,
+            updated_at: now.clone(),
+        },
+        started_at: Some(now),
+    })
+}
+
+struct ReloginTargetSelection {
+    selection: Option<crate::pool::AccountSelection>,
+    pending: Option<PendingCredential>,
+}
+
+impl ReloginTargetSelection {
+    fn as_ref(&self) -> Option<&crate::pool::AccountSelection> {
+        self.selection.as_ref()
+    }
 }
 
 pub fn should_use_stored_credential_relogin(
@@ -1083,6 +1207,40 @@ pub fn should_use_stored_credential_relogin(
 
 fn should_logout_before_stored_relogin(options: &ReloginOptions) -> bool {
     options.logout_first
+}
+
+fn relogin_birth_date_for_pending(pending: Option<&PendingCredential>) -> Option<AdultBirthDate> {
+    pending.and_then(|pending| resolve_credential_birth_date(Some(&pending.stored), None))
+}
+
+fn ensure_pending_relogin_target(
+    store: &mut CredentialStore,
+    pending: Option<&PendingCredential>,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    let normalized_email = normalize_email_key(&pending.stored.email);
+    let skipped_before = store.skipped.len();
+    store
+        .skipped
+        .retain(|email| normalize_email_key(email) != normalized_email);
+    let removed_skipped = store.skipped.len() != skipped_before;
+    if store.pending.contains_key(&normalized_email) {
+        return removed_skipped;
+    }
+    store.pending.insert(normalized_email, pending.clone());
+    true
+}
+
+fn reconcile_pending_relogin_target(
+    store: &mut CredentialStore,
+    pending: Option<&PendingCredential>,
+) -> Result<()> {
+    if ensure_pending_relogin_target(store, pending) {
+        save_credential_store(store)?;
+    }
+    Ok(())
 }
 
 pub fn create_next_fallback_options() -> CreateCommandOptions {
@@ -1231,7 +1389,9 @@ fn should_retry_create_until_usable(options: &CreateCommandOptions) -> bool {
 }
 
 fn should_retry_create_after_error(options: &CreateCommandOptions, error: &anyhow::Error) -> bool {
-    should_retry_create_until_usable(options) || is_workflow_skip_account_error(error)
+    should_retry_create_until_usable(options)
+        || is_workflow_skip_account_error(error)
+        || is_missing_account_login_ref_error(error)
 }
 
 fn should_stop_create_retry_for_reusable_account(options: &CreateCommandOptions) -> bool {
@@ -1280,7 +1440,7 @@ fn reusable_account_exists_for_auto_create_retry(options: &CreateCommandOptions)
     Ok(candidate.is_some())
 }
 
-fn prepare_next_auto_create_attempt(
+fn skip_pending_account_and_advance_family(
     store: &mut CredentialStore,
     family_key: &str,
     profile_name: &str,
@@ -1295,7 +1455,7 @@ fn prepare_next_auto_create_attempt(
     }
 
     store.pending.remove(&normalized_email);
-    let max_skipped_slots = max_skipped_slots_for_family(store.families.get(family_key)).max(1);
+    let max_skipped_slots = max_skipped_slots_for_family(store.families.get(family_key));
     let mut existing_family_skips =
         collect_skipped_account_emails_for_family(store, profile_name, base_email);
     existing_family_skips.retain(|email| normalize_email_key(email) != normalized_email);
@@ -1306,7 +1466,7 @@ fn prepare_next_auto_create_attempt(
             .unwrap_or(0)
     });
     let existing_skip_count = existing_family_skips.len() as u32;
-    if existing_skip_count >= max_skipped_slots {
+    if max_skipped_slots > 0 && existing_skip_count >= max_skipped_slots {
         let to_remove =
             existing_skip_count.saturating_sub(max_skipped_slots.saturating_sub(1)) as usize;
         for email in existing_family_skips.into_iter().take(to_remove) {
@@ -1498,7 +1658,7 @@ fn execute_create_flow_attempt(
             Err(error) => {
                 if should_retry_create_until_usable(options) {
                     fatal(restore_active_auth(previous_auth.as_ref()))?;
-                    fatal(prepare_next_auto_create_attempt(
+                    fatal(skip_pending_account_and_advance_family(
                         &mut store,
                         &family_key,
                         &profile_name,
@@ -1586,7 +1746,7 @@ fn execute_create_flow_attempt(
         Err(error) => {
             fatal(restore_active_auth(previous_auth.as_ref()))?;
             if should_retry_create_after_error(options, &error) {
-                fatal(prepare_next_auto_create_attempt(
+                fatal(skip_pending_account_and_advance_family(
                     &mut store,
                     &family_key,
                     &profile_name,
@@ -1617,7 +1777,7 @@ fn execute_create_flow_attempt(
         );
         fatal(restore_active_auth(previous_auth.as_ref()))?;
         if should_retry_create_until_usable(options) {
-            fatal(prepare_next_auto_create_attempt(
+            fatal(skip_pending_account_and_advance_family(
                 &mut store,
                 &family_key,
                 &profile_name,
@@ -1655,7 +1815,7 @@ fn execute_create_flow_attempt(
         Err(error) => {
             if should_retry_create_until_usable(options) {
                 fatal(restore_active_auth(previous_auth.as_ref()))?;
-                fatal(prepare_next_auto_create_attempt(
+                fatal(skip_pending_account_and_advance_family(
                     &mut store,
                     &family_key,
                     &profile_name,
@@ -2152,6 +2312,19 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 }
 
                 if next_action == Some("retry_attempt") {
+                    if retry_reason == Some("final_add_phone")
+                        && stop_on_final_add_phone_retry_exhaustion()
+                    {
+                        return Err(anyhow!(login_error_message(
+                            error_message,
+                            format!(
+                                "OpenAI final_add_phone blocked {email}{}.",
+                                current_url
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default()
+                            )
+                        )));
+                    }
                     max_attempts = max_attempts.max(codex_login_max_attempts(retry_reason));
                     if attempt < max_attempts {
                         let delay_ms = codex_login_retry_delay_ms(retry_reason, attempt);
@@ -2905,6 +3078,12 @@ fn is_workflow_skip_account_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<WorkflowSkipAccountError>().is_some()
 }
 
+fn is_missing_account_login_ref_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("Workflow input 'account_login_ref' must be a secret ref")
+}
+
 fn is_retryable_codex_login_workflow_error_message(message: &str) -> bool {
     let normalized = message.trim().to_lowercase();
     !normalized.is_empty()
@@ -2952,6 +3131,13 @@ fn codex_login_max_attempts(retry_reason: Option<&str>) -> usize {
 
 fn should_skip_account_after_retry_exhaustion(retry_reason: Option<&str>) -> bool {
     retry_reason == Some("final_add_phone")
+}
+
+fn stop_on_final_add_phone_retry_exhaustion() -> bool {
+    matches!(
+        std::env::var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV).as_deref(),
+        Ok("1")
+    )
 }
 
 fn should_reset_device_auth_session_for_rate_limit(
@@ -3279,7 +3465,8 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
         .into_iter()
         .filter(|(email, record)| {
             !inventory_emails.contains(email)
-                && !should_drop_non_dev_pending_credential(&record.stored.base_email)
+                && (!migrate_legacy_non_default_families
+                    || !should_drop_non_dev_pending_credential(&record.stored.base_email))
         })
         .collect::<HashMap<_, _>>();
     let migration_default_create_base_email = explicit_default_create_base_email
@@ -4120,6 +4307,17 @@ fn compute_fresh_account_family_suffix(
     known_emails: Vec<String>,
     skipped_emails: Vec<String>,
 ) -> Result<u32> {
+    let mut covered_suffixes = HashSet::new();
+    for email in &known_emails {
+        if let Some(suffix) = extract_account_family_suffix(email, base_email)? {
+            covered_suffixes.insert(suffix);
+        }
+    }
+    for email in &skipped_emails {
+        if let Some(suffix) = extract_account_family_suffix(email, base_email)? {
+            covered_suffixes.insert(suffix);
+        }
+    }
     let should_reserve_skipped = !skipped_emails.is_empty()
         && (skipped_emails.len() as u32) <= max_skipped_slots_for_family(family);
     let computed = compute_next_account_family_suffix_with_skips(
@@ -4129,6 +4327,13 @@ fn compute_fresh_account_family_suffix(
         max_skipped_slots_for_family(family),
     )?;
     if !should_reserve_skipped {
+        if let Some(entry) = family {
+            let frontier = entry.next_suffix;
+            if frontier > computed && (1..frontier).all(|suffix| covered_suffixes.contains(&suffix))
+            {
+                return Ok(frontier);
+            }
+        }
         Ok(computed)
     } else {
         Ok(family
@@ -5971,65 +6176,212 @@ input:
 
     #[test]
     fn prepare_next_auto_create_attempt_preserves_current_skip_when_budget_is_full() {
-        let mut store = CredentialStore::default();
-        store.pending.insert(
-            "devbench.14@astronlab.com".to_string(),
-            make_pending(
-                "devbench.14@astronlab.com",
+        with_rotate_home("codex-rotate-skip-budget", |_| {
+            let mut store = CredentialStore::default();
+            store.pending.insert(
+                "devbench.14@astronlab.com".to_string(),
+                make_pending(
+                    "devbench.14@astronlab.com",
+                    "dev-1",
+                    "devbench.{n}@astronlab.com",
+                    14,
+                    "2026-04-13T06:00:00.000Z",
+                ),
+            );
+            store.skipped.extend(
+                ["devbench.12@astronlab.com", "devbench.13@astronlab.com"].map(str::to_string),
+            );
+            store.families.insert(
+                "dev-1::devbench.{n}@astronlab.com".to_string(),
+                CredentialFamily {
+                    profile_name: "dev-1".to_string(),
+                    base_email: "devbench.{n}@astronlab.com".to_string(),
+                    next_suffix: 14,
+                    max_skipped_slots: 2,
+                    created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                    updated_at: "2026-04-13T05:00:00.000Z".to_string(),
+                    last_created_email: None,
+                    deleted: Vec::new(),
+                },
+            );
+
+            skip_pending_account_and_advance_family(
+                &mut store,
+                "dev-1::devbench.{n}@astronlab.com",
                 "dev-1",
                 "devbench.{n}@astronlab.com",
                 14,
+                "devbench.14@astronlab.com",
                 "2026-04-13T06:00:00.000Z",
-            ),
-        );
-        store
-            .skipped
-            .extend(["devbench.12@astronlab.com", "devbench.13@astronlab.com"].map(str::to_string));
-        store.families.insert(
-            "dev-1::devbench.{n}@astronlab.com".to_string(),
-            CredentialFamily {
-                profile_name: "dev-1".to_string(),
-                base_email: "devbench.{n}@astronlab.com".to_string(),
-                next_suffix: 14,
-                max_skipped_slots: 2,
-                created_at: "2026-04-13T05:00:00.000Z".to_string(),
-                updated_at: "2026-04-13T05:00:00.000Z".to_string(),
-                last_created_email: None,
-                deleted: Vec::new(),
-            },
-        );
+            )
+            .expect("prepare next attempt");
 
-        prepare_next_auto_create_attempt(
-            &mut store,
-            "dev-1::devbench.{n}@astronlab.com",
-            "dev-1",
-            "devbench.{n}@astronlab.com",
-            14,
-            "devbench.14@astronlab.com",
-            "2026-04-13T06:00:00.000Z",
-        )
-        .expect("prepare next attempt");
+            assert!(!store.pending.contains_key("devbench.14@astronlab.com"));
+            assert!(store.skipped.contains("devbench.14@astronlab.com"));
+            assert!(!store.skipped.contains("devbench.12@astronlab.com"));
+            assert!(store.skipped.contains("devbench.13@astronlab.com"));
 
-        assert!(!store.pending.contains_key("devbench.14@astronlab.com"));
-        assert!(store.skipped.contains("devbench.14@astronlab.com"));
-        assert!(!store.skipped.contains("devbench.12@astronlab.com"));
-        assert!(store.skipped.contains("devbench.13@astronlab.com"));
-
-        let next_suffix = compute_next_account_family_suffix_with_skips(
-            "devbench.{n}@astronlab.com",
-            (1..=13)
-                .map(|suffix| format!("devbench.{suffix}@astronlab.com"))
-                .collect(),
-            collect_skipped_account_emails_for_family(
-                &store,
-                "dev-1",
+            let next_suffix = compute_next_account_family_suffix_with_skips(
                 "devbench.{n}@astronlab.com",
-            ),
-            max_skipped_slots_for_family(store.families.get("dev-1::devbench.{n}@astronlab.com")),
-        )
-        .expect("next suffix");
+                (1..=13)
+                    .map(|suffix| format!("devbench.{suffix}@astronlab.com"))
+                    .collect(),
+                collect_skipped_account_emails_for_family(
+                    &store,
+                    "dev-1",
+                    "devbench.{n}@astronlab.com",
+                ),
+                max_skipped_slots_for_family(
+                    store.families.get("dev-1::devbench.{n}@astronlab.com"),
+                ),
+            )
+            .expect("next suffix");
 
-        assert_eq!(next_suffix, 15);
+            assert_eq!(next_suffix, 15);
+        });
+    }
+
+    #[test]
+    fn skip_pending_account_and_advance_family_unblocks_next_gmail_suffix() {
+        with_rotate_home("codex-rotate-gmail-skip", |_| {
+            let mut store = CredentialStore::default();
+            store.pending.insert(
+                "dev3astronlab+5@gmail.com".to_string(),
+                make_pending(
+                    "dev3astronlab+5@gmail.com",
+                    "dev-1",
+                    "dev3astronlab+{n}@gmail.com",
+                    5,
+                    "2026-04-14T19:56:37.881Z",
+                ),
+            );
+            store.families.insert(
+                "dev-1::dev3astronlab+{n}@gmail.com".to_string(),
+                CredentialFamily {
+                    profile_name: "dev-1".to_string(),
+                    base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+                    next_suffix: 6,
+                    max_skipped_slots: 0,
+                    created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                    updated_at: "2026-04-14T19:56:10.036Z".to_string(),
+                    last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
+                    deleted: Vec::new(),
+                },
+            );
+
+            skip_pending_account_and_advance_family(
+                &mut store,
+                "dev-1::dev3astronlab+{n}@gmail.com",
+                "dev-1",
+                "dev3astronlab+{n}@gmail.com",
+                5,
+                "dev3astronlab+5@gmail.com",
+                "2026-04-14T19:56:37.881Z",
+            )
+            .expect("skip pending gmail account");
+
+            assert!(!store.pending.contains_key("dev3astronlab+5@gmail.com"));
+            assert!(store.skipped.contains("dev3astronlab+5@gmail.com"));
+            assert_eq!(
+                store
+                    .families
+                    .get("dev-1::dev3astronlab+{n}@gmail.com")
+                    .expect("gmail family")
+                    .next_suffix,
+                6
+            );
+
+            let next_suffix = compute_fresh_account_family_suffix(
+                store.families.get("dev-1::dev3astronlab+{n}@gmail.com"),
+                "dev3astronlab+{n}@gmail.com",
+                vec![
+                    "dev3astronlab+1@gmail.com".to_string(),
+                    "dev3astronlab+2@gmail.com".to_string(),
+                    "dev3astronlab+3@gmail.com".to_string(),
+                    "dev3astronlab+4@gmail.com".to_string(),
+                ],
+                collect_skipped_account_emails_for_family(
+                    &store,
+                    "dev-1",
+                    "dev3astronlab+{n}@gmail.com",
+                ),
+            )
+            .expect("compute next gmail suffix");
+            assert_eq!(next_suffix, 6);
+        });
+    }
+
+    #[test]
+    fn skip_pending_account_and_advance_family_keeps_existing_runtime_gmail_skips_reserved() {
+        with_rotate_home("codex-rotate-gmail-skip-reserved", |_| {
+            let mut store = CredentialStore::default();
+            store
+                .skipped
+                .insert("dev3astronlab+5@gmail.com".to_string());
+            store.pending.insert(
+                "dev3astronlab+6@gmail.com".to_string(),
+                make_pending(
+                    "dev3astronlab+6@gmail.com",
+                    "dev-1",
+                    "dev3astronlab+{n}@gmail.com",
+                    6,
+                    "2026-04-14T21:40:53.532Z",
+                ),
+            );
+            store.families.insert(
+                "dev-1::dev3astronlab+{n}@gmail.com".to_string(),
+                CredentialFamily {
+                    profile_name: "dev-1".to_string(),
+                    base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+                    next_suffix: 6,
+                    max_skipped_slots: 0,
+                    created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                    updated_at: "2026-04-14T21:40:53.532Z".to_string(),
+                    last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
+                    deleted: Vec::new(),
+                },
+            );
+
+            skip_pending_account_and_advance_family(
+                &mut store,
+                "dev-1::dev3astronlab+{n}@gmail.com",
+                "dev-1",
+                "dev3astronlab+{n}@gmail.com",
+                6,
+                "dev3astronlab+6@gmail.com",
+                "2026-04-14T21:40:53.532Z",
+            )
+            .expect("skip pending gmail account");
+
+            assert!(store.skipped.contains("dev3astronlab+5@gmail.com"));
+            assert!(store.skipped.contains("dev3astronlab+6@gmail.com"));
+            assert_eq!(
+                store
+                    .families
+                    .get("dev-1::dev3astronlab+{n}@gmail.com")
+                    .expect("gmail family")
+                    .next_suffix,
+                7
+            );
+
+            let next_suffix = compute_fresh_account_family_suffix(
+                store.families.get("dev-1::dev3astronlab+{n}@gmail.com"),
+                "dev3astronlab+{n}@gmail.com",
+                vec![
+                    "dev3astronlab+1@gmail.com".to_string(),
+                    "dev3astronlab+2@gmail.com".to_string(),
+                    "dev3astronlab+3@gmail.com".to_string(),
+                    "dev3astronlab+4@gmail.com".to_string(),
+                ],
+                collect_skipped_account_emails_for_family(
+                    &store,
+                    "dev-1",
+                    "dev3astronlab+{n}@gmail.com",
+                ),
+            )
+            .expect("compute next gmail suffix");
+            assert_eq!(next_suffix, 7);
+        });
     }
 
     #[test]
@@ -6330,9 +6682,21 @@ end
     }
 
     #[test]
+    fn missing_account_login_ref_errors_are_retried_for_create() {
+        let error =
+            anyhow!("Workflow input 'account_login_ref' must be a secret ref to satisfy step 'fill_signup_password'");
+        assert!(is_missing_account_login_ref_error(&error));
+        assert!(should_retry_create_after_error(
+            &CreateCommandOptions::default(),
+            &error
+        ));
+    }
+
+    #[test]
     fn unrelated_create_errors_do_not_trigger_policy_skip() {
         let error = anyhow!("Codex browser login did not reach the callback.");
         assert!(!is_workflow_skip_account_error(&error));
+        assert!(!is_missing_account_login_ref_error(&error));
         assert!(!should_retry_create_after_error(
             &CreateCommandOptions::default(),
             &error
@@ -7050,6 +7414,155 @@ end
     }
 
     #[test]
+    fn relogin_selector_accepts_pending_email() {
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![make_account_entry("dev.1@astronlab.com", "acct-1")],
+        };
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "dev3astronlab+5@gmail.com".to_string(),
+            make_pending(
+                "dev3astronlab+5@gmail.com",
+                "dev-1",
+                "dev3astronlab+{n}@gmail.com",
+                5,
+                "2026-04-14T15:12:25.003Z",
+            ),
+        );
+
+        let selection = resolve_relogin_target(&pool, &store, "dev3astronlab+5@gmail.com")
+            .expect("pending selector should resolve");
+        assert!(selection.selection.is_none());
+        assert_eq!(
+            selection
+                .pending
+                .as_ref()
+                .map(|entry| entry.stored.email.as_str()),
+            Some("dev3astronlab+5@gmail.com")
+        );
+    }
+
+    #[test]
+    fn relogin_selector_accepts_exact_family_email_without_pool_or_pending() {
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![make_account_entry("dev.1@astronlab.com", "acct-1")],
+        };
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::dev3astronlab+{n}@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+                next_suffix: 7,
+                max_skipped_slots: 0,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-14T16:01:04.952Z".to_string(),
+                last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
+                deleted: Vec::new(),
+            },
+        );
+
+        let selection = resolve_relogin_target(&pool, &store, "dev3astronlab+6@gmail.com")
+            .expect("family selector should resolve");
+        let pending = selection.pending.expect("synthetic pending relogin target");
+        assert!(selection.selection.is_none());
+        assert_eq!(pending.stored.email, "dev3astronlab+6@gmail.com");
+        assert_eq!(pending.stored.profile_name, "dev-1");
+        assert_eq!(pending.stored.base_email, "dev3astronlab+{n}@gmail.com");
+        assert_eq!(pending.stored.suffix, 6);
+        assert_eq!(pending.stored.birth_month, Some(1));
+        assert_eq!(pending.stored.birth_day, Some(24));
+        assert_eq!(pending.stored.birth_year, Some(1990));
+    }
+
+    #[test]
+    fn relogin_birth_date_for_pending_reuses_pending_profile_birth_date() {
+        let mut pending = make_pending(
+            "dev3astronlab+5@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            5,
+            "2026-04-14T15:12:25.003Z",
+        );
+        pending.stored.birth_month = Some(1);
+        pending.stored.birth_day = Some(24);
+        pending.stored.birth_year = Some(1990);
+
+        let birth_date =
+            relogin_birth_date_for_pending(Some(&pending)).expect("pending birth date");
+        assert_eq!(birth_date.birth_month, 1);
+        assert_eq!(birth_date.birth_day, 24);
+        assert_eq!(birth_date.birth_year, 1990);
+    }
+
+    #[test]
+    fn ensure_pending_relogin_target_inserts_synthesized_family_email_once() {
+        let mut store = CredentialStore::default();
+        let pending = make_pending(
+            "dev3astronlab+6@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            6,
+            "2026-04-14T16:12:25.003Z",
+        );
+
+        assert!(ensure_pending_relogin_target(&mut store, Some(&pending)));
+        assert!(store.pending.contains_key("dev3astronlab+6@gmail.com"));
+        assert!(!ensure_pending_relogin_target(&mut store, Some(&pending)));
+    }
+
+    #[test]
+    fn ensure_pending_relogin_target_removes_matching_skipped_entry() {
+        let mut store = CredentialStore::default();
+        store.skipped = [
+            "dev3astronlab+5@gmail.com".to_string(),
+            "devbench.19@astronlab.com".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let pending = make_pending(
+            "dev3astronlab+5@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            5,
+            "2026-04-14T16:12:25.003Z",
+        );
+
+        assert!(ensure_pending_relogin_target(&mut store, Some(&pending)));
+        assert!(store.pending.contains_key("dev3astronlab+5@gmail.com"));
+        assert_eq!(
+            store.skipped,
+            ["devbench.19@astronlab.com".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ensure_pending_relogin_target_reports_dirty_when_only_skipped_cleanup_changed() {
+        let mut store = CredentialStore::default();
+        let pending = make_pending(
+            "dev3astronlab+5@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            5,
+            "2026-04-14T16:12:25.003Z",
+        );
+        store
+            .pending
+            .insert("dev3astronlab+5@gmail.com".to_string(), pending.clone());
+        store.skipped = ["dev3astronlab+5@gmail.com".to_string()]
+            .into_iter()
+            .collect();
+
+        assert!(ensure_pending_relogin_target(&mut store, Some(&pending)));
+        assert!(store.pending.contains_key("dev3astronlab+5@gmail.com"));
+        assert!(store.skipped.is_empty());
+    }
+
+    #[test]
     fn normalize_credential_store_drops_legacy_bench_families_on_v4_migration() {
         let store = normalize_credential_store(json!({
             "version": 3,
@@ -7155,6 +7668,40 @@ end
                 "dev.user+1@gmail.com".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn normalize_credential_store_keeps_current_default_gmail_template_pending() {
+        let store = normalize_credential_store(json!({
+            "version": 7,
+            "default_create_base_email": "dev3astronlab+{n}@gmail.com",
+            "families": {
+                "dev-1::dev3astronlab+{n}@gmail.com": {
+                    "profile_name": "dev-1",
+                    "base_email": "dev3astronlab+{n}@gmail.com",
+                    "next_suffix": 7,
+                    "max_skipped_slots": 0,
+                    "created_at": "2026-04-13T05:00:00.000Z",
+                    "updated_at": "2026-04-14T15:12:25.003Z",
+                    "last_created_email": "dev3astronlab+4@gmail.com",
+                    "deleted": []
+                }
+            },
+            "pending": {
+                "dev3astronlab+5@gmail.com": {
+                    "email": "dev3astronlab+5@gmail.com",
+                    "profile_name": "dev-1",
+                    "base_email": "dev3astronlab+{n}@gmail.com",
+                    "suffix": 5,
+                    "selector": null,
+                    "alias": null,
+                    "created_at": "2026-04-14T15:12:25.003Z",
+                    "updated_at": "2026-04-14T15:12:25.003Z",
+                    "started_at": "2026-04-14T15:12:25.003Z"
+                }
+            }
+        }));
+        assert!(store.pending.contains_key("dev3astronlab+5@gmail.com"));
     }
 
     #[test]
@@ -7394,6 +7941,21 @@ end
         assert!(should_skip_account_after_retry_exhaustion(Some(
             "final_add_phone"
         )));
+    }
+
+    #[test]
+    fn final_add_phone_short_circuit_flag_is_opt_in() {
+        unsafe {
+            std::env::remove_var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV);
+        }
+        assert!(!stop_on_final_add_phone_retry_exhaustion());
+        unsafe {
+            std::env::set_var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV, "1");
+        }
+        assert!(stop_on_final_add_phone_retry_exhaustion());
+        unsafe {
+            std::env::remove_var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV);
+        }
     }
 
     #[test]
