@@ -45,6 +45,11 @@ fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> 
         .unwrap_or(true)
 }
 
+fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
+    account_rotation_enabled(disabled_domains, &entry.email)
+        || entry.last_quota_usable != Some(true)
+}
+
 fn disabled_rotation_target_error(domains: &[String]) -> anyhow::Error {
     let listed = domains.join(", ");
     let key_hint = if domains.len() == 1 {
@@ -625,6 +630,7 @@ pub fn cmd_list_stream(writer: &mut dyn Write) -> Result<()> {
 
 fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -647,15 +653,23 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut unavailable_count = 0;
     let mut healthy_account_sections = Vec::new();
     output.push_line(String::new())?;
+    let visible_count = pool
+        .accounts
+        .iter()
+        .filter(|entry| inventory_account_visible(&disabled_domains, entry))
+        .count();
     output.push_line(format!(
         "{BOLD}Codex OAuth Account Pool{RESET} ({} account(s))",
-        pool.accounts.len()
+        visible_count
     ))?;
     output.push_line(String::new())?;
     output.push_line(format!("{BOLD}Total Accounts{RESET}"))?;
     output.push_line(String::new())?;
 
     for index in display_order {
+        if !inventory_account_visible(&disabled_domains, &pool.accounts[index]) {
+            continue;
+        }
         let is_active = index == pool.active_index;
         let account_header_line = build_list_account_header_line(&pool.accounts[index], is_active);
         output.push_line(account_header_line.clone())?;
@@ -944,23 +958,30 @@ pub fn cmd_status() -> Result<String> {
 
 pub fn current_pool_overview() -> Result<PoolOverview> {
     let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     if dirty {
         save_pool(&pool)?;
     }
+    let visible_indices = pool
+        .accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            inventory_account_visible(&disabled_domains, entry).then_some(index)
+        })
+        .collect::<Vec<_>>();
     Ok(PoolOverview {
-        inventory_count: pool.accounts.len(),
-        inventory_active_slot: if pool.accounts.is_empty() {
-            None
-        } else {
-            Some(pool.active_index.saturating_add(1))
-        },
-        inventory_healthy_count: pool
-            .accounts
+        inventory_count: visible_indices.len(),
+        inventory_active_slot: visible_indices
             .iter()
-            .filter(|entry| entry.last_quota_usable == Some(true))
+            .position(|index| *index == pool.active_index)
+            .map(|slot| slot.saturating_add(1)),
+        inventory_healthy_count: visible_indices
+            .iter()
+            .filter(|index| pool.accounts[**index].last_quota_usable == Some(true))
             .count(),
     })
 }
@@ -2302,13 +2323,16 @@ mod tests {
     }
 
     fn write_disabled_domain_state() -> Result<()> {
-        write_rotate_state_json(&json!({
-            "domain": {
-                "astronlab.com": {
-                    "rotation_enabled": false
-                }
+        let mut state = load_rotate_state_json()?;
+        if !state.is_object() {
+            state = json!({});
+        }
+        state["domain"] = json!({
+            "astronlab.com": {
+                "rotation_enabled": false
             }
-        }))
+        });
+        write_rotate_state_json(&state)
     }
 
     #[test]
@@ -2680,6 +2704,64 @@ mod tests {
     }
 
     #[test]
+    fn cmd_list_hides_healthy_accounts_from_disabled_domains() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut healthy_disabled = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
+            healthy_disabled.label = "dev.hidden@astronlab.com_free".to_string();
+            healthy_disabled.email = "dev.hidden@astronlab.com".to_string();
+            healthy_disabled.account_id = "acct-hidden".to_string();
+            healthy_disabled.auth = make_auth("dev.hidden@astronlab.com", "acct-hidden", "free");
+            healthy_disabled.auth.tokens.account_id = "acct-hidden".to_string();
+            healthy_disabled.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+            let mut exhausted_disabled =
+                stored_entry(Some(false), Some("2026-04-09T02:00:00.000Z"));
+            exhausted_disabled.label = "dev.visible@astronlab.com_free".to_string();
+            exhausted_disabled.email = "dev.visible@astronlab.com".to_string();
+            exhausted_disabled.account_id = "acct-visible".to_string();
+            exhausted_disabled.auth =
+                make_auth("dev.visible@astronlab.com", "acct-visible", "free");
+            exhausted_disabled.auth.tokens.account_id = "acct-visible".to_string();
+            exhausted_disabled.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+            save_pool(&Pool {
+                active_index: 1,
+                accounts: vec![healthy_disabled, exhausted_disabled],
+            })?;
+            write_disabled_domain_state()?;
+            assert!(load_disabled_rotation_domains()?.contains("astronlab.com"));
+
+            let output = strip_ansi(&cmd_list()?);
+
+            assert!(
+                output.contains("Codex OAuth Account Pool (1 account(s))"),
+                "{output}"
+            );
+            assert!(!output.contains("dev.hidden@astronlab.com_free"));
+            assert!(output.contains("dev.visible@astronlab.com_free"));
+            assert!(output.contains("Healthy Accounts (0 account(s))"));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should hide healthy disabled-domain accounts");
+    }
+
+    #[test]
     fn cmd_list_sorts_total_accounts_by_quota_refresh_eta() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -3046,6 +3128,64 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("overview should count healthy accounts");
+    }
+
+    #[test]
+    fn current_pool_overview_hides_healthy_accounts_from_disabled_domains() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut healthy_disabled = stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z"));
+            healthy_disabled.label = "dev.hidden@astronlab.com_free".to_string();
+            healthy_disabled.email = "dev.hidden@astronlab.com".to_string();
+            healthy_disabled.account_id = "acct-hidden".to_string();
+            healthy_disabled.auth = make_auth("dev.hidden@astronlab.com", "acct-hidden", "free");
+            healthy_disabled.auth.tokens.account_id = "acct-hidden".to_string();
+
+            let mut healthy_enabled = stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z"));
+            healthy_enabled.label = "dev.visible@gmail.com_plus".to_string();
+            healthy_enabled.email = "dev.visible@gmail.com".to_string();
+            healthy_enabled.account_id = "acct-visible".to_string();
+            healthy_enabled.auth = make_auth("dev.visible@gmail.com", "acct-visible", "plus");
+            healthy_enabled.auth.tokens.account_id = "acct-visible".to_string();
+
+            let mut exhausted_disabled =
+                stored_entry(Some(false), Some("2026-04-08T12:00:00.000Z"));
+            exhausted_disabled.label = "dev.exhausted@astronlab.com_free".to_string();
+            exhausted_disabled.email = "dev.exhausted@astronlab.com".to_string();
+            exhausted_disabled.account_id = "acct-exhausted".to_string();
+            exhausted_disabled.auth =
+                make_auth("dev.exhausted@astronlab.com", "acct-exhausted", "free");
+            exhausted_disabled.auth.tokens.account_id = "acct-exhausted".to_string();
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![healthy_disabled, healthy_enabled, exhausted_disabled],
+            })?;
+            write_disabled_domain_state()?;
+            assert!(load_disabled_rotation_domains()?.contains("astronlab.com"));
+
+            let overview = current_pool_overview()?;
+            assert_eq!(overview.inventory_count, 2);
+            assert_eq!(overview.inventory_active_slot, None);
+            assert_eq!(overview.inventory_healthy_count, 1);
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("overview should hide healthy disabled-domain accounts");
     }
 
     #[test]
