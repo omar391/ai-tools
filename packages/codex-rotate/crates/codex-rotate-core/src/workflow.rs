@@ -41,7 +41,7 @@ const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
 const DEFAULT_CODEX_APP_BUNDLE_BIN: &str = "/Applications/Codex.app/Contents/Resources/codex";
 const DEFAULT_CREATE_BASE_EMAIL: &str = "dev.{n}@astronlab.com";
-const ROTATE_STATE_VERSION: u8 = 5;
+const ROTATE_STATE_VERSION: u8 = 7;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS: usize = 6;
@@ -184,6 +184,8 @@ pub struct CredentialFamily {
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
 }
 
 fn default_max_skipped_slots_per_family() -> u32 {
@@ -194,6 +196,8 @@ fn default_max_skipped_slots_per_family() -> u32 {
 pub struct DomainConfig {
     #[serde(default = "default_rotation_enabled")]
     pub rotation_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_suffix_per_family: Option<u32>,
 }
 
 fn default_rotation_enabled() -> bool {
@@ -1319,6 +1323,7 @@ fn prepare_next_auto_create_attempt(
                 created_at: started_at.to_string(),
                 updated_at,
                 last_created_email: None,
+                deleted: Vec::new(),
             },
         );
     }
@@ -1380,6 +1385,11 @@ fn execute_create_flow_attempt(
             skipped_emails,
         ))?,
     };
+    fatal(ensure_suffix_within_domain_limit_in_store(
+        &store,
+        &base_email,
+        suffix,
+    ))?;
     let created_email = existing_pending
         .as_ref()
         .map(|entry| entry.stored.email.clone())
@@ -1748,6 +1758,9 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
                 .unwrap_or_else(|| started_at.to_string()),
             updated_at,
             last_created_email: Some(created_email.clone()),
+            deleted: family
+                .map(|entry| entry.deleted.clone())
+                .unwrap_or_default(),
         },
     );
     save_credential_store(store)?;
@@ -3321,6 +3334,15 @@ fn normalize_credential_store(raw: Value) -> CredentialStore {
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
+    for family in families.values_mut() {
+        family.deleted = family
+            .deleted
+            .iter()
+            .map(|email| normalize_email_key(email))
+            .collect::<Vec<_>>();
+        family.deleted.sort();
+        family.deleted.dedup();
+    }
     let legacy_accounts = normalize_stored_credential_map(raw.get("accounts"));
     for account in legacy_accounts.values() {
         merge_legacy_account_into_families(&mut families, account);
@@ -3807,6 +3829,7 @@ fn resolve_managed_profile_name_from_candidates(
 fn resolve_create_base_email(
     requested_base_email: Option<&str>,
     discovered_base_email: Option<&str>,
+    default_base_email: &str,
 ) -> Result<String> {
     if let Some(requested_base_email) = requested_base_email {
         return normalize_base_email_family(requested_base_email);
@@ -3814,7 +3837,7 @@ fn resolve_create_base_email(
     if let Some(discovered_base_email) = discovered_base_email {
         return normalize_base_email_family(discovered_base_email);
     }
-    normalize_base_email_family(DEFAULT_CREATE_BASE_EMAIL)
+    normalize_base_email_family(default_base_email)
 }
 
 fn resolve_create_base_email_for_profile(
@@ -3825,10 +3848,15 @@ fn resolve_create_base_email_for_profile(
 ) -> Result<String> {
     let discovered_base_email = if requested_base_email.is_none() {
         select_pending_base_email_hint_for_profile(store, profile_name, alias)
+            .or_else(|| select_stored_base_email_hint(store, profile_name))
     } else {
         None
     };
-    resolve_create_base_email(requested_base_email, discovered_base_email.as_deref())
+    resolve_create_base_email(
+        requested_base_email,
+        discovered_base_email.as_deref(),
+        &store.default_create_base_email,
+    )
 }
 
 fn make_credential_family_key(profile_name: &str, base_email: &str) -> Result<String> {
@@ -3887,6 +3915,36 @@ fn ensure_rotation_enabled_for_base_email_in_store(
         return Err(disabled_rotation_error(&domain));
     }
     Ok(())
+}
+
+fn max_suffix_per_family_for_base_email_in_store(
+    store: &CredentialStore,
+    base_email: &str,
+) -> Option<u32> {
+    let family = parse_email_family(base_email).ok()?;
+    store
+        .domain
+        .get(&family.domain_part)
+        .and_then(|config| config.max_suffix_per_family)
+}
+
+fn ensure_suffix_within_domain_limit_in_store(
+    store: &CredentialStore,
+    base_email: &str,
+    suffix: u32,
+) -> Result<()> {
+    let Some(max_suffix) = max_suffix_per_family_for_base_email_in_store(store, base_email) else {
+        return Ok(());
+    };
+    if suffix <= max_suffix {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Account creation for {} stops at suffix {}. {} would exceed the domain limit.",
+        base_email,
+        max_suffix,
+        suffix
+    ))
 }
 
 #[cfg(test)]
@@ -4077,6 +4135,9 @@ fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<Str
         .map(|entry| entry.email.clone())
         .collect::<Vec<_>>();
     emails.extend(store.pending.keys().cloned());
+    for family in store.families.values() {
+        emails.extend(family.deleted.iter().cloned());
+    }
     emails
 }
 
@@ -4108,6 +4169,17 @@ fn max_skipped_slots_for_family(family: Option<&CredentialFamily>) -> u32 {
     family
         .map(|entry| entry.max_skipped_slots)
         .unwrap_or(DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY)
+}
+
+fn family_is_selectable_for_create_hint(
+    store: &CredentialStore,
+    base_email: &str,
+    frontier: u32,
+) -> bool {
+    disabled_rotation_domain_for_base_email_in_store(store, base_email).is_none()
+        && max_suffix_per_family_for_base_email_in_store(store, base_email)
+            .map(|limit| frontier <= limit)
+            .unwrap_or(true)
 }
 
 fn select_pending_credential_for_family(
@@ -4170,6 +4242,11 @@ fn select_pending_base_email_hint_for_profile(
         .values()
         .filter(|entry| {
             entry.stored.profile_name == profile_name
+                && family_is_selectable_for_create_hint(
+                    store,
+                    &entry.stored.base_email,
+                    entry.stored.suffix.saturating_add(1),
+                )
                 && (normalized_alias.is_none()
                     || normalize_alias(entry.stored.alias.as_deref()) == normalized_alias)
         })
@@ -4403,7 +4480,6 @@ fn select_best_email_for_managed_profile(
     candidates.into_iter().next().map(|(_, email, _, _)| email)
 }
 
-#[cfg(test)]
 fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) -> Option<String> {
     let mut candidates = HashMap::<String, (u32, i64, u32)>::new();
 
@@ -4422,6 +4498,10 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
 
     for family in store.families.values() {
         if family.profile_name == profile_name {
+            if !family_is_selectable_for_create_hint(store, &family.base_email, family.next_suffix)
+            {
+                continue;
+            }
             remember(
                 Some(&family.base_email),
                 Some(family.updated_at.as_str()),
@@ -4431,6 +4511,13 @@ fn select_stored_base_email_hint(store: &CredentialStore, profile_name: &str) ->
     }
     for pending in store.pending.values() {
         if pending.stored.profile_name == profile_name {
+            if !family_is_selectable_for_create_hint(
+                store,
+                &pending.stored.base_email,
+                pending.stored.suffix.saturating_add(1),
+            ) {
+                continue;
+            }
             remember(
                 Some(&pending.stored.base_email),
                 pending
@@ -4604,6 +4691,9 @@ fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCreden
         Some(existing) => {
             let previous = existing.clone();
             existing.next_suffix = existing.next_suffix.max(next_suffix);
+            existing
+                .deleted
+                .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if parse_sortable_timestamp(Some(next_created_at.as_str()))
                 < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
@@ -4629,6 +4719,7 @@ fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCreden
                     created_at: next_created_at,
                     updated_at: next_updated_at,
                     last_created_email: next_last_created_email,
+                    deleted: Vec::new(),
                 },
             );
             true
@@ -4649,6 +4740,9 @@ fn merge_legacy_account_into_families(
     match families.get_mut(&family_key) {
         Some(existing) => {
             existing.next_suffix = existing.next_suffix.max(account.suffix.saturating_add(1));
+            existing
+                .deleted
+                .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if created_at < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
             {
@@ -4670,6 +4764,7 @@ fn merge_legacy_account_into_families(
                     created_at: account.created_at.clone(),
                     updated_at: account.updated_at.clone(),
                     last_created_email: Some(account.email.clone()),
+                    deleted: Vec::new(),
                 },
             );
         }
@@ -4685,6 +4780,40 @@ fn parse_sortable_timestamp(value: Option<&str>) -> i64 {
 
 fn normalize_email_key(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+pub fn record_deleted_account(email: &str) -> Result<bool> {
+    let normalized_email = normalize_email_key(email);
+    let mut store = load_credential_store()?;
+    let Some(family_match) = select_family_for_account_email(&store, &normalized_email) else {
+        let removed_pending = store.pending.remove(&normalized_email).is_some();
+        let removed_skipped = store.skipped.remove(&normalized_email);
+        if removed_pending || removed_skipped {
+            save_credential_store(&store)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    };
+
+    let removed_pending = store.pending.remove(&normalized_email).is_some();
+    let removed_skipped = store.skipped.remove(&normalized_email);
+    let mut dirty = removed_pending || removed_skipped;
+    if let Some(family) = store.families.get_mut(&family_match.key) {
+        if !family
+            .deleted
+            .iter()
+            .any(|entry| normalize_email_key(entry) == normalized_email)
+        {
+            family.deleted.push(normalized_email.clone());
+            family.deleted.sort();
+            family.deleted.dedup();
+            dirty = true;
+        }
+    }
+    if dirty {
+        save_credential_store(&store)?;
+    }
+    Ok(dirty)
 }
 
 pub(crate) fn extract_email_domain(email: &str) -> Option<String> {
@@ -5760,6 +5889,7 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: None,
+            deleted: Vec::new(),
         };
 
         let next_suffix = compute_fresh_account_family_suffix(
@@ -5788,6 +5918,7 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: None,
+            deleted: Vec::new(),
         };
 
         let next_suffix = compute_fresh_account_family_suffix(
@@ -5802,6 +5933,40 @@ input:
         .expect("next suffix");
 
         assert_eq!(next_suffix, 2);
+    }
+
+    #[test]
+    fn collect_known_account_emails_includes_family_deleted_entries() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::dev.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.{n}@astronlab.com".to_string(),
+                next_suffix: 10,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-13T05:00:00.000Z".to_string(),
+                last_created_email: Some("dev.9@astronlab.com".to_string()),
+                deleted: vec!["dev.2@astronlab.com".to_string()],
+            },
+        );
+
+        let next_suffix = compute_fresh_account_family_suffix(
+            store.families.get("dev-1::dev.{n}@astronlab.com"),
+            "dev.{n}@astronlab.com",
+            collect_known_account_emails(
+                &Pool {
+                    active_index: 0,
+                    accounts: vec![make_account_entry("dev.1@astronlab.com", "acct-1")],
+                },
+                &store,
+            ),
+            Vec::new(),
+        )
+        .expect("next suffix");
+
+        assert_eq!(next_suffix, 3);
     }
 
     #[test]
@@ -5830,6 +5995,7 @@ input:
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-13T05:00:00.000Z".to_string(),
                 last_created_email: None,
+                deleted: Vec::new(),
             },
         );
 
@@ -6081,15 +6247,21 @@ end
     #[test]
     fn resolve_create_base_email_prefers_requested_then_discovered_then_default() {
         assert_eq!(
-            resolve_create_base_email(Some("other@gmail.com"), Some("dev.user@gmail.com")).unwrap(),
+            resolve_create_base_email(
+                Some("other@gmail.com"),
+                Some("dev.user@gmail.com"),
+                "dev.{n}@astronlab.com",
+            )
+            .unwrap(),
             "other@gmail.com"
         );
         assert_eq!(
-            resolve_create_base_email(None, Some("Dev.User+4@gmail.com")).unwrap(),
+            resolve_create_base_email(None, Some("Dev.User+4@gmail.com"), "dev.{n}@astronlab.com",)
+                .unwrap(),
             "dev.user@gmail.com"
         );
         assert_eq!(
-            resolve_create_base_email(None, None).unwrap(),
+            resolve_create_base_email(None, None, "dev.{n}@astronlab.com").unwrap(),
             "dev.{n}@astronlab.com"
         );
     }
@@ -6225,9 +6397,9 @@ end
     }
 
     #[test]
-    fn normalize_credential_store_sets_v5_default_create_family() {
+    fn normalize_credential_store_sets_v7_default_create_family() {
         let store = normalize_credential_store(json!({}));
-        assert_eq!(store.version, 5);
+        assert_eq!(store.version, 7);
         assert_eq!(store.default_create_base_email, "dev.{n}@astronlab.com");
     }
 
@@ -6236,7 +6408,8 @@ end
         let store = normalize_credential_store(json!({
             "domain": {
                 "AstronLab.com": {
-                    "rotation_enabled": false
+                    "rotation_enabled": false,
+                    "max_suffix_per_family": 6
                 }
             }
         }));
@@ -6244,7 +6417,8 @@ end
         assert_eq!(
             store.domain.get("astronlab.com"),
             Some(&DomainConfig {
-                rotation_enabled: false
+                rotation_enabled: false,
+                max_suffix_per_family: Some(6),
             })
         );
         assert!(!is_rotation_enabled_for_email_in_store(
@@ -6265,6 +6439,7 @@ end
                 "astronlab.com".to_string(),
                 DomainConfig {
                     rotation_enabled: false,
+                    max_suffix_per_family: Some(6),
                 },
             );
 
@@ -6274,6 +6449,10 @@ end
             assert_eq!(
                 saved["domain"]["astronlab.com"]["rotation_enabled"],
                 Value::Bool(false)
+            );
+            assert_eq!(
+                saved["domain"]["astronlab.com"]["max_suffix_per_family"],
+                Value::from(6)
             );
         });
     }
@@ -6312,6 +6491,34 @@ end
                 .get("dev-1::dev.{n}@astronlab.com")
                 .map(|family| family.max_skipped_slots),
             Some(DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY)
+        );
+    }
+
+    #[test]
+    fn normalize_credential_store_reads_family_deleted_emails() {
+        let store = normalize_credential_store(json!({
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "base_email": "dev.{n}@astronlab.com",
+                    "next_suffix": 23,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z",
+                    "last_created_email": "dev.22@astronlab.com",
+                    "deleted": ["DEV.2@astronlab.com", "dev.3@astronlab.com"]
+                }
+            }
+        }));
+
+        assert_eq!(
+            store
+                .families
+                .get("dev-1::dev.{n}@astronlab.com")
+                .map(|family| family.deleted.clone()),
+            Some(vec![
+                "dev.2@astronlab.com".to_string(),
+                "dev.3@astronlab.com".to_string()
+            ])
         );
     }
 
@@ -6453,6 +6660,7 @@ end
                 created_at: "2026-04-06T16:00:00.000Z".to_string(),
                 updated_at: "2026-04-06T16:00:00.000Z".to_string(),
                 last_created_email: Some("qa.299@astronlab.com".to_string()),
+                deleted: Vec::new(),
             },
         );
         store.pending.insert(
@@ -6542,6 +6750,95 @@ end
     }
 
     #[test]
+    fn resolve_create_base_email_for_profile_prefers_existing_family_hint_before_default() {
+        let mut store = CredentialStore::default();
+        store.default_create_base_email = "dev.{n}@astronlab.com".to_string();
+        store.domain.insert(
+            "astronlab.com".to_string(),
+            DomainConfig {
+                rotation_enabled: false,
+                max_suffix_per_family: None,
+            },
+        );
+        store.domain.insert(
+            "gmail.com".to_string(),
+            DomainConfig {
+                rotation_enabled: true,
+                max_suffix_per_family: Some(6),
+            },
+        );
+        store.families.insert(
+            "dev-1::dev3astronlab+{n}@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+                next_suffix: 3,
+                max_skipped_slots: 0,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-14T06:11:25.913Z".to_string(),
+                last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
+                deleted: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            resolve_create_base_email_for_profile(&store, "dev-1", None, None).unwrap(),
+            "dev3astronlab+{n}@gmail.com"
+        );
+    }
+
+    #[test]
+    fn resolve_create_base_email_for_profile_ignores_disabled_family_hints() {
+        let mut store = CredentialStore::default();
+        store.default_create_base_email = "dev.{n}@astronlab.com".to_string();
+        store.domain.insert(
+            "astronlab.com".to_string(),
+            DomainConfig {
+                rotation_enabled: false,
+                max_suffix_per_family: None,
+            },
+        );
+        store.domain.insert(
+            "gmail.com".to_string(),
+            DomainConfig {
+                rotation_enabled: true,
+                max_suffix_per_family: Some(6),
+            },
+        );
+        store.families.insert(
+            "dev-1::dev.{n}@astronlab.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.{n}@astronlab.com".to_string(),
+                next_suffix: 107,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-14T06:11:25.913Z".to_string(),
+                last_created_email: Some("dev.106@astronlab.com".to_string()),
+                deleted: Vec::new(),
+            },
+        );
+        store.families.insert(
+            "dev-1::dev3astronlab+{n}@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+                next_suffix: 3,
+                max_skipped_slots: 0,
+                created_at: "2026-04-13T05:00:00.000Z".to_string(),
+                updated_at: "2026-04-14T06:11:25.913Z".to_string(),
+                last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
+                deleted: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            resolve_create_base_email_for_profile(&store, "dev-1", None, None).unwrap(),
+            "dev3astronlab+{n}@gmail.com"
+        );
+    }
+
+    #[test]
     fn resolve_create_base_email_for_profile_respects_explicit_override() {
         let mut store = CredentialStore::default();
         store.pending.insert(
@@ -6574,6 +6871,7 @@ end
             "astronlab.com".to_string(),
             DomainConfig {
                 rotation_enabled: false,
+                max_suffix_per_family: None,
             },
         );
 
@@ -6583,6 +6881,25 @@ end
         assert!(error
             .to_string()
             .contains("Rotation is disabled for astronlab.com accounts"));
+    }
+
+    #[test]
+    fn create_base_email_guard_blocks_suffix_beyond_domain_limit() {
+        let mut store = CredentialStore::default();
+        store.domain.insert(
+            "gmail.com".to_string(),
+            DomainConfig {
+                rotation_enabled: true,
+                max_suffix_per_family: Some(6),
+            },
+        );
+
+        ensure_suffix_within_domain_limit_in_store(&store, "dev3astronlab+{n}@gmail.com", 6)
+            .expect("suffix 6 should be allowed");
+        let error =
+            ensure_suffix_within_domain_limit_in_store(&store, "dev3astronlab+{n}@gmail.com", 7)
+                .unwrap_err();
+        assert!(error.to_string().contains("stops at suffix 6"));
     }
 
     #[test]
@@ -6607,6 +6924,7 @@ end
                     "astronlab.com".to_string(),
                     DomainConfig {
                         rotation_enabled: false,
+                        max_suffix_per_family: None,
                     },
                 );
                 save_credential_store(&store)?;
@@ -6986,6 +7304,7 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
+                deleted: Vec::new(),
             },
         );
         store.families.insert(
@@ -6998,6 +7317,7 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+2@gmail.com".to_string()),
+                deleted: Vec::new(),
             },
         );
 
@@ -7020,6 +7340,7 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
+                deleted: Vec::new(),
             },
         );
         store.families.insert(
@@ -7032,6 +7353,7 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+4@gmail.com".to_string()),
+                deleted: Vec::new(),
             },
         );
 

@@ -23,7 +23,7 @@ use crate::state::{load_rotate_state_json, write_rotate_state_json};
 use crate::workflow::{
     cmd_create, cmd_create_with_progress, create_next_fallback_options, extract_email_domain,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
-    reconcile_added_account_credential_state,
+    reconcile_added_account_credential_state, record_deleted_account,
 };
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -1159,6 +1159,7 @@ pub fn cmd_remove(selector: &str) -> Result<String> {
     let mut pool = load_pool()?;
     let selection = resolve_account_selector(&pool, selector)?;
     let removed = pool.accounts.remove(selection.index);
+    record_deleted_account(&removed.email)?;
     if pool.accounts.is_empty() || pool.active_index >= pool.accounts.len() {
         pool.active_index = 0;
     }
