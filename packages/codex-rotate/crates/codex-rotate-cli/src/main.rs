@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -24,12 +25,12 @@ use codex_rotate_refresh::stop_running_trays;
 use codex_rotate_refresh::{
     clear_tray_service_registration, detect_local_build, launch_tray_process,
     preferred_release_binary, rebuild_local_binary, resolve_rebuilt_local_binary,
-    sources_newer_than_binary, tray_service_pid, TargetKind,
+    sources_newer_than_binary, stop_running_daemons, tray_service_pid, TargetKind,
 };
 use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
 use codex_rotate_runtime::ipc::{
-    daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
-    SnapshotMessageKind, StatusSnapshot,
+    daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
+    ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
 };
 use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
@@ -37,6 +38,7 @@ use managed_login::{run_managed_browser_wrapper, run_managed_login};
 const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -412,12 +414,13 @@ fn tray_quit_message() -> Result<String> {
     set_tray_enabled(false)?;
     let daemon_was_running = daemon_is_reachable();
     if daemon_was_running {
-        let _ = invoke(InvokeAction::Shutdown);
+        request_daemon_shutdown(DAEMON_SHUTDOWN_TIMEOUT);
     }
     #[cfg(target_os = "macos")]
     {
         if !tray_is_running_with_path(&tray_binary)? {
             clear_tray_service_registration();
+            stop_daemon_if_still_running()?;
             return Ok(if daemon_was_running {
                 "Stopped Codex Rotate daemon.".to_string()
             } else {
@@ -426,6 +429,7 @@ fn tray_quit_message() -> Result<String> {
         }
         clear_tray_service_registration();
         if wait_for_tray_state(&tray_binary, false) {
+            stop_daemon_if_still_running()?;
             return Ok(if daemon_was_running {
                 "Stopped Codex Rotate tray and daemon.".to_string()
             } else {
@@ -442,6 +446,7 @@ fn tray_quit_message() -> Result<String> {
         let process_ids = list_running_tray_process_ids(&tray_binary)?;
         if process_ids.is_empty() {
             clear_tray_service_registration();
+            stop_daemon_if_still_running()?;
             return Ok(if daemon_was_running {
                 "Stopped Codex Rotate daemon.".to_string()
             } else {
@@ -456,6 +461,7 @@ fn tray_quit_message() -> Result<String> {
         clear_tray_service_registration();
 
         if wait_for_tray_state(&tray_binary, false) {
+            stop_daemon_if_still_running()?;
             return Ok(if daemon_was_running {
                 "Stopped Codex Rotate tray and daemon.".to_string()
             } else {
@@ -467,6 +473,54 @@ fn tray_quit_message() -> Result<String> {
             "Timed out waiting for the Codex Rotate tray to stop."
         ))
     }
+}
+
+fn run_with_timeout<F, T>(timeout: Duration, operation: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(operation());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => Some(result),
+        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn request_daemon_shutdown(timeout: Duration) -> bool {
+    matches!(
+        run_with_timeout(timeout, || invoke(InvokeAction::Shutdown)),
+        Some(Ok(_))
+    )
+}
+
+fn stop_daemon_if_still_running() -> Result<()> {
+    if !daemon_is_reachable() {
+        return Ok(());
+    }
+
+    let current_binary =
+        env::current_exe().context("Failed to resolve the codex-rotate CLI binary.")?;
+    let daemon_socket = daemon_socket_path().context("Failed to resolve daemon socket path.")?;
+    stop_running_daemons(&current_binary, &daemon_socket)?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !daemon_is_reachable() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if daemon_is_reachable() {
+        return Err(anyhow!(
+            "Timed out waiting for the Codex Rotate daemon to stop."
+        ));
+    }
+    Ok(())
 }
 
 fn tray_is_running() -> Result<bool> {
@@ -515,22 +569,21 @@ fn launch_tray_binary(tray_binary: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn wait_for_stable_tray_after_open(tray_binary: &Path) -> Result<()> {
-    let Some(build) = detect_local_build(tray_binary, TargetKind::Tray) else {
-        return Ok(());
-    };
-    let Some(release_binary) = preferred_release_binary(&build)? else {
-        return Ok(());
-    };
+    let expected_binaries = stable_tray_binary_candidates(tray_binary)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if tray_service_matches_binary(&release_binary)? {
+        if tray_service_matches_any_binary(&expected_binaries)? {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
     Err(anyhow!(
-        "Timed out waiting for Codex Rotate tray to settle on {}.",
-        release_binary.display()
+        "Timed out waiting for Codex Rotate tray to settle on one of: {}.",
+        expected_binaries
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -551,7 +604,7 @@ fn wait_for_tray_state(tray_binary: &Path, running: bool) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn tray_service_matches_binary(expected_binary: &Path) -> Result<bool> {
+fn tray_service_matches_any_binary(expected_binaries: &[PathBuf]) -> Result<bool> {
     let Some(process_id) = tray_service_pid()? else {
         return Ok(false);
     };
@@ -562,7 +615,36 @@ fn tray_service_matches_binary(expected_binary: &Path) -> Result<bool> {
         return Ok(false);
     }
     let command = String::from_utf8_lossy(&output.stdout);
-    Ok(command_matches_binary(&command, expected_binary))
+    Ok(expected_binaries
+        .iter()
+        .any(|expected_binary| service_command_matches_binary(&command, expected_binary)))
+}
+
+#[cfg(target_os = "macos")]
+fn stable_tray_binary_candidates(tray_binary: &Path) -> Result<Vec<PathBuf>> {
+    let mut candidates = vec![tray_binary.to_path_buf()];
+    let Some(build) = detect_local_build(tray_binary, TargetKind::Tray) else {
+        return Ok(candidates);
+    };
+    let Some(release_binary) = preferred_release_binary(&build)? else {
+        return Ok(candidates);
+    };
+    if !candidates.contains(&release_binary) {
+        candidates.push(release_binary);
+    }
+    Ok(candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn service_command_matches_binary(command: &str, binary: &Path) -> bool {
+    if command_matches_binary(command, binary) {
+        return true;
+    }
+    let mut parts = command.split_whitespace();
+    let first = parts.next();
+    let second = parts.next();
+    let binary = binary.display().to_string();
+    shell_like_command(first) && second == Some(binary.as_str())
 }
 
 fn command_matches_binary(command: &str, binary: &Path) -> bool {
@@ -681,7 +763,6 @@ fn command_tokens_match_binary(first: Option<&str>, second: Option<&str>, binary
     first == Some(binary) || (shell_like_command(first) && second == Some(binary))
 }
 
-#[cfg(not(target_os = "macos"))]
 fn shell_like_command(command: Option<&str>) -> bool {
     let Some(command) = command else {
         return false;
@@ -1279,6 +1360,15 @@ mod tests {
     }
 
     #[test]
+    fn run_with_timeout_returns_none_when_operation_blocks_past_deadline() {
+        let result = run_with_timeout(Duration::from_millis(10), || {
+            thread::sleep(Duration::from_millis(50));
+            7
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn create_parser_preserves_flags_and_alias() {
         let options = parse_internal_create_options(&[
             "bench".to_string(),
@@ -1370,6 +1460,98 @@ mod tests {
             binary
         ));
         assert!(!command_matches_binary("/tmp/other-tray", binary));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stable_tray_binary_candidates_accepts_debug_binary_while_release_is_current() {
+        let repo_root = unique_temp_dir("codex-rotate-stable-tray");
+        let debug_binary = repo_root
+            .join("target")
+            .join("debug")
+            .join("codex-rotate-tray");
+        let release_binary = repo_root
+            .join("target")
+            .join("release")
+            .join("codex-rotate-tray");
+
+        fs::create_dir_all(debug_binary.parent().expect("debug parent")).expect("debug dir");
+        fs::create_dir_all(release_binary.parent().expect("release parent")).expect("release dir");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate-app")
+                .join("src-tauri")
+                .join("src"),
+        )
+        .expect("tray src dir");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-core")
+                .join("src"),
+        )
+        .expect("core src dir");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-runtime")
+                .join("src"),
+        )
+        .expect("runtime src dir");
+        fs::write(repo_root.join("Cargo.toml"), "").expect("root cargo");
+        fs::write(repo_root.join("Cargo.lock"), "").expect("root lock");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate-app")
+                .join("src-tauri")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("tray cargo");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-core")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("core cargo");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-runtime")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("runtime cargo");
+        fs::write(&debug_binary, "").expect("debug binary");
+        fs::write(&release_binary, "").expect("release binary");
+
+        let candidates = stable_tray_binary_candidates(&debug_binary).expect("stable candidates");
+        assert_eq!(candidates[0], debug_binary);
+        assert!(candidates.contains(&release_binary));
+
+        fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_command_matches_binary_accepts_shell_wrapped_scripts() {
+        let binary = Path::new("/tmp/codex-rotate-tray");
+        assert!(service_command_matches_binary(
+            "/bin/sh /tmp/codex-rotate-tray",
+            binary
+        ));
     }
 
     #[test]
