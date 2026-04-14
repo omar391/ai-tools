@@ -1397,6 +1397,16 @@ pub(crate) fn sync_pool_active_account_from_codex(
     sync_pool_active_account_from_auth(pool, current_auth)
 }
 
+pub fn sync_pool_active_account_from_current_auth() -> Result<bool> {
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let changed = sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    if changed {
+        save_pool(&pool)?;
+    }
+    Ok(changed)
+}
+
 fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) -> Result<bool> {
     let current_account_id = extract_account_id_from_auth(&current_auth);
     let current_email = extract_email_from_auth(&current_auth);
@@ -3016,6 +3026,53 @@ mod tests {
         assert!(!changed);
         assert_eq!(pool.accounts.len(), 1);
         assert_eq!(pool.active_index, 0);
+    }
+
+    #[test]
+    fn sync_pool_active_account_from_current_auth_persists_missing_auth_into_pool() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            if let Some(parent) = paths.codex_auth_file.parent() {
+                std::fs::create_dir_all(parent).expect("create auth parent");
+            }
+            write_codex_auth(
+                &paths.codex_auth_file,
+                &make_auth("dev.36@astronlab.com", "acct-36", "free"),
+            )?;
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![stored_entry(Some(true), None)],
+            })?;
+
+            let changed = sync_pool_active_account_from_current_auth()?;
+            let pool = load_pool()?;
+
+            assert!(changed);
+            assert_eq!(pool.accounts.len(), 2);
+            assert_eq!(pool.active_index, 1);
+            assert_eq!(pool.accounts[1].email, "dev.36@astronlab.com");
+            assert_eq!(pool.accounts[1].account_id, "acct-36");
+            assert_eq!(pool.accounts[1].label, "dev.36@astronlab.com_free");
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("current auth sync should persist the missing pool entry");
     }
 
     #[test]

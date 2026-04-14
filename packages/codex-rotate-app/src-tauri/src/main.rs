@@ -1,6 +1,7 @@
 use codex_rotate_refresh::clear_tray_service_registration;
 use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
+use codex_rotate_runtime::watch::set_tray_enabled;
 use codex_rotate_tray::{
     error_snapshot, rendered_snapshot, spawn_subscription_loop_controlled,
     spawn_tray_refresh_loop_controlled, SharedRenderState,
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Manager,
 };
@@ -332,6 +333,7 @@ struct MenuHandles {
     quota_item: MenuItem<tauri::Wry>,
     status_item: MenuItem<tauri::Wry>,
     last_rotation_item: MenuItem<tauri::Wry>,
+    auto_create_item: CheckMenuItem<tauri::Wry>,
     launch_item: MenuItem<tauri::Wry>,
     check_item: MenuItem<tauri::Wry>,
     rotate_item: MenuItem<tauri::Wry>,
@@ -356,6 +358,9 @@ fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
         let _ = menu
             .last_rotation_item
             .set_text(rendered.rotation_text.clone());
+        let _ = menu
+            .auto_create_item
+            .set_checked(rendered.auto_create_enabled);
         let _ = menu.launch_item.set_enabled(rendered.launch_enabled);
         let _ = menu.check_item.set_enabled(rendered.check_enabled);
         let _ = menu.rotate_item.set_enabled(rendered.rotate_enabled);
@@ -386,6 +391,19 @@ fn spawn_invoke(app: AppHandle, action: InvokeAction) {
     });
 }
 
+fn toggled_checked_state(current: bool) -> bool {
+    !current
+}
+
+fn next_auto_create_enabled(app: &AppHandle) -> bool {
+    toggled_checked_state(
+        app.state::<MenuHandles>()
+        .auto_create_item
+        .is_checked()
+        .unwrap_or(true),
+    )
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -413,6 +431,14 @@ fn main() {
                 false,
                 None::<&str>,
             )?;
+            let auto_create_item = CheckMenuItem::with_id(
+                app,
+                "auto_create",
+                "Auto Create",
+                true,
+                true,
+                None::<&str>,
+            )?;
             let launch_item =
                 MenuItem::with_id(app, "launch", "Open Managed Codex", true, None::<&str>)?;
             let check_item = MenuItem::with_id(app, "check", "Check Now", true, None::<&str>)?;
@@ -425,6 +451,7 @@ fn main() {
                 quota_item: quota_item.clone(),
                 status_item: status_item.clone(),
                 last_rotation_item: last_rotation_item.clone(),
+                auto_create_item: auto_create_item.clone(),
                 launch_item: launch_item.clone(),
                 check_item: check_item.clone(),
                 rotate_item: rotate_item.clone(),
@@ -438,6 +465,7 @@ fn main() {
                     &quota_item,
                     &status_item,
                     &last_rotation_item,
+                    &auto_create_item,
                     &inventory_item,
                     &launch_item,
                     &check_item,
@@ -457,7 +485,20 @@ fn main() {
                         "launch" => spawn_invoke(app.clone(), InvokeAction::OpenManaged),
                         "check" => spawn_invoke(app.clone(), InvokeAction::Refresh),
                         "rotate" => spawn_invoke(app.clone(), InvokeAction::Next),
+                        "auto_create" => {
+                            let enabled = next_auto_create_enabled(&app);
+                            let _ = app
+                                .state::<MenuHandles>()
+                                .auto_create_item
+                                .set_checked(enabled);
+                            spawn_invoke(
+                                app.clone(),
+                                InvokeAction::SetAutoCreateEnabled { enabled },
+                            );
+                        }
                         "quit" => {
+                            let _ = set_tray_enabled(false);
+                            let _ = invoke(InvokeAction::Shutdown);
                             clear_tray_service_registration();
                             app_handle.exit(0);
                         }
@@ -500,6 +541,17 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run codex rotate tray");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toggled_checked_state;
+
+    #[test]
+    fn toggled_checked_state_inverts_the_current_menu_value() {
+        assert!(toggled_checked_state(false));
+        assert!(!toggled_checked_state(true));
+    }
 }
 
 #[cfg(test)]

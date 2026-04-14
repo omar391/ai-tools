@@ -31,6 +31,7 @@ use codex_rotate_runtime::ipc::{
     daemon_is_reachable, invoke, subscribe, CreateInvocation, InvokeAction, ReloginInvocation,
     SnapshotMessageKind, StatusSnapshot,
 };
+use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
 
 const BOLD: &str = "\x1b[1m";
@@ -136,9 +137,6 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
     }
 
     let action = match command {
-        Some("add") => Some(InvokeAction::Add {
-            alias: parse_add_alias(args)?,
-        }),
         Some("create") => Some(InvokeAction::Create {
             options: parse_public_create_invocation(args)?,
         }),
@@ -150,8 +148,8 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("remove") => Some(InvokeAction::Remove {
             selector: parse_remove_selector(args)?.to_string(),
         }),
-        Some("list") | Some("status") | Some("daemon") | Some("tray") | None | Some("help")
-        | Some("--help") | Some("-h") => None,
+        Some("add") | Some("list") | Some("status") | Some("daemon") | Some("tray") | None
+        | Some("help") | Some("--help") | Some("-h") => None,
         Some(_) => None,
     };
 
@@ -381,6 +379,7 @@ fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
 
 fn tray_open_message() -> Result<String> {
     let tray_binary = resolve_tray_binary()?;
+    set_tray_enabled(true)?;
     refresh_local_tray_if_needed(&tray_binary)?;
     if tray_is_running_with_path(&tray_binary)? {
         if daemon_is_reachable() {
@@ -410,15 +409,28 @@ fn tray_open_message() -> Result<String> {
 
 fn tray_quit_message() -> Result<String> {
     let tray_binary = resolve_tray_binary()?;
+    set_tray_enabled(false)?;
+    let daemon_was_running = daemon_is_reachable();
+    if daemon_was_running {
+        let _ = invoke(InvokeAction::Shutdown);
+    }
     #[cfg(target_os = "macos")]
     {
         if !tray_is_running_with_path(&tray_binary)? {
             clear_tray_service_registration();
-            return Ok("Codex Rotate tray is not running.".to_string());
+            return Ok(if daemon_was_running {
+                "Stopped Codex Rotate daemon.".to_string()
+            } else {
+                "Codex Rotate tray is not running.".to_string()
+            });
         }
         clear_tray_service_registration();
         if wait_for_tray_state(&tray_binary, false) {
-            return Ok("Stopped Codex Rotate tray.".to_string());
+            return Ok(if daemon_was_running {
+                "Stopped Codex Rotate tray and daemon.".to_string()
+            } else {
+                "Stopped Codex Rotate tray.".to_string()
+            });
         }
         return Err(anyhow!(
             "Timed out waiting for the Codex Rotate tray to stop."
@@ -430,7 +442,11 @@ fn tray_quit_message() -> Result<String> {
         let process_ids = list_running_tray_process_ids(&tray_binary)?;
         if process_ids.is_empty() {
             clear_tray_service_registration();
-            return Ok("Codex Rotate tray is not running.".to_string());
+            return Ok(if daemon_was_running {
+                "Stopped Codex Rotate daemon.".to_string()
+            } else {
+                "Codex Rotate tray is not running.".to_string()
+            });
         }
 
         for process_id in process_ids {
@@ -440,7 +456,11 @@ fn tray_quit_message() -> Result<String> {
         clear_tray_service_registration();
 
         if wait_for_tray_state(&tray_binary, false) {
-            return Ok("Stopped Codex Rotate tray.".to_string());
+            return Ok(if daemon_was_running {
+                "Stopped Codex Rotate tray and daemon.".to_string()
+            } else {
+                "Stopped Codex Rotate tray.".to_string()
+            });
         }
 
         Err(anyhow!(
@@ -1512,6 +1532,7 @@ mod tests {
                     String::from_utf8(output).expect("utf8").trim(),
                     "Started Codex Rotate tray."
                 );
+                assert!(codex_rotate_runtime::watch::tray_enabled()?);
 
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while Instant::now() < deadline && !started_path.exists() {
@@ -1532,6 +1553,7 @@ mod tests {
                     String::from_utf8(output).expect("utf8").trim(),
                     "Stopped Codex Rotate tray."
                 );
+                assert!(!codex_rotate_runtime::watch::tray_enabled()?);
 
                 let error = run_tray_command(&mut Vec::new(), &["status".to_string()])
                     .expect_err("tray should be stopped");
@@ -1597,13 +1619,6 @@ mod tests {
     #[test]
     fn proxy_dispatch_covers_supported_cli_commands() {
         let cases = vec![
-            (
-                Some("add"),
-                vec!["bench".to_string()],
-                InvokeAction::Add {
-                    alias: Some("bench".to_string()),
-                },
-            ),
             (
                 Some("create"),
                 vec![
@@ -1686,8 +1701,10 @@ mod tests {
             let handle = spawn_reachable_daemon();
             let list_output = try_run_via_daemon(Some("list"), &[])?;
             let status_output = try_run_via_daemon(Some("status"), &[])?;
+            let add_output = try_run_via_daemon(Some("add"), &["bench".to_string()])?;
             assert!(list_output.is_none());
             assert!(status_output.is_none());
+            assert!(add_output.is_none());
             handle.join().expect("reachable daemon thread")?;
             Ok(())
         })

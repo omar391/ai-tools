@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_paths;
 
+fn default_enabled_flag() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RuntimeCapabilities {
@@ -62,6 +66,8 @@ pub struct StatusSnapshot {
     pub last_message: Option<String>,
     pub last_message_kind: Option<SnapshotMessageKind>,
     pub next_tick_at: Option<String>,
+    #[serde(default = "default_enabled_flag")]
+    pub auto_create_enabled: bool,
     pub capabilities: RuntimeCapabilities,
 }
 
@@ -92,6 +98,8 @@ pub enum InvokeAction {
     Status,
     List,
     Add { alias: Option<String> },
+    SetAutoCreateEnabled { enabled: bool },
+    Shutdown,
     Next,
     Prev,
     Create { options: CreateInvocation },

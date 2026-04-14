@@ -52,6 +52,18 @@ pub struct WatchState {
     pub thread_recovery_pending_events: Vec<ThreadRecoveryEvent>,
     pub thread_recovery_backfill_complete: bool,
     pub quota: Option<CachedQuotaState>,
+    #[serde(default = "default_auto_create_enabled")]
+    pub auto_create_enabled: bool,
+    #[serde(default = "default_tray_enabled")]
+    pub tray_enabled: bool,
+}
+
+fn default_auto_create_enabled() -> bool {
+    true
+}
+
+fn default_tray_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +134,26 @@ pub fn write_watch_state(state: &WatchState) -> Result<()> {
     write_file_atomically(&paths.watch_state_file, &raw)
 }
 
+pub fn auto_create_enabled() -> Result<bool> {
+    Ok(read_watch_state()?.auto_create_enabled)
+}
+
+pub fn set_auto_create_enabled(enabled: bool) -> Result<()> {
+    let mut state = read_watch_state()?;
+    state.auto_create_enabled = enabled;
+    write_watch_state(&state)
+}
+
+pub fn tray_enabled() -> Result<bool> {
+    Ok(read_watch_state()?.tray_enabled)
+}
+
+pub fn set_tray_enabled(enabled: bool) -> Result<()> {
+    let mut state = read_watch_state()?;
+    state.tray_enabled = enabled;
+    write_watch_state(&state)
+}
+
 pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterationResult> {
     let port = options.port.unwrap_or(9333);
     let cooldown_ms = options.cooldown_ms.unwrap_or(DEFAULT_COOLDOWN_MS);
@@ -149,6 +181,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id,
         previous_state.quota.as_ref(),
         options.force_quota_refresh,
+        previous_state.auto_create_enabled,
     )?;
     if signal_log_cursor_reset && decision.signals.is_empty() {
         decision.last_signal_id = latest_codex_signal_id;
@@ -264,6 +297,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         thread_recovery_pending_events: previous_state.thread_recovery_pending_events.clone(),
         thread_recovery_backfill_complete: previous_state.thread_recovery_backfill_complete,
         quota: quota_cache,
+        auto_create_enabled: previous_state.auto_create_enabled,
+        tray_enabled: previous_state.tray_enabled,
     };
     if should_run_thread_recovery(
         &previous_state,
@@ -532,6 +567,7 @@ fn decide_rotation(
     after_signal_id: Option<i64>,
     previous_cache: Option<&CachedQuotaState>,
     force_quota_refresh: bool,
+    auto_create_enabled: bool,
 ) -> Result<(RotationDecision, Option<CachedQuotaState>)> {
     let paths = resolve_paths()?;
     let signals = read_codex_signals(&paths.codex_logs_db_file, after_signal_id, 50)?;
@@ -571,7 +607,12 @@ fn decide_rotation(
         .unwrap_or(false)
         && other_usable_account_exists()?;
 
-    let plan = plan_rotation(assessment.as_ref(), &signals, has_usable_other_account);
+    let plan = plan_rotation(
+        assessment.as_ref(),
+        &signals,
+        has_usable_other_account,
+        auto_create_enabled,
+    );
     Ok((
         RotationDecision {
             last_signal_id,
@@ -614,6 +655,7 @@ fn plan_rotation(
     assessment: Option<&DecisionQuotaAssessment>,
     signals: &[CodexLogSignal],
     has_usable_other_account: bool,
+    auto_create_enabled: bool,
 ) -> (bool, Option<String>, Option<RotationCommand>, Vec<String>) {
     let Some(assessment) = assessment else {
         return (
@@ -643,6 +685,14 @@ fn plan_rotation(
         .unwrap_or(false)
     {
         let percent = assessment.primary_quota_left_percent.unwrap();
+        if !auto_create_enabled {
+            return (
+                false,
+                Some(format!("quota low: {percent}% left, auto create disabled")),
+                None,
+                Vec::new(),
+            );
+        }
         if has_usable_other_account {
             return (
                 false,
@@ -794,7 +844,7 @@ mod tests {
             blocker: None,
             primary_quota_left_percent: Some(20),
         };
-        let plan = plan_rotation(Some(&assessment), &[], false);
+        let plan = plan_rotation(Some(&assessment), &[], false, true);
         assert!(plan.0);
         assert_eq!(plan.2, Some(RotationCommand::Create));
         assert_eq!(plan.3, vec!["--ignore-current".to_string()]);
@@ -808,7 +858,7 @@ mod tests {
             blocker: Some("5h quota exhausted".to_string()),
             primary_quota_left_percent: Some(0),
         };
-        let plan = plan_rotation(Some(&assessment), &[], false);
+        let plan = plan_rotation(Some(&assessment), &[], false, true);
         assert!(plan.0);
         assert_eq!(plan.2, Some(RotationCommand::Next));
     }
@@ -821,9 +871,26 @@ mod tests {
             blocker: None,
             primary_quota_left_percent: Some(20),
         };
-        let plan = plan_rotation(Some(&assessment), &[], true);
+        let plan = plan_rotation(Some(&assessment), &[], true, true);
         assert!(!plan.0);
         assert_eq!(plan.2, None);
+    }
+
+    #[test]
+    fn plan_rotation_skips_create_when_auto_create_is_disabled() {
+        let assessment = DecisionQuotaAssessment {
+            summary: "5h 20% left".to_string(),
+            usable: true,
+            blocker: None,
+            primary_quota_left_percent: Some(20),
+        };
+        let plan = plan_rotation(Some(&assessment), &[], false, false);
+        assert!(!plan.0);
+        assert_eq!(plan.2, None);
+        assert_eq!(
+            plan.1.as_deref(),
+            Some("quota low: 20% left, auto create disabled")
+        );
     }
 
     #[test]

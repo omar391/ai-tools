@@ -21,7 +21,8 @@ use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
-    read_watch_state, refresh_quota_cache, run_watch_iteration, WatchIterationOptions, WatchState,
+    auto_create_enabled, read_watch_state, refresh_quota_cache, run_watch_iteration,
+    set_auto_create_enabled, tray_enabled, WatchIterationOptions, WatchState,
 };
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Utc};
@@ -29,7 +30,7 @@ use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::cancel;
 use codex_rotate_core::pool::{
     cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
-    rotate_next_internal_with_progress, NextResult,
+    rotate_next_internal_with_progress, sync_pool_active_account_from_current_auth, NextResult,
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
@@ -51,6 +52,7 @@ const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TRAY_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DAEMON_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_TAKEOVER_ARG: &str = "--takeover";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -83,6 +85,7 @@ struct SharedDaemon {
     snapshot_cache: Arc<Mutex<StatusSnapshot>>,
     subscribers: Arc<Mutex<Vec<Sender<StatusSnapshot>>>>,
     in_flight_invocations: Arc<AtomicUsize>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl SharedDaemon {
@@ -94,6 +97,7 @@ impl SharedDaemon {
             snapshot_cache: Arc::new(Mutex::new(snapshot)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             in_flight_invocations: Arc::new(AtomicUsize::new(0)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -181,6 +185,9 @@ pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
 
         let listener = UnixListener::bind(&paths.daemon_socket)
             .with_context(|| format!("Failed to bind {}.", paths.daemon_socket.display()))?;
+        listener
+            .set_nonblocking(true)
+            .context("Failed to configure daemon socket as nonblocking.")?;
         log_daemon_info(format!(
             "Daemon listening on {}.",
             paths.daemon_socket.display()
@@ -207,23 +214,31 @@ pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
         spawn_tray_supervisor_loop();
         spawn_watch_loop(daemon.clone());
 
-        for stream in listener.incoming() {
-            let daemon = daemon.clone();
-            match stream {
-                Ok(stream) => {
+        loop {
+            if daemon.shutdown_requested() {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let daemon = daemon.clone();
                     thread::spawn(move || {
                         if let Err(error) = handle_client(daemon, stream) {
                             log_daemon_error(format!("client handler failed: {error:#}"));
                         }
                     });
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(DAEMON_ACCEPT_POLL_INTERVAL);
+                }
                 Err(error) => {
                     let message = format!("daemon accept failed: {error}");
                     log_daemon_error(&message);
                     eprintln!("codex-rotate: {message}");
+                    thread::sleep(DAEMON_ACCEPT_POLL_INTERVAL);
                 }
             }
         }
+        log_daemon_info("Daemon shutdown requested; exiting.");
         Ok(())
     }
 
@@ -349,11 +364,18 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
 
 fn spawn_tray_supervisor_loop() {
     thread::spawn(move || loop {
-        match ensure_tray_process_registered() {
-            Ok(true) => log_daemon_info("Restored Codex Rotate tray launch agent."),
+        match tray_enabled() {
+            Ok(true) => match ensure_tray_process_registered() {
+                Ok(true) => log_daemon_info("Restored Codex Rotate tray launch agent."),
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!("tray supervision failed: {error}");
+                    log_daemon_error(&message);
+                }
+            },
             Ok(false) => {}
             Err(error) => {
-                let message = format!("tray supervision failed: {error}");
+                let message = format!("tray supervision state failed: {error}");
                 log_daemon_error(&message);
             }
         }
@@ -486,6 +508,14 @@ impl SharedDaemon {
     fn has_in_flight_invocations(&self) -> bool {
         self.in_flight_invocations.load(Ordering::SeqCst) > 0
     }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
 }
 
 struct InvocationGuard {
@@ -616,6 +646,31 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
                 first_line(&output),
             );
             Ok(output)
+        }),
+        InvokeAction::SetAutoCreateEnabled { enabled } => daemon.with_state_mut(|state| {
+            set_auto_create_enabled(enabled)?;
+            state.snapshot.auto_create_enabled = enabled;
+            let message = if enabled {
+                "Auto create enabled."
+            } else {
+                "Auto create disabled."
+            };
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Status,
+                message.to_string(),
+            );
+            Ok(message.to_string())
+        }),
+        InvokeAction::Shutdown => daemon.with_state_mut(|state| {
+            state.snapshot.next_tick_at = None;
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Status,
+                "Codex Rotate is shutting down.".to_string(),
+            );
+            daemon.request_shutdown();
+            Ok("Stopping Codex Rotate daemon.".to_string())
         }),
         InvokeAction::Next => {
             let progress_daemon = daemon.clone();
@@ -852,8 +907,10 @@ fn next_result_summary(result: &NextResult) -> Option<codex_rotate_core::auth::A
 }
 
 fn refresh_static_snapshot(state: &mut DaemonState) {
+    let _ = sync_pool_active_account_from_current_auth();
     refresh_inventory_count(&mut state.snapshot);
     refresh_auth_summary(&mut state.snapshot);
+    state.snapshot.auto_create_enabled = auto_create_enabled().unwrap_or(true);
 }
 
 fn hydrate_quota_cache_from_watch_state(state: &mut DaemonState) {

@@ -12,7 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use codex_rotate_runtime::ipc::{daemon_socket_path, subscribe, RuntimeCapabilities};
+use codex_rotate_runtime::ipc::{
+    daemon_socket_path, invoke, subscribe, InvokeAction, RuntimeCapabilities,
+};
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -718,6 +720,44 @@ fn sigterm_cancels_only_the_in_flight_daemon_create_request() -> Result<()> {
     let _guard = env_mutex().lock().expect("env mutex");
     let mut harness = DaemonCreateHarness::start("codex-rotate-cancel-term-e2e")?;
     harness.expect_cancel_on_signal("-TERM", 15)?;
+    Ok(())
+}
+
+#[test]
+fn shutdown_invoke_stops_the_daemon() -> Result<()> {
+    let _guard = env_mutex().lock().expect("env mutex");
+    let sandbox = unique_temp_dir("codex-rotate-daemon-shutdown");
+    let rotate_home = sandbox.join("rotate-home");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&rotate_home)?;
+    fs::create_dir_all(&codex_home)?;
+
+    let dummy_cdp = DummyCdpServer::start()?;
+    let _env = EnvGuard::set(&rotate_home, &codex_home, dummy_cdp.port);
+
+    let mut daemon = spawn_daemon(&rotate_home, &codex_home, dummy_cdp.port)?;
+    wait_for_socket(&mut daemon, Duration::from_secs(10))?;
+    assert!(daemon_socket_path()?.exists());
+
+    let output = invoke(InvokeAction::Shutdown)?;
+    assert_eq!(output.trim(), "Stopping Codex Rotate daemon.");
+
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(10))?;
+    assert!(
+        status.success(),
+        "daemon should exit cleanly, got {status:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && daemon_socket_path()?.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !daemon_socket_path()?.exists(),
+        "daemon socket should be removed after shutdown"
+    );
+
+    fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
 
