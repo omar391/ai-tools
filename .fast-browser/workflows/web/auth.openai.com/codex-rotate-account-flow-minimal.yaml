@@ -748,12 +748,16 @@ use:
                 continue;
               }
               const after = await waitForTransition("signup_email");
-              transitions.push({ ...performed, ...after });
-              if (allowedStages.has(after.stage) && after.stage !== "signup_email") {
+              const normalizedStage = after.stage === "auth_prompt"
+                && String(after.current_url || "").includes("/log-in/password")
+                  ? "signup_password"
+                  : after.stage;
+              transitions.push({ ...performed, ...after, normalized_stage: normalizedStage });
+              if (allowedStages.has(normalizedStage) && normalizedStage !== "signup_email") {
                 return {
                   ok: true,
                   strategy: performed.strategy,
-                  next_stage: after.stage,
+                  next_stage: normalizedStage,
                   current_url: after.current_url,
                   headline: after.headline,
                   transitions,
@@ -2535,7 +2539,7 @@ do:
       metadata:
         description: "Collect the signup OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -2599,7 +2603,7 @@ do:
       metadata:
         description: Delete the used signup OTP email from Gmail after the verification step succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
@@ -2851,7 +2855,7 @@ do:
       metadata:
         description: "Collect the replayed-login OTP from Gmail on the same managed profile."
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -3241,7 +3245,7 @@ do:
       metadata:
         description: Delete the used replayed-login OTP email from Gmail after the verification step succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
@@ -3318,7 +3322,7 @@ do:
       metadata:
         description: Re-collect the replayed-login OTP from Gmail once after the first submit fails.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -3344,7 +3348,7 @@ do:
       metadata:
         description: Re-collect the replayed-login OTP once more when Gmail still has not surfaced a usable replacement code.
         ref:
-          digest: sha256:7fa1a49e94894da811c64ecaf97d7760d365c4f449389d2e9b6ad4ce9bf31e1d
+          digest: sha256:5534954dc9bae7e3d670f3f175d1377f18dcec3fe53a6af7ee70c18f6d72ed34
       call: workflow.sys.web.mail-google-com.collect-verification-artifact
       with:
         version: 1.0.0
@@ -3779,7 +3783,7 @@ do:
       metadata:
         description: Delete the replacement replayed-login OTP email from Gmail after the retry succeeds.
         ref:
-          digest: sha256:47e7f883aaa00e6d2e2e09d58e940655c174c5276ed978ead6dfa62d0af9d096
+          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
       call: workflow.sys.web.mail-google-com.delete-verification-artifact
       with:
         version: 1.0.0
