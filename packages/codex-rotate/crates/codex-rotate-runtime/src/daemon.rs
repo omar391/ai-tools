@@ -3,6 +3,7 @@ use std::io::{BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -40,8 +41,9 @@ use codex_rotate_core::workflow::{
 use codex_rotate_refresh::{
     current_process_local_build, daemon_socket_is_older_than_binary,
     ensure_tray_process_registered, local_refresh_disabled, maybe_start_background_release_build,
-    preferred_release_binary, rebuild_local_binary, sources_newer_than_binary,
-    stop_other_local_daemons, supports_live_local_refresh, TargetKind, INSTANCE_HOME_ARG,
+    preferred_release_binary, rebuild_local_binary, schedule_tray_relaunch_process,
+    sources_newer_than_binary, stop_other_local_daemons, supports_live_local_refresh,
+    tray_service_pid, TargetKind, INSTANCE_HOME_ARG,
 };
 
 const DEFAULT_PORT: u16 = 9333;
@@ -365,14 +367,32 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
 fn spawn_tray_supervisor_loop() {
     thread::spawn(move || loop {
         match tray_enabled() {
-            Ok(true) => match ensure_tray_process_registered() {
-                Ok(true) => log_daemon_info("Restored Codex Rotate tray launch agent."),
-                Ok(false) => {}
-                Err(error) => {
-                    let message = format!("tray supervision failed: {error}");
-                    log_daemon_error(&message);
+            Ok(true) => {
+                let refreshed = match maybe_refresh_local_tray_process() {
+                    Ok(true) => {
+                        log_daemon_info("Refreshed Codex Rotate tray after local changes.");
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        let message = format!("tray refresh failed: {error}");
+                        log_daemon_error(&message);
+                        false
+                    }
+                };
+                if refreshed {
+                    thread::sleep(TRAY_SUPERVISOR_INTERVAL);
+                    continue;
                 }
-            },
+                match ensure_tray_process_registered() {
+                    Ok(true) => log_daemon_info("Restored Codex Rotate tray launch agent."),
+                    Ok(false) => {}
+                    Err(error) => {
+                        let message = format!("tray supervision failed: {error}");
+                        log_daemon_error(&message);
+                    }
+                }
+            }
             Ok(false) => {}
             Err(error) => {
                 let message = format!("tray supervision state failed: {error}");
@@ -381,6 +401,102 @@ fn spawn_tray_supervisor_loop() {
         }
         thread::sleep(TRAY_SUPERVISOR_INTERVAL);
     });
+}
+
+fn maybe_refresh_local_tray_process() -> Result<bool> {
+    if local_refresh_disabled() {
+        return Ok(false);
+    }
+    let Some(tray_binary) = resolve_tray_binary_for_supervisor() else {
+        return Ok(false);
+    };
+    let Some(build) = codex_rotate_refresh::detect_local_build(&tray_binary, TargetKind::Tray)
+    else {
+        return Ok(false);
+    };
+    if !supports_live_local_refresh(&build) {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    if tray_service_pid()?.is_some() {
+        return Ok(false);
+    }
+
+    let sources_newer_than_binary = sources_newer_than_binary(&build)?;
+    if sources_newer_than_binary {
+        log_daemon_info(format!(
+            "Local tray sources changed while tray was offline. Rebuilding {}.",
+            build.binary_path.display()
+        ));
+        rebuild_local_binary(&build)?;
+    }
+    if maybe_start_background_release_build(&build)? {
+        log_daemon_info("Queued background release build for codex-rotate-tray.");
+    }
+    if let Some(release_binary) = preferred_release_binary(&build)? {
+        log_daemon_info(format!(
+            "Promoting tray to release binary {} from daemon supervisor.",
+            release_binary.display()
+        ));
+        schedule_tray_relaunch_process(&release_binary)?;
+        return Ok(true);
+    }
+    if !sources_newer_than_binary {
+        return Ok(false);
+    }
+
+    log_daemon_info(format!(
+        "Relaunching tray with rebuilt binary {} from daemon supervisor.",
+        build.binary_path.display()
+    ));
+    schedule_tray_relaunch_process(&build.binary_path)?;
+    Ok(true)
+}
+
+fn resolve_tray_binary_for_supervisor() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_ROTATE_TRAY_BIN").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Some(cli_build) = current_process_local_build(TargetKind::Cli) {
+        let binary_name = tray_binary_name();
+        for candidate in [
+            cli_build
+                .repo_root
+                .join("target")
+                .join("release")
+                .join(binary_name),
+            cli_build
+                .repo_root
+                .join("target")
+                .join("debug")
+                .join(binary_name),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let current_exe = std::env::current_exe().ok()?;
+    let current_dir = current_exe.parent()?;
+    let sibling = current_dir.join(tray_binary_name());
+    sibling.is_file().then_some(sibling)
+}
+
+fn tray_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "codex-rotate-tray.exe"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "codex-rotate-tray"
+    }
 }
 
 #[cfg(unix)]
@@ -1306,6 +1422,28 @@ mod tests {
         let result = maybe_refresh_local_daemon_process(None, true).expect("refresh result");
 
         assert!(!result);
+    }
+
+    #[test]
+    fn tray_supervisor_uses_explicit_tray_binary_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_tray_bin = std::env::var_os("CODEX_ROTATE_TRAY_BIN");
+        let fake_tray = unique_temp_dir("codex-rotate-tray-binary");
+        fs::write(&fake_tray, "").expect("write fake tray");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_TRAY_BIN", &fake_tray);
+        }
+
+        let resolved = resolve_tray_binary_for_supervisor();
+
+        match previous_tray_bin {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_TRAY_BIN", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_TRAY_BIN") },
+        }
+        fs::remove_file(&fake_tray).ok();
+
+        assert_eq!(resolved.as_deref(), Some(fake_tray.as_path()));
     }
 
     #[test]

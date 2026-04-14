@@ -39,17 +39,21 @@ pub fn ensure_tray_process_registered() -> Result<bool> {
         }
 
         let label = tray_launchd_label();
-        if launchctl_service_is_registered(&label)? {
+        let registered = launchctl_service_is_registered(&label)?;
+        let running = tray_service_pid()?.is_some();
+        if !registered_tray_service_requires_restart(registered, running) {
             return Ok(false);
         }
 
-        bootstrap_tray_launch_agent_after_reset(
-            &plist_path,
-            "Failed to restore Codex Rotate tray launch agent after reset",
-        )?;
+        if !registered {
+            bootstrap_tray_launch_agent_after_reset(
+                &plist_path,
+                "Failed to restore Codex Rotate tray launch agent after reset",
+            )?;
+        }
         kickstart_tray_launch_agent(
             &label,
-            "Failed to kickstart restored Codex Rotate tray launch agent.",
+            "Failed to kickstart Codex Rotate tray launch agent.",
         )?;
         return Ok(true);
     }
@@ -58,6 +62,10 @@ pub fn ensure_tray_process_registered() -> Result<bool> {
     {
         Ok(false)
     }
+}
+
+fn registered_tray_service_requires_restart(registered: bool, running: bool) -> bool {
+    !registered || !running
 }
 
 pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
@@ -473,6 +481,13 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(name, value) },
             None => unsafe { std::env::remove_var(name) },
         }
+    }
+
+    #[test]
+    fn registered_tray_service_requires_running_pid() {
+        assert!(!registered_tray_service_requires_restart(true, true));
+        assert!(registered_tray_service_requires_restart(true, false));
+        assert!(registered_tray_service_requires_restart(false, false));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
