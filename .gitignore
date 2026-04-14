@@ -45,3 +45,4 @@ packages/codex-rotate/benchmarks/results/
 !.trunk/configs/
 !.trunk/configs/**
 .worktree-target/
+worktrees/
