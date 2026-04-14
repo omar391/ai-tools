@@ -23,7 +23,8 @@ use crate::quota::{
 use crate::state::write_rotate_state_json;
 use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 use crate::workflow::{
-    cmd_create, cmd_create_with_progress, create_next_fallback_options, extract_email_domain,
+    auto_disable_domain_for_account, cmd_create, cmd_create_with_progress,
+    create_next_fallback_options, extract_email_domain,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
     reconcile_added_account_credential_state, record_deleted_account,
 };
@@ -50,6 +51,57 @@ fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> 
 fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
     account_rotation_enabled(disabled_domains, &entry.email)
         || entry.last_quota_usable != Some(true)
+}
+
+fn is_terminal_refresh_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("refresh_token_invalidated")
+        || message.contains("refresh token has been invalidated")
+        || message.contains("refresh token already rotated")
+        || message.contains("refresh_token_reused")
+}
+
+fn account_requires_terminal_cleanup(entry: &AccountEntry) -> bool {
+    entry
+        .last_quota_blocker
+        .as_deref()
+        .map(is_terminal_refresh_error)
+        .unwrap_or(false)
+}
+
+fn remove_account_from_pool(pool: &mut Pool, index: usize) {
+    pool.accounts.remove(index);
+    if pool.accounts.is_empty() || pool.active_index >= pool.accounts.len() {
+        pool.active_index = 0;
+    } else if index < pool.active_index && pool.active_index > 0 {
+        pool.active_index -= 1;
+    }
+}
+
+fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
+    let Some(entry) = pool.accounts.get(index).cloned() else {
+        return Ok(false);
+    };
+    auto_disable_domain_for_account(&entry.email)?;
+    let _ = record_deleted_account(&entry.email)?;
+    remove_account_from_pool(pool, index);
+    Ok(true)
+}
+
+fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
+    let mut indices = pool
+        .accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| account_requires_terminal_cleanup(entry).then_some(index))
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    let mut changed = false;
+    for index in indices.into_iter().rev() {
+        changed |= cleanup_terminal_account(pool, index)?;
+    }
+    Ok(changed)
 }
 
 fn disabled_rotation_target_error(domains: &[String]) -> anyhow::Error {
@@ -424,7 +476,11 @@ pub fn rotate_next_internal_with_progress(
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
 
@@ -452,6 +508,17 @@ pub fn rotate_next_internal_with_progress(
             false,
         )?;
         dirty |= inspection.updated;
+        if account_requires_terminal_cleanup(&pool.accounts[candidate_index]) {
+            dirty |= cleanup_terminal_account(&mut pool, candidate_index)?;
+            if pool.accounts.is_empty() {
+                if dirty {
+                    save_pool(&pool)?;
+                }
+                return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+            }
+            cursor_index = previous_index.min(pool.accounts.len().saturating_sub(1));
+            continue;
+        }
         inspected_later_indices.insert(candidate_index);
         if inspection
             .usage
@@ -642,6 +709,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if pool.accounts.is_empty() {
         output.push_line(format!(
             "{YELLOW}WARN{RESET} No accounts in pool. Add one with: codex-rotate add"
@@ -675,6 +743,9 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     output.push_line(String::new())?;
 
     for index in display_order {
+        if index >= pool.accounts.len() {
+            continue;
+        }
         if !inventory_account_visible(&disabled_domains, &pool.accounts[index]) {
             continue;
         }
@@ -686,6 +757,10 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
             dirty |= inspection.updated;
+            if account_requires_terminal_cleanup(&pool.accounts[index]) {
+                dirty |= cleanup_terminal_account(&mut pool, index)?;
+                continue;
+            }
         }
 
         let quota_line = format_cached_quota_line(&pool.accounts[index]);
@@ -970,6 +1045,7 @@ pub fn current_pool_overview() -> Result<PoolOverview> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if dirty {
         save_pool(&pool)?;
     }
@@ -1004,6 +1080,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     let mut live_pool_index = None;
 
     output.push_line(String::new())?;
@@ -1031,7 +1108,16 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, true)?;
             dirty |= inspection.updated;
-            if let Some(usage) = inspection.usage.as_ref() {
+            if account_requires_terminal_cleanup(&pool.accounts[index]) {
+                dirty |= cleanup_terminal_account(&mut pool, index)?;
+                live_pool_index = None;
+                output.push_line(format!(
+                    "  {BOLD}Quota:{RESET}            unavailable ({})",
+                    inspection
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ))?;
+            } else if let Some(usage) = inspection.usage.as_ref() {
                 if let Some(window) = usage
                     .rate_limit
                     .as_ref()
@@ -2023,10 +2109,14 @@ pub(crate) fn find_next_usable_account(
     disabled_domains: &HashSet<String>,
 ) -> Result<(Option<RotationCandidate>, bool)> {
     let mut next_dirty = dirty;
+    next_dirty |= prune_terminal_accounts_from_pool(pool)?;
     let probe_order =
         build_reusable_account_probe_order(pool.active_index, pool.accounts.len(), mode);
 
     for index in probe_order {
+        if index >= pool.accounts.len() {
+            continue;
+        }
         if skip_indices.contains(&index) {
             continue;
         }
@@ -2045,6 +2135,10 @@ pub(crate) fn find_next_usable_account(
             index == pool.active_index,
         )?;
         next_dirty |= inspection.updated;
+        if account_requires_terminal_cleanup(&pool.accounts[index]) {
+            next_dirty |= cleanup_terminal_account(pool, index)?;
+            continue;
+        }
         if let Some(usage) = inspection.usage.as_ref() {
             if has_usable_quota(usage) {
                 return Ok((
@@ -2982,6 +3076,83 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("list should hide healthy disabled-domain accounts");
+    }
+
+    #[test]
+    fn cmd_list_prunes_invalidated_refresh_token_accounts_and_suspends_domain() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut invalidated = stored_entry(None, Some("2026-04-14T06:08:54.124Z"));
+            invalidated.label = "devbench.9@astronlab.com_free".to_string();
+            invalidated.email = "devbench.9@astronlab.com".to_string();
+            invalidated.account_id = "acct-invalidated".to_string();
+            invalidated.auth = make_auth("devbench.9@astronlab.com", "acct-invalidated", "free");
+            invalidated.auth.tokens.account_id = "acct-invalidated".to_string();
+            invalidated.last_quota_blocker = Some("Token refresh failed (401): refresh_token_invalidated: Your refresh token has been invalidated. Please try signing in again.".to_string());
+
+            write_rotate_state_json(&json!({
+                "families": {
+                    "dev-1::devbench.{n}@astronlab.com": {
+                        "profile_name": "dev-1",
+                        "base_email": "devbench.{n}@astronlab.com",
+                        "next_suffix": 10,
+                        "max_skipped_slots": 0,
+                        "created_at": "2026-04-13T05:00:00.000Z",
+                        "updated_at": "2026-04-14T06:11:25.913Z",
+                        "last_created_email": "devbench.9@astronlab.com",
+                        "deleted": []
+                    }
+                }
+            }))?;
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![invalidated],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+            assert!(!output.contains("devbench.9@astronlab.com_free"));
+
+            let state = load_rotate_state_json()?;
+            assert_eq!(
+                state["accounts"].as_array().map(|entries| entries.len()),
+                Some(0)
+            );
+            assert_eq!(
+                state["domain"]["astronlab.com"]["rotation_enabled"],
+                Value::Bool(false)
+            );
+            let reactivate_at = state["domain"]["astronlab.com"]["reactivate_at"]
+                .as_str()
+                .expect("reactivate_at");
+            let parsed = DateTime::parse_from_rfc3339(reactivate_at)
+                .expect("parse reactivate_at")
+                .with_timezone(&Utc);
+            let delta_days = (parsed - Utc::now()).num_days();
+            assert!((8..=9).contains(&delta_days), "{reactivate_at}");
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]["deleted"]
+                    .as_array()
+                    .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+                Some(vec!["devbench.9@astronlab.com"])
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should prune invalidated refresh-token accounts");
     }
 
     #[test]

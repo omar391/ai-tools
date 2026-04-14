@@ -44,7 +44,8 @@ const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 const DEFAULT_CODEX_BIN: &str = "codex";
 const DEFAULT_CODEX_APP_BUNDLE_BIN: &str = "/Applications/Codex.app/Contents/Resources/codex";
-const ROTATE_STATE_VERSION: u8 = 7;
+const ROTATE_STATE_VERSION: u8 = 8;
+const AUTO_DOMAIN_REACTIVATION_DAYS: i64 = 9;
 const EMAIL_FAMILY_PLACEHOLDER: &str = "{n}";
 const AUTO_CREATE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_CODEX_LOGIN_MAX_ATTEMPTS: usize = 6;
@@ -202,6 +203,8 @@ pub struct DomainConfig {
     pub rotation_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_suffix_per_family: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reactivate_at: Option<String>,
 }
 
 fn default_rotation_enabled() -> bool {
@@ -3355,7 +3358,59 @@ fn resolve_codex_bin_with_paths(explicit: Option<&str>, app_bundle_bin: &Path) -
 
 fn load_credential_store() -> Result<CredentialStore> {
     let _ = migrate_legacy_credential_store_if_needed()?;
-    Ok(normalize_credential_store(load_rotate_state_json()?))
+    let mut store = normalize_credential_store(load_rotate_state_json()?);
+    if reactivate_elapsed_domains(&mut store.domain, Utc::now()) {
+        save_credential_store(&store)?;
+    }
+    Ok(store)
+}
+
+fn reactivate_elapsed_domains(
+    domains: &mut HashMap<String, DomainConfig>,
+    now: DateTime<Utc>,
+) -> bool {
+    let mut changed = false;
+    for config in domains.values_mut() {
+        if config.rotation_enabled {
+            if config.reactivate_at.is_some() {
+                config.reactivate_at = None;
+                changed = true;
+            }
+            continue;
+        }
+        let Some(reactivate_at) = config.reactivate_at.as_deref() else {
+            continue;
+        };
+        let reactivate_at = parse_sortable_timestamp(Some(reactivate_at));
+        if reactivate_at > 0 && reactivate_at <= now.timestamp_millis() {
+            config.rotation_enabled = true;
+            config.reactivate_at = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn auto_disable_domain_for_account(email: &str) -> Result<bool> {
+    let Some(domain) = extract_email_domain(email) else {
+        return Ok(false);
+    };
+    let mut store = load_credential_store()?;
+    let reactivate_at = (Utc::now() + chrono::Duration::days(AUTO_DOMAIN_REACTIVATION_DAYS))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let config = store.domain.entry(domain).or_insert(DomainConfig {
+        rotation_enabled: true,
+        max_suffix_per_family: None,
+        reactivate_at: None,
+    });
+    let changed =
+        config.rotation_enabled || config.reactivate_at.as_deref() != Some(reactivate_at.as_str());
+    config.rotation_enabled = false;
+    config.reactivate_at = Some(reactivate_at);
+    if changed {
+        save_credential_store(&store)?;
+    }
+    Ok(changed)
 }
 
 pub(crate) fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
@@ -6773,7 +6828,7 @@ end
     #[test]
     fn normalize_credential_store_leaves_v7_default_create_family_empty_until_configured() {
         let store = normalize_credential_store(json!({}));
-        assert_eq!(store.version, 7);
+        assert_eq!(store.version, 8);
         assert!(store.default_create_base_email.is_empty());
     }
 
@@ -6793,6 +6848,7 @@ end
             Some(&DomainConfig {
                 rotation_enabled: false,
                 max_suffix_per_family: Some(6),
+                reactivate_at: None,
             })
         );
         assert!(!is_rotation_enabled_for_email_in_store(
@@ -6814,6 +6870,7 @@ end
                 DomainConfig {
                     rotation_enabled: false,
                     max_suffix_per_family: Some(6),
+                    reactivate_at: None,
                 },
             );
 
@@ -6829,6 +6886,33 @@ end
                 Value::from(6)
             );
         });
+    }
+
+    #[test]
+    fn reactivate_elapsed_domains_reenables_expired_domain_config() {
+        let mut domains = HashMap::from([(
+            "astronlab.com".to_string(),
+            DomainConfig {
+                rotation_enabled: false,
+                max_suffix_per_family: None,
+                reactivate_at: Some("2026-04-01T00:00:00.000Z".to_string()),
+            },
+        )]);
+
+        assert!(reactivate_elapsed_domains(
+            &mut domains,
+            DateTime::parse_from_rfc3339("2026-04-14T00:00:00.000Z")
+                .expect("parse now")
+                .with_timezone(&Utc)
+        ));
+        assert_eq!(
+            domains.get("astronlab.com"),
+            Some(&DomainConfig {
+                rotation_enabled: true,
+                max_suffix_per_family: None,
+                reactivate_at: None,
+            })
+        );
     }
 
     #[test]
@@ -7256,6 +7340,7 @@ end
             DomainConfig {
                 rotation_enabled: false,
                 max_suffix_per_family: None,
+                reactivate_at: None,
             },
         );
         store.domain.insert(
@@ -7263,6 +7348,7 @@ end
             DomainConfig {
                 rotation_enabled: true,
                 max_suffix_per_family: Some(6),
+                reactivate_at: None,
             },
         );
         store.families.insert(
@@ -7294,6 +7380,7 @@ end
             DomainConfig {
                 rotation_enabled: false,
                 max_suffix_per_family: None,
+                reactivate_at: None,
             },
         );
         store.domain.insert(
@@ -7301,6 +7388,7 @@ end
             DomainConfig {
                 rotation_enabled: true,
                 max_suffix_per_family: Some(6),
+                reactivate_at: None,
             },
         );
         store.families.insert(
@@ -7370,6 +7458,7 @@ end
             DomainConfig {
                 rotation_enabled: false,
                 max_suffix_per_family: None,
+                reactivate_at: None,
             },
         );
 
@@ -7389,6 +7478,7 @@ end
             DomainConfig {
                 rotation_enabled: true,
                 max_suffix_per_family: Some(6),
+                reactivate_at: None,
             },
         );
 
@@ -7422,6 +7512,7 @@ end
                     DomainConfig {
                         rotation_enabled: false,
                         max_suffix_per_family: None,
+                        reactivate_at: None,
                     },
                 );
                 save_credential_store(&store)?;
@@ -7640,7 +7731,7 @@ end
                 }
             }
         }));
-        assert_eq!(store.version, 7);
+        assert_eq!(store.version, 8);
         assert_eq!(store.default_create_base_email, "dev.{n}@astronlab.com");
         assert!(store.families.contains_key("dev-1::dev.{n}@astronlab.com"));
         assert!(!store
