@@ -1470,11 +1470,16 @@ fn normalize_identity_plan_type(plan_type: &str) -> Option<String> {
 fn should_preserve_expected_email(existing_email: &str, auth_email: &str) -> bool {
     let normalized_existing = existing_email.trim().to_lowercase();
     let normalized_auth = auth_email.trim().to_lowercase();
+    let existing_is_gmail_plus = normalized_existing.ends_with("@gmail.com")
+        && normalized_existing
+            .split_once('@')
+            .map(|(local, _)| local.contains('+'))
+            .unwrap_or(false);
     !normalized_existing.is_empty()
         && normalized_existing != "unknown"
         && normalized_existing != normalized_auth
-        && !normalized_existing.ends_with("@gmail.com")
         && normalized_auth.ends_with("@gmail.com")
+        && (!normalized_existing.ends_with("@gmail.com") || existing_is_gmail_plus)
 }
 
 pub(crate) fn account_entry_matches_identity(
@@ -3616,6 +3621,52 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("cmd_add_expected_email should preserve the target email");
+    }
+
+    #[test]
+    fn cmd_add_expected_email_preserves_target_gmail_plus_family_against_provider_gmail_auth() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            if let Some(parent) = paths.codex_auth_file.parent() {
+                std::fs::create_dir_all(parent).expect("create auth parent");
+            }
+            write_codex_auth(
+                &paths.codex_auth_file,
+                &make_auth("1.dev.astronlab+6@gmail.com", "acct-dev-gmail-6", "free"),
+            )?;
+
+            let output = cmd_add_expected_email("dev3astronlab+6@gmail.com", None)?;
+            let pool = load_pool()?;
+
+            assert!(strip_ansi(&output).contains("dev3astronlab+6@gmail.com_free"));
+            assert_eq!(pool.accounts.len(), 1);
+            assert_eq!(pool.active_index, 0);
+            assert_eq!(pool.accounts[0].email, "dev3astronlab+6@gmail.com");
+            assert_eq!(pool.accounts[0].label, "dev3astronlab+6@gmail.com_free");
+            assert_eq!(pool.accounts[0].account_id, "acct-dev-gmail-6");
+            assert_eq!(
+                extract_email_from_auth(&pool.accounts[0].auth),
+                "1.dev.astronlab+6@gmail.com"
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("cmd_add_expected_email should preserve the gmail-plus target email");
     }
 
     #[test]

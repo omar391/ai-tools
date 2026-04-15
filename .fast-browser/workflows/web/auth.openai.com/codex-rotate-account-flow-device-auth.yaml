@@ -6271,7 +6271,7 @@ do:
         templateRef: classify_openai_auth_surface
         description: Reclassify the explicit ChatGPT login surface after the auth landing's secondary login step.
   - open_chatgpt_direct_login_before_security_settings_after_auth_landing:
-      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url || '')) && state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.login_cta_visible === true}"
+      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url || ''))}"
       metadata:
         description: Reopen the direct OpenAI login form when the pre-security ChatGPT auth landing still resolves to the combined log-in-or-create-account shell.
       call: afn.driver.browser.navigate
@@ -6290,7 +6290,7 @@ do:
       set:
         pre_settings_login_entry: "${(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action : ((state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action : (state.steps.classify_chatgpt_login_entry_before_security_settings?.action || {}))}"
   - fill_chatgpt_login_email_before_security_settings:
-      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'login_email' || (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'auth_prompt' && state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.email_input === true))}"
+      if: "${state.vars.reuse_device_auth_session !== true && (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'login_email' || (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'auth_prompt' && state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.email_input === true) || /auth\\.openai\\.com\\/log-in(?:$|[?#])/i.test(String(state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.current_url || '')))}"
       metadata:
         templateRef: fill_openai_email_field
         description: Fill the account email on the explicit ChatGPT login branch before opening Security settings.
@@ -6486,7 +6486,7 @@ do:
                     ready: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.authenticated_chatgpt_shell === true,
                     current_url: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.current_url || null,
                     headline: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.headline || null,
-                    stage: "app_shell",
+                    stage: state.steps.wait_for_authenticated_chatgpt_shell_before_security_settings.action.authenticated_chatgpt_shell === true ? "app_shell" : null,
                   }
                 : null,
               state.steps?.classify_chatgpt_after_add_phone_wait_before_security_settings_long?.action,
@@ -6503,11 +6503,11 @@ do:
               return candidate
                 && typeof candidate === "object"
                 && candidate.skipped !== true
-                && (candidate.ready === true || candidate.stage === "app_shell");
+                && candidate.ready === true;
             }) || {};
             return {
               authenticated_chatgpt_shell_before_security_settings: {
-                ready: effective.ready === true || effective.stage === "app_shell",
+                ready: effective.ready === true,
                 current_url: effective.current_url || null,
                 headline: effective.headline || null,
                 stage: effective.stage || null,

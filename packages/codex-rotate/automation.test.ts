@@ -6800,15 +6800,26 @@ describe("device-auth workflow", () => {
     expect(openStep?.if).toContain(
       "/auth\\.openai\\.com\\/log-in-or-create-account/i.test",
     );
-    expect(openStep?.if).toContain(
-      "classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.login_cta_visible === true",
-    );
+    expect(openStep?.if).not.toContain("login_cta_visible === true");
     expect(openStep?.with?.body?.url).toBe("https://auth.openai.com/log-in");
     expect(classifyStep?.if).toContain(
       "open_chatgpt_direct_login_before_security_settings_after_auth_landing?.action?.ok === true",
     );
     expect(cacheStep?.set?.pre_settings_login_entry).toContain(
       "classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen",
+    );
+  });
+
+  test("device-auth pre-security ChatGPT login branch tolerates a plain direct log-in surface after reopen", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const fillStep = workflow.do?.find(
+      (entry) => "fill_chatgpt_login_email_before_security_settings" in entry,
+    )?.fill_chatgpt_login_email_before_security_settings as
+      | { if?: string }
+      | undefined;
+
+    expect(fillStep?.if).toContain(
+      "/auth\\.openai\\.com\\/log-in(?:$|[?#])/i.test",
     );
   });
 
@@ -6821,6 +6832,8 @@ describe("device-auth workflow", () => {
     expect(workflowText).toContain(
       "state.vars.prepare_flow_ready !== true && state.steps.cache_effective_authenticated_chatgpt_shell_before_security_settings?.action?.value?.authenticated_chatgpt_shell_before_security_settings?.ready === true",
     );
+    expect(workflowText).toContain("candidate.ready === true");
+    expect(workflowText).not.toContain('candidate.stage === "app_shell"');
   });
 
   test("submits device-auth verification using the OTP already present in the DOM when workflow state is empty", async () => {
