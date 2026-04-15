@@ -27,6 +27,7 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://auth.openai.com",
   "https://chatgpt.com",
 ];
+const OPENAI_ACCOUNT_SECRET_FIELD_PATH = "/password";
 
 function getProcessCwdSafe(): string | null {
   try {
@@ -205,6 +206,15 @@ export interface FastBrowserRunResult {
   } | null;
 }
 
+export interface GmailVerificationArtifactForCleanup {
+  gmailMessageId: string;
+  gmailThreadId: string | null;
+  gmailMessageUrl: string | null;
+  messageSubject: string | null;
+  messagePreview: string | null;
+  selectedEmail: string | null;
+}
+
 interface FastBrowserDaemonRunResponse {
   ok: boolean;
   result?: FastBrowserRunResult;
@@ -223,6 +233,92 @@ interface FastBrowserCliResponse<TResult> {
     message?: string;
     details?: unknown;
   };
+}
+
+function normalizeOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readVerificationArtifactRecord(
+  raw: unknown,
+): GmailVerificationArtifactForCleanup | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const gmailMessageId =
+    normalizeOptionalString(record.gmail_message_id) ||
+    normalizeOptionalString(record.gmailMessageId);
+  if (!gmailMessageId) {
+    return null;
+  }
+  return {
+    gmailMessageId,
+    gmailThreadId:
+      normalizeOptionalString(record.gmail_thread_id) ||
+      normalizeOptionalString(record.gmailThreadId),
+    gmailMessageUrl:
+      normalizeOptionalString(record.gmail_message_url) ||
+      normalizeOptionalString(record.gmailMessageUrl),
+    messageSubject:
+      normalizeOptionalString(record.message_subject) ||
+      normalizeOptionalString(record.messageSubject),
+    messagePreview:
+      normalizeOptionalString(record.message_preview) ||
+      normalizeOptionalString(record.messagePreview),
+    selectedEmail:
+      normalizeOptionalString(record.selected_email) ||
+      normalizeOptionalString(record.selectedEmail),
+  };
+}
+
+function readVerificationArtifactFromAction(
+  action: unknown,
+): GmailVerificationArtifactForCleanup | null {
+  if (!action || typeof action !== "object" || Array.isArray(action)) {
+    return null;
+  }
+  const record = action as Record<string, unknown>;
+  return (
+    readVerificationArtifactRecord(record?.result) ||
+    readVerificationArtifactRecord(
+      (record?.result as Record<string, unknown> | undefined)?.result,
+    ) ||
+    readVerificationArtifactRecord(
+      (
+        (record?.result as Record<string, unknown> | undefined)?.result as
+          | Record<string, unknown>
+          | undefined
+      )?.output,
+    ) ||
+    readVerificationArtifactRecord(
+      (record?.result as Record<string, unknown> | undefined)?.output,
+    ) ||
+    readVerificationArtifactRecord(record?.output) ||
+    readVerificationArtifactRecord(record)
+  );
+}
+
+export function collectVerificationArtifactsForCleanup(
+  result: FastBrowserRunResult | null | undefined,
+): GmailVerificationArtifactForCleanup[] {
+  const steps = result?.state?.steps;
+  if (!steps || typeof steps !== "object") {
+    return [];
+  }
+  const artifacts: GmailVerificationArtifactForCleanup[] = [];
+  const seenMessageIds = new Set<string>();
+
+  for (const step of Object.values(steps)) {
+    const artifact = readVerificationArtifactFromAction(step?.action);
+    if (!artifact || seenMessageIds.has(artifact.gmailMessageId)) {
+      continue;
+    }
+    seenMessageIds.add(artifact.gmailMessageId);
+    artifacts.push(artifact);
+  }
+
+  return artifacts;
 }
 
 export function extractFastBrowserCliResult<TResult>(
@@ -550,6 +646,100 @@ async function resolveOptionalCodexRotateSecretLocator(
   }
 }
 
+async function resolveOptionalCodexRotateSecretRef(
+  profileName: string,
+  locator: CodexRotateSecretLocator | null | undefined,
+): Promise<CodexRotateSecretRef | null> {
+  if (!locator) {
+    return null;
+  }
+  await ensureFastBrowserSecretSession(
+    profileName,
+    locator.store ?? "bitwarden-cli",
+    shouldPromptForCodexRotateSecretUnlock(),
+  );
+  try {
+    const selector = buildFastBrowserSecretRefResolveSelector(locator);
+    const response = await runFastBrowserCliJsonRequest<
+      Record<string, unknown>
+    >(
+      ["secrets", "item"],
+      {
+        action: "resolve",
+        selector,
+      },
+      "fast-browser secrets item resolve",
+    );
+    if (!response?.ok) {
+      throw new Error(
+        response?.error?.message ||
+          "fast-browser failed to resolve the requested secret ref.",
+      );
+    }
+    return applyLocatorFieldPathToSecretRef(
+      normalizeCodexRotateSecretRef(extractFastBrowserCliResult(response)?.ref),
+      locator,
+    );
+  } catch (error) {
+    if (isMissingOptionalSecretLocatorError(locator, error)) {
+      return null;
+    }
+    if (isUnavailableOptionalSecretLocatorError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export function buildFastBrowserSecretRefResolveSelector(
+  locator: CodexRotateSecretLocator,
+): Record<string, unknown> {
+  if (locator.kind === "login_lookup") {
+    return {
+      kind: "login",
+      ...(locator.store ? { store: locator.store } : {}),
+      username: locator.username,
+      uris: locator.uris,
+    };
+  }
+  return {
+    kind: "locator",
+    locator: toFastBrowserCliSecretLocator(locator),
+  };
+}
+
+export function applyLocatorFieldPathToSecretRef(
+  ref: CodexRotateSecretRef | null,
+  locator: CodexRotateSecretLocator,
+): CodexRotateSecretRef | null {
+  if (!ref) {
+    return null;
+  }
+  if (ref.field_path) {
+    return ref;
+  }
+  const fieldPath = locator.field_path ?? null;
+  if (!fieldPath) {
+    return ref;
+  }
+  return {
+    ...ref,
+    field_path: fieldPath,
+  };
+}
+
+export function applyAccountPasswordFieldPath(
+  ref: CodexRotateSecretRef | null,
+): CodexRotateSecretRef | null {
+  if (!ref || ref.field_path) {
+    return ref;
+  }
+  return {
+    ...ref,
+    field_path: OPENAI_ACCOUNT_SECRET_FIELD_PATH,
+  };
+}
+
 function normalizeBitwardenCliAccountSecretIdentity(
   profileName: string,
   email: string,
@@ -630,7 +820,7 @@ export async function prepareBitwardenCliAccountSecretRef(
         extractFastBrowserCliResult(existing)?.ref,
       );
       if (existingRef) {
-        return existingRef;
+        return applyAccountPasswordFieldPath(existingRef);
       }
 
       const created = await runFastBrowserCliJsonRequest<{
@@ -663,7 +853,7 @@ export async function prepareBitwardenCliAccountSecretRef(
           `Fast-browser Bitwarden adapter did not return a secret ref for ${normalized.email}.`,
         );
       }
-      return createdRef;
+      return applyAccountPasswordFieldPath(createdRef);
     },
   );
 }
@@ -703,8 +893,10 @@ async function findBitwardenCliAccountSecretRefWithOptions(
             `Fast-browser Bitwarden adapter failed while looking up the vault item for ${normalized.email}.`,
         );
       }
-      return normalizeCodexRotateSecretRef(
-        extractFastBrowserCliResult(response)?.ref,
+      return applyAccountPasswordFieldPath(
+        normalizeCodexRotateSecretRef(
+          extractFastBrowserCliResult(response)?.ref,
+        ),
       );
     },
   );
@@ -1115,6 +1307,46 @@ async function runFastBrowserDaemonWorkflow(
   return hydratedResult;
 }
 
+async function deleteVerificationArtifactsAfterSuccessfulLogin(
+  profileName: string,
+  email: string,
+  result: FastBrowserRunResult,
+): Promise<void> {
+  const artifacts = collectVerificationArtifactsForCleanup(result);
+  if (artifacts.length === 0) {
+    return;
+  }
+
+  for (const artifact of artifacts) {
+    try {
+      await runFastBrowserDaemonWorkflow(
+        "workflow.sys.web.mail-google-com.delete-verification-artifact",
+        {
+          enabled: true,
+          preferred_email: artifact.selectedEmail || undefined,
+          search_query: `from:openai to:${String(email || "").trim()} newer_than:7d`,
+          message_match_text: String(email || "").trim() || "OpenAI",
+          gmail_message_id: artifact.gmailMessageId,
+          gmail_thread_id: artifact.gmailThreadId || undefined,
+          gmail_message_url: artifact.gmailMessageUrl || undefined,
+          message_subject: artifact.messageSubject || undefined,
+          message_preview: artifact.messagePreview || undefined,
+        },
+        profileName,
+        {
+          artifactMode: "minimal",
+          responseMode: "action_only",
+        },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(
+        `[codex-rotate] post-success Gmail verification artifact cleanup failed for ${email}: ${message}\n`,
+      );
+    }
+  }
+}
+
 function requireWorkflowInputString(
   value: string | null | undefined,
   field: string,
@@ -1140,6 +1372,7 @@ async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
   accountLoginLocator: CodexRotateSecretLocator | null,
+  accountLoginRef: CodexRotateSecretRef | null,
   workflowRunStamp?: string,
   options?: {
     artifactMode?: "minimal" | "full";
@@ -1204,6 +1437,7 @@ async function runCodexBrowserLoginWorkflow(
         ? { codex_login_exit_path: options.codexSession.exit_path }
         : {}),
       email,
+      ...(accountLoginRef ? { account_login_ref: accountLoginRef } : {}),
       ...(accountLoginLocator
         ? { account_login_locator: accountLoginLocator }
         : {}),
@@ -1256,12 +1490,17 @@ export async function completeCodexLoginViaWorkflowAttempt(
           profileName,
           accountLoginLocator,
         );
+  const workflowAccountLoginRef = await resolveOptionalCodexRotateSecretRef(
+    profileName,
+    workflowAccountLoginLocator,
+  );
 
   try {
     const loginResult = await runCodexBrowserLoginWorkflow(
       profileName,
       email,
       workflowAccountLoginLocator,
+      workflowAccountLoginRef,
       options?.workflowRunStamp,
       {
         codexBin: options?.codexBin,
@@ -1274,6 +1513,11 @@ export async function completeCodexLoginViaWorkflowAttempt(
         birthDay: options?.birthDay,
         birthYear: options?.birthYear,
       },
+    );
+    await deleteVerificationArtifactsAfterSuccessfulLogin(
+      profileName,
+      email,
+      loginResult,
     );
     return {
       result: loginResult,

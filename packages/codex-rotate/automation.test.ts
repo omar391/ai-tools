@@ -1322,7 +1322,7 @@ describe("active auth workflows", () => {
     expect(runtimeSources).not.toContain('"secrets clear"');
   });
 
-  test("main remains ordered original-first with device-auth fallback after benchmarking", async () => {
+  test("main remains ordered stepwise-first with device-auth fallback after benchmarking", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -1345,8 +1345,8 @@ describe("active auth workflows", () => {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-minimal",
-        version: "1.0.1",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+        version: "1.1.0",
       },
       {
         call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
@@ -1386,7 +1386,7 @@ describe("active auth workflows", () => {
     );
   });
 
-  test("main keeps primary workflow-owned retry and skip outcomes on the minimal path", () => {
+  test("main keeps primary workflow-owned retry and skip outcomes on the stepwise path", () => {
     const workflowText = readFileSync(
       join(
         repoRoot,
@@ -3299,6 +3299,68 @@ describe("original workflow verification helper", () => {
 });
 
 describe("stepwise workflow verification helper", () => {
+  test("minimal login email submit waits for the password transition after continue", async () => {
+    const result = await runWorkflowFunctionScriptOnContent(
+      minimalWorkflowPath,
+      "submit_login_email_form",
+      `
+        <html>
+          <body>
+            <form id="login-form">
+              <label>
+                Email
+                <input
+                  type="email"
+                  name="email"
+                  autocomplete="email"
+                  value="dev3astronlab+1@gmail.com"
+                />
+              </label>
+              <button type="submit">Continue</button>
+            </form>
+            <script>
+              document.getElementById("login-form").addEventListener("submit", (event) => {
+                event.preventDefault();
+                setTimeout(() => {
+                  history.replaceState({}, "", "/log-in/password");
+                  document.body.innerHTML =
+                    '<form><label>Password<input type="password" name="password" autocomplete="current-password" /></label><button type="submit">Log in</button></form>';
+                }, 100);
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        email: "dev3astronlab+1@gmail.com",
+      },
+      "https://auth.openai.com/log-in",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.next_stage).toBe("login_password");
+    expect(String(result.current_url || "")).toContain("/log-in/password");
+  });
+
+  test("minimal replay-login gates stay aligned with locator-based password and stage-based verification routing", () => {
+    const workflowText = readFileSync(minimalWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator != null",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator == null",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification'",
+    );
+    expect(workflowText).not.toContain("inputs.account_login_ref != null");
+    expect(workflowText).not.toContain("inputs.account_login_ref == null");
+    expect(workflowText).not.toContain(
+      "state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true",
+    );
+  });
+
   test("submits signup OTPs from segmented otp-named inputs", async () => {
     const result = await runWorkflowStepScriptOnContent(
       stepwiseWorkflowPath,

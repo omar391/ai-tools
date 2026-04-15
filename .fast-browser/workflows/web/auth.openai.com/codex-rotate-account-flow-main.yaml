@@ -3,7 +3,7 @@ document:
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
   version: 1.0.13
-  summary: "Benchmark-ordered codex-rotate OpenAI account flow that runs the current original non-device control first and falls back to device auth when needed."
+  summary: "Benchmark-ordered codex-rotate OpenAI account flow that runs the current stepwise non-device control first and falls back to device auth when needed."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -36,6 +36,9 @@ input:
         codex_login_stderr_path: {}
         codex_login_exit_path: {}
         email: {}
+        account_login_ref:
+          type: object
+          format: secret-ref
         account_login_locator:
           type: object
           format: secret-locator
@@ -54,10 +57,10 @@ input:
 do:
   - run_primary_non_device_flow:
       metadata:
-        description: "Run the current pinned original non-device OpenAI account flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow
+        description: "Run the current pinned stepwise non-device OpenAI account flow."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise
       with:
-        version: 1.0.8
+        version: 1.1.0
         input:
           enabled: "${inputs.enabled}"
           mode: "codex_login"
@@ -71,6 +74,7 @@ do:
           codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
           codex_login_exit_path: "${inputs.codex_login_exit_path}"
           email: "${inputs.email}"
+          account_login_ref: "${inputs.account_login_ref}"
           account_login_locator: "${inputs.account_login_locator}"
           full_name: "${inputs.full_name}"
           birth_month: "${inputs.birth_month}"
@@ -78,9 +82,9 @@ do:
           birth_year: "${inputs.birth_year}"
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - run_device_auth_fallback:
-      if: "${state.steps.run_primary_non_device_flow?.action?.result?.output?.success !== true && state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'complete'}"
+      if: "${state.steps.run_primary_non_device_flow?.action?.result?.output?.success !== true && state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'complete' && state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'skip_account' && (state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'replay_auth_url' || state.steps.run_primary_non_device_flow?.action?.result?.output?.replay_reason == 'about_you') && state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'retry_attempt'}"
       metadata:
-        description: Fallback to the current device-auth workflow when the primary original non-device flow does not complete.
+        description: Fallback to the current device-auth workflow when the primary stepwise non-device flow does not complete.
       call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth
       with:
         version: 1.3.13
@@ -98,6 +102,7 @@ do:
           codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
           codex_login_exit_path: "${inputs.codex_login_exit_path}"
           email: "${inputs.email}"
+          account_login_ref: "${inputs.account_login_ref}"
           account_login_locator: "${inputs.account_login_locator}"
           full_name: "${inputs.full_name}"
           birth_month: "${inputs.birth_month}"
@@ -106,7 +111,7 @@ do:
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the primary original outcome when it completed, otherwise return the device-auth fallback outcome."
+        description: "Return the primary stepwise outcome when it completed, otherwise return the device-auth fallback outcome."
       run:
         script:
           language: javascript
@@ -117,25 +122,42 @@ do:
               state.steps.run_device_auth_fallback?.action?.result?.output || null;
             const primaryComplete =
               primary.success === true || primary.next_action === "complete";
-            const selected = primaryComplete || !fallback ? primary : fallback;
+            const primarySkip =
+              primary.next_action === "skip_account";
+            const primarySetupBlocked =
+              primary.next_action === "replay_auth_url"
+              && primary.replay_reason === "about_you";
+            const primaryRetryable =
+              !primarySetupBlocked
+              && (primary.next_action === "replay_auth_url"
+              || primary.next_action === "retry_attempt");
+            const selected =
+              primaryComplete || primarySkip || primaryRetryable || !fallback
+                ? primary
+                : fallback;
 
             return {
               ...(selected && typeof selected === "object" ? selected : {}),
               selected_flow:
-                primaryComplete || !fallback
-                  ? "workspace.web.auth-openai-com.codex-rotate-account-flow"
-                  : "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
+              primaryComplete || primarySkip || primaryRetryable || !fallback
+                ? "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise"
+                : "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
               primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
               fallback_flow:
                 "workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
               primary_completed: primaryComplete,
-              primary_skipped_by_policy:
-                primary.next_action === "skip_account",
+              primary_skipped_by_policy: primarySkip,
+              primary_setup_blocked_by_policy: primarySetupBlocked,
+              primary_retryable_by_policy: primaryRetryable,
               fallback_attempted: Boolean(fallback),
-              fallback_selected: !primaryComplete && Boolean(fallback),
+              fallback_selected:
+                !primaryComplete
+                && !primarySkip
+                && !primaryRetryable
+                && Boolean(fallback),
               selection_strategy:
-                "benchmark-ordered-original-then-device-auth-fallback",
+                "benchmark-ordered-stepwise-then-device-auth-fallback",
             };
 output:
   as: "${state.steps.finalize_selected_flow?.action?.value || {}}"
