@@ -35,6 +35,9 @@ input:
         codex_login_stderr_path: {}
         codex_login_exit_path: {}
         email: {}
+        account_login_ref:
+          type: object
+          format: secret-ref
         account_login_locator:
           type: object
           format: secret-locator
@@ -120,7 +123,195 @@ use:
       call: afn.driver.browser.exec_script
       with:
         body:
-          script: "const result = await page.evaluate(() => {\n  const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n  const isVisible = (node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  };\n  const candidates = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\"))\n    .filter((node) => isVisible(node));\n  const target = candidates.find((node) => {\n    const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\"));\n    return /log in with a one-time code|login with a one-time code|one-time code|one time code/i.test(text);\n  });\n  if (!target) {\n    return { ok: false, error: \"one-time-code-button-not-found\" };\n  }\n  target.click();\n  return {\n    ok: true,\n    clicked_text: normalize(target instanceof HTMLInputElement ? target.value : (target.innerText || target.textContent || \"\")) || null,\n  };\n});\nif (result.ok) {\n  await page.waitForTimeout(1200);\n}\nreturn {\n  ...result,\n  current_url: page.url(),\n};\n"
+          script: |
+            const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+            const detectStage = async () => await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              const title = normalize(document.title || "");
+              const path = location.pathname;
+              const host = location.hostname;
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
+              const oauthConsentCopy = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(bodyText)
+                || /sign in to codex/i.test(title);
+              const oauthContinueVisible = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']")).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) {
+                  return false;
+                }
+                const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
+                return /continue to codex|continue to openai|authorize|allow|accept/i.test(text)
+                  || (oauthConsentCopy && /^continue$/i.test(text));
+              });
+              const incorrectCredentials = /incorrect email address or password|incorrect password|wrong password|invalid email or password/i.test(bodyText);
+              const retryableTimeout = /oops, an error occurred|an error occurred during authentication|operation timed out|try again/i.test(bodyText);
+              const needsEmailVerification = (!oauthConsentCopy && verificationInput)
+                || (!oauthConsentCopy && /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText))
+                || (!oauthConsentCopy && /email-verification/i.test(path));
+              let stage = "unknown";
+              if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+                stage = "callback_complete";
+              } else if (oauthConsentCopy && oauthContinueVisible) {
+                stage = "oauth_consent";
+              } else if (retryableTimeout) {
+                stage = "retryable_timeout";
+              } else if (needsEmailVerification) {
+                stage = "email_verification";
+              } else if (/\/log-in(?:\/|$)/i.test(path) && hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]')) {
+                stage = "login_password";
+              } else if (/\/log-in(?:\/|$)/i.test(path) && hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]')) {
+                stage = "login_email";
+              }
+              return {
+                stage,
+                current_url: location.href,
+                incorrect_credentials: incorrectCredentials,
+                retryable_timeout: retryableTimeout,
+              };
+            });
+            const waitForTransition = async (currentStage, timeoutMs = 1800) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (latest.stage !== currentStage && latest.stage !== "unknown") {
+                  return latest;
+                }
+                await page.waitForTimeout(250).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+            const clickMatching = async (requestedMode) => {
+              const patterns =
+                requestedMode === "retryable"
+                  ? [/^try again$/i, /try again/i]
+                  : requestedMode === "chooser"
+                    ? [/try another way/i, /other options/i, /use another method/i, /more ways/i, /choose another/i]
+                    : [/log in with a one-time code/i, /login with a one-time code/i, /one-time code/i, /one time code/i, /email me a code/i, /send (?:me )?(?:a )?code/i, /verification code/i];
+              const missingError =
+                requestedMode === "retryable"
+                  ? "retryable-try-again-not-found"
+                  : requestedMode === "chooser"
+                    ? "chooser-button-not-found"
+                    : "direct-button-not-found";
+              const controls = page.locator("button, a, [role='button'], input[type='submit']");
+              const count = await controls.count().catch(() => 0);
+              for (let index = 0; index < count; index += 1) {
+                const locator = controls.nth(index);
+                if (!(await locator.isVisible().catch(() => false))) {
+                  continue;
+                }
+                const label = normalize(await locator.evaluate((node) => {
+                  if (node instanceof HTMLInputElement) {
+                    return node.value || node.getAttribute("aria-label") || "";
+                  }
+                  if (!(node instanceof Element)) {
+                    return "";
+                  }
+                  return node.innerText || node.textContent || node.getAttribute("aria-label") || "";
+                }).catch(() => ""));
+                if (!patterns.some((pattern) => pattern.test(label))) {
+                  continue;
+                }
+                await locator.scrollIntoViewIfNeeded().catch(() => {});
+                await locator.click({ timeout: 500 }).catch(async () => {
+                  await locator.evaluate((node) => {
+                    if (node instanceof HTMLElement) {
+                      node.click();
+                    }
+                  }).catch(async () => {
+                    await locator.click({ force: true }).catch(() => {});
+                  });
+                });
+                return { ok: true, clicked_text: label || null };
+              }
+              return { ok: false, error: missingError };
+            };
+            const clicks = [];
+            let retried = false;
+            let result = await clickMatching("direct");
+            if (result.ok) {
+              clicks.push(result.clicked_text || null);
+            } else {
+              const chooser = await clickMatching("chooser");
+              if (chooser.ok) {
+                clicks.push(chooser.clicked_text || null);
+                await page.waitForTimeout(350).catch(() => {});
+                result = await clickMatching("direct");
+                if (result.ok) {
+                  clicks.push(result.clicked_text || null);
+                }
+              }
+            }
+            if (!result.ok) {
+              throw new Error(String(result.error || "one-time-code-button-not-found"));
+            }
+            let after = await waitForTransition("login_password");
+            if (after.stage === "retryable_timeout") {
+              const retryable = await clickMatching("retryable");
+              if (retryable.ok) {
+                retried = true;
+                clicks.push(retryable.clicked_text || null);
+                const retryChoice = await clickMatching("direct");
+                if (retryChoice.ok) {
+                  clicks.push(retryChoice.clicked_text || null);
+                }
+                after = await waitForTransition("retryable_timeout");
+              }
+            }
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              if (after.stage === "retryable_timeout") {
+                const retryable = await clickMatching("retryable");
+                if (retryable.ok) {
+                  retried = true;
+                  clicks.push(retryable.clicked_text || null);
+                  const retryChoice = await clickMatching("direct");
+                  if (retryChoice.ok) {
+                    clicks.push(retryChoice.clicked_text || null);
+                  }
+                  after = await waitForTransition("retryable_timeout");
+                  continue;
+                }
+              }
+              if (after.stage !== "login_password" && after.stage !== "unknown" && after.stage !== "retryable_timeout") {
+                break;
+              }
+              const retry = await clickMatching("direct");
+              if (!retry.ok) {
+                break;
+              }
+              retried = true;
+              clicks.push(retry.clicked_text || null);
+              after = await waitForTransition("login_password");
+            }
+            if (after.stage === "login_password" || after.stage === "unknown" || after.stage === "retryable_timeout") {
+              throw new Error("one-time-code-recovery-did-not-advance:" + (after.current_url || page.url()));
+            }
+            return {
+              ok: true,
+              clicked_text: clicks.filter(Boolean).join(" -> ") || null,
+              retried,
+              stage: after.stage,
+              current_url: after.current_url,
+            };
     wait_for_openai_surface_ready:
       metadata:
         description: "Wait for the OpenAI auth surface to render a stable visible shell before classifying it."
@@ -168,7 +359,7 @@ use:
           script: "const expectedEmail = String(args.email || \"\").trim().toLowerCase();\nconst detectStage = async () => await page.evaluate(() => {\n  const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n  const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || \"\") : \"\");\n  const title = normalize(document.title || \"\");\n  const path = location.pathname;\n  const host = location.hostname;\n  const emailInput = hasVisible('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]');\n  const passwordInput = hasVisible('input[type=\"password\"], input[name=\"password\"], input[name=\"new-password\"], input[autocomplete=\"current-password\"], input[autocomplete=\"new-password\"]');\n  const verificationInput = hasVisible('input[name*=\"code\" i], input[autocomplete=\"one-time-code\"], input[inputmode=\"numeric\"]');\n  const antiBotGate = /just a moment/i.test(title)\n    || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)\n    || hasVisible('input[name=\"cf-turnstile-response\"], iframe[src*=\"challenge\"], iframe[title*=\"Widget containing\"]');\n  const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);\n  const sessionEnded = /your session has ended/i.test(bodyText);\n  const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);\n  const needsEmailVerification = verificationInput\n    || /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)\n    || /email-verification/i.test(path);\n  let stage = \"unknown\";\n  if (/^(localhost|127\\.0\\.0\\.1)$/i.test(host)) {\n    stage = \"callback_complete\";\n  } else if (antiBotGate) {\n    stage = \"security_verification\";\n  } else if (rateLimitExceeded) {\n    stage = \"rate_limit\";\n  } else if (sessionEnded) {\n    stage = \"session_ended\";\n  } else if (retryableTimeout) {\n    stage = \"retryable_timeout\";\n  } else if (needsEmailVerification) {\n    stage = \"email_verification\";\n  } else if (/\\/log-in(?:\\/|$)/i.test(path) && passwordInput) {\n    stage = \"login_password\";\n  } else if (/\\/log-in(?:\\/|$)/i.test(path) && emailInput) {\n    stage = \"login_email\";\n  } else if (emailInput || passwordInput || verificationInput) {\n    stage = \"auth_prompt\";\n  }\n  return {\n    stage,\n    current_url: location.href,\n    headline: bodyText.split(\"\\\\n\").map((value) => value.trim()).filter(Boolean)[0] || title || null,\n  };\n});\n\nconst fieldSelectors = [\n  'input[type=\"email\"]',\n  'input[name=\"email\"]',\n  'input[autocomplete=\"email\"]',\n  'input[autocomplete=\"username\"]',\n];\nlet field = null;\nfor (const selector of fieldSelectors) {\n  const candidate = page.locator(selector).first();\n  if (!(await candidate.count().catch(() => 0))) {\n    continue;\n  }\n  if (!(await candidate.isVisible().catch(() => false))) {\n    continue;\n  }\n  field = candidate;\n  break;\n}\nif (!field) {\n  throw new Error(\"login-email-field-not-found\");\n}\nconst value = String(await field.inputValue().catch(() => \"\")).trim().toLowerCase();\nif (!value || value !== expectedEmail) {\n  throw new Error(\"login-email-not-filled:\" + (value || \"empty\"));\n}\n\nconst allowedStages = new Set([\n  \"login_password\",\n  \"email_verification\",\n  \"security_verification\",\n  \"retryable_timeout\",\n  \"rate_limit\",\n  \"session_ended\",\n  \"callback_complete\",\n]);\n\nconst clickVisibleContinue = async () => {\n  const result = await field.evaluate((input) => {\n    const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n    const isVisible = (node) => {\n      if (!(node instanceof Element)) {\n        return false;\n      }\n      const style = window.getComputedStyle(node);\n      if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n        return false;\n      }\n      const rect = node.getBoundingClientRect();\n      return rect.width > 0 && rect.height > 0;\n    };\n    const readLabel = (node) => {\n      if (!(node instanceof Element)) {\n        return \"\";\n      }\n      if (node instanceof HTMLInputElement) {\n        return normalize(node.value || node.getAttribute(\"aria-label\") || \"\");\n      }\n      return normalize(node.innerText || node.textContent || node.getAttribute(\"aria-label\") || \"\");\n    };\n    const form = input instanceof Element ? input.closest(\"form\") : null;\n    const scope = form || document;\n    const candidates = Array.from(scope.querySelectorAll(\"button, input[type='submit'], [role='button']\"))\n      .filter((node) => isVisible(node) && node.getAttribute(\"aria-disabled\") !== \"true\" && !node.hasAttribute(\"disabled\"));\n    const preferred = candidates.find((node) => {\n      const label = readLabel(node);\n      const isSubmitNode = (node instanceof HTMLButtonElement && node.type === \"submit\")\n        || (node instanceof HTMLInputElement && node.type === \"submit\");\n      return isSubmitNode && /continue|next|log in|sign in|submit|verify/i.test(label);\n    }) || candidates.find((node) => /continue|next|log in|sign in|submit|verify/i.test(readLabel(node)));\n    if (preferred instanceof HTMLElement) {\n      preferred.click();\n      return {\n        ok: true,\n        strategy: \"form-dom-click\",\n        label: readLabel(preferred) || null,\n      };\n    }\n    if (form instanceof HTMLFormElement) {\n      form.requestSubmit();\n      return {\n        ok: true,\n        strategy: \"form-request-submit\",\n        label: null,\n      };\n    }\n    return null;\n  }).catch(() => null);\n  return result;\n};\n\nconst attempts = [\n  async () => clickVisibleContinue(),\n  async () => {\n    await field.press(\"Enter\").catch(() => {});\n    return { strategy: \"press-enter\", label: null };\n  },\n  async () => {\n    await field.evaluate((input) => {\n      if (input instanceof HTMLElement) {\n        input.blur();\n      }\n      const form = input instanceof Element ? input.closest(\"form\") : null;\n      if (form instanceof HTMLFormElement) {\n        form.requestSubmit();\n      }\n    }).catch(() => {});\n    return { strategy: \"request-submit\", label: null };\n  },\n];\n\nconst waitForTransition = async (sameStage, timeoutMs = 6500) => {\n  const startedAt = Date.now();\n  let latest = await detectStage();\n  while (Date.now() - startedAt < timeoutMs) {\n    if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {\n      return latest;\n    }\n    await page.waitForTimeout(500).catch(() => {});\n    latest = await detectStage();\n  }\n  return latest;\n};\n\nconst transitions = [];\nfor (const attempt of attempts) {\n  const performed = await attempt();\n  if (!performed) {\n    continue;\n  }\n  const after = await waitForTransition(\"login_email\");\n  transitions.push({ ...performed, ...after });\n  if (allowedStages.has(after.stage) && after.stage !== \"login_email\") {\n    return {\n      ok: true,\n      strategy: performed.strategy,\n      next_stage: after.stage,\n      current_url: after.current_url,\n      headline: after.headline,\n      transitions,\n    };\n  }\n}\n\nconst finalState = await detectStage();\nthrow new Error(\"login-email-submit-stuck:\" + String(finalState.stage || \"unknown\") + \":\" + String(finalState.current_url || page.url()));\n"
     fill_openai_password_field:
       metadata:
-        description: "Fill the OpenAI password field from the runtime-resolved login locator."
+        description: "Fill the OpenAI password field from the runtime-resolved login secret ref."
         mode: headless_ok
         targetRef: primary
       call: afn.driver.browser.type
@@ -180,8 +371,8 @@ use:
           click_away_after_fill: true
           settle_ms: 250
           value_from:
-            secret_locator_input:
-              name: account_login_locator
+            secret_ref_input:
+              name: account_login_ref
     fill_openai_about_you_form:
       metadata:
         description: "Fill the OpenAI about-you form and verify that its primary submit control becomes enabled."
@@ -916,7 +1107,7 @@ do:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after email-step security handling."
   - fill_login_password:
-      if: "${state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator != null}"
+      if: "${state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref != null}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the newly created password on the replayed OpenAI login page."
@@ -930,7 +1121,7 @@ do:
               kind: js
               expression: "const fields = Array.from(document.querySelectorAll('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]'));\nconst values = fields.map((field) => String(field.value || ''));\nconst submit = Array.from(document.querySelectorAll('button[type=\"submit\"], input[type=\"submit\"], button, [role=\"button\"]')).find((node) => {\n  if (!(node instanceof Element)) {\n    return false;\n  }\n  const style = window.getComputedStyle(node);\n  if (!style || style.display === 'none' || style.visibility === 'hidden') {\n    return false;\n  }\n  const rect = node.getBoundingClientRect();\n  if (!(rect.width > 0 && rect.height > 0)) {\n    return false;\n  }\n  const label = String(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || '')).replace(/\\s+/g, ' ').trim();\n  return /continue|next|log in|sign in|submit|verify/i.test(label);\n});\nconst submitDisabled = submit instanceof Element ? (submit.hasAttribute('disabled') || submit.getAttribute('aria-disabled') === 'true') : null;\nconst hasValue = values.some((value) => value.length > 0);\nreturn {\n  ok: hasValue && submitDisabled === false,\n  has_value: hasValue,\n  value_lengths: values.map((value) => value.length),\n  submit_disabled: submitDisabled,\n};\n"
   - submit_login_password:
-      if: "${state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator != null && state.steps.fill_login_password?.action?.ok === true}"
+      if: "${state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref != null && state.steps.fill_login_password?.action?.ok === true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the replayed OpenAI login password step."
@@ -956,12 +1147,12 @@ do:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after password-step security handling."
   - choose_login_one_time_code_recovery:
-      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
+      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
       metadata:
         templateRef: click_one_time_code_button
         description: "Switch to the one-time-code recovery branch when password login cannot proceed."
   - classify_after_login_recovery_choice:
-      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
+      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
       metadata:
         templateRef: classify_openai_surface
         description: "Classify the replayed login state after selecting the recovery branch."
@@ -971,7 +1162,7 @@ do:
         templateRef: clear_openai_security_gate
         description: "Clear any security gate encountered after switching to one-time-code recovery."
   - classify_after_login_recovery_gate:
-      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
+      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
       metadata:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after any recovery-path security handling."

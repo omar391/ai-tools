@@ -536,6 +536,34 @@ console.log(typeof automation.completeCodexLoginViaWorkflowAttempt);
 
     expect(resolved).toBe(mainSkillPath);
   });
+
+  test("respects CODEX_ROTATE_REPO_ROOT when resolving the automation repo root", () => {
+    const automationModuleUrl = new URL("./automation.ts", import.meta.url)
+      .href;
+    const repoRoot = "/tmp/codex-rotate-worktree-root";
+    const result = spawnSync(
+      "node",
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "-e",
+        `
+import { resolveCodexRotateRepoRoot } from ${JSON.stringify(automationModuleUrl)};
+console.log(resolveCodexRotateRepoRoot());
+`,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_ROTATE_REPO_ROOT: repoRoot,
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe(repoRoot);
+  });
 });
 
 describe("optional secret locator fallback", () => {
@@ -1100,11 +1128,7 @@ describe("active auth workflows", () => {
   });
 
   test("all non-device flows arm consent click when the final surface is already oauth_consent", async () => {
-    for (const workflowPath of [
-      originalWorkflowPath,
-      minimalWorkflowPath,
-      stepwiseWorkflowPath,
-    ]) {
+    for (const workflowPath of [minimalWorkflowPath, stepwiseWorkflowPath]) {
       const workflow = await loadWorkflow(workflowPath);
       const acceptStep = workflow.do?.find(
         (entry) => "accept_oauth_consent" in entry,
@@ -2397,6 +2421,542 @@ describe("minimal verification helper", () => {
     expect(result.retried).toBe(true);
   });
 
+  test("opens the intermediate chooser before selecting email-code recovery", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <p>Incorrect email address or password</p>
+            <input type="password" name="password" />
+            <button id="chooser" type="button">Try another way</button>
+            <div id="options" hidden>
+              <button id="email-code" type="button">Email me a code</button>
+            </div>
+            <script>
+              const chooser = document.getElementById("chooser");
+              const options = document.getElementById("options");
+              const emailCode = document.getElementById("email-code");
+              chooser.addEventListener("click", () => {
+                options.hidden = false;
+              });
+              emailCode.addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("email_verification");
+    expect(String(result.clicked_text || "")).toContain("Try another way");
+    expect(String(result.clicked_text || "")).toContain("Email me a code");
+  });
+
+  test("non-device one-time-code recovery avoids workflow-template interpolation in its live error path", () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflowText = readFileSync(workflowPath, "utf8");
+      expect(workflowText).toContain(
+        'throw new Error("one-time-code-recovery-did-not-advance:" + (after.current_url || page.url()));',
+      );
+      expect(workflowText).not.toContain(
+        "one-time-code-recovery-did-not-advance:${after.current_url || page.url()}",
+      );
+    }
+  });
+
+  test("stepwise retries one-time-code recovery after an invalid_state timeout page", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <p>Incorrect email address or password</p>
+            <input type="password" name="password" />
+            <button id="recovery" type="button">Log in with a one-time code</button>
+            <script>
+              document.getElementById("recovery").addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Oops, an error occurred!</h1><p>An error occurred during authentication (invalid_state). Please try again.</p><button id="retry" type="button">Try again</button>';
+                const retry = document.getElementById("retry");
+                retry.addEventListener("click", () => {
+                  document.body.innerHTML =
+                    '<h1>Enter your password</h1><p>Incorrect email address or password</p><input type="password" name="password" /><button id="recovery-again" type="button">Log in with a one-time code</button>';
+                  document.getElementById("recovery-again").addEventListener("click", () => {
+                    document.body.innerHTML =
+                      '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                    history.replaceState({}, "", "https://auth.openai.com/email-verification");
+                  });
+                });
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("email_verification");
+    expect(result.retried).toBe(true);
+    expect(String(result.clicked_text || "")).toContain("Try again");
+  });
+
+  test("stepwise retries one-time-code recovery when the first click stays on the password page", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+            <button id="recovery" type="button">Log in with a one-time code</button>
+            <script>
+              let attempts = 0;
+              document.getElementById("recovery").addEventListener("click", () => {
+                attempts += 1;
+                if (attempts < 2) {
+                  return;
+                }
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("email_verification");
+    expect(result.retried).toBe(true);
+    expect(String(result.clicked_text || "")).toContain(
+      "Log in with a one-time code",
+    );
+  });
+
+  test("non-device one-time-code recovery tolerates multiple password-page bounces before advancing", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const result = await runWorkflowStepScript(
+        workflowPath,
+        "choose_login_one_time_code_recovery",
+        `
+          <html>
+            <body style="min-height: 100vh;">
+              <h1>Enter your password</h1>
+              <input type="password" name="password" />
+              <button id="recovery" type="button">Log in with a one-time code</button>
+              <script>
+                let attempts = 0;
+                const installRecovery = () => {
+                  document.getElementById("recovery")?.addEventListener("click", () => {
+                    attempts += 1;
+                    if (attempts < 3) {
+                      document.body.innerHTML =
+                        '<h1>Enter your password</h1><input type="password" name="password" /><button id="recovery" type="button">Log in with a one-time code</button>';
+                      installRecovery();
+                      return;
+                    }
+                    document.body.innerHTML =
+                      '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                    history.replaceState({}, "", "https://auth.openai.com/email-verification");
+                  });
+                };
+                installRecovery();
+              </script>
+            </body>
+          </html>
+        `,
+        {},
+        {},
+        "https://auth.openai.com/log-in/password",
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.stage).toBe("email_verification");
+      expect(result.retried).toBe(true);
+      expect(String(result.clicked_text || "")).toContain(
+        "Log in with a one-time code",
+      );
+    }
+  });
+
+  test("stepwise one-time-code recovery reports a stuck password page without throwing", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+            <button id="recovery" type="button">Log in with a one-time code</button>
+            <script>
+              const installRecovery = () => {
+                document.getElementById("recovery")?.addEventListener("click", () => {
+                  document.body.innerHTML =
+                    '<h1>Enter your password</h1><input type="password" name="password" /><button id="recovery" type="button">Log in with a one-time code</button>';
+                  installRecovery();
+                });
+              };
+              installRecovery();
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("login_password");
+    expect(result.stayed_on_password_page).toBe(true);
+    expect(String(result.current_url || "")).toContain("/log-in/password");
+  });
+
+  test("stepwise forgot-password recovery opens the email verification path", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_forgot_password_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+            <a id="forgot" href="#" role="link">Forgot password?</a>
+            <script>
+              document.getElementById("forgot").addEventListener("click", (event) => {
+                event.preventDefault();
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(String(result.clicked_text || "")).toContain("Forgot password");
+  });
+
+  test("stepwise forgot-password recovery clears a retryable timeout before opening email verification", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_forgot_password_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Oops, an error occurred!</h1>
+            <button id="retry" type="button">Try again</button>
+            <script>
+              document.getElementById("retry").addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Enter your password</h1><input type="password" name="password" /><a id="forgot" href="#" role="link">Forgot password?</a>';
+                const forgot = document.getElementById("forgot");
+                forgot.addEventListener("click", (event) => {
+                  event.preventDefault();
+                  document.body.innerHTML =
+                    '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                  history.replaceState({}, "", "https://auth.openai.com/email-verification");
+                });
+                history.replaceState({}, "", "https://auth.openai.com/log-in/password");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(String(result.clicked_text || "")).toContain("Try again");
+    expect(String(result.clicked_text || "")).toContain("Forgot password");
+  });
+
+  test("stepwise forgot-password recovery keeps the retry branch alive even before the reset link appears", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_forgot_password_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Oops, an error occurred!</h1>
+            <button id="retry" type="button">Try again</button>
+            <script>
+              document.getElementById("retry").addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Enter your password</h1><input type="password" name="password" />';
+                history.replaceState({}, "", "https://auth.openai.com/log-in/password");
+                setTimeout(() => {
+                  document.body.innerHTML =
+                    '<h1>Reset password</h1><input type="email" name="email" /><button type="button">Continue</button>';
+                  history.replaceState({}, "", "https://auth.openai.com/reset-password");
+                }, 700);
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.skipped).toBeUndefined();
+    expect(result.retried).toBe(true);
+    expect(String(result.clicked_text || "")).toContain("Try again");
+  });
+
+  test("stepwise forgot-password recovery stays alive on the password page even when recovery controls are not yet visible", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "choose_login_forgot_password_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.skipped).toBeUndefined();
+    expect(result.recovery_unavailable).toBe(true);
+    expect(String(result.current_url || "")).toContain("/log-in/password");
+  });
+
+  test("stepwise submits the reset-password request and advances to email verification", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "submit_login_reset_password_request",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Reset password</h1>
+            <label>Email<input type="email" name="email" /></label>
+            <button id="send" type="button">Continue</button>
+            <script>
+              document.getElementById("send").addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {
+        email: "dev3astronlab+5@gmail.com",
+      },
+      "https://auth.openai.com/reset-password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.email_filled).toBe("dev3astronlab+5@gmail.com");
+    expect(String(result.clicked_text || "")).toContain("Continue");
+  });
+
+  test("stepwise retries the reset-password submit once after a retryable timeout overlay", async () => {
+    const result = await runWorkflowStepScript(
+      stepwiseWorkflowPath,
+      "submit_login_reset_password_request",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Reset password</h1>
+            <label>Email<input type="email" name="email" /></label>
+            <button id="send" type="button">Continue</button>
+            <script>
+              let first = true;
+              document.getElementById("send").addEventListener("click", () => {
+                if (first) {
+                  first = false;
+                  document.body.innerHTML =
+                    '<h1>Oops, an error occurred!</h1><button id="retry" type="button">Try again</button><button id="send-again" type="button">Continue</button>';
+                  history.replaceState({}, "", "https://auth.openai.com/reset-password");
+                  document.getElementById("retry").addEventListener("click", () => {});
+                  document.getElementById("send-again").addEventListener("click", () => {
+                    document.body.innerHTML =
+                      '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                    history.replaceState({}, "", "https://auth.openai.com/email-verification");
+                  });
+                  return;
+                }
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {
+        email: "dev3astronlab+5@gmail.com",
+      },
+      "https://auth.openai.com/reset-password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.timeout_retried).toBe(true);
+    expect(String(result.retry_clicked_text || "")).toContain("Try again");
+    expect(String(result.resubmit_clicked_text || "")).toContain("Continue");
+    expect(String(result.current_url || "")).toContain("/email-verification");
+  });
+
+  test("stepwise routes recovery-unavailable password pages into the reset-password submit step", async () => {
+    const workflow = await loadWorkflow(stepwiseWorkflowPath);
+    const submitStep = workflow.do?.find(
+      (entry) => "submit_login_reset_password_request" in entry,
+    )?.submit_login_reset_password_request as { if?: string } | undefined;
+
+    expect(submitStep?.if).toContain(
+      "choose_login_forgot_password_recovery?.action?.recovery_unavailable === true",
+    );
+    expect(submitStep?.if).toContain(
+      "classify_after_login_forgot_password_gate?.action?.stage === 'login_password'",
+    );
+  });
+
+  test("stepwise retries reset-password after a delayed timeout classification on the reset page", async () => {
+    const workflow = await loadWorkflow(stepwiseWorkflowPath);
+    const retryStep = workflow.do?.find(
+      (entry) => "retry_login_reset_password_request_after_timeout" in entry,
+    )?.retry_login_reset_password_request_after_timeout as
+      | { if?: string }
+      | undefined;
+    const resendStep = workflow.do?.find(
+      (entry) => "resend_login_verification_email" in entry,
+    )?.resend_login_verification_email as { if?: string } | undefined;
+
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_request?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_gate?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_request?.action?.reset_password_prompt === true",
+    );
+    expect(resendStep?.if).toContain(
+      "classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification'",
+    );
+    expect(resendStep?.if).toContain(
+      "classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'",
+    );
+  });
+
+  test("original opens the intermediate chooser before selecting email-code recovery", async () => {
+    const result = await runWorkflowStepScript(
+      originalWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <p>Incorrect email address or password</p>
+            <input type="password" name="password" />
+            <button id="chooser" type="button">Try another way</button>
+            <div id="options" hidden>
+              <button id="email-code" type="button">Email me a code</button>
+            </div>
+            <script>
+              const chooser = document.getElementById("chooser");
+              const options = document.getElementById("options");
+              const emailCode = document.getElementById("email-code");
+              chooser.addEventListener("click", () => {
+                options.hidden = false;
+              });
+              emailCode.addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("email_verification");
+    expect(String(result.clicked_text || "")).toContain("Try another way");
+    expect(String(result.clicked_text || "")).toContain("Email me a code");
+  });
+
+  test("original falls back to a DOM click when the one-time-code button is not pointer-clickable", async () => {
+    const result = await runWorkflowStepScript(
+      originalWorkflowPath,
+      "choose_login_one_time_code_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+            <button id="recovery" type="button" style="pointer-events: none;">Log in with a one-time code</button>
+            <script>
+              document.getElementById("recovery").addEventListener("click", () => {
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("email_verification");
+    expect(String(result.clicked_text || "")).toContain(
+      "Log in with a one-time code",
+    );
+  });
+
   test("fills segmented OTP inputs and advances the flow", async () => {
     const result = await runMinimalStepScript(
       "submit_login_verification_code",
@@ -3531,22 +4091,32 @@ describe("stepwise workflow verification helper", () => {
     expect(String(result.current_url || "")).toContain("/log-in/password");
   });
 
-  test("minimal replay-login gates stay aligned with locator-based password and stage-based verification routing", () => {
-    const workflowText = readFileSync(minimalWorkflowPath, "utf8");
+  test("non-device replay-login gates stay aligned with ref-based password and stage-based verification routing", () => {
+    const workflows = [
+      readFileSync(originalWorkflowPath, "utf8"),
+      readFileSync(minimalWorkflowPath, "utf8"),
+      readFileSync(stepwiseWorkflowPath, "utf8"),
+    ];
 
-    expect(workflowText).toContain(
-      "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator != null",
-    );
-    expect(workflowText).toContain(
-      "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_locator == null",
-    );
-    expect(workflowText).toContain(
-      "state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification'",
-    );
-    expect(workflowText).not.toContain("inputs.account_login_ref != null");
-    expect(workflowText).not.toContain("inputs.account_login_ref == null");
-    expect(workflowText).not.toContain(
-      "state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true",
+    for (const workflowText of workflows) {
+      expect(workflowText).toContain("account_login_ref");
+      expect(workflowText).toContain(
+        "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref != null",
+      );
+      expect(workflowText).toContain(
+        "state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref == null",
+      );
+      expect(workflowText).toContain(
+        "state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification'",
+      );
+      expect(workflowText).not.toContain(
+        "state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true",
+      );
+    }
+
+    const stepwiseWorkflowText = readFileSync(stepwiseWorkflowPath, "utf8");
+    expect(stepwiseWorkflowText).toContain(
+      'reason: "forgot-password-link-not-found-or-not-on-password-page"',
     );
   });
 
@@ -3935,6 +4505,88 @@ describe("stepwise workflow verification helper", () => {
       expect(result.retry_reason).toBeNull();
       expect(result.error_message).toContain("account setup");
     }
+  });
+
+  test("non-device flows keep replayed auth prompts authoritative over generic retryable timeout metadata", async () => {
+    for (const workflowPath of [minimalWorkflowPath, stepwiseWorkflowPath]) {
+      const result = await runWorkflowRunScript(
+        workflowPath,
+        "finalize_flow_summary",
+        {
+          email: "dev3astronlab+5@gmail.com",
+        },
+        {
+          steps: {
+            complete_login_or_consent: {
+              action: {
+                stage: "retryable_timeout",
+                retryable_timeout: true,
+                current_url: "https://auth.openai.com/log-in/password",
+                headline: "Welcome back",
+              },
+            },
+          },
+        },
+      );
+
+      expect(result.next_action).toBe("replay_auth_url");
+      expect(result.replay_reason).toBe("auth_prompt");
+      expect(result.retry_reason).toBeNull();
+      expect(result.error_message).toContain("auth prompt");
+    }
+  });
+
+  test("stepwise keeps reset-password recovery on the primary non-device replay path", async () => {
+    const result = await runWorkflowRunScript(
+      stepwiseWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "dev3astronlab+5@gmail.com",
+      },
+      {
+        steps: {
+          complete_login_or_consent: {
+            action: {
+              current_url: "https://auth.openai.com/reset-password",
+              headline: "Reset password",
+              reset_password_prompt: true,
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("replay_auth_url");
+    expect(result.replay_reason).toBe("reset_password");
+    expect(result.retry_reason).toBeNull();
+    expect(result.error_message).toContain("password-reset recovery");
+  });
+
+  test("stepwise keeps reset-password recovery authoritative over a retryable-timeout overlay on the reset page", async () => {
+    const result = await runWorkflowRunScript(
+      stepwiseWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "dev3astronlab+5@gmail.com",
+      },
+      {
+        steps: {
+          complete_login_or_consent: {
+            action: {
+              current_url: "https://auth.openai.com/reset-password",
+              headline: "Oops, an error occurred!",
+              reset_password_prompt: true,
+              retryable_timeout: true,
+              stage: "retryable_timeout",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("replay_auth_url");
+    expect(result.replay_reason).toBe("reset_password");
+    expect(result.retry_reason).toBeNull();
   });
 
   test("non-device flows retry the replayed about-you form in-place before falling back to full auth replay", async () => {

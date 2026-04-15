@@ -2240,7 +2240,9 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         ),
         Some(_) => report_progress(
             progress.as_ref(),
-            format!("Found a stored OpenAI login secret for {email}; attempting password login first."),
+            format!(
+                "An OpenAI login secret locator is configured for {email}; attempting password login first when a usable secret resolves."
+            ),
         ),
         None => report_progress(
             progress.as_ref(),
