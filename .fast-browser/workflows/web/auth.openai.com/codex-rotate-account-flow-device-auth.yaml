@@ -7273,6 +7273,19 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the current OpenAI login surface before continuing the device-auth account login locally."
+  - open_device_auth_direct_login_from_initial_login_entry:
+      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_device_auth_login_entry?.action?.current_url || '')) && state.steps.classify_device_auth_login_entry?.action?.login_cta_visible === true}"
+      metadata:
+        description: Reopen the direct OpenAI login form when the initial device-auth login entry resolves to the combined log-in-or-create-account shell.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://auth.openai.com/log-in
+  - classify_device_auth_login_entry_after_initial_reopen:
+      if: "${state.steps.open_device_auth_direct_login_from_initial_login_entry?.action?.ok === true && state.steps.open_device_auth_direct_login_from_initial_login_entry?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the device-auth login surface after reopening direct OpenAI login from the initial combined auth shell.
   - click_device_auth_login_button_from_auth_landing:
       if: "${state.steps.classify_device_auth_login_entry?.action?.stage === 'public_chatgpt' && /chatgpt\\.com\\/auth\\/login/i.test(String(state.steps.classify_device_auth_login_entry?.action?.current_url || '')) && state.steps.classify_device_auth_login_entry?.action?.login_cta_visible === true}"
       metadata:
@@ -7335,7 +7348,7 @@ do:
       metadata:
         description: "Cache the effective device-auth login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_retry?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_retry?.action?.stage || state.steps.classify_device_auth_login_entry_retry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_retry?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {})))}"
+        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_retry?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_retry?.action?.stage || state.steps.classify_device_auth_login_entry_retry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_retry?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : ((state.steps.classify_device_auth_login_entry_after_initial_reopen?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_initial_reopen?.action?.stage || state.steps.classify_device_auth_login_entry_after_initial_reopen?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_initial_reopen?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {}))))}"
   - fill_device_auth_login_email:
       if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true))}"
       metadata:
