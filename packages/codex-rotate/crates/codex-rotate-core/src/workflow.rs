@@ -4395,12 +4395,13 @@ fn compute_fresh_account_family_suffix(
     known_emails: Vec<String>,
     skipped_emails: Vec<String>,
 ) -> Result<u32> {
-    let mut covered_suffixes = HashSet::new();
+    let mut known_suffixes = HashSet::new();
     for email in &known_emails {
         if let Some(suffix) = extract_account_family_suffix(email, base_email)? {
-            covered_suffixes.insert(suffix);
+            known_suffixes.insert(suffix);
         }
     }
+    let mut covered_suffixes = known_suffixes.clone();
     for email in &skipped_emails {
         if let Some(suffix) = extract_account_family_suffix(email, base_email)? {
             covered_suffixes.insert(suffix);
@@ -4417,8 +4418,7 @@ fn compute_fresh_account_family_suffix(
     if !should_reserve_skipped {
         if let Some(entry) = family {
             let frontier = entry.next_suffix;
-            if frontier > computed && (1..frontier).all(|suffix| covered_suffixes.contains(&suffix))
-            {
+            if frontier > computed && (1..frontier).all(|suffix| known_suffixes.contains(&suffix)) {
                 return Ok(frontier);
             }
         }
@@ -6395,7 +6395,7 @@ input:
                 ),
             )
             .expect("compute next gmail suffix");
-            assert_eq!(next_suffix, 6);
+            assert_eq!(next_suffix, 5);
         });
     }
 
@@ -6468,7 +6468,7 @@ input:
                 ),
             )
             .expect("compute next gmail suffix");
-            assert_eq!(next_suffix, 7);
+            assert_eq!(next_suffix, 5);
         });
     }
 
