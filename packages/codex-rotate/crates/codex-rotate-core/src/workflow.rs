@@ -902,7 +902,15 @@ pub fn cmd_create_with_progress(
         save_pool(&pool)?;
     }
 
-    let result = execute_create_flow_with_progress(&options, progress)?;
+    let result = match execute_create_flow_with_progress(&options, progress) {
+        Ok(result) => result,
+        Err(error) if should_preserve_pending_on_create_error(&error) => {
+            return Ok(format!(
+                "{YELLOW}WARN{RESET} Account creation is environment-blocked at final add_phone. Pending account state was preserved."
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let quota_summary = summarize_quota_for_create(&result);
     if options.restore_previous_auth_after_create {
         restore_active_auth(previous_auth.as_ref())?;
@@ -1376,6 +1384,11 @@ fn execute_create_flow_with_progress(
                 cancel::sleep_with_cancellation(AUTO_CREATE_RETRY_DELAY)?;
             }
             Err(CreateFlowAttemptFailure::Fatal(error))
+                if should_preserve_pending_on_create_error(&error) =>
+            {
+                return Err(error);
+            }
+            Err(CreateFlowAttemptFailure::Fatal(error))
                 if should_retry_create_until_usable(options) =>
             {
                 if should_stop_create_retry_for_reusable_account(options)
@@ -1411,6 +1424,10 @@ fn report_progress(progress: Option<&AutomationProgressCallback>, message: impl 
 
 fn fatal<T>(result: Result<T>) -> std::result::Result<T, CreateFlowAttemptFailure> {
     result.map_err(CreateFlowAttemptFailure::Fatal)
+}
+
+fn should_preserve_pending_on_create_error(error: &anyhow::Error) -> bool {
+    is_final_add_phone_environment_blocker_error(error)
 }
 
 fn should_retry_create_until_usable(options: &CreateCommandOptions) -> bool {
@@ -1773,7 +1790,7 @@ fn execute_create_flow_attempt(
         skip_locator_preflight: Some(skip_locator_preflight),
         prefer_signup_recovery: Some(prefer_signup_recovery_for_create(reusing_pending)),
         prefer_password_login: skip_locator_preflight.then_some(true),
-        treat_final_add_phone_as_environment_blocker: Some(false),
+        treat_final_add_phone_as_environment_blocker: Some(true),
         birth_date: Some(&birth_date),
         progress: progress.clone(),
     });
@@ -1781,6 +1798,10 @@ fn execute_create_flow_attempt(
         Ok(value) => value,
         Err(error) => {
             fatal(restore_active_auth(previous_auth.as_ref()))?;
+            if should_preserve_pending_on_create_error(&error) {
+                fatal(save_credential_store(&store))?;
+                return Err(CreateFlowAttemptFailure::Fatal(error));
+            }
             if should_retry_create_after_error(options, &error) {
                 fatal(skip_pending_account_and_advance_family(
                     &mut store,
@@ -8364,6 +8385,19 @@ end
         )));
         assert!(!is_final_add_phone_environment_blocker_error(&anyhow!(
             "Codex browser login did not reach the callback for dev3astronlab+5@gmail.com."
+        )));
+    }
+
+    #[test]
+    fn create_preserves_pending_for_final_add_phone_environment_blockers() {
+        assert!(should_preserve_pending_on_create_error(&anyhow!(
+            "OpenAI final_add_phone blocked dev3astronlab+6@gmail.com (https://auth.openai.com/add-phone)."
+        )));
+        assert!(should_preserve_pending_on_create_error(&anyhow!(
+            "The workflow requested skipping dev3astronlab+6@gmail.com after exhausting final add-phone retries (https://auth.openai.com/log-in)."
+        )));
+        assert!(!should_preserve_pending_on_create_error(&anyhow!(
+            "Workflow input 'account_login_ref' must be a secret ref to satisfy step 'fill_signup_password'"
         )));
     }
 

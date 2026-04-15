@@ -4109,14 +4109,30 @@ describe("stepwise workflow verification helper", () => {
       expect(workflowText).toContain(
         "state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification'",
       );
+      expect(workflowText).toContain(
+        "templateRef: fill_generated_openai_password_field",
+      );
       expect(workflowText).not.toContain(
         "state.steps.classify_after_login_password_gate?.action?.needs_email_verification === true",
       );
     }
 
     const stepwiseWorkflowText = readFileSync(stepwiseWorkflowPath, "utf8");
+    const minimalWorkflowText = readFileSync(minimalWorkflowPath, "utf8");
     expect(stepwiseWorkflowText).toContain(
       'reason: "forgot-password-link-not-found-or-not-on-password-page"',
+    );
+    expect(stepwiseWorkflowText).toContain(
+      "state.steps.classify_after_signup_email_gate?.action?.stage === 'signup_password'",
+    );
+    expect(stepwiseWorkflowText).not.toContain(
+      "state.steps.classify_after_signup_email_gate?.action?.stage === 'signup_password' || state.steps.classify_after_signup_email_gate?.action?.stage === 'login_password'",
+    );
+    expect(minimalWorkflowText).toContain(
+      "state.steps.classify_after_signup_email_gate?.action?.stage === 'signup_password'",
+    );
+    expect(minimalWorkflowText).not.toContain(
+      "state.steps.classify_after_signup_email_gate?.action?.stage === 'signup_password' || state.steps.classify_after_signup_email_gate?.action?.stage === 'login_password'",
     );
   });
 

@@ -365,7 +365,7 @@ use:
       call: afn.driver.browser.type
       with:
         body:
-          selector: 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]'
+          selector: input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]
           dispatch_events_after_fill: true
           blur_after_fill: true
           click_away_after_fill: true
@@ -373,6 +373,20 @@ use:
           value_from:
             secret_ref_input:
               name: account_login_ref
+    fill_generated_openai_password_field:
+      metadata:
+        description: Fill the OpenAI password field from the generated workflow password.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.type
+      with:
+        body:
+          selector: input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]
+          text: ${inputs.password}
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          click_away_after_fill: true
+          settle_ms: 250
     fill_openai_about_you_form:
       metadata:
         description: "Fill the OpenAI about-you form and verify that its primary submit control becomes enabled."
@@ -898,7 +912,7 @@ do:
   - fill_signup_password:
       if: "${state.steps.classify_after_signup_email_gate?.action?.stage === 'signup_password'}"
       metadata:
-        templateRef: fill_openai_password_field
+        templateRef: fill_generated_openai_password_field
         description: "Fill the new account password on the signup password page."
         browser:
           validation:
