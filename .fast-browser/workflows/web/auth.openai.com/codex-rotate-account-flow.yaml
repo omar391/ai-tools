@@ -1040,7 +1040,7 @@ do:
         templateRef: classify_openai_surface
         description: Refresh the login verification state after returning from Gmail.
   - submit_login_verification_code:
-      if: "${(state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification') && state.steps.classify_login_verification_ready_gate?.action?.stage === 'email_verification'}"
+      if: "${(state.steps.reopen_existing_account_auth_url?.action?.ok === true && state.steps.reopen_existing_account_auth_url?.action?.skipped !== true) || (state.steps.reopen_captured_auth_url?.action?.ok === true && state.steps.reopen_captured_auth_url?.action?.skipped !== true)}"
       metadata:
         description: Fill and submit the replayed-login OTP from Gmail.
         mode: headless_ok
@@ -1048,7 +1048,364 @@ do:
       call: afn.driver.browser.exec_script
       with:
         body:
-          script: "const readSixDigitCode = (value) => {\n  const match = String(value || \"\").match(/(?:^|\\D)(\\d{6})(?:\\D|$)/);\n  return match?.[1] || null;\n};\nconst extractVerificationCode = (action) => {\n  const outputs = [\n    action?.result?.result?.output,\n    action?.result?.output,\n    action?.output,\n  ].filter((value) => value && typeof value === \"object\");\n  for (const output of outputs) {\n    const directCode =\n      readSixDigitCode(output.code)\n      || readSixDigitCode(output.verification_code)\n      || readSixDigitCode(output.otp)\n      || readSixDigitCode(output.one_time_code);\n    if (directCode) {\n      return directCode;\n    }\n  }\n  for (const output of outputs) {\n    const derivedCode =\n      readSixDigitCode(output.message_subject)\n      || readSixDigitCode(output.message_preview)\n      || readSixDigitCode(output.verification_link_text);\n    if (derivedCode) {\n      return derivedCode;\n    }\n  }\n  return null;\n};\nconst code = String(\n  extractVerificationCode(state.steps.collect_login_verification_artifact?.action)\n  || \"\"\n).replace(/\\D+/g, \"\").slice(0, 6);\nif (code.length < 6) {\n  return {\n    ok: false,\n    error: \"login-verification-code-missing\",\n    stage: \"email_verification\",\n    current_url: page.url(),\n  };\n}\n\nconst verificationSelector = 'input[name*=\"code\" i], input[name*=\"otp\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[aria-label*=\"otp\" i], input[placeholder*=\"code\" i], input[placeholder*=\"otp\" i], input[inputmode=\"numeric\"][maxlength=\"1\"], input[inputmode=\"numeric\"][maxlength=\"6\"]';\n\nconst detectStage = async () => await page.evaluate(() => {\n  const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n  const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  });\n\n  const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || \"\") : \"\");\n  const title = normalize(document.title || \"\");\n  const path = location.pathname;\n  const host = location.hostname;\n  const emailInput = hasVisible('input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"email\"], input[autocomplete=\"username\"]');\n  const passwordInput = hasVisible('input[type=\"password\"], input[name=\"password\"], input[name=\"new-password\"], input[autocomplete=\"current-password\"], input[autocomplete=\"new-password\"]');\n  const verificationInput = hasVisible('input[name*=\"code\" i], input[name*=\"otp\" i], input[autocomplete=\"one-time-code\"], input[aria-label*=\"code\" i], input[aria-label*=\"otp\" i], input[placeholder*=\"code\" i], input[placeholder*=\"otp\" i], input[inputmode=\"numeric\"][maxlength=\"1\"], input[inputmode=\"numeric\"][maxlength=\"6\"]');\n  const antiBotGate = /just a moment/i.test(title)\n    || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)\n    || hasVisible('input[name=\"cf-turnstile-response\"], iframe[src*=\"challenge\"], iframe[title*=\"Widget containing\"]');\n  const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);\n  const sessionEnded = /your session has ended/i.test(bodyText);\n  const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);\n  const addPhonePrompt = /add-phone/i.test(path)\n    || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);\n  const followUpStep = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)\n    || /about-you/i.test(path);\n  const oauthConsentCopy = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(bodyText)\n    || /sign in to codex/i.test(title);\n  const oauthContinueVisible = Array.from(document.querySelectorAll(\"button, a, [role='button'], input[type='submit']\")).some((node) => {\n    if (!(node instanceof Element)) {\n      return false;\n    }\n    const style = window.getComputedStyle(node);\n    if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n      return false;\n    }\n    const rect = node.getBoundingClientRect();\n    if (!(rect.width > 0 && rect.height > 0)) {\n      return false;\n    }\n    const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || \"\"));\n    return /continue to codex|continue to openai|authorize|allow|accept/i.test(text)\n      || (oauthConsentCopy && /^continue$/i.test(text));\n  });\n  const needsEmailVerification = (!oauthConsentCopy && verificationInput)\n    || (!oauthConsentCopy && /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText))\n    || (!oauthConsentCopy && /email-verification/i.test(path));\n\n  let stage = \"unknown\";\n  if (/^(localhost|127\\.0\\.0\\.1)$/i.test(host)) {\n    stage = \"callback_complete\";\n  } else if (antiBotGate) {\n    stage = \"security_verification\";\n  } else if (rateLimitExceeded) {\n    stage = \"rate_limit\";\n  } else if (sessionEnded) {\n    stage = \"session_ended\";\n  } else if (retryableTimeout) {\n    stage = \"retryable_timeout\";\n  } else if (addPhonePrompt) {\n    stage = \"add_phone\";\n  } else if (oauthConsentCopy && oauthContinueVisible) {\n    stage = \"oauth_consent\";\n  } else if (followUpStep) {\n    stage = \"about_you\";\n  } else if (needsEmailVerification) {\n    stage = \"email_verification\";\n  } else if (/\\/log-in(?:\\/|$)/i.test(path) && passwordInput) {\n    stage = \"login_password\";\n  } else if (/\\/log-in(?:\\/|$)/i.test(path) && emailInput) {\n    stage = \"login_email\";\n  } else if (emailInput || passwordInput || verificationInput) {\n    stage = \"auth_prompt\";\n  }\n\n  return {\n    stage,\n    current_url: location.href,\n    headline: bodyText.split(\"\\n\").map((value) => value.trim()).filter(Boolean)[0] || title || null,\n    incorrect_code: /incorrect code/i.test(bodyText),\n  };\n});\n\nconst inputLocator = page.locator(verificationSelector);\nconst inputCount = await inputLocator.count().catch(() => 0);\nconst inputs = [];\nfor (let index = 0; index < inputCount; index += 1) {\n  const candidate = inputLocator.nth(index);\n  if (await candidate.isVisible().catch(() => false)) {\n    inputs.push(candidate);\n  }\n}\nconst input = inputs[0] || inputLocator.first();\nawait input.waitFor({ state: \"visible\", timeout: 8000 }).catch(() => {});\nif ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {\n  const before = await detectStage();\n  throw new Error(\"login-verification-input-not-ready:\" + String(before.stage || \"unknown\") + \":\" + String(before.current_url || page.url()));\n}\nconst fillField = async (locator, value) => {\n  await locator.scrollIntoViewIfNeeded().catch(() => {});\n  await locator.click({ timeout: 1500 }).catch(() => {});\n  await locator.fill(\"\").catch(() => {});\n  const filled = await locator.fill(value).then(() => true).catch(() => false);\n  if (!filled) {\n    await locator.press(\"Meta+A\").catch(() => {});\n    await locator.press(\"Control+A\").catch(() => {});\n    await locator.press(\"Backspace\").catch(() => {});\n    await locator.pressSequentially(value, { delay: 45 }).catch(() => {});\n  }\n};\nconst readCombinedValue = async () => {\n  const parts = [];\n  for (const locator of inputs.length ? inputs : [input]) {\n    parts.push(String(await locator.inputValue().catch(() => \"\")).replace(/\\D+/g, \"\"));\n  }\n  return parts.join(\"\").slice(0, code.length);\n};\nif (inputs.length > 1) {\n  for (let index = 0; index < inputs.length && index < code.length; index += 1) {\n    await fillField(inputs[index], code[index]);\n  }\n} else {\n  await fillField(input, code);\n}\nawait page.waitForTimeout(150).catch(() => {});\nlet value = await readCombinedValue();\nif (value !== code && inputs.length > 1) {\n  await input.click({ timeout: 1500 }).catch(() => {});\n  await input.press(\"Meta+A\").catch(() => {});\n  await input.press(\"Control+A\").catch(() => {});\n  await input.press(\"Backspace\").catch(() => {});\n  await input.pressSequentially(code, { delay: 45 }).catch(() => {});\n  await page.waitForTimeout(150).catch(() => {});\n  value = await readCombinedValue();\n}\nif (value.length < 6 || value !== code) {\n  throw new Error(\"login-verification-input-mismatch:\" + (value || \"empty\"));\n}\n\nconst allowedStages = new Set([\n  \"about_you\",\n  \"add_phone\",\n  \"oauth_consent\",\n  \"security_verification\",\n  \"retryable_timeout\",\n  \"rate_limit\",\n  \"session_ended\",\n  \"callback_complete\",\n]);\n\nconst clickVisibleContinue = async () => {\n  const result = await input.evaluate((field) => {\n    const normalize = (value) => String(value || \"\").replace(/\\s+/g, \" \").trim();\n    const isVisible = (node) => {\n      if (!(node instanceof Element)) {\n        return false;\n      }\n      const style = window.getComputedStyle(node);\n      if (!style || style.display === \"none\" || style.visibility === \"hidden\") {\n        return false;\n      }\n      const rect = node.getBoundingClientRect();\n      return rect.width > 0 && rect.height > 0;\n    };\n    const readLabel = (node) => {\n      if (!(node instanceof Element)) {\n        return \"\";\n      }\n      if (node instanceof HTMLInputElement) {\n        return normalize(node.value || node.getAttribute(\"aria-label\") || \"\");\n      }\n      return normalize(node.innerText || node.textContent || node.getAttribute(\"aria-label\") || \"\");\n    };\n    const form = field instanceof Element ? field.closest(\"form\") : null;\n    const scope = form || document;\n    const candidates = Array.from(scope.querySelectorAll(\"button, input[type='submit'], [role='button']\"))\n      .filter((node) => isVisible(node) && node.getAttribute(\"aria-disabled\") !== \"true\" && !node.hasAttribute(\"disabled\"));\n    const preferred = candidates.find((node) => {\n      const label = readLabel(node);\n      const isSubmitNode = (node instanceof HTMLButtonElement && node.type === \"submit\")\n        || (node instanceof HTMLInputElement && node.type === \"submit\");\n      return isSubmitNode && /continue|next|verify|submit|authorize|allow|accept/i.test(label);\n    }) || candidates.find((node) => /continue|next|verify|submit|authorize|allow|accept/i.test(readLabel(node)));\n    if (preferred instanceof HTMLElement) {\n      preferred.click();\n      return {\n        ok: true,\n        strategy: \"form-dom-click\",\n        label: readLabel(preferred) || null,\n      };\n    }\n    if (form instanceof HTMLFormElement) {\n      form.requestSubmit();\n      return {\n        ok: true,\n        strategy: \"form-request-submit\",\n        label: null,\n      };\n    }\n    return null;\n  }).catch(() => null);\n  return result;\n};\n\nconst attempts = [\n  async () => clickVisibleContinue(),\n  async () => {\n    await input.press(\"Enter\").catch(() => {});\n    return { strategy: \"press-enter\", label: null };\n  },\n  async () => {\n    await input.evaluate((field) => {\n      if (field instanceof HTMLElement) {\n        field.blur();\n      }\n      const form = field instanceof Element ? field.closest(\"form\") : null;\n      if (form instanceof HTMLFormElement) {\n        form.requestSubmit();\n      }\n    }).catch(() => {});\n    return { strategy: \"request-submit\", label: null };\n  },\n];\n\nconst waitForTransition = async (sameStage, timeoutMs = 8000) => {\n  const startedAt = Date.now();\n  let latest = await detectStage();\n  while (Date.now() - startedAt < timeoutMs) {\n    if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {\n      return latest;\n    }\n    if (latest.incorrect_code) {\n      return latest;\n    }\n    await page.waitForTimeout(500).catch(() => {});\n    latest = await detectStage();\n  }\n  return latest;\n};\n\nconst transitions = [];\nfor (const attempt of attempts) {\n  const performed = await attempt();\n  if (!performed) {\n    continue;\n  }\n  const after = await waitForTransition(\"email_verification\");\n  transitions.push({ ...performed, ...after });\n  if (allowedStages.has(after.stage) && after.stage !== \"email_verification\") {\n    return {\n      ok: true,\n      code,\n      strategy: performed.strategy,\n      clicked_text: performed.label || null,\n      next_stage: after.stage,\n      current_url: after.current_url,\n      headline: after.headline,\n      transitions,\n    };\n  }\n  if (after.incorrect_code) {\n    throw new Error(\"login-verification-code-rejected:\" + String(after.current_url || page.url()));\n  }\n}\n\nconst finalState = await detectStage();\nif (finalState.incorrect_code) {\n  throw new Error(\"login-verification-code-rejected:\" + String(finalState.current_url || page.url()));\n}\nthrow new Error(\"login-verification-submit-stuck:\" + String(finalState.stage || \"unknown\") + \":\" + String(finalState.current_url || page.url()));\n"
+          script: |
+            const readSixDigitCode = (value) => {
+              const match = String(value || "").match(/(?:^|\D)(\d{6})(?:\D|$)/);
+              return match?.[1] || null;
+            };
+            const extractVerificationCode = (action) => {
+              const outputs = [
+                action?.result?.result?.output,
+                action?.result?.output,
+                action?.output,
+              ].filter((value) => value && typeof value === "object");
+              for (const output of outputs) {
+                const directCode =
+                  readSixDigitCode(output.code)
+                  || readSixDigitCode(output.verification_code)
+                  || readSixDigitCode(output.otp)
+                  || readSixDigitCode(output.one_time_code);
+                if (directCode) {
+                  return directCode;
+                }
+              }
+              for (const output of outputs) {
+                const derivedCode =
+                  readSixDigitCode(output.message_subject)
+                  || readSixDigitCode(output.message_preview)
+                  || readSixDigitCode(output.verification_link_text);
+                if (derivedCode) {
+                  return derivedCode;
+                }
+              }
+              return null;
+            };
+            const code = String(
+              extractVerificationCode(state.steps.collect_login_verification_artifact?.action)
+              || ""
+            ).replace(/\D+/g, "").slice(0, 6);
+            if (code.length < 6) {
+              return {
+                ok: false,
+                error: "login-verification-code-missing",
+                stage: "email_verification",
+                current_url: page.url(),
+              };
+            }
+
+            const verificationSelector = 'input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]';
+
+            const detectStage = async () => await page.evaluate(() => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+
+              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+              const title = normalize(document.title || "");
+              const path = location.pathname;
+              const host = location.hostname;
+              const emailInput = hasVisible('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]');
+              const passwordInput = hasVisible('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]');
+              const verificationInput = hasVisible('input[name*="code" i], input[name*="otp" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[aria-label*="otp" i], input[placeholder*="code" i], input[placeholder*="otp" i], input[inputmode="numeric"][maxlength="1"], input[inputmode="numeric"][maxlength="6"]');
+              const antiBotGate = /just a moment/i.test(title)
+                || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)
+                || hasVisible('input[name="cf-turnstile-response"], iframe[src*="challenge"], iframe[title*="Widget containing"]');
+              const retryableTimeout = /oops, an error occurred|operation timed out|try again/i.test(bodyText);
+              const sessionEnded = /your session has ended/i.test(bodyText);
+              const rateLimitExceeded = /rate limit exceeded|too many requests|please try again later/i.test(bodyText);
+              const addPhonePrompt = /add-phone/i.test(path)
+                || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText);
+              const followUpStep = /confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText)
+                || /about-you/i.test(path);
+              const oauthConsentCopy = /sign in to codex with chatgpt|share your name, email, and profile picture with codex|share your name, email, and profile picture|link your account/i.test(bodyText)
+                || /sign in to codex/i.test(title);
+              const oauthContinueVisible = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']")).some((node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) {
+                  return false;
+                }
+                const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
+                return /continue to codex|continue to openai|authorize|allow|accept/i.test(text)
+                  || (oauthConsentCopy && /^continue$/i.test(text));
+              });
+              const needsEmailVerification = (!oauthConsentCopy && verificationInput)
+                || (!oauthConsentCopy && /check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText))
+                || (!oauthConsentCopy && /email-verification/i.test(path));
+
+              let stage = "unknown";
+              if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+                stage = "callback_complete";
+              } else if (antiBotGate) {
+                stage = "security_verification";
+              } else if (rateLimitExceeded) {
+                stage = "rate_limit";
+              } else if (sessionEnded) {
+                stage = "session_ended";
+              } else if (retryableTimeout) {
+                stage = "retryable_timeout";
+              } else if (addPhonePrompt) {
+                stage = "add_phone";
+              } else if (oauthConsentCopy && oauthContinueVisible) {
+                stage = "oauth_consent";
+              } else if (followUpStep) {
+                stage = "about_you";
+              } else if (needsEmailVerification) {
+                stage = "email_verification";
+              } else if (/\/log-in(?:\/|$)/i.test(path) && passwordInput) {
+                stage = "login_password";
+              } else if (/\/log-in(?:\/|$)/i.test(path) && emailInput) {
+                stage = "login_email";
+              } else if (emailInput || passwordInput || verificationInput) {
+                stage = "auth_prompt";
+              }
+
+              return {
+                stage,
+                current_url: location.href,
+                headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                incorrect_code: /incorrect code/i.test(bodyText),
+              };
+            });
+
+            const inputLocator = page.locator(verificationSelector);
+            const inputCount = await inputLocator.count().catch(() => 0);
+            const inputs = [];
+            for (let index = 0; index < inputCount; index += 1) {
+              const candidate = inputLocator.nth(index);
+              if (await candidate.isVisible().catch(() => false)) {
+                inputs.push(candidate);
+              }
+            }
+            const input = inputs[0] || inputLocator.first();
+            await input.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+            if ((await input.count().catch(() => 0)) === 0 || !(await input.isVisible().catch(() => false))) {
+              const before = await detectStage();
+              return {
+                ok: false,
+                error: "login-verification-input-not-ready",
+                stage: before.stage || "unknown",
+                current_url: before.current_url || page.url(),
+                headline: before.headline || null,
+              };
+            }
+            const fillField = async (locator, value) => {
+              await locator.scrollIntoViewIfNeeded().catch(() => {});
+              await locator.click({ timeout: 1500 }).catch(() => {});
+              await locator.fill("").catch(() => {});
+              const filled = await locator.fill(value).then(() => true).catch(() => false);
+              if (!filled) {
+                await locator.press("Meta+A").catch(() => {});
+                await locator.press("Control+A").catch(() => {});
+                await locator.press("Backspace").catch(() => {});
+                await locator.pressSequentially(value, { delay: 45 }).catch(() => {});
+              }
+            };
+            const readCombinedValue = async () => {
+              const parts = [];
+              for (const locator of inputs.length ? inputs : [input]) {
+                parts.push(String(await locator.inputValue().catch(() => "")).replace(/\D+/g, ""));
+              }
+              return parts.join("").slice(0, code.length);
+            };
+            if (inputs.length > 1) {
+              for (let index = 0; index < inputs.length && index < code.length; index += 1) {
+                await fillField(inputs[index], code[index]);
+              }
+            } else {
+              await fillField(input, code);
+            }
+            await page.waitForTimeout(150).catch(() => {});
+            let value = await readCombinedValue();
+            if (value !== code && inputs.length > 1) {
+              await input.click({ timeout: 1500 }).catch(() => {});
+              await input.press("Meta+A").catch(() => {});
+              await input.press("Control+A").catch(() => {});
+              await input.press("Backspace").catch(() => {});
+              await input.pressSequentially(code, { delay: 45 }).catch(() => {});
+              await page.waitForTimeout(150).catch(() => {});
+              value = await readCombinedValue();
+            }
+            if (value.length < 6 || value !== code) {
+              return {
+                ok: false,
+                error: "login-verification-input-mismatch",
+                stage: "email_verification",
+                current_url: page.url(),
+                typed_value: value || "",
+              };
+            }
+
+            const allowedStages = new Set([
+              "about_you",
+              "add_phone",
+              "oauth_consent",
+              "security_verification",
+              "retryable_timeout",
+              "rate_limit",
+              "session_ended",
+              "callback_complete",
+            ]);
+
+            const clickVisibleContinue = async () => {
+              const result = await input.evaluate((field) => {
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const readLabel = (node) => {
+                  if (!(node instanceof Element)) {
+                    return "";
+                  }
+                  if (node instanceof HTMLInputElement) {
+                    return normalize(node.value || node.getAttribute("aria-label") || "");
+                  }
+                  return normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "");
+                };
+                const form = field instanceof Element ? field.closest("form") : null;
+                const scope = form || document;
+                const candidates = Array.from(scope.querySelectorAll("button, input[type='submit'], [role='button']"))
+                  .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+                const preferred = candidates.find((node) => {
+                  const label = readLabel(node);
+                  const isSubmitNode = (node instanceof HTMLButtonElement && node.type === "submit")
+                    || (node instanceof HTMLInputElement && node.type === "submit");
+                  return isSubmitNode && /continue|next|verify|submit|authorize|allow|accept/i.test(label);
+                }) || candidates.find((node) => /continue|next|verify|submit|authorize|allow|accept/i.test(readLabel(node)));
+                if (preferred instanceof HTMLElement) {
+                  preferred.click();
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click",
+                    label: readLabel(preferred) || null,
+                  };
+                }
+                if (form instanceof HTMLFormElement) {
+                  form.requestSubmit();
+                  return {
+                    ok: true,
+                    strategy: "form-request-submit",
+                    label: null,
+                  };
+                }
+                return null;
+              }).catch(() => null);
+              return result;
+            };
+
+            const attempts = [
+              async () => clickVisibleContinue(),
+              async () => {
+                await input.press("Enter").catch(() => {});
+                return { strategy: "press-enter", label: null };
+              },
+              async () => {
+                await input.evaluate((field) => {
+                  if (field instanceof HTMLElement) {
+                    field.blur();
+                  }
+                  const form = field instanceof Element ? field.closest("form") : null;
+                  if (form instanceof HTMLFormElement) {
+                    form.requestSubmit();
+                  }
+                }).catch(() => {});
+                return { strategy: "request-submit", label: null };
+              },
+            ];
+
+            const waitForTransition = async (sameStage, timeoutMs = 8000) => {
+              const startedAt = Date.now();
+              let latest = await detectStage();
+              while (Date.now() - startedAt < timeoutMs) {
+                if (allowedStages.has(latest.stage) && latest.stage !== sameStage) {
+                  return latest;
+                }
+                if (latest.incorrect_code) {
+                  return latest;
+                }
+                await page.waitForTimeout(500).catch(() => {});
+                latest = await detectStage();
+              }
+              return latest;
+            };
+
+            const transitions = [];
+            for (const attempt of attempts) {
+              const performed = await attempt();
+              if (!performed) {
+                continue;
+              }
+              const after = await waitForTransition("email_verification");
+              transitions.push({ ...performed, ...after });
+              if (allowedStages.has(after.stage) && after.stage !== "email_verification") {
+                return {
+                  ok: true,
+                  code,
+                  strategy: performed.strategy,
+                  clicked_text: performed.label || null,
+                  next_stage: after.stage,
+                  current_url: after.current_url,
+                  headline: after.headline,
+                  transitions,
+                };
+              }
+              if (after.incorrect_code) {
+                return {
+                  ok: false,
+                  error: "login-verification-code-rejected",
+                  stage: after.stage || "email_verification",
+                  current_url: after.current_url || page.url(),
+                  headline: after.headline || null,
+                  incorrect_code: true,
+                  transitions,
+                };
+              }
+            }
+
+            const finalState = await detectStage();
+            if (finalState.incorrect_code) {
+              return {
+                ok: false,
+                error: "login-verification-code-rejected",
+                stage: finalState.stage || "email_verification",
+                current_url: finalState.current_url || page.url(),
+                headline: finalState.headline || null,
+                incorrect_code: true,
+                transitions,
+              };
+            }
+            return {
+              ok: false,
+              error: "login-verification-submit-stuck",
+              stage: finalState.stage || "unknown",
+              current_url: finalState.current_url || page.url(),
+              headline: finalState.headline || null,
+              incorrect_code: finalState.incorrect_code === true,
+              transitions,
+            };
   - classify_after_login_verification:
       if: "${(state.steps.reopen_existing_account_auth_url?.action?.ok === true && state.steps.reopen_existing_account_auth_url?.action?.skipped !== true) || (state.steps.reopen_captured_auth_url?.action?.ok === true && state.steps.reopen_captured_auth_url?.action?.skipped !== true)}"
       metadata:

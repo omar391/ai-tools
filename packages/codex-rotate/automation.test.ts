@@ -3333,6 +3333,113 @@ describe("original workflow verification helper", () => {
     expect(result.code).toBe("111222");
     expect(result.next_stage).toBe("oauth_consent");
   });
+
+  test("original reports a replayed-login OTP rejection as structured workflow state", async () => {
+    const result = await runOriginalStepScript(
+      "submit_login_verification_code",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <input inputmode="numeric" aria-label="Code" />
+            <button id="continue" type="button">Continue</button>
+            <script>
+              const input = document.querySelector("input");
+              document.getElementById("continue").addEventListener("click", () => {
+                if (input.value === "654321") {
+                  document.body.innerHTML =
+                    '<h1>Check your inbox</h1><p>Incorrect code. Use the newest code.</p><input inputmode="numeric" aria-label="Code" /><button type="button">Continue</button>';
+                }
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        steps: {
+          collect_login_verification_artifact: {
+            action: {
+              result: {
+                output: {
+                  code: "654321",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("login-verification-code-rejected");
+    expect(result.stage).toBe("email_verification");
+    expect(result.incorrect_code).toBe(true);
+  });
+
+  test("original uses a recollected replayed-login OTP on the second in-workflow submit", async () => {
+    const result = await runOriginalStepScript(
+      "submit_login_verification_code_after_submit_failure",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Check your inbox</h1>
+            <p>Enter the verification code we just sent.</p>
+            <div id="otp" style="display: flex; gap: 8px;">
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+              <input inputmode="numeric" maxlength="1" />
+            </div>
+            <button id="continue" type="button" disabled>Continue</button>
+            <script>
+              const inputs = Array.from(document.querySelectorAll("#otp input"));
+              const button = document.getElementById("continue");
+              const readCode = () => inputs.map((input) => input.value).join("");
+              const sync = () => {
+                button.disabled = readCode().length < 6;
+              };
+              inputs.forEach((input) => {
+                input.addEventListener("input", () => {
+                  input.value = String(input.value || "").replace(/\\D+/g, "").slice(-1);
+                  sync();
+                });
+              });
+              button.addEventListener("click", () => {
+                if (readCode() === "111222") {
+                  document.body.innerHTML =
+                    '<h1>Sign in to Codex with ChatGPT</h1><button>Continue to Codex</button>';
+                }
+              });
+              sync();
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        vars: {
+          login_verification_code_retry: "111222",
+        },
+        steps: {
+          recollect_login_verification_artifact_after_submit_failure: {
+            action: {
+              result: {
+                output: {
+                  code: "111222",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("111222");
+    expect(result.next_stage).toBe("oauth_consent");
+  });
 });
 
 describe("stepwise workflow verification helper", () => {
