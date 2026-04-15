@@ -11,6 +11,12 @@ use crate::process::spawn_detached_process;
 #[cfg(target_os = "macos")]
 pub const MACOS_TRAY_LAUNCHD_LABEL: &str = "com.astronlab.codex-rotate.tray";
 
+#[cfg(target_os = "macos")]
+const TRAY_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(target_os = "macos")]
+const TRAY_LAUNCH_POLL_ATTEMPTS: usize = 20;
+
 pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -20,6 +26,13 @@ pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
             &plist_path,
             "Failed to bootstrap Codex Rotate tray launch agent after reset",
         )?;
+        if wait_for_launchctl_service_pid(
+            &label,
+            TRAY_LAUNCH_POLL_ATTEMPTS,
+            TRAY_LAUNCH_POLL_INTERVAL,
+        )? {
+            return Ok(());
+        }
         kickstart_tray_launch_agent(&label, "Failed to start Codex Rotate tray launch agent.")?;
         return Ok(());
     }
@@ -50,6 +63,13 @@ pub fn ensure_tray_process_registered() -> Result<bool> {
                 &plist_path,
                 "Failed to restore Codex Rotate tray launch agent after reset",
             )?;
+            if wait_for_launchctl_service_pid(
+                &label,
+                TRAY_LAUNCH_POLL_ATTEMPTS,
+                TRAY_LAUNCH_POLL_INTERVAL,
+            )? {
+                return Ok(true);
+            }
         }
         kickstart_tray_launch_agent(
             &label,
@@ -207,16 +227,9 @@ fn launchctl_bootstrap_plist(plist_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchctl_kickstart_label(label: &str) -> Result<()> {
+fn launchctl_kickstart_label(label: &str) -> Result<Output> {
     let service = launchctl_service_target(label);
-    let output = launchctl_output(["kickstart", "-k", &service])?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "{}",
-        format_launchctl_failure("kickstart", &output, None)
-    ))
+    launchctl_output(["kickstart", "-k", &service])
 }
 
 #[cfg(target_os = "macos")]
@@ -276,7 +289,24 @@ fn bootstrap_tray_launch_agent_after_reset(plist_path: &Path, message: &str) -> 
 
 #[cfg(target_os = "macos")]
 fn kickstart_tray_launch_agent(label: &str, message: &str) -> Result<()> {
-    launchctl_kickstart_label(label).with_context(|| message.to_string())
+    let output = launchctl_kickstart_label(label).with_context(|| message.to_string())?;
+    if !output.status.success() && !launchctl_output_is_absent_service(&output) {
+        return Err(anyhow!(
+            "{}",
+            format_launchctl_failure("kickstart", &output, None)
+        ))
+        .with_context(|| message.to_string());
+    }
+    if wait_for_launchctl_service_pid(label, TRAY_LAUNCH_POLL_ATTEMPTS, TRAY_LAUNCH_POLL_INTERVAL)?
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "launchctl kickstart did not produce a running pid for {}.",
+        label
+    ))
+    .with_context(|| message.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -371,6 +401,21 @@ fn launchctl_service_target(label: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn wait_for_launchctl_service_pid(
+    label: &str,
+    attempts: usize,
+    poll_interval: Duration,
+) -> Result<bool> {
+    for _ in 0..attempts {
+        if launchctl_service_pid(label)?.is_some() {
+            return Ok(true);
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(launchctl_service_pid(label)?.is_some())
+}
+
+#[cfg(target_os = "macos")]
 fn tray_launchd_label() -> String {
     default_tray_launchd_label().unwrap_or_else(|_| MACOS_TRAY_LAUNCHD_LABEL.to_string())
 }
@@ -417,20 +462,47 @@ fn shell_single_quote_string(value: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn build_tray_launch_agent_reset_script(plist_path: &Path, label: &str) -> String {
+    build_tray_launch_agent_reset_script_with_pid(plist_path, label, std::process::id())
+}
+
+#[cfg(target_os = "macos")]
+fn build_tray_launch_agent_reset_script_with_pid(
+    plist_path: &Path,
+    label: &str,
+    current_pid: u32,
+) -> String {
     format!(
-        "sleep 1; \
-launchctl bootout {domain} {plist} >/dev/null 2>&1 || true; \
+        "launchctl bootout {domain} {plist} >/dev/null 2>&1 || true; \
 launchctl remove {label} >/dev/null 2>&1 || true; \
+target_pid={current_pid}; \
+j=0; \
+while kill -0 \"$target_pid\" >/dev/null 2>&1; do \
+  j=$((j + 1)); \
+  [ $j -ge 40 ] && break; \
+  sleep 0.25; \
+done; \
 i=0; \
 while [ $i -lt 5 ]; do \
-  launchctl bootstrap {domain} {plist} >/dev/null 2>&1 && \
-  launchctl kickstart -k {service} >/dev/null 2>&1 && exit 0; \
-  i=$((i + 1)); \
-  sleep 1; \
   launchctl bootout {domain} {plist} >/dev/null 2>&1 || true; \
   launchctl remove {label} >/dev/null 2>&1 || true; \
+  launchctl bootstrap {domain} {plist} >/dev/null 2>&1 || true; \
+  k=0; \
+  while [ $k -lt 8 ]; do \
+    launchctl print {service} 2>/dev/null | grep -Eq '^[[:space:]]*pid = [0-9]+' && exit 0; \
+    k=$((k + 1)); \
+    sleep 0.25; \
+  done; \
+  launchctl kickstart -k {service} >/dev/null 2>&1 || true; \
+  k=0; \
+  while [ $k -lt 12 ]; do \
+    launchctl print {service} 2>/dev/null | grep -Eq '^[[:space:]]*pid = [0-9]+' && exit 0; \
+    k=$((k + 1)); \
+    sleep 0.25; \
+  done; \
+  i=$((i + 1)); \
 done; \
 exit 1",
+        current_pid = current_pid,
         domain = shell_single_quote_string(&launchctl_user_domain()),
         plist = shell_single_quote(plist_path),
         label = shell_single_quote_string(label),
@@ -530,6 +602,21 @@ mod tests {
             stderr: b"Could not find service \"com.astronlab.codex-rotate.tray\" in domain for user gui: 501\n".to_vec(),
         };
         assert!(launchctl_output_is_absent_service(&output));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_reset_script_waits_for_old_pid_and_new_service_pid() {
+        let script = build_tray_launch_agent_reset_script_with_pid(
+            Path::new("/tmp/codex-rotate-tray.plist"),
+            "com.astronlab.codex-rotate.tray.demo",
+            4242,
+        );
+        assert!(script.starts_with("launchctl bootout "));
+        assert!(script.contains("target_pid=4242;"));
+        assert!(script.contains("while kill -0 \"$target_pid\""));
+        assert!(script.contains("launchctl print 'gui/"));
+        assert!(script.contains("grep -Eq '^[[:space:]]*pid = [0-9]+'"));
     }
 
     #[cfg(target_os = "macos")]
