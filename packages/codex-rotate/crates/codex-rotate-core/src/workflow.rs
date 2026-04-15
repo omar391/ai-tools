@@ -1881,14 +1881,17 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
         progress.as_ref(),
         format!("Inspecting quota for {}.", created_email),
     );
-    let inspected =
-        inspect_pool_entry_for_created_email(&extract_account_id_from_auth(auth), &created_email)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Created {}, but could not find the new account in the pool after login.",
-                    created_email
-                )
-            })?;
+    let inspected = inspect_pool_entry_for_created_email(
+        &extract_account_id_from_auth(auth),
+        &created_email,
+        &summarize_codex_auth(auth).plan_type,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "Created {}, but could not find the new account in the pool after login.",
+            created_email
+        )
+    })?;
 
     let updated_at = now_iso();
     store.pending.remove(&normalize_email_key(&created_email));
@@ -1995,28 +1998,58 @@ fn find_created_pool_entry_index(
     pool: &Pool,
     account_id: &str,
     expected_email: &str,
+    expected_plan: &str,
 ) -> Option<usize> {
     let normalized_expected_email = normalize_email_key(expected_email);
+    let normalized_expected_plan = normalize_created_pool_plan_type(expected_plan);
     if !normalized_expected_email.is_empty() && normalized_expected_email != "unknown" {
         if let Some(index) = pool.accounts.iter().position(|entry| {
             normalize_email_key(entry.email.as_str()) == normalized_expected_email
+                && normalize_created_pool_plan_type(&entry.plan_type) == normalized_expected_plan
         }) {
             return Some(index);
         }
     }
 
     pool.accounts.iter().position(|entry| {
-        entry.account_id == account_id || entry.auth.tokens.account_id == account_id
+        (entry.account_id == account_id || entry.auth.tokens.account_id == account_id)
+            && normalize_created_pool_plan_type(&entry.plan_type) == normalized_expected_plan
     })
+}
+
+fn normalize_created_pool_plan_type(plan_type: &str) -> String {
+    let normalized = plan_type
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = normalized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if compact.is_empty() {
+        "unknown".to_string()
+    } else {
+        compact
+    }
 }
 
 fn inspect_pool_entry_for_created_email(
     account_id: &str,
     expected_email: &str,
+    expected_plan: &str,
 ) -> Result<Option<InspectedPoolEntry>> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
-    let index = find_created_pool_entry_index(&pool, account_id, expected_email);
+    let index = find_created_pool_entry_index(&pool, account_id, expected_email, expected_plan);
     let Some(index) = index else {
         return Ok(None);
     };
@@ -2035,7 +2068,7 @@ fn inspect_pool_entry_for_created_email(
 }
 
 fn inspect_pool_entry_by_account_id(account_id: &str) -> Result<Option<InspectedPoolEntry>> {
-    inspect_pool_entry_for_created_email(account_id, "")
+    inspect_pool_entry_for_created_email(account_id, "", "")
 }
 
 struct InspectedPoolEntry {
@@ -8160,7 +8193,80 @@ end
         };
 
         assert_eq!(
-            find_created_pool_entry_index(&pool, "acct-shared", "devbench.17@astronlab.com",),
+            find_created_pool_entry_index(
+                &pool,
+                "acct-shared",
+                "devbench.17@astronlab.com",
+                "free",
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn created_pool_lookup_distinguishes_same_email_different_plan() {
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![
+                AccountEntry {
+                    label: "dev.1@hotspotprime.com_team".to_string(),
+                    alias: None,
+                    email: "dev.1@hotspotprime.com".to_string(),
+                    account_id: "acct-team".to_string(),
+                    plan_type: "team".to_string(),
+                    auth: CodexAuth {
+                        auth_mode: "chatgpt".to_string(),
+                        openai_api_key: None,
+                        tokens: crate::auth::AuthTokens {
+                            id_token: "id-team".to_string(),
+                            access_token: "access-team".to_string(),
+                            refresh_token: Some("refresh-team".to_string()),
+                            account_id: "acct-team".to_string(),
+                        },
+                        last_refresh: "2026-04-14T21:43:26.386Z".to_string(),
+                    },
+                    added_at: "2026-04-14T21:41:35.592Z".to_string(),
+                    last_quota_usable: None,
+                    last_quota_summary: None,
+                    last_quota_blocker: None,
+                    last_quota_checked_at: None,
+                    last_quota_primary_left_percent: None,
+                    last_quota_next_refresh_at: None,
+                },
+                AccountEntry {
+                    label: "dev.1@hotspotprime.com_free".to_string(),
+                    alias: None,
+                    email: "dev.1@hotspotprime.com".to_string(),
+                    account_id: "acct-free".to_string(),
+                    plan_type: "free".to_string(),
+                    auth: CodexAuth {
+                        auth_mode: "chatgpt".to_string(),
+                        openai_api_key: None,
+                        tokens: crate::auth::AuthTokens {
+                            id_token: "id-free".to_string(),
+                            access_token: "access-free".to_string(),
+                            refresh_token: Some("refresh-free".to_string()),
+                            account_id: "acct-free".to_string(),
+                        },
+                        last_refresh: "2026-04-14T21:43:29.948Z".to_string(),
+                    },
+                    added_at: "2026-04-14T21:41:35.592Z".to_string(),
+                    last_quota_usable: None,
+                    last_quota_summary: None,
+                    last_quota_blocker: None,
+                    last_quota_checked_at: None,
+                    last_quota_primary_left_percent: None,
+                    last_quota_next_refresh_at: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            find_created_pool_entry_index(&pool, "acct-team", "dev.1@hotspotprime.com", "team",),
+            Some(0)
+        );
+        assert_eq!(
+            find_created_pool_entry_index(&pool, "acct-free", "dev.1@hotspotprime.com", "free",),
             Some(1)
         );
     }

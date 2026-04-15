@@ -358,13 +358,18 @@ pub fn cmd_add_expected_email(expected_email: &str, alias: Option<&str>) -> Resu
     let next_alias = normalize_alias(alias).filter(|value| value != &expected_label);
 
     let mut pool = load_pool()?;
-    let index = find_pool_account_index_by_identity(&pool, &account_id, &normalized_expected_email)
-        .ok_or_else(|| {
-            anyhow!(
-                "Added auth for {}, but could not find the corresponding pool entry.",
-                normalized_expected_email
-            )
-        })?;
+    let index = find_pool_account_index_by_identity(
+        &pool,
+        &account_id,
+        &normalized_expected_email,
+        &plan_type,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "Added auth for {}, but could not find the corresponding pool entry.",
+            normalized_expected_email
+        )
+    })?;
 
     let entry = &mut pool.accounts[index];
     let changed = entry.email != normalized_expected_email
@@ -1020,7 +1025,7 @@ fn cmd_status_impl(output: &mut LineEmitter<'_>) -> Result<()> {
             auth.last_refresh
         ))?;
 
-        live_pool_index = find_pool_account_index_by_identity(&pool, &account_id, &email);
+        live_pool_index = find_pool_account_index_by_identity(&pool, &account_id, &email, &plan);
 
         if let Some(index) = live_pool_index {
             let inspection =
@@ -1283,7 +1288,7 @@ fn extract_email_from_auth(auth: &CodexAuth) -> String {
     "unknown".to_string()
 }
 
-fn extract_plan_from_auth(auth: &CodexAuth) -> String {
+pub(crate) fn extract_plan_from_auth(auth: &CodexAuth) -> String {
     decode_jwt_payload(&auth.tokens.access_token)
         .ok()
         .and_then(|payload| {
@@ -1324,7 +1329,7 @@ fn normalize_email_for_label(email: &str) -> String {
     }
 }
 
-fn normalize_plan_type_for_label(plan_type: &str) -> String {
+pub(crate) fn normalize_plan_type_for_label(plan_type: &str) -> String {
     let normalized = plan_type
         .trim()
         .to_lowercase()
@@ -1366,6 +1371,15 @@ fn normalize_identity_email(email: &str) -> Option<String> {
     }
 }
 
+fn normalize_identity_plan_type(plan_type: &str) -> Option<String> {
+    let normalized = normalize_plan_type_for_label(plan_type);
+    if normalized == "unknown" {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 fn should_preserve_expected_email(existing_email: &str, auth_email: &str) -> bool {
     let normalized_existing = existing_email.trim().to_lowercase();
     let normalized_auth = auth_email.trim().to_lowercase();
@@ -1380,12 +1394,18 @@ pub(crate) fn account_entry_matches_identity(
     entry: &AccountEntry,
     account_id: &str,
     email: &str,
+    plan_type: &str,
 ) -> bool {
     let target_email = normalize_identity_email(email);
     let entry_email = normalize_identity_email(&entry.email);
+    let target_plan = normalize_identity_plan_type(plan_type);
+    let entry_plan = normalize_identity_plan_type(&entry.plan_type);
 
     if target_email.is_some() && entry_email.as_deref() == target_email.as_deref() {
-        return true;
+        return match (entry_plan.as_deref(), target_plan.as_deref()) {
+            (Some(existing_plan), Some(target_plan)) => existing_plan == target_plan,
+            _ => true,
+        };
     }
 
     let normalized_account_id = account_id.trim();
@@ -1394,6 +1414,14 @@ pub(crate) fn account_entry_matches_identity(
             || entry.auth.tokens.account_id == normalized_account_id);
     if !has_matching_account_id {
         return false;
+    }
+
+    if let (Some(existing_plan), Some(target_plan)) =
+        (entry_plan.as_deref(), target_plan.as_deref())
+    {
+        if existing_plan != target_plan {
+            return false;
+        }
     }
 
     match (entry_email.as_deref(), target_email.as_deref()) {
@@ -1411,6 +1439,7 @@ pub(crate) fn account_entry_matches_auth_identity(entry: &AccountEntry, auth: &C
         entry,
         &extract_account_id_from_auth(auth),
         &extract_email_from_auth(auth),
+        &extract_plan_from_auth(auth),
     )
 }
 
@@ -1470,9 +1499,12 @@ fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) 
     let current_label = build_account_label(&current_email, &current_plan_type);
     let mut changed = false;
 
-    let Some(current_index) =
-        find_pool_account_index_by_identity(pool, &current_account_id, &current_email)
-    else {
+    let Some(current_index) = find_pool_account_index_by_identity(
+        pool,
+        &current_account_id,
+        &current_email,
+        &current_plan_type,
+    ) else {
         pool.accounts.push(AccountEntry {
             label: current_label,
             alias: None,
@@ -1504,10 +1536,16 @@ fn find_pool_account_index_by_identity(
     pool: &Pool,
     account_id: &str,
     email: &str,
+    plan_type: &str,
 ) -> Option<usize> {
-    if let Some(normalized_email) = normalize_identity_email(email) {
+    if let (Some(normalized_email), Some(normalized_plan)) = (
+        normalize_identity_email(email),
+        normalize_identity_plan_type(plan_type),
+    ) {
         if let Some(index) = pool.accounts.iter().position(|entry| {
             normalize_identity_email(&entry.email).as_deref() == Some(normalized_email.as_str())
+                && normalize_identity_plan_type(&entry.plan_type).as_deref()
+                    == Some(normalized_plan.as_str())
         }) {
             return Some(index);
         }
@@ -1515,7 +1553,7 @@ fn find_pool_account_index_by_identity(
 
     pool.accounts
         .iter()
-        .position(|entry| account_entry_matches_identity(entry, account_id, email))
+        .position(|entry| account_entry_matches_identity(entry, account_id, email, plan_type))
 }
 
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
@@ -2506,7 +2544,7 @@ mod tests {
         };
 
         assert_eq!(
-            find_pool_account_index_by_identity(&pool, "acct-27", "dev.26@astronlab.com"),
+            find_pool_account_index_by_identity(&pool, "acct-27", "dev.26@astronlab.com", "free"),
             Some(0)
         );
     }
@@ -2523,8 +2561,49 @@ mod tests {
         };
 
         assert_eq!(
-            find_pool_account_index_by_identity(&pool, "missing", "dev.26@astronlab.com"),
+            find_pool_account_index_by_identity(&pool, "missing", "dev.26@astronlab.com", "free"),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn pool_identity_lookup_distinguishes_same_email_different_plan() {
+        let mut team = stored_entry(Some(true), None);
+        team.email = "dev.1@hotspotprime.com".to_string();
+        team.label = "dev.1@hotspotprime.com_team".to_string();
+        team.plan_type = "team".to_string();
+        team.account_id = "acct-team".to_string();
+        team.auth = make_auth("dev.1@hotspotprime.com", "acct-team", "team");
+
+        let mut free = stored_entry(Some(true), None);
+        free.email = "dev.1@hotspotprime.com".to_string();
+        free.label = "dev.1@hotspotprime.com_free".to_string();
+        free.plan_type = "free".to_string();
+        free.account_id = "acct-free".to_string();
+        free.auth = make_auth("dev.1@hotspotprime.com", "acct-free", "free");
+
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![team, free],
+        };
+
+        assert_eq!(
+            find_pool_account_index_by_identity(
+                &pool,
+                "acct-team",
+                "dev.1@hotspotprime.com",
+                "team",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            find_pool_account_index_by_identity(
+                &pool,
+                "acct-free",
+                "dev.1@hotspotprime.com",
+                "free",
+            ),
+            Some(1)
         );
     }
 
@@ -2543,7 +2622,12 @@ mod tests {
         };
 
         assert_eq!(
-            find_pool_account_index_by_identity(&pool, "acct-team", "dev.3@hotspotprime.com"),
+            find_pool_account_index_by_identity(
+                &pool,
+                "acct-team",
+                "dev.3@hotspotprime.com",
+                "team"
+            ),
             None
         );
     }
