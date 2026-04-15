@@ -1170,6 +1170,377 @@ do:
       metadata:
         templateRef: classify_openai_surface
         description: "Classify the replayed login state after selecting the recovery branch."
+  - choose_login_forgot_password_recovery:
+      if: "${(state.steps.classify_after_login_email_gate?.action?.stage === 'login_password' && inputs.account_login_ref == null) || state.steps.classify_after_login_password_gate?.action?.invalid_credentials === true || state.steps.classify_after_login_password_gate?.action?.reset_password_prompt === true || state.steps.classify_after_login_password_gate?.action?.username_not_found === true}"
+      metadata:
+        description: Fall back to the forgot-password recovery path when the one-time-code branch does not advance.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const clickVisibleLabel = async (pattern) => {
+              return await page.evaluate((rawPattern) => {
+                const pattern = new RegExp(String(rawPattern), "i");
+                const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                const isVisible = (node) => {
+                  if (!(node instanceof Element)) {
+                    return false;
+                  }
+                  const style = window.getComputedStyle(node);
+                  if (!style || style.display === "none" || style.visibility === "hidden") {
+                    return false;
+                  }
+                  const rect = node.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const candidates = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']"))
+                  .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"));
+                const match = candidates.find((node) =>
+                  pattern.test(
+                    normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || "")),
+                  ),
+                );
+                if (!(match instanceof HTMLElement)) {
+                  return { ok: false, reason: "not-found", current_url: String(window.location.href || "") };
+                }
+                const clickedText =
+                  normalize(match instanceof HTMLInputElement ? match.value : (match.innerText || match.textContent || "")) || null;
+                match.click();
+                return {
+                  ok: true,
+                  clicked_text: clickedText,
+                  current_url: String(window.location.href || ""),
+                };
+              }, pattern.source).catch((error) => ({
+                ok: false,
+                reason: error instanceof Error ? error.message : String(error || "click-failed"),
+              }));
+            };
+            const onPasswordPage = () => /\/log-in\/password(?:[/?#]|$)/i.test(String(page.url() || ""));
+            if (!onPasswordPage()) {
+              return {
+                ok: true,
+                skipped: true,
+                reason: "forgot-password-link-not-found-or-not-on-password-page",
+              };
+            }
+            let result = await clickVisibleLabel(/forgot password|reset password/);
+            if (!result.ok) {
+              const retryable = await clickVisibleLabel(/try again|retry/);
+              if (retryable.ok) {
+                await page.waitForTimeout(350).catch(() => {});
+                if (!onPasswordPage()) {
+                  return {
+                    ok: true,
+                    clicked_text: retryable.clicked_text || null,
+                    current_url: page.url(),
+                  };
+                }
+                const forgotAfterRetry = await clickVisibleLabel(/forgot password|reset password/);
+                if (forgotAfterRetry.ok) {
+                  result = {
+                    ok: true,
+                    clicked_text: [retryable.clicked_text, forgotAfterRetry.clicked_text]
+                      .filter(Boolean)
+                      .join(" -> ") || null,
+                    current_url: forgotAfterRetry.current_url || page.url(),
+                  };
+                } else {
+                  result = {
+                    ok: true,
+                    clicked_text: retryable.clicked_text || null,
+                    retried: true,
+                    reason: "retry-only-password-recovery",
+                    current_url: page.url(),
+                  };
+                }
+              } else {
+                result = {
+                  ok: true,
+                  recovery_unavailable: true,
+                  reason: "forgot-password-link-not-found-or-not-on-password-page",
+                  current_url: page.url(),
+                };
+              }
+            }
+            if (!result || result.ok !== true) {
+              throw new Error(String(result && result.reason ? result.reason : "forgot-password-click-failed"));
+            }
+            return result;
+  - wait_after_login_forgot_password_recovery:
+      if: "${state.steps.choose_login_forgot_password_recovery?.action?.ok === true && state.steps.choose_login_forgot_password_recovery?.action?.skipped !== true}"
+      metadata:
+        description: Allow the forgot-password recovery path to render before classifying the next page.
+      wait:
+        milliseconds: 1800
+  - classify_after_login_forgot_password_recovery:
+      if: "${state.steps.choose_login_forgot_password_recovery?.action?.ok === true && state.steps.choose_login_forgot_password_recovery?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Classify the replayed login state after opening the forgot-password recovery path.
+  - clear_login_forgot_password_security_gate:
+      if: "${state.steps.classify_after_login_forgot_password_recovery?.action?.anti_bot_gate === true}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any security gate encountered after opening forgot-password recovery.
+  - classify_after_login_forgot_password_gate:
+      if: "${state.steps.choose_login_forgot_password_recovery?.action?.ok === true && state.steps.choose_login_forgot_password_recovery?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Refresh the replayed login state after any forgot-password recovery security handling.
+  - submit_login_reset_password_request:
+      if: "${state.steps.classify_after_login_forgot_password_recovery?.action?.reset_password_prompt === true || state.steps.classify_after_login_forgot_password_gate?.action?.reset_password_prompt === true || state.steps.choose_login_forgot_password_recovery?.action?.recovery_unavailable === true || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'login_password' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'login_password'}"
+      metadata:
+        description: Submit the generic OpenAI reset-password request when forgot-password recovery opens the reset form.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const email = String(args.email || "").trim();
+            if (!/\/reset-password(?:[/?#]|$)/i.test(String(page.url() || ""))) {
+              await page.goto("https://auth.openai.com/reset-password", { waitUntil: "domcontentloaded" }).catch(() => {});
+              await page.waitForTimeout(1200).catch(() => {});
+            }
+            const clickResetControl = async (patterns) => {
+              const controls = page.locator("button, a, [role='button'], input[type='submit']");
+              const count = await controls.count().catch(() => 0);
+              for (let index = 0; index < count; index += 1) {
+                const locator = controls.nth(index);
+                if (!(await locator.isVisible().catch(() => false))) {
+                  continue;
+                }
+                const label = String(await locator.evaluate((node) => {
+                  if (node instanceof HTMLInputElement) {
+                    return node.value || node.getAttribute("aria-label") || "";
+                  }
+                  if (!(node instanceof Element)) {
+                    return "";
+                  }
+                  return node.innerText || node.textContent || node.getAttribute("aria-label") || "";
+                }).catch(() => "")).replace(/\s+/g, " ").trim();
+                if (!patterns.some((pattern) => pattern.test(label))) {
+                  continue;
+                }
+                await locator.scrollIntoViewIfNeeded().catch(() => {});
+                await locator.click({ timeout: 800 }).catch(async () => {
+                  await locator.evaluate((node) => {
+                    if (node instanceof HTMLElement) {
+                      node.click();
+                    }
+                  }).catch(() => {});
+                });
+                return label || null;
+              }
+              return null;
+            };
+            const result = await page.evaluate(({ email }) => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const emailInput = Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]'))
+                .find((node) => isVisible(node));
+              if (emailInput instanceof HTMLInputElement && email) {
+                emailInput.focus();
+                emailInput.value = "";
+                emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                emailInput.value = email;
+                emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                emailInput.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+              const submit = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit']"))
+                .filter((node) => isVisible(node) && node.getAttribute("aria-disabled") !== "true" && !node.hasAttribute("disabled"))
+                .find((node) => {
+                  const text = normalize(node instanceof HTMLInputElement ? node.value : (node.innerText || node.textContent || ""));
+                  return /continue|send|email me|send link|reset password|submit/i.test(text);
+                });
+              if (!(submit instanceof HTMLElement)) {
+                return {
+                  ok: false,
+                  reason: "reset-password-submit-control-not-found",
+                  current_url: String(window.location.href || ""),
+                };
+              }
+              const clickedText = normalize(submit instanceof HTMLInputElement ? submit.value : (submit.innerText || submit.textContent || "")) || null;
+              submit.click();
+              return {
+                ok: true,
+                clicked_text: clickedText,
+                current_url: String(window.location.href || ""),
+                email_filled: emailInput instanceof HTMLInputElement ? normalize(emailInput.value || "") || null : null,
+              };
+            }, { email }).catch((error) => ({
+              ok: false,
+              reason: error instanceof Error ? error.message : String(error || "reset-password-submit-failed"),
+            }));
+            if (!result || result.ok !== true) {
+              throw new Error(String(result && result.reason ? result.reason : "reset-password-submit-failed"));
+            }
+            await page.waitForTimeout(1200).catch(() => {});
+            const bodyText = await page.locator("body").innerText().catch(() => "");
+            let timeoutRetried = false;
+            let retryClickedText = null;
+            let resubmitClickedText = null;
+            if (/\/reset-password(?:[/?#]|$)/i.test(String(page.url() || "")) && /oops, an error occurred|operation timed out|try again/i.test(String(bodyText || ""))) {
+              retryClickedText = await clickResetControl([/^try again$/i, /try again/i]);
+              if (retryClickedText) {
+                timeoutRetried = true;
+                await page.waitForTimeout(350).catch(() => {});
+                resubmitClickedText = await clickResetControl([/continue/i, /send/i, /email me/i, /send link/i, /reset password/i, /submit/i]);
+                await page.waitForTimeout(1200).catch(() => {});
+              }
+            }
+            return {
+              ...result,
+              current_url: page.url(),
+              timeout_retried: timeoutRetried,
+              retry_clicked_text: retryClickedText,
+              resubmit_clicked_text: resubmitClickedText,
+            };
+  - wait_after_login_reset_password_request:
+      if: "${state.steps.submit_login_reset_password_request?.action?.ok === true && state.steps.submit_login_reset_password_request?.action?.skipped !== true}"
+      metadata:
+        description: Allow the reset-password request surface to settle before classifying the next page.
+      wait:
+        milliseconds: 1800
+  - classify_after_login_reset_password_request:
+      if: "${state.steps.submit_login_reset_password_request?.action?.ok === true && state.steps.submit_login_reset_password_request?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Classify the replayed login state after submitting the reset-password request.
+  - clear_login_reset_password_security_gate:
+      if: "${state.steps.classify_after_login_reset_password_request?.action?.anti_bot_gate === true}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any security gate encountered after submitting the reset-password request.
+  - classify_after_login_reset_password_gate:
+      if: "${state.steps.submit_login_reset_password_request?.action?.ok === true && state.steps.submit_login_reset_password_request?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Refresh the replayed login state after any reset-password security handling.
+  - retry_login_reset_password_request_after_timeout:
+      if: "${(state.steps.classify_after_login_reset_password_request?.action?.retryable_timeout === true && state.steps.classify_after_login_reset_password_request?.action?.reset_password_prompt === true) || (state.steps.classify_after_login_reset_password_gate?.action?.retryable_timeout === true && state.steps.classify_after_login_reset_password_gate?.action?.reset_password_prompt === true)}"
+      metadata:
+        description: Retry the reset-password request once more when the timeout overlay appears only after the post-submit settle/classify pass.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.exec_script
+      with:
+        body:
+          script: |
+            const email = String(args.email || "").trim();
+            const clickResetControl = async (patterns) => {
+              const controls = page.locator("button, a, [role='button'], input[type='submit']");
+              const count = await controls.count().catch(() => 0);
+              for (let index = 0; index < count; index += 1) {
+                const locator = controls.nth(index);
+                if (!(await locator.isVisible().catch(() => false))) {
+                  continue;
+                }
+                const label = String(await locator.evaluate((node) => {
+                  if (node instanceof HTMLInputElement) {
+                    return node.value || node.getAttribute("aria-label") || "";
+                  }
+                  if (!(node instanceof Element)) {
+                    return "";
+                  }
+                  return node.innerText || node.textContent || node.getAttribute("aria-label") || "";
+                }).catch(() => "")).replace(/\s+/g, " ").trim();
+                if (!patterns.some((pattern) => pattern.test(label))) {
+                  continue;
+                }
+                await locator.scrollIntoViewIfNeeded().catch(() => {});
+                await locator.click({ timeout: 800 }).catch(async () => {
+                  await locator.evaluate((node) => {
+                    if (node instanceof HTMLElement) {
+                      node.click();
+                    }
+                  }).catch(() => {});
+                });
+                return label || null;
+              }
+              return null;
+            };
+            if (!/\/reset-password(?:[/?#]|$)/i.test(String(page.url() || ""))) {
+              throw new Error("reset-password-timeout-retry-not-on-reset-page");
+            }
+            const retryClickedText = await clickResetControl([/^try again$/i, /try again/i]);
+            if (!retryClickedText) {
+              throw new Error("reset-password-timeout-retry-button-not-found");
+            }
+            await page.waitForTimeout(350).catch(() => {});
+            const emailFill = await page.evaluate(({ email }) => {
+              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+              const isVisible = (node) => {
+                if (!(node instanceof Element)) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style || style.display === "none" || style.visibility === "hidden") {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const emailInput = Array.from(document.querySelectorAll('input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"]'))
+                .find((node) => isVisible(node));
+              if (emailInput instanceof HTMLInputElement && email) {
+                emailInput.focus();
+                emailInput.value = "";
+                emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                emailInput.value = email;
+                emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                emailInput.dispatchEvent(new Event("change", { bubbles: true }));
+                return normalize(emailInput.value || "") || null;
+              }
+              return null;
+            }, { email }).catch(() => null);
+            const resubmitClickedText = await clickResetControl([/continue/i, /send/i, /email me/i, /send link/i, /reset password/i, /submit/i]);
+            if (!resubmitClickedText) {
+              throw new Error("reset-password-timeout-resubmit-button-not-found");
+            }
+            await page.waitForTimeout(1200).catch(() => {});
+            return {
+              ok: true,
+              retry_clicked_text: retryClickedText,
+              resubmit_clicked_text: resubmitClickedText,
+              email_filled: emailFill,
+              current_url: page.url(),
+              timeout_retried: true,
+            };
+  - wait_after_login_reset_password_timeout_retry:
+      if: "${state.steps.retry_login_reset_password_request_after_timeout?.action?.ok === true && state.steps.retry_login_reset_password_request_after_timeout?.action?.skipped !== true}"
+      metadata:
+        description: Allow the reset-password timeout retry to settle before classifying the replayed login state again.
+      wait:
+        milliseconds: 1800
+  - classify_after_login_reset_password_timeout_retry:
+      if: "${state.steps.retry_login_reset_password_request_after_timeout?.action?.ok === true && state.steps.retry_login_reset_password_request_after_timeout?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Classify the replayed login state after retrying the reset-password request from the delayed timeout overlay.
+  - clear_login_reset_password_timeout_retry_security_gate:
+      if: "${state.steps.classify_after_login_reset_password_timeout_retry?.action?.anti_bot_gate === true}"
+      metadata:
+        templateRef: clear_openai_security_gate
+        description: Clear any security gate encountered after retrying the reset-password request from the delayed timeout overlay.
+  - classify_after_login_reset_password_timeout_retry_gate:
+      if: "${state.steps.retry_login_reset_password_request_after_timeout?.action?.ok === true && state.steps.retry_login_reset_password_request_after_timeout?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_surface
+        description: Refresh the replayed login state after any security handling for the delayed reset-password timeout retry.
   - clear_login_recovery_security_gate:
       if: "${state.steps.classify_after_login_recovery_choice?.action?.anti_bot_gate === true}"
       metadata:
@@ -1181,7 +1552,7 @@ do:
         templateRef: classify_openai_surface
         description: "Refresh the replayed login state after any recovery-path security handling."
   - resend_login_verification_email:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: "Request a fresh replayed-login verification email before collecting the OTP from Gmail."
         mode: headless_ok
@@ -1201,7 +1572,7 @@ do:
         body:
           script: "await page.waitForTimeout(10000).catch(() => {});\nreturn { ok: true, waited_ms: 10000 };\n"
   - collect_login_verification_artifact:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: Collect the replayed-login OTP from Gmail on the same managed profile.
         ref:
@@ -1215,7 +1586,7 @@ do:
           message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
           link_host_regex: "auth\\.openai\\.com|chatgpt\\.com"
   - return_to_login_verification_page:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         description: Return from Gmail to the active OpenAI login verification page before submitting the OTP.
         mode: headless_ok
@@ -1225,22 +1596,22 @@ do:
         body:
           url: "https://auth.openai.com/email-verification"
   - stabilize_login_verification_surface:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: wait_for_openai_surface_ready
         description: Wait for the login verification page to render after returning from Gmail.
   - classify_login_verification_ready:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: Confirm the OpenAI login verification page is active again after returning from Gmail.
   - clear_login_verification_return_gate:
-      if: "${(state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification') && state.steps.classify_login_verification_ready?.action?.anti_bot_gate === true}"
+      if: "${(state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification') && state.steps.classify_login_verification_ready?.action?.anti_bot_gate === true}"
       metadata:
         templateRef: clear_openai_security_gate
         description: Clear any security gate encountered when returning to the login verification page.
   - classify_login_verification_ready_gate:
-      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification'}"
+      if: "${state.steps.classify_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_recovery?.action?.stage === 'email_verification' || state.steps.classify_after_login_forgot_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_request?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_gate?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification' || state.steps.classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'}"
       metadata:
         templateRef: classify_openai_surface
         description: Refresh the login verification state after returning from Gmail.

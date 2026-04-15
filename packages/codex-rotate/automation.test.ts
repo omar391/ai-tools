@@ -2952,6 +2952,78 @@ describe("minimal verification helper", () => {
     );
   });
 
+  test("original forgot-password recovery opens the email verification path", async () => {
+    const result = await runWorkflowStepScript(
+      originalWorkflowPath,
+      "choose_login_forgot_password_recovery",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Enter your password</h1>
+            <input type="password" name="password" />
+            <a id="forgot" href="#" role="link">Forgot password?</a>
+            <script>
+              document.getElementById("forgot").addEventListener("click", (event) => {
+                event.preventDefault();
+                document.body.innerHTML =
+                  '<h1>Check your inbox</h1><input autocomplete="one-time-code" />';
+                history.replaceState({}, "", "https://auth.openai.com/email-verification");
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(String(result.clicked_text || "")).toContain("Forgot password");
+  });
+
+  test("original routes recovery-unavailable password pages into the reset-password submit step", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const submitStep = workflow.do?.find(
+      (entry) => "submit_login_reset_password_request" in entry,
+    )?.submit_login_reset_password_request as { if?: string } | undefined;
+
+    expect(submitStep?.if).toContain(
+      "choose_login_forgot_password_recovery?.action?.recovery_unavailable === true",
+    );
+    expect(submitStep?.if).toContain(
+      "classify_after_login_forgot_password_gate?.action?.stage === 'login_password'",
+    );
+  });
+
+  test("original retries reset-password after a delayed timeout classification on the reset page", async () => {
+    const workflow = await loadWorkflow(originalWorkflowPath);
+    const retryStep = workflow.do?.find(
+      (entry) => "retry_login_reset_password_request_after_timeout" in entry,
+    )?.retry_login_reset_password_request_after_timeout as
+      | { if?: string }
+      | undefined;
+    const resendStep = workflow.do?.find(
+      (entry) => "resend_login_verification_email" in entry,
+    )?.resend_login_verification_email as { if?: string } | undefined;
+
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_request?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_gate?.action?.retryable_timeout === true",
+    );
+    expect(retryStep?.if).toContain(
+      "classify_after_login_reset_password_request?.action?.reset_password_prompt === true",
+    );
+    expect(resendStep?.if).toContain(
+      "classify_after_login_reset_password_timeout_retry?.action?.stage === 'email_verification'",
+    );
+    expect(resendStep?.if).toContain(
+      "classify_after_login_reset_password_timeout_retry_gate?.action?.stage === 'email_verification'",
+    );
+  });
+
   test("fills segmented OTP inputs and advances the flow", async () => {
     const result = await runMinimalStepScript(
       "submit_login_verification_code",
