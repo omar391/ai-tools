@@ -189,7 +189,7 @@ fn main() {
 fn run() -> Result<()> {
     let options = parse_args(&env::args().skip(1).collect::<Vec<_>>())?;
     let repo_root = repo_root()?;
-    ensure_main_worktree_operation_allowed(&repo_root, "Benchmark account creation")?;
+    ensure_benchmark_worktree_operation_allowed(&repo_root, options.operation)?;
     let rotate_home = resolve_home_override("CODEX_ROTATE_HOME", ".codex-rotate")?;
     let codex_home = resolve_home_override("CODEX_HOME", ".codex")?;
     let cli_binary = resolve_cli_binary(&repo_root)?;
@@ -330,6 +330,16 @@ fn run() -> Result<()> {
             .unwrap_or("none")
     );
 
+    Ok(())
+}
+
+fn ensure_benchmark_worktree_operation_allowed(
+    repo_root: &Path,
+    operation: BenchmarkOperation,
+) -> Result<()> {
+    if matches!(operation, BenchmarkOperation::Create) {
+        ensure_main_worktree_operation_allowed(repo_root, "Benchmark account creation")?;
+    }
     Ok(())
 }
 
@@ -2223,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_run_is_blocked_from_linked_worktrees() {
+    fn benchmark_create_is_blocked_from_linked_worktrees() {
         let repo_root = repo_root().expect("repo root");
         let Some(main_worktree_root) = resolve_main_worktree_root(&repo_root) else {
             return;
@@ -2233,11 +2243,25 @@ mod tests {
         }
 
         let error =
-            ensure_main_worktree_operation_allowed(&repo_root, "Benchmark account creation")
-                .expect_err("linked worktree should be rejected");
+            ensure_benchmark_worktree_operation_allowed(&repo_root, BenchmarkOperation::Create)
+                .expect_err("linked worktree create benchmark should be rejected");
 
         assert!(error
             .to_string()
             .contains("Benchmark account creation is disabled from linked worktrees."));
+    }
+
+    #[test]
+    fn benchmark_relogin_is_allowed_from_linked_worktrees() {
+        let repo_root = repo_root().expect("repo root");
+        let Some(main_worktree_root) = resolve_main_worktree_root(&repo_root) else {
+            return;
+        };
+        if main_worktree_root == repo_root {
+            return;
+        }
+
+        ensure_benchmark_worktree_operation_allowed(&repo_root, BenchmarkOperation::Relogin)
+            .expect("linked worktree relogin benchmark should be allowed");
     }
 }
