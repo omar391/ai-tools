@@ -6,7 +6,9 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(MODULE_DIR, "..", "..");
+const REPO_ROOT = resolve(
+  process.env.CODEX_ROTATE_REPO_ROOT || resolve(MODULE_DIR, "..", ".."),
+);
 const DEFAULT_ROTATE_HOME = join(homedir(), ".codex-rotate");
 let ROTATE_HOME = resolve(process.env.CODEX_ROTATE_HOME || DEFAULT_ROTATE_HOME);
 const NODE_BINARY =
@@ -109,6 +111,10 @@ export function resolveFastBrowserSkillPath(
     mainWorktreeRoot,
   );
   return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+}
+
+export function resolveCodexRotateRepoRoot(): string {
+  return REPO_ROOT;
 }
 
 function ensureProcessWorkingDirectory(): void {

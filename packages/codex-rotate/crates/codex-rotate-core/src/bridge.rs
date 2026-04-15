@@ -81,6 +81,7 @@ where
         .arg("--request-file")
         .arg(request_file.path())
         .current_dir(&paths.asset_root)
+        .env("CODEX_ROTATE_REPO_ROOT", paths.repo_root.as_os_str())
         .env("CODEX_ROTATE_ASSET_ROOT", paths.asset_root.as_os_str())
         .env("CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK", "1")
         .env(

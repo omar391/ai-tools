@@ -32,7 +32,9 @@ const DEFAULT_CODEX_LOGS_DB_FILE: &str = "logs_1.sqlite";
 const DEFAULT_CODEX_STATE_DB_FILE: &str = "state_5.sqlite";
 
 pub fn resolve_paths() -> Result<CorePaths> {
-    let repo_root = repo_root()?;
+    let repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(repo_root()?);
     let home = dirs::home_dir().context("Failed to resolve home directory.")?;
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -388,7 +390,8 @@ mod tests {
     use super::{
         cleanup_legacy_rotate_home_artifacts, ensure_main_worktree_operation_allowed_with_root,
         fast_browser_script_candidates, resolve_codex_logs_db_file, resolve_codex_state_db_file,
-        resolve_node_binary, DEFAULT_CODEX_LOGS_DB_FILE, DEFAULT_CODEX_STATE_DB_FILE,
+        resolve_node_binary, resolve_paths, DEFAULT_CODEX_LOGS_DB_FILE,
+        DEFAULT_CODEX_STATE_DB_FILE,
     };
     use crate::test_support::ENV_MUTEX;
     use std::fs;
@@ -433,6 +436,50 @@ mod tests {
         }
 
         assert_eq!(resolved, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_paths_prefers_runtime_repo_root_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo-root");
+        fs::create_dir_all(repo_root.join("packages").join("codex-rotate"))
+            .expect("create asset root");
+        fs::create_dir_all(
+            repo_root
+                .join(".fast-browser")
+                .join("workflows")
+                .join("web")
+                .join("auth.openai.com"),
+        )
+        .expect("create workflow dir");
+
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", &repo_root);
+        }
+
+        let resolved = resolve_paths().expect("resolve paths");
+
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
+        }
+
+        assert_eq!(resolved.repo_root, repo_root);
+        assert_eq!(
+            resolved.asset_root,
+            repo_root.join("packages").join("codex-rotate")
+        );
+        assert_eq!(
+            resolved.account_flow_file,
+            repo_root
+                .join(".fast-browser")
+                .join("workflows")
+                .join("web")
+                .join("auth.openai.com")
+                .join("codex-rotate-account-flow-main.yaml")
+        );
     }
 
     #[test]
