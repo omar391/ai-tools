@@ -126,7 +126,10 @@ struct CreateCommandResult {
 #[derive(Debug)]
 enum CreateFlowAttemptFailure {
     Fatal(anyhow::Error),
-    Retryable(anyhow::Error),
+    Retryable {
+        error: anyhow::Error,
+        retry_reserved_email: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1312,14 +1315,19 @@ fn execute_create_flow_with_progress(
     progress: Option<AutomationProgressCallback>,
 ) -> Result<CreateCommandResult> {
     let mut attempt = 1usize;
+    let mut retry_reserved_emails = HashSet::new();
     loop {
         cancel::check_canceled()?;
-        match execute_create_flow_attempt(options, progress.clone()) {
+        match execute_create_flow_attempt(options, progress.clone(), &retry_reserved_emails) {
             Ok(result) => return Ok(result),
-            Err(CreateFlowAttemptFailure::Retryable(error))
-                if should_retry_create_after_error(options, &error) =>
-            {
+            Err(CreateFlowAttemptFailure::Retryable {
+                error,
+                retry_reserved_email,
+            }) if should_retry_create_after_error(options, &error) => {
                 let workflow_skip = is_workflow_skip_account_error(&error);
+                if let Some(email) = retry_reserved_email {
+                    retry_reserved_emails.insert(normalize_email_key(&email));
+                }
                 if should_stop_create_retry_for_reusable_account(options)
                     && reusable_account_exists_for_auto_create_retry(options)?
                 {
@@ -1371,7 +1379,7 @@ fn execute_create_flow_with_progress(
                 attempt = attempt.saturating_add(1);
                 cancel::sleep_with_cancellation(AUTO_CREATE_RETRY_DELAY)?;
             }
-            Err(CreateFlowAttemptFailure::Retryable(error))
+            Err(CreateFlowAttemptFailure::Retryable { error, .. })
             | Err(CreateFlowAttemptFailure::Fatal(error)) => return Err(error),
         }
     }
@@ -1508,6 +1516,7 @@ fn prefer_signup_recovery_for_create(_reusing_pending: bool) -> bool {
 fn execute_create_flow_attempt(
     options: &CreateCommandOptions,
     progress: Option<AutomationProgressCallback>,
+    retry_reserved_emails: &HashSet<String>,
 ) -> std::result::Result<CreateCommandResult, CreateFlowAttemptFailure> {
     let paths = fatal(resolve_paths())?;
     fatal(ensure_main_worktree_operation_allowed(
@@ -1552,11 +1561,12 @@ fn execute_create_flow_attempt(
     let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
         Some(entry) => entry.stored.suffix,
-        None => fatal(compute_fresh_account_family_suffix(
+        None => fatal(compute_create_attempt_family_suffix(
             family.as_ref(),
             &base_email,
             known_emails,
             skipped_emails,
+            retry_reserved_emails,
         ))?,
     };
     fatal(ensure_suffix_within_domain_limit_in_store(
@@ -1670,7 +1680,10 @@ fn execute_create_flow_attempt(
                         &created_email,
                         started_at.as_str(),
                     ))?;
-                    return Err(CreateFlowAttemptFailure::Retryable(error));
+                    return Err(CreateFlowAttemptFailure::Retryable {
+                        error,
+                        retry_reserved_email: Some(created_email.clone()),
+                    });
                 }
                 return Err(CreateFlowAttemptFailure::Fatal(error));
             }
@@ -1758,7 +1771,10 @@ fn execute_create_flow_attempt(
                     &created_email,
                     started_at.as_str(),
                 ))?;
-                return Err(CreateFlowAttemptFailure::Retryable(error));
+                return Err(CreateFlowAttemptFailure::Retryable {
+                    error,
+                    retry_reserved_email: Some(created_email.clone()),
+                });
             }
             fatal(save_credential_store(&store))?;
             return Err(CreateFlowAttemptFailure::Fatal(error));
@@ -1789,7 +1805,10 @@ fn execute_create_flow_attempt(
                 &created_email,
                 started_at.as_str(),
             ))?;
-            return Err(CreateFlowAttemptFailure::Retryable(error));
+            return Err(CreateFlowAttemptFailure::Retryable {
+                error,
+                retry_reserved_email: Some(created_email.clone()),
+            });
         }
         fatal(save_credential_store(&store))?;
         return Err(CreateFlowAttemptFailure::Fatal(error));
@@ -1827,7 +1846,10 @@ fn execute_create_flow_attempt(
                     &created_email,
                     started_at.as_str(),
                 ))?;
-                return Err(CreateFlowAttemptFailure::Retryable(error));
+                return Err(CreateFlowAttemptFailure::Retryable {
+                    error,
+                    retry_reserved_email: Some(created_email.clone()),
+                });
             }
             return Err(CreateFlowAttemptFailure::Fatal(error));
         }
@@ -4430,6 +4452,17 @@ fn compute_fresh_account_family_suffix(
     }
 }
 
+fn compute_create_attempt_family_suffix(
+    family: Option<&CredentialFamily>,
+    base_email: &str,
+    mut known_emails: Vec<String>,
+    skipped_emails: Vec<String>,
+    retry_reserved_emails: &HashSet<String>,
+) -> Result<u32> {
+    known_emails.extend(retry_reserved_emails.iter().cloned());
+    compute_fresh_account_family_suffix(family, base_email, known_emails, skipped_emails)
+}
+
 fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<String> {
     let mut emails = pool
         .accounts
@@ -6470,6 +6503,41 @@ input:
             .expect("compute next gmail suffix");
             assert_eq!(next_suffix, 5);
         });
+    }
+
+    #[test]
+    fn compute_create_attempt_family_suffix_advances_past_current_retry_reserved_gmail_slot() {
+        let family = CredentialFamily {
+            profile_name: "dev-1".to_string(),
+            base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+            next_suffix: 7,
+            max_skipped_slots: 0,
+            created_at: "2026-04-13T05:00:00.000Z".to_string(),
+            updated_at: "2026-04-15T04:22:55.044Z".to_string(),
+            last_created_email: Some("dev3astronlab+1@gmail.com".to_string()),
+            deleted: Vec::new(),
+        };
+
+        let next_suffix = compute_create_attempt_family_suffix(
+            Some(&family),
+            "dev3astronlab+{n}@gmail.com",
+            vec![
+                "dev3astronlab+1@gmail.com".to_string(),
+                "dev3astronlab+2@gmail.com".to_string(),
+                "dev3astronlab+3@gmail.com".to_string(),
+                "dev3astronlab+4@gmail.com".to_string(),
+            ],
+            vec![
+                "dev3astronlab+5@gmail.com".to_string(),
+                "dev3astronlab+6@gmail.com".to_string(),
+            ],
+            &["dev3astronlab+5@gmail.com".to_string()]
+                .into_iter()
+                .collect(),
+        )
+        .expect("next suffix");
+
+        assert_eq!(next_suffix, 6);
     }
 
     #[test]
