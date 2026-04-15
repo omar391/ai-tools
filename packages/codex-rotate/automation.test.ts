@@ -5519,6 +5519,70 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("reopens the direct login form when the signup invalid_state fallback lands on log-in-or-create-account", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openStep = workflow.do?.find(
+      (entry) =>
+        "open_prepare_direct_login_after_signup_invalid_state_auth_landing" in
+        entry,
+    )?.open_prepare_direct_login_after_signup_invalid_state_auth_landing as
+      | { if?: string; with?: { body?: { url?: string } } }
+      | undefined;
+    const classifyStep = workflow.do?.find(
+      (entry) =>
+        "classify_prepare_login_entry_after_signup_invalid_state_auth_landing" in
+        entry,
+    )?.classify_prepare_login_entry_after_signup_invalid_state_auth_landing as
+      | { if?: string }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_prepare_after_login_email_state" in entry,
+    )?.cache_effective_prepare_after_login_email_state as
+      | { run?: { script?: { code?: string } } }
+      | undefined;
+
+    expect(openStep?.if).toContain(
+      "/auth\\.openai\\.com\\/log-in-or-create-account/i.test",
+    );
+    expect(openStep?.if).toContain(
+      "classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.login_cta_visible === true",
+    );
+    expect(openStep?.with?.body?.url).toBe("https://auth.openai.com/log-in");
+    expect(classifyStep?.if).toContain(
+      "open_prepare_direct_login_after_signup_invalid_state_auth_landing?.action?.ok === true",
+    );
+    expect(cacheStep?.run?.script?.code).toContain(
+      "classify_prepare_login_entry_after_signup_invalid_state_auth_landing",
+    );
+  });
+
+  test("classifies the OpenAI log-in-or-create-account shell as a recoverable auth prompt", async () => {
+    const result = await runWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "classify_prepare_login_entry_after_signup_invalid_state_fallback",
+      `
+        <html>
+          <head>
+            <title>OpenAI</title>
+          </head>
+          <body>
+            <h1>Welcome back</h1>
+            <button type="button">Log in</button>
+            <button type="button">Sign up</button>
+          </body>
+        </html>
+      `,
+      {},
+      {},
+      "https://auth.openai.com/log-in-or-create-account",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.stage).toBe("auth_prompt");
+    expect(result.login_cta_visible).toBe(true);
+    expect(result.email_input).toBe(false);
+  });
+
   test("retries the prepare login email once more after the signup invalid_state fallback still lands on the email step", async () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 

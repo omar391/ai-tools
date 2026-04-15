@@ -4724,8 +4724,29 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: Classify the direct OpenAI login fallback after repeated signup invalid-state shells.
+  - open_prepare_direct_login_after_signup_invalid_state_auth_landing:
+      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.current_url || '')) && state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.login_cta_visible === true}"
+      metadata:
+        description: Reopen the direct OpenAI login form when the signup invalid-state fallback lands on the combined log-in-or-create-account shell.
+        mode: headless_ok
+        targetRef: primary
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://auth.openai.com/log-in
+  - wait_after_prepare_direct_login_after_signup_invalid_state_auth_landing:
+      if: "${state.steps.open_prepare_direct_login_after_signup_invalid_state_auth_landing?.action?.ok === true && state.steps.open_prepare_direct_login_after_signup_invalid_state_auth_landing?.action?.skipped !== true}"
+      metadata:
+        description: Allow the direct OpenAI login form to render after the combined auth landing fallback.
+      wait:
+        milliseconds: 900
+  - classify_prepare_login_entry_after_signup_invalid_state_auth_landing:
+      if: "${state.steps.open_prepare_direct_login_after_signup_invalid_state_auth_landing?.action?.ok === true && state.steps.open_prepare_direct_login_after_signup_invalid_state_auth_landing?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Classify the direct OpenAI login form after reopening it from the combined auth landing fallback.
   - fill_prepare_login_email_after_signup_invalid_state_fallback:
-      if: "${state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'login_email' || (state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.email_input === true)}"
+      if: "${state.steps.classify_prepare_login_entry_after_signup_invalid_state_auth_landing?.action?.stage === 'login_email' || (state.steps.classify_prepare_login_entry_after_signup_invalid_state_auth_landing?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_entry_after_signup_invalid_state_auth_landing?.action?.email_input === true) || state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'login_email' || (state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.email_input === true)}"
       metadata:
         templateRef: fill_openai_email_field
         description: Re-enter the target email on the direct OpenAI login fallback after repeated signup invalid-state shells.
@@ -4771,6 +4792,7 @@ do:
             const candidates = [
               state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback_retry?.action,
               state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback?.action,
+              state.steps?.classify_prepare_login_entry_after_signup_invalid_state_auth_landing?.action,
               state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action,
               state.steps?.classify_prepare_after_forced_signup_email_timeout_retry_submit?.action,
               state.steps?.classify_prepare_after_forced_signup_email_timeout_retry?.action,

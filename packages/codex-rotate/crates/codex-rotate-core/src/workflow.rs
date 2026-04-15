@@ -979,7 +979,10 @@ pub fn cmd_relogin_with_progress(
         .and_then(|entry| resolve_relogin_credential(&store, entry))
         .or_else(|| pending.as_ref().map(|pending| pending.stored.clone()));
     let relogin_birth_date = relogin_birth_date_for_pending(pending.as_ref());
-    let prefer_signup_recovery = pending.as_ref().map(|_| true);
+    let prefer_signup_recovery = Some(prefer_signup_recovery_for_relogin(
+        pending.as_ref(),
+        stored_credential.as_ref(),
+    ));
 
     if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
         let stored_credential = stored_credential.ok_or_else(|| {
@@ -1008,6 +1011,7 @@ pub fn cmd_relogin_with_progress(
                 skip_locator_preflight: None,
                 prefer_signup_recovery,
                 prefer_password_login: None,
+                treat_final_add_phone_as_environment_blocker: Some(true),
                 birth_date: relogin_birth_date.as_ref(),
                 progress: progress.clone(),
             })
@@ -1015,7 +1019,14 @@ pub fn cmd_relogin_with_progress(
         let login_outcome = match login_result {
             Ok(value) => value,
             Err(error) => {
-                restore_active_auth(previous_auth.as_ref())?;
+                if is_final_add_phone_environment_blocker_error(&error) {
+                    reconcile_pending_relogin_target(&mut store, pending.as_ref())?;
+                    return Ok(format!(
+                        "{YELLOW}WARN{RESET} Re-login for {} is environment-blocked at final add_phone. Pending account state was preserved.",
+                        display_summary
+                    ));
+                }
+                restore_active_auth_after_relogin(previous_auth.as_ref())?;
                 if is_workflow_skip_account_error(&error)
                     || is_missing_account_login_ref_error(&error)
                 {
@@ -1055,7 +1066,7 @@ pub fn cmd_relogin_with_progress(
                 &expected_email,
             )
         {
-            restore_active_auth(previous_auth.as_ref())?;
+            restore_active_auth_after_relogin(previous_auth.as_ref())?;
             return Err(anyhow!(
                 "Expected {}, but Codex logged into {}.",
                 expected_email,
@@ -1213,6 +1224,13 @@ pub fn should_use_stored_credential_relogin(
 
 fn should_logout_before_stored_relogin(options: &ReloginOptions) -> bool {
     options.logout_first
+}
+
+fn prefer_signup_recovery_for_relogin(
+    pending: Option<&PendingCredential>,
+    stored_credential: Option<&StoredCredential>,
+) -> bool {
+    pending.is_some() && stored_credential.is_none()
 }
 
 fn relogin_birth_date_for_pending(pending: Option<&PendingCredential>) -> Option<AdultBirthDate> {
@@ -1755,6 +1773,7 @@ fn execute_create_flow_attempt(
         skip_locator_preflight: Some(skip_locator_preflight),
         prefer_signup_recovery: Some(prefer_signup_recovery_for_create(reusing_pending)),
         prefer_password_login: skip_locator_preflight.then_some(true),
+        treat_final_add_phone_as_environment_blocker: Some(false),
         birth_date: Some(&birth_date),
         progress: progress.clone(),
     });
@@ -2156,6 +2175,13 @@ fn restore_active_auth(previous_auth: Option<&CodexAuth>) -> Result<()> {
     Ok(())
 }
 
+fn restore_active_auth_after_relogin(previous_auth: Option<&CodexAuth>) -> Result<()> {
+    if previous_auth.is_some() {
+        restore_active_auth(previous_auth)?;
+    }
+    Ok(())
+}
+
 struct CompleteCodexLoginArgs<'a> {
     profile_name: &'a str,
     email: &'a str,
@@ -2166,6 +2192,7 @@ struct CompleteCodexLoginArgs<'a> {
     skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
     prefer_password_login: Option<bool>,
+    treat_final_add_phone_as_environment_blocker: Option<bool>,
     birth_date: Option<&'a AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
 }
@@ -2187,6 +2214,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         skip_locator_preflight,
         prefer_signup_recovery,
         prefer_password_login,
+        treat_final_add_phone_as_environment_blocker,
         birth_date,
         progress,
     } = args;
@@ -2372,7 +2400,8 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
 
                 if next_action == Some("retry_attempt") {
                     if retry_reason == Some("final_add_phone")
-                        && stop_on_final_add_phone_retry_exhaustion()
+                        && (stop_on_final_add_phone_retry_exhaustion()
+                            || treat_final_add_phone_as_environment_blocker == Some(true))
                     {
                         return Err(final_add_phone_short_circuit_error(
                             email,
@@ -3137,6 +3166,17 @@ fn is_missing_account_login_ref_error(error: &anyhow::Error) -> bool {
     error
         .to_string()
         .contains("Workflow input 'account_login_ref' must be a secret ref")
+}
+
+fn is_final_add_phone_environment_blocker_error(error: &anyhow::Error) -> bool {
+    let normalized = error.to_string().trim().to_lowercase();
+    !normalized.is_empty()
+        && (normalized.contains("openai final_add_phone blocked")
+            || normalized.contains(
+                "openai still requires phone setup before the codex callback can complete",
+            )
+            || normalized.contains("after exhausting final add-phone retries")
+            || normalized.contains("after exhausting final add phone retries"))
 }
 
 fn is_retryable_codex_login_workflow_error_message(message: &str) -> bool {
@@ -5427,6 +5467,37 @@ mod tests {
                 ..ReloginOptions::default()
             }
         ));
+    }
+
+    #[test]
+    fn pending_relogin_with_stored_credential_prefers_login_recovery_not_signup() {
+        let pending = make_pending(
+            "dev3astronlab+5@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            5,
+            "2026-04-14T15:12:25.003Z",
+        );
+        let stored = pending.stored.clone();
+
+        assert!(!prefer_signup_recovery_for_relogin(
+            Some(&pending),
+            Some(&stored),
+        ));
+    }
+
+    #[test]
+    fn synthesized_pending_relogin_without_stored_credential_can_prefer_signup_recovery() {
+        let pending = make_pending(
+            "dev3astronlab+6@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            6,
+            "2026-04-14T16:12:25.003Z",
+        );
+
+        assert!(prefer_signup_recovery_for_relogin(Some(&pending), None));
+        assert!(!prefer_signup_recovery_for_relogin(None, None));
     }
 
     #[test]
@@ -8225,6 +8296,22 @@ end
     }
 
     #[test]
+    fn detects_final_add_phone_environment_blocker_errors() {
+        assert!(is_final_add_phone_environment_blocker_error(&anyhow!(
+            "OpenAI final_add_phone blocked dev3astronlab+5@gmail.com (https://auth.openai.com/log-in)."
+        )));
+        assert!(is_final_add_phone_environment_blocker_error(&anyhow!(
+            "The workflow requested skipping dev3astronlab+5@gmail.com after exhausting final add-phone retries (https://auth.openai.com/log-in)."
+        )));
+        assert!(is_final_add_phone_environment_blocker_error(&anyhow!(
+            "OpenAI still requires phone setup before the Codex callback can complete."
+        )));
+        assert!(!is_final_add_phone_environment_blocker_error(&anyhow!(
+            "Codex browser login did not reach the callback for dev3astronlab+5@gmail.com."
+        )));
+    }
+
+    #[test]
     fn relogin_family_match_prefers_exact_last_created_email() {
         let mut store = CredentialStore::default();
         store.families.insert(
@@ -8555,6 +8642,44 @@ end
 
             result.expect("session auth should override default auth");
         });
+    }
+
+    #[test]
+    fn relogin_restore_without_snapshot_preserves_current_auth_file() {
+        with_rotate_home(
+            "codex-rotate-relogin-restore-preserve-auth",
+            |rotate_home| {
+                let codex_home = rotate_home.join("codex-home");
+                fs::create_dir_all(&codex_home).expect("create codex home");
+                let previous_codex_home = std::env::var_os("CODEX_HOME");
+                unsafe {
+                    std::env::set_var("CODEX_HOME", &codex_home);
+                }
+
+                let result = (|| -> Result<()> {
+                    let auth_path = codex_home.join("auth.json");
+                    let current_auth = make_auth("dev3astronlab+1@gmail.com", "acct-gmail-1");
+                    write_codex_auth(&auth_path, &current_auth)?;
+
+                    restore_active_auth_after_relogin(None)?;
+
+                    let restored = load_codex_auth(&auth_path)?;
+                    assert_eq!(restored, current_auth);
+                    Ok(())
+                })();
+
+                match previous_codex_home {
+                    Some(value) => unsafe {
+                        std::env::set_var("CODEX_HOME", value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var("CODEX_HOME");
+                    },
+                }
+
+                result.expect("relogin restore should preserve existing auth without a snapshot");
+            },
+        );
     }
 
     #[test]
