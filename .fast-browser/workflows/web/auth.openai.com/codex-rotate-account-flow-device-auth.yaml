@@ -5054,6 +5054,9 @@ do:
             const directLoginShell =
               /\/log-in(?:[/?#]|$)/i.test(String(afterEmail.current_url || ""))
               || /\/log-in(?:[/?#]|$)/i.test(String(state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.current_url || ""));
+            const oneTimeCodeVisible =
+              afterEmail.one_time_code_cta === true
+              || state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.one_time_code_cta === true;
             const existingAccountFallbackActive =
               state.steps?.classify_prepare_after_signup_password_gate?.action?.existing_account_prompt === true
               || state.steps?.classify_prepare_after_signup_password_gate?.action?.stage === "existing_account_prompt"
@@ -5071,7 +5074,7 @@ do:
               ((!preferPasswordLogin) && (passwordStage || passwordAuthPrompt))
               || ((passwordStage || passwordAuthPrompt) && preferPasswordLogin && passwordAttempted !== true)
               || (existingAccountFallbackActive && (passwordStage || passwordAuthPrompt))
-              || (signupInvalidStateFallbackActive && directLoginShell)
+              || (signupInvalidStateFallbackActive && directLoginShell && oneTimeCodeVisible)
               || afterPassword.invalid_credentials === true
               || afterPassword.reset_password_prompt === true
               || afterPassword.username_not_found === true;
@@ -5083,6 +5086,7 @@ do:
               existing_account_fallback_active: existingAccountFallbackActive,
               signup_invalid_state_fallback_active: signupInvalidStateFallbackActive,
               direct_login_shell: directLoginShell,
+              one_time_code_visible: oneTimeCodeVisible,
               password_stage: passwordStage,
               password_auth_prompt: passwordAuthPrompt,
               password_attempted: passwordAttempted,
@@ -7291,8 +7295,21 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Reclassify the device-auth login surface after the ChatGPT auth landing's secondary login step."
+  - open_device_auth_direct_login_after_auth_landing:
+      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url || '')) && state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.login_cta_visible === true}"
+      metadata:
+        description: Reopen the direct OpenAI login form when the device-auth auth landing still resolves to the combined log-in-or-create-account shell.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://auth.openai.com/log-in
+  - classify_device_auth_login_entry_after_auth_landing_reopen:
+      if: "${state.steps.open_device_auth_direct_login_after_auth_landing?.action?.ok === true && state.steps.open_device_auth_direct_login_after_auth_landing?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the device-auth login surface after reopening direct OpenAI login from the combined auth shell.
   - wait_after_device_auth_login_entry_unknown:
-      if: "${state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage === 'unknown'}"
+      if: "${state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.skipped !== true ? state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.stage === 'unknown' : (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage === 'unknown')}"
       metadata:
         description: Give the device-auth login shell a moment to finish rendering when the secondary auth-landing classification returns unknown.
       wait:
@@ -7313,7 +7330,7 @@ do:
       metadata:
         description: "Cache the effective device-auth login-entry state after any secondary ChatGPT auth-landing recovery."
       set:
-        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_retry?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_retry?.action?.stage || state.steps.classify_device_auth_login_entry_retry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_retry?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {}))}"
+        effective_device_auth_login_entry_state: "${(state.steps.classify_device_auth_login_entry_retry?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_retry?.action?.stage || state.steps.classify_device_auth_login_entry_retry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_retry?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing_reopen?.action : ((state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.skipped !== true && (state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.stage || state.steps.classify_device_auth_login_entry_after_auth_landing?.action?.current_url)) ? state.steps.classify_device_auth_login_entry_after_auth_landing?.action : (((state.steps.classify_device_auth_login_entry?.action?.skipped !== true) && (state.steps.classify_device_auth_login_entry?.action?.stage || state.steps.classify_device_auth_login_entry?.action?.current_url)) ? state.steps.classify_device_auth_login_entry?.action : {})))}"
   - fill_device_auth_login_email:
       if: "${state.vars.device_auth_login_branch_started === 'true' && (state.vars.effective_device_auth_login_entry_state?.stage === 'login_email' || (state.vars.effective_device_auth_login_entry_state?.stage === 'auth_prompt' && state.vars.effective_device_auth_login_entry_state?.email_input === true))}"
       metadata:
