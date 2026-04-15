@@ -87,7 +87,9 @@ struct SharedDaemon {
     snapshot_cache: Arc<Mutex<StatusSnapshot>>,
     subscribers: Arc<Mutex<Vec<Sender<StatusSnapshot>>>>,
     in_flight_invocations: Arc<AtomicUsize>,
+    active_operations: Arc<AtomicUsize>,
     shutdown_requested: Arc<AtomicBool>,
+    shutdown_when_idle_requested: Arc<AtomicBool>,
 }
 
 impl SharedDaemon {
@@ -99,7 +101,9 @@ impl SharedDaemon {
             snapshot_cache: Arc::new(Mutex::new(snapshot)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             in_flight_invocations: Arc::new(AtomicUsize::new(0)),
+            active_operations: Arc::new(AtomicUsize::new(0)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_when_idle_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -217,7 +221,7 @@ pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
         spawn_watch_loop(daemon.clone());
 
         loop {
-            if daemon.shutdown_requested() {
+            if poll_shutdown_request(&daemon) {
                 break;
             }
             match listener.accept() {
@@ -352,6 +356,7 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
         let progress_daemon = daemon.clone();
         let progress: Arc<dyn Fn(String) + Send + Sync> =
             Arc::new(move |message| progress_daemon.set_progress_message(message));
+        let _activity = ActivityGuard::new(daemon.active_operations.clone());
         let result =
             daemon.with_state_mut(|state| run_watch_check(state, false, Some(progress.clone())));
         if let Err(error) = result {
@@ -615,7 +620,14 @@ impl SharedDaemon {
     }
 
     fn handle_invoke(&self, action: InvokeAction) -> Result<String> {
+        if matches!(action, InvokeAction::Shutdown) {
+            return Ok(request_daemon_shutdown(self));
+        }
+        if matches!(action, InvokeAction::ShutdownWhenIdle) {
+            return Ok(request_daemon_shutdown_when_idle(self));
+        }
         let _guard = InvocationGuard::new(self.in_flight_invocations.clone());
+        let _activity = ActivityGuard::new(self.active_operations.clone());
         let result = run_invoke_action(self, action);
         self.publish_state_snapshot();
         result
@@ -625,12 +637,27 @@ impl SharedDaemon {
         self.in_flight_invocations.load(Ordering::SeqCst) > 0
     }
 
+    fn has_active_operations(&self) -> bool {
+        self.active_operations.load(Ordering::SeqCst) > 0
+    }
+
     fn request_shutdown(&self) {
+        self.shutdown_when_idle_requested
+            .store(false, Ordering::SeqCst);
         self.shutdown_requested.store(true, Ordering::SeqCst);
     }
 
     fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn request_shutdown_when_idle(&self) {
+        self.shutdown_when_idle_requested
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn shutdown_when_idle_requested(&self) -> bool {
+        self.shutdown_when_idle_requested.load(Ordering::SeqCst)
     }
 }
 
@@ -646,6 +673,23 @@ impl InvocationGuard {
 }
 
 impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ActivityGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActivityGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
     }
@@ -778,16 +822,8 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
             );
             Ok(message.to_string())
         }),
-        InvokeAction::Shutdown => daemon.with_state_mut(|state| {
-            state.snapshot.next_tick_at = None;
-            set_snapshot_message(
-                &mut state.snapshot,
-                SnapshotMessageKind::Status,
-                "Codex Rotate is shutting down.".to_string(),
-            );
-            daemon.request_shutdown();
-            Ok("Stopping Codex Rotate daemon.".to_string())
-        }),
+        InvokeAction::Shutdown => Ok(request_daemon_shutdown(daemon)),
+        InvokeAction::ShutdownWhenIdle => Ok(request_daemon_shutdown_when_idle(daemon)),
         InvokeAction::Next => {
             let progress_daemon = daemon.clone();
             let progress: Arc<dyn Fn(String) + Send + Sync> =
@@ -1133,6 +1169,61 @@ fn set_snapshot_message(
     snapshot.last_message_kind = Some(kind);
 }
 
+fn poll_shutdown_request(daemon: &SharedDaemon) -> bool {
+    if daemon.shutdown_requested() {
+        return true;
+    }
+    if daemon.shutdown_when_idle_requested() && !daemon.has_active_operations() {
+        let _ = request_daemon_shutdown(daemon);
+        return true;
+    }
+    false
+}
+
+fn request_daemon_shutdown(daemon: &SharedDaemon) -> String {
+    let message = "Codex Rotate is shutting down.".to_string();
+    if let Ok(mut state) = daemon.state.try_lock() {
+        state.snapshot.next_tick_at = None;
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            message.clone(),
+        );
+        daemon.publish_snapshot(state.snapshot.clone());
+    } else {
+        let mut snapshot = daemon.snapshot();
+        snapshot.next_tick_at = None;
+        set_snapshot_message(&mut snapshot, SnapshotMessageKind::Status, message);
+        daemon.publish_snapshot(snapshot);
+    }
+    daemon.request_shutdown();
+    "Stopping Codex Rotate daemon.".to_string()
+}
+
+fn request_daemon_shutdown_when_idle(daemon: &SharedDaemon) -> String {
+    if !daemon.has_active_operations() {
+        return request_daemon_shutdown(daemon);
+    }
+
+    let message = "Codex Rotate will shut down after the current task finishes.".to_string();
+    if let Ok(mut state) = daemon.state.try_lock() {
+        state.snapshot.next_tick_at = None;
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            message.clone(),
+        );
+        daemon.publish_snapshot(state.snapshot.clone());
+    } else {
+        let mut snapshot = daemon.snapshot();
+        snapshot.next_tick_at = None;
+        set_snapshot_message(&mut snapshot, SnapshotMessageKind::Status, message);
+        daemon.publish_snapshot(snapshot);
+    }
+    daemon.request_shutdown_when_idle();
+    "Will stop Codex Rotate after the current task finishes.".to_string()
+}
+
 fn next_watch_interval(current_quota_percent: Option<u8>) -> Duration {
     let seconds = match current_quota_percent {
         Some(percent) if percent > LOW_QUOTA_WATCH_THRESHOLD_PERCENT => HEALTHY_INTERVAL_SECONDS,
@@ -1283,9 +1374,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1503,6 +1595,65 @@ mod tests {
             maybe_refresh_local_daemon_process(Some(&daemon), false).expect("refresh result");
 
         assert!(!result);
+    }
+
+    #[test]
+    fn shutdown_invoke_does_not_wait_for_the_daemon_state_lock() {
+        let daemon = SharedDaemon::new();
+        let state_guard = daemon.state.lock().expect("daemon state mutex");
+        let (sender, receiver) = mpsc::channel();
+        let daemon_for_thread = daemon.clone();
+
+        let handle = thread::spawn(move || {
+            let result = daemon_for_thread.handle_invoke(InvokeAction::Shutdown);
+            sender.send(result).expect("send shutdown result");
+        });
+
+        let response = receiver.recv_timeout(Duration::from_millis(200));
+        drop(state_guard);
+        handle.join().expect("join shutdown thread");
+
+        let output = response.expect("shutdown should complete without waiting for the state lock");
+        assert_eq!(
+            output.expect("shutdown invoke"),
+            "Stopping Codex Rotate daemon."
+        );
+        assert!(daemon.shutdown_requested());
+        assert_eq!(
+            daemon.snapshot().last_message.as_deref(),
+            Some("Codex Rotate is shutting down.")
+        );
+    }
+
+    #[test]
+    fn shutdown_when_idle_waits_for_active_operations_to_finish() {
+        let daemon = SharedDaemon::new();
+        let _activity = ActivityGuard::new(daemon.active_operations.clone());
+
+        let output = daemon
+            .handle_invoke(InvokeAction::ShutdownWhenIdle)
+            .expect("shutdown when idle");
+
+        assert_eq!(
+            output,
+            "Will stop Codex Rotate after the current task finishes."
+        );
+        assert!(!daemon.shutdown_requested());
+        assert!(daemon.shutdown_when_idle_requested());
+        assert!(!poll_shutdown_request(&daemon));
+    }
+
+    #[test]
+    fn shutdown_when_idle_requests_shutdown_once_idle() {
+        let daemon = SharedDaemon::new();
+
+        let output = daemon
+            .handle_invoke(InvokeAction::ShutdownWhenIdle)
+            .expect("shutdown when idle");
+
+        assert_eq!(output, "Stopping Codex Rotate daemon.");
+        assert!(daemon.shutdown_requested());
+        assert!(poll_shutdown_request(&daemon));
     }
 
     #[test]
