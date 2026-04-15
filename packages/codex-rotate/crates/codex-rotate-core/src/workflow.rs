@@ -1557,6 +1557,7 @@ fn execute_create_flow_attempt(
         &profile_name,
         &base_email,
         options.alias.as_deref(),
+        retry_reserved_emails,
     );
     let reusing_pending = existing_pending.is_some();
     let suffix = match existing_pending.as_ref() {
@@ -2373,15 +2374,11 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     if retry_reason == Some("final_add_phone")
                         && stop_on_final_add_phone_retry_exhaustion()
                     {
-                        return Err(anyhow!(login_error_message(
+                        return Err(final_add_phone_short_circuit_error(
+                            email,
+                            current_url,
                             error_message,
-                            format!(
-                                "OpenAI final_add_phone blocked {email}{}.",
-                                current_url
-                                    .map(|value| format!(" ({value})"))
-                                    .unwrap_or_default()
-                            )
-                        )));
+                        ));
                     }
                     max_attempts = max_attempts.max(codex_login_max_attempts(retry_reason));
                     if attempt < max_attempts {
@@ -3196,6 +3193,22 @@ fn stop_on_final_add_phone_retry_exhaustion() -> bool {
         std::env::var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV).as_deref(),
         Ok("1")
     )
+}
+
+fn final_add_phone_short_circuit_error(
+    email: &str,
+    current_url: Option<&str>,
+    error_message: Option<&str>,
+) -> anyhow::Error {
+    anyhow::Error::new(WorkflowSkipAccountError::new(login_error_message(
+        error_message,
+        format!(
+            "The workflow requested skipping {email} after final add-phone short-circuit{}.",
+            current_url
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default()
+        ),
+    )))
 }
 
 fn should_reset_device_auth_session_for_rate_limit(
@@ -4522,6 +4535,7 @@ fn select_pending_credential_for_family(
     profile_name: &str,
     base_email: &str,
     alias: Option<&str>,
+    excluded_emails: &HashSet<String>,
 ) -> Option<PendingCredential> {
     let normalized_base_email = normalize_base_email_family(base_email).ok()?;
     let normalized_alias = normalize_alias(alias);
@@ -4530,6 +4544,7 @@ fn select_pending_credential_for_family(
         .values()
         .filter(|entry| {
             entry.stored.profile_name == profile_name
+                && !excluded_emails.contains(&normalize_email_key(&entry.stored.email))
                 && normalize_base_email_family(&entry.stored.base_email)
                     .map(|value| value == normalized_base_email)
                     .unwrap_or(false)
@@ -7227,8 +7242,14 @@ end
         );
 
         assert_eq!(
-            select_pending_credential_for_family(&store, "dev-1", "dev.user@gmail.com", None)
-                .map(|entry| entry.stored.email),
+            select_pending_credential_for_family(
+                &store,
+                "dev-1",
+                "dev.user@gmail.com",
+                None,
+                &HashSet::new(),
+            )
+            .map(|entry| entry.stored.email),
             Some("dev.user+1@gmail.com".to_string())
         );
     }
@@ -7261,9 +7282,48 @@ end
                 "dev-1",
                 "dev.user@gmail.com",
                 Some("team-a"),
+                &HashSet::new(),
             )
             .map(|entry| entry.stored.email),
             Some("dev.user+2@gmail.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_pending_credential_for_family_ignores_retry_reserved_email() {
+        let mut store = CredentialStore::default();
+        store.pending.insert(
+            "dev.user+5@gmail.com".to_string(),
+            make_pending(
+                "dev.user+5@gmail.com",
+                "dev-1",
+                "dev.user@gmail.com",
+                5,
+                "2026-03-20T05:00:00.000Z",
+            ),
+        );
+        store.pending.insert(
+            "dev.user+6@gmail.com".to_string(),
+            make_pending(
+                "dev.user+6@gmail.com",
+                "dev-1",
+                "dev.user@gmail.com",
+                6,
+                "2026-03-20T06:00:00.000Z",
+            ),
+        );
+        let excluded = HashSet::from([normalize_email_key("dev.user+5@gmail.com")]);
+
+        assert_eq!(
+            select_pending_credential_for_family(
+                &store,
+                "dev-1",
+                "dev.user@gmail.com",
+                None,
+                &excluded,
+            )
+            .map(|entry| entry.stored.email),
+            Some("dev.user+6@gmail.com".to_string())
         );
     }
 
@@ -8148,6 +8208,20 @@ end
         unsafe {
             std::env::remove_var(CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE_ENV);
         }
+    }
+
+    #[test]
+    fn final_add_phone_short_circuit_returns_skip_account_error() {
+        let error = final_add_phone_short_circuit_error(
+            "dev.user+5@gmail.com",
+            Some("https://auth.openai.com/log-in"),
+            Some("blocked"),
+        );
+        assert!(is_workflow_skip_account_error(&error));
+        assert!(should_retry_create_after_error(
+            &CreateCommandOptions::default(),
+            &error
+        ));
     }
 
     #[test]
