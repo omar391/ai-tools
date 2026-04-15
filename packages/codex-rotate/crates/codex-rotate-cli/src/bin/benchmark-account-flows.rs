@@ -5,18 +5,21 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{SecondsFormat, Utc};
 use codex_rotate_core::paths::ensure_main_worktree_operation_allowed;
-use serde::Serialize;
+use codex_rotate_core::paths::resolve_paths;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const DEFAULT_PROFILE: &str = "dev-1";
 const DEFAULT_RUNS: u32 = 1;
+const PROFILE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
+const PROFILE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +151,34 @@ struct SelectionOutput {
     selected_device_auth: Option<SelectionEntry>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FastBrowserCliEnvelope<T> {
+    ok: bool,
+    result: Option<T>,
+    error: Option<FastBrowserCliError>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FastBrowserCliError {
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileInspectStatus {
+    profile_name: Option<String>,
+    request_queue: Option<ProfileInspectRequestQueue>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileInspectRequestQueue {
+    active: Option<Value>,
+    queued_count: Option<u64>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error:#}");
@@ -213,8 +244,10 @@ fn run() -> Result<()> {
     }
 
     let mut records = Vec::new();
+    let mut reserved_relogin_selectors = HashSet::new();
     for candidate in &candidates {
         for iteration in 1..=options.runs {
+            wait_for_managed_profile_idle(&repo_root, &options.profile_name)?;
             let snapshot = read_snapshot(&rotate_state_path, &codex_home);
             let base_email = resolve_benchmark_base_email(&options, candidate, &snapshot)?;
             let record = benchmark_candidate(
@@ -226,6 +259,7 @@ fn run() -> Result<()> {
                 &cli_binary,
                 &rotate_state_path,
                 &codex_home,
+                &mut reserved_relogin_selectors,
             )?;
             println!(
                 "[benchmark] {} success={} latency_ms={} created={} failure={}",
@@ -434,14 +468,22 @@ fn benchmark_candidate(
     cli_binary: &Path,
     rotate_state_path: &Path,
     codex_home: &Path,
+    reserved_relogin_selectors: &mut HashSet<String>,
 ) -> Result<BenchmarkRecord> {
     let before = read_snapshot(rotate_state_path, codex_home);
     let run_label = format!("{}-{}", candidate.id, iso_now());
     let relogin_selector = match options.operation {
         BenchmarkOperation::Create => None,
-        BenchmarkOperation::Relogin => Some(resolve_benchmark_relogin_selector(
-            options, &before, base_email,
-        )?),
+        BenchmarkOperation::Relogin => {
+            let selector = resolve_benchmark_relogin_selector(
+                options,
+                &before,
+                base_email,
+                reserved_relogin_selectors,
+            )?;
+            reserved_relogin_selectors.insert(selector.clone());
+            Some(selector)
+        }
     };
     let command =
         build_benchmark_command(cli_binary, options, base_email, relogin_selector.as_deref());
@@ -597,6 +639,7 @@ fn resolve_benchmark_relogin_selector(
     options: &Options,
     snapshot: &Snapshot,
     base_email: &str,
+    reserved: &HashSet<String>,
 ) -> Result<String> {
     if let Some(value) = options.relogin_selector_override.as_deref() {
         return Ok(value.to_string());
@@ -616,12 +659,18 @@ fn resolve_benchmark_relogin_selector(
             .cmp(&extract_template_suffix(right, base_email))
             .then_with(|| left.cmp(right))
     });
-    candidates.into_iter().next().ok_or_else(|| {
-        anyhow!(
-            "No pooled or pending account matches {} for relogin benchmarking.",
-            base_email
-        )
-    })
+    let selector = candidates
+        .iter()
+        .find(|email| !reserved.contains(*email))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+        .ok_or_else(|| {
+            anyhow!(
+                "No pooled or pending account matches {} for relogin benchmarking.",
+                base_email
+            )
+        })?;
+    Ok(selector)
 }
 
 fn resolve_cli_binary(repo_root: &Path) -> Result<PathBuf> {
@@ -651,6 +700,137 @@ fn resolve_cli_binary(repo_root: &Path) -> Result<PathBuf> {
             .collect::<Vec<_>>()
             .join("\n")
     ))
+}
+
+fn wait_for_managed_profile_idle(repo_root: &Path, profile_name: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let idle_state = inspect_profile_idle_state(repo_root, profile_name)?;
+        if idle_state.idle {
+            return Ok(());
+        }
+        if started.elapsed() >= PROFILE_IDLE_WAIT_TIMEOUT {
+            return Err(anyhow!(
+                "Managed profile \"{}\" stayed busy before benchmark start ({}).",
+                profile_name,
+                idle_state
+                    .reason
+                    .unwrap_or_else(|| "request queue not idle".to_string())
+            ));
+        }
+        thread::sleep(PROFILE_IDLE_POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProfileIdleState {
+    idle: bool,
+    reason: Option<String>,
+}
+
+fn inspect_profile_idle_state(repo_root: &Path, profile_name: &str) -> Result<ProfileIdleState> {
+    let paths = resolve_paths()?;
+    let output = Command::new(&paths.node_bin)
+        .arg(&paths.fast_browser_script)
+        .arg("profiles")
+        .arg("inspect")
+        .arg("--profile")
+        .arg(profile_name)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to run {} {} profiles inspect --profile {}.",
+                paths.node_bin,
+                paths.fast_browser_script.display(),
+                profile_name
+            )
+        })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(anyhow!(if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "fast-browser profiles inspect --profile {} exited with status {}.",
+                profile_name, output.status
+            )
+        }));
+    }
+    parse_profile_idle_state(&output.stdout)
+}
+
+fn parse_profile_idle_state(stdout: &[u8]) -> Result<ProfileIdleState> {
+    let envelope: FastBrowserCliEnvelope<ProfileInspectStatus> = serde_json::from_slice(stdout)
+        .context("fast-browser profiles inspect returned invalid JSON.")?;
+    if !envelope.ok {
+        return Err(anyhow!(
+            "{}",
+            envelope
+                .error
+                .and_then(|error| error.message)
+                .unwrap_or_else(|| "fast-browser profiles inspect failed.".to_string())
+        ));
+    }
+    let result = envelope
+        .result
+        .context("fast-browser profiles inspect did not return a result.")?;
+    let queue = result.request_queue.unwrap_or(ProfileInspectRequestQueue {
+        active: None,
+        queued_count: Some(0),
+    });
+    let queued_count = queue.queued_count.unwrap_or(0);
+    if queue.active.is_none() && queued_count == 0 {
+        return Ok(ProfileIdleState {
+            idle: true,
+            reason: None,
+        });
+    }
+    let reason = match (queue.active, queued_count) {
+        (Some(active), 0) => Some(format!(
+            "active request present for profile {}: {}",
+            result
+                .profile_name
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            summarize_active_request(&active)
+        )),
+        (None, count) => Some(format!(
+            "queuedCount={} for profile {}",
+            count,
+            result
+                .profile_name
+                .unwrap_or_else(|| "<unknown>".to_string())
+        )),
+        (Some(active), count) => Some(format!(
+            "active request present and queuedCount={} for profile {}: {}",
+            count,
+            result
+                .profile_name
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            summarize_active_request(&active)
+        )),
+    };
+    Ok(ProfileIdleState {
+        idle: false,
+        reason,
+    })
+}
+
+fn summarize_active_request(active: &Value) -> String {
+    let id = active.get("id").and_then(Value::as_i64);
+    let method = active.get("method").and_then(Value::as_str);
+    let workflow_ref = active.get("workflowRef").and_then(Value::as_str);
+    match (id, method, workflow_ref) {
+        (Some(id), Some(method), Some(workflow_ref)) => {
+            format!("id={id} method={method} workflowRef={workflow_ref}")
+        }
+        (Some(id), Some(method), None) => format!("id={id} method={method}"),
+        (Some(id), None, Some(workflow_ref)) => format!("id={id} workflowRef={workflow_ref}"),
+        (None, Some(method), Some(workflow_ref)) => {
+            format!("method={method} workflowRef={workflow_ref}")
+        }
+        _ => active.to_string(),
+    }
 }
 
 fn run_command_with_capture(
@@ -1732,6 +1912,7 @@ mod tests {
             relogin_selector_override: None,
             base_email_override: HashMap::new(),
         };
+        let mut reserved_relogin_selectors = HashSet::new();
 
         let result = benchmark_candidate(
             &candidate,
@@ -1742,6 +1923,7 @@ mod tests {
             &cli_binary,
             &rotate_home.join("accounts.json"),
             &codex_home,
+            &mut reserved_relogin_selectors,
         );
 
         match previous_codex_home {
@@ -1767,6 +1949,92 @@ mod tests {
         assert_eq!(account_emails, vec!["dev3astronlab+1@gmail.com"]);
 
         fs::remove_dir_all(&tempdir).ok();
+    }
+
+    #[test]
+    fn parse_profile_idle_state_reports_idle_when_queue_is_empty() {
+        let state = parse_profile_idle_state(
+            br#"{
+                "abiVersion":"1.0.0",
+                "command":"profiles.inspect",
+                "ok":true,
+                "result":{
+                    "ok":true,
+                    "profileName":"dev-1",
+                    "requestQueue":{
+                        "active":null,
+                        "queuedCount":0
+                    }
+                }
+            }"#,
+        )
+        .expect("idle state");
+
+        assert_eq!(
+            state,
+            ProfileIdleState {
+                idle: true,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_idle_state_reports_busy_active_request() {
+        let state = parse_profile_idle_state(
+            br#"{
+                "abiVersion":"1.0.0",
+                "command":"profiles.inspect",
+                "ok":true,
+                "result":{
+                    "ok":true,
+                    "profileName":"dev-1",
+                    "requestQueue":{
+                        "active":{
+                            "id":23,
+                            "method":"run",
+                            "workflowRef":"workspace.web.auth-openai-com.codex-rotate-account-flow-main"
+                        },
+                        "queuedCount":0
+                    }
+                }
+            }"#,
+        )
+        .expect("busy state");
+
+        assert!(!state.idle);
+        assert_eq!(
+            state.reason.as_deref(),
+            Some(
+                "active request present for profile dev-1: id=23 method=run workflowRef=workspace.web.auth-openai-com.codex-rotate-account-flow-main"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_profile_idle_state_reports_busy_queue_without_active_request() {
+        let state = parse_profile_idle_state(
+            br#"{
+                "abiVersion":"1.0.0",
+                "command":"profiles.inspect",
+                "ok":true,
+                "result":{
+                    "ok":true,
+                    "profileName":"dev-1",
+                    "requestQueue":{
+                        "active":null,
+                        "queuedCount":2
+                    }
+                }
+            }"#,
+        )
+        .expect("queued state");
+
+        assert!(!state.idle);
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("queuedCount=2 for profile dev-1")
+        );
     }
 
     #[test]
@@ -1830,9 +2098,14 @@ mod tests {
             pending_emails: HashSet::new(),
         };
 
-        let selector =
-            resolve_benchmark_relogin_selector(&options, &snapshot, "dev3astronlab+{n}@gmail.com")
-                .expect("selector");
+        let reserved = HashSet::new();
+        let selector = resolve_benchmark_relogin_selector(
+            &options,
+            &snapshot,
+            "dev3astronlab+{n}@gmail.com",
+            &reserved,
+        )
+        .expect("selector");
         assert_eq!(selector, "dev3astronlab+1@gmail.com");
     }
 
@@ -1853,10 +2126,48 @@ mod tests {
             pending_emails: HashSet::from(["dev3astronlab+5@gmail.com".to_string()]),
         };
 
-        let selector =
-            resolve_benchmark_relogin_selector(&options, &snapshot, "dev3astronlab+{n}@gmail.com")
-                .expect("selector");
+        let reserved = HashSet::new();
+        let selector = resolve_benchmark_relogin_selector(
+            &options,
+            &snapshot,
+            "dev3astronlab+{n}@gmail.com",
+            &reserved,
+        )
+        .expect("selector");
         assert_eq!(selector, "dev3astronlab+5@gmail.com");
+    }
+
+    #[test]
+    fn resolve_benchmark_relogin_selector_prefers_unused_family_account_before_reusing_one() {
+        let options = Options {
+            mode: Mode::All,
+            runs: 1,
+            profile_name: "dev-1".to_string(),
+            operation: BenchmarkOperation::Relogin,
+            relogin_selector_override: None,
+            base_email_override: HashMap::new(),
+        };
+        let snapshot = Snapshot {
+            auth_email: None,
+            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            account_emails: HashSet::from([
+                "dev3astronlab+1@gmail.com".to_string(),
+                "dev3astronlab+2@gmail.com".to_string(),
+                "dev3astronlab+3@gmail.com".to_string(),
+            ]),
+            pending_emails: HashSet::new(),
+        };
+        let reserved = HashSet::from(["dev3astronlab+1@gmail.com".to_string()]);
+
+        let selector = resolve_benchmark_relogin_selector(
+            &options,
+            &snapshot,
+            "dev3astronlab+{n}@gmail.com",
+            &reserved,
+        )
+        .expect("selector");
+
+        assert_eq!(selector, "dev3astronlab+2@gmail.com");
     }
 
     #[test]

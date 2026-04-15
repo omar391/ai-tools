@@ -2544,7 +2544,8 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                         )
                     )));
                 }
-                if flow.codex_login_exit_ok == Some(false) {
+                if flow.codex_login_exit_ok == Some(false) && !login_cancelled_after_callback(&flow)
+                {
                     let detail = flow
                         .codex_login_stderr_tail
                         .as_deref()
@@ -3313,6 +3314,30 @@ fn state_mismatch_in_login_flow(
     .join("\n")
     .to_lowercase();
     combined.contains("state mismatch")
+}
+
+fn login_cancelled_after_callback(flow: &CodexRotateAuthFlowSummary) -> bool {
+    if flow.callback_complete != Some(true) || flow.codex_login_exit_ok != Some(false) {
+        return false;
+    }
+    let callback_url = flow.current_url.as_deref().unwrap_or_default();
+    let callback_surface = callback_url.starts_with("http://localhost:")
+        || callback_url.contains("/auth/callback")
+        || callback_url.contains("/success");
+    if !callback_surface {
+        return false;
+    }
+    let combined = [
+        flow.headline.as_deref(),
+        flow.codex_login_stderr_tail.as_deref(),
+        flow.codex_login_stdout_tail.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+    .to_lowercase();
+    combined.contains("login cancelled")
 }
 
 fn promote_codex_auth_from_session(session: Option<&CodexRotateAuthFlowSession>) -> Result<()> {
@@ -6139,6 +6164,35 @@ input:
         );
         assert_eq!(summary.next_action, None);
         assert_eq!(summary.error_message, None);
+    }
+
+    #[test]
+    fn treats_cancelled_codex_exit_after_local_callback_as_recoverable() {
+        let summary = CodexRotateAuthFlowSummary {
+            current_url: Some("http://localhost:1455/auth/callback".to_string()),
+            callback_complete: Some(true),
+            codex_login_exit_ok: Some(false),
+            codex_login_stderr_tail: Some(
+                "Starting local login server on http://localhost:1455.\nLogin server error: Login cancelled"
+                    .to_string(),
+            ),
+            ..CodexRotateAuthFlowSummary::default()
+        };
+
+        assert!(login_cancelled_after_callback(&summary));
+    }
+
+    #[test]
+    fn does_not_treat_non_callback_cancelled_exit_as_recoverable() {
+        let summary = CodexRotateAuthFlowSummary {
+            current_url: Some("https://auth.openai.com/log-in".to_string()),
+            callback_complete: Some(true),
+            codex_login_exit_ok: Some(false),
+            codex_login_stderr_tail: Some("Login server error: Login cancelled".to_string()),
+            ..CodexRotateAuthFlowSummary::default()
+        };
+
+        assert!(!login_cancelled_after_callback(&summary));
     }
 
     #[test]
