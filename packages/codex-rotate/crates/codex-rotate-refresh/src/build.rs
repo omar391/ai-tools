@@ -81,8 +81,8 @@ pub fn resolve_rebuilt_local_binary(
     Ok(Some(build.binary_path.clone()))
 }
 
-pub fn supports_live_local_refresh(build: &LocalBinaryBuild) -> bool {
-    build.profile == BuildProfile::Debug
+pub fn supports_live_local_refresh(_build: &LocalBinaryBuild) -> bool {
+    true
 }
 
 pub fn maybe_start_background_release_build(build: &LocalBinaryBuild) -> Result<bool> {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn live_refresh_is_only_enabled_for_debug_builds() {
+    fn live_refresh_stays_enabled_for_local_release_builds() {
         let repo_root = PathBuf::from("/tmp/codex-rotate-live-refresh");
         let debug_build = LocalBinaryBuild {
             repo_root: repo_root.clone(),
@@ -336,7 +336,7 @@ mod tests {
         };
 
         assert!(supports_live_local_refresh(&debug_build));
-        assert!(!supports_live_local_refresh(&release_build));
+        assert!(supports_live_local_refresh(&release_build));
     }
 
     fn with_env_var<T>(
