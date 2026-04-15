@@ -450,6 +450,7 @@ fn benchmark_candidate(
         "CODEX_ROTATE_ACCOUNT_FLOW_FILE".into(),
         candidate.file_path.clone().into_os_string(),
     );
+    command_env.insert("CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE".into(), "1".into());
 
     println!(
         "[benchmark] starting {} iteration={} flow={} base_email={}",
@@ -604,9 +605,12 @@ fn resolve_benchmark_relogin_selector(
     let mut candidates = snapshot
         .account_emails
         .iter()
+        .chain(snapshot.pending_emails.iter())
         .filter(|email| email_matches_base_email(email, base_email))
         .cloned()
         .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
     candidates.sort_by(|left, right| {
         extract_template_suffix(left, base_email)
             .cmp(&extract_template_suffix(right, base_email))
@@ -614,7 +618,7 @@ fn resolve_benchmark_relogin_selector(
     });
     candidates.into_iter().next().ok_or_else(|| {
         anyhow!(
-            "No pooled account matches {} for relogin benchmarking.",
+            "No pooled or pending account matches {} for relogin benchmarking.",
             base_email
         )
     })
@@ -1830,6 +1834,29 @@ mod tests {
             resolve_benchmark_relogin_selector(&options, &snapshot, "dev3astronlab+{n}@gmail.com")
                 .expect("selector");
         assert_eq!(selector, "dev3astronlab+1@gmail.com");
+    }
+
+    #[test]
+    fn resolve_benchmark_relogin_selector_allows_pending_family_accounts() {
+        let options = Options {
+            mode: Mode::All,
+            runs: 1,
+            profile_name: "dev-1".to_string(),
+            operation: BenchmarkOperation::Relogin,
+            relogin_selector_override: None,
+            base_email_override: HashMap::new(),
+        };
+        let snapshot = Snapshot {
+            auth_email: None,
+            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            account_emails: HashSet::new(),
+            pending_emails: HashSet::from(["dev3astronlab+5@gmail.com".to_string()]),
+        };
+
+        let selector =
+            resolve_benchmark_relogin_selector(&options, &snapshot, "dev3astronlab+{n}@gmail.com")
+                .expect("selector");
+        assert_eq!(selector, "dev3astronlab+5@gmail.com");
     }
 
     #[test]
