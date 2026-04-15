@@ -2015,6 +2015,43 @@ describe("device-auth recovery preference", () => {
     expect(result.prefer_password_login).toBe(true);
     expect(result.should_recover).toBe(false);
   });
+
+  test("recovers with one-time-code after the signup invalid_state fallback returns to the direct login shell", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_one_time_code_recovery_flag",
+      {
+        prefer_password_login: "true",
+      },
+      {
+        steps: {
+          classify_prepare_after_login_email_signup_invalid_state_fallback: {
+            action: {
+              ok: true,
+              stage: "unknown",
+              current_url: "https://auth.openai.com/log-in",
+            },
+          },
+          cache_effective_prepare_after_login_email_state: {
+            action: {
+              value: {
+                effective_prepare_after_login_email_state: {
+                  stage: "unknown",
+                  current_url: "https://auth.openai.com/log-in",
+                },
+              },
+            },
+          },
+        },
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.signup_invalid_state_fallback_active).toBe(true);
+    expect(result.direct_login_shell).toBe(true);
+    expect(result.should_recover).toBe(true);
+  });
 });
 
 describe("minimal about-you helper", () => {
@@ -4775,8 +4812,8 @@ describe("device-auth workflow", () => {
 
     expect(step?.call).toBe("afn.driver.browser.exec_script");
     expect(step?.with?.body?.script).toContain("pressSequentially(code");
-    expect(step?.with?.body?.script).toContain(
-      "state.vars.prepare_login_verification_code",
+    expect(step?.with?.body?.script).toMatch(
+      /state\.vars\??\.prepare_login_verification_code/,
     );
     expect(step?.with?.body?.script).toContain(
       "recollect_prepare_login_verification_artifact_after_missing_code",
@@ -5160,6 +5197,58 @@ describe("device-auth workflow", () => {
 
     expect(result.ok).toBe(true);
     expect(result.security_open).toBe(true);
+  });
+
+  test("tolerates a QUIC logout navigation error while clearing prepare device-auth site state", async () => {
+    const script = await loadWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "clear_prepare_device_auth_site_state",
+    );
+    const execute = new AsyncFunction("page", "state", "args", script);
+    const result = (await execute(
+      {
+        goto: async () => {
+          throw new Error(
+            "page.goto: net::ERR_QUIC_PROTOCOL_ERROR at https://chatgpt.com/auth/logout",
+          );
+        },
+        url: () => "about:blank",
+      },
+      {},
+      {},
+    )) as Record<string, unknown>;
+
+    expect(result.ok).toBe(true);
+    expect(result.tolerated_logout_navigation_error).toBe(true);
+    expect(String(result.logout_navigation_error_message || "")).toContain(
+      "ERR_QUIC_PROTOCOL_ERROR",
+    );
+  });
+
+  test("tolerates a QUIC logout navigation error after the settings-based logout path", async () => {
+    const script = await loadWorkflowStepScript(
+      deviceAuthWorkflowPath,
+      "clear_prepare_device_auth_site_state_after_ui_logout",
+    );
+    const execute = new AsyncFunction("page", "state", "args", script);
+    const result = (await execute(
+      {
+        goto: async () => {
+          throw new Error(
+            "page.goto: net::ERR_QUIC_PROTOCOL_ERROR at https://chatgpt.com/auth/logout",
+          );
+        },
+        url: () => "about:blank",
+      },
+      {},
+      {},
+    )) as Record<string, unknown>;
+
+    expect(result.ok).toBe(true);
+    expect(result.tolerated_logout_navigation_error).toBe(true);
+    expect(String(result.logout_navigation_error_message || "")).toContain(
+      "ERR_QUIC_PROTOCOL_ERROR",
+    );
   });
 
   test("uses the direct OpenAI login surface as the existing-account fallback during device-auth prepare", () => {
@@ -6451,7 +6540,19 @@ describe("device-auth workflow", () => {
     expect(String(originalScript || "")).not.toContain(
       'page.locator(\'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]\').first()',
     );
-    expect(originalScript).toBe(stepwiseScript);
+    expect(String(stepwiseScript || "")).toContain(
+      "Execution context was destroyed|Cannot find context|Target closed|Frame was detached",
+    );
+    expect(String(stepwiseScript || "")).not.toContain(
+      "Timeout \\\\d+ms exceeded",
+    );
+    expect(String(stepwiseScript || "")).toContain("const passwordSelector =");
+    expect(String(stepwiseScript || "")).toContain(
+      "await page.$(passwordSelector)",
+    );
+    expect(String(stepwiseScript || "")).not.toContain(
+      'page.locator(\'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]\').first()',
+    );
   });
 
   test("device-auth signup password submit treats direct navigation to email verification as progress", async () => {

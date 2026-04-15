@@ -1182,6 +1182,7 @@ use:
             const day = normalize(args.birth_day || "24");
             const year = normalize(args.birth_year || "1990");
             const birthdayValue = month.padStart(2, "0") + "/" + day.padStart(2, "0") + "/" + year;
+            const birthdayDigitsValue = month.padStart(2, "0") + day.padStart(2, "0") + year;
             const birthdayDigits = digitsOnly(birthdayValue);
             const monthNumber = Math.max(1, Math.min(12, Number.parseInt(month, 10) || 1));
             const dayNumber = Math.max(1, Math.min(31, Number.parseInt(day, 10) || 1));
@@ -1502,7 +1503,6 @@ use:
               }).catch(() => {});
             };
             const fillBirthdayInput = async (locator) => {
-              const birthdayDigitsValue = month.padStart(2, "0") + day.padStart(2, "0") + year;
               await locator.scrollIntoViewIfNeeded().catch(() => {});
               await locator.click({ timeout: 1500 }).catch(() => {});
               await page.keyboard.press("Meta+A").catch(() => {});
@@ -1662,6 +1662,30 @@ use:
               }
               return match[1].padStart(2, "0") + "/" + match[2].padStart(2, "0") + "/" + match[3];
             };
+            const settleAboutYouForm = async () => {
+              await blurFormSafely();
+            };
+            const reinforceAboutYouFieldsIfNeeded = async (nameLocator, birthdayLocator, ageLocator) => {
+              let submitState = await readSubmitState();
+              if (!submitState.found || submitState.disabled === false) {
+                return submitState;
+              }
+              if (nameLocator) {
+                await setInputValue(nameLocator, fullName);
+              }
+              if (birthdayLocator) {
+                await setInputValue(birthdayLocator, birthdayValue);
+                let currentValue = normalize(await readInputValue(birthdayLocator));
+                if (digitsOnly(currentValue) !== birthdayDigits) {
+                  await setInputValue(birthdayLocator, birthdayDigitsValue);
+                }
+              } else if (ageLocator) {
+                await setInputValue(ageLocator, ageValue);
+              }
+              await settleAboutYouForm();
+              submitState = await readSubmitState();
+              return submitState;
+            };
             const tryFocusedAboutYouFallback = async () => {
               let typedSomething = false;
               const nameValueLocator = nameField || visibleInputs[0]?.locator || null;
@@ -1682,12 +1706,12 @@ use:
                 : null;
               if (!aboutYouValueLocator && typedSomething && visibleBirthdayBefore) {
                 await blurFormSafely();
-                const submitState = await readSubmitState();
+                const submitState = await reinforceAboutYouFieldsIfNeeded(nameValueLocator, null, null);
                 const nameActual = nameValueLocator
                   ? normalize(await readInputValue(nameValueLocator))
                   : null;
                 return {
-                  ok: true,
+                  ok: submitState.found !== true || submitState.disabled === false,
                   name_value: nameActual || null,
                   month_value: null,
                   day_value: null,
@@ -1719,7 +1743,7 @@ use:
                 }
               }
               await blurFormSafely();
-              const submitState = await readSubmitState();
+              const submitState = await reinforceAboutYouFieldsIfNeeded(nameValueLocator, birthdayField, ageField);
               const visibleBirthdayAfter = await readVisibleBirthdayValue();
               const nameActual = nameValueLocator
                 ? normalize(await readInputValue(nameValueLocator))
@@ -1727,7 +1751,7 @@ use:
               const ageActual = ageField
                 ? normalize(await readInputValue(ageField))
                 : null;
-              if (typedSomething && (submitState.disabled === false || (nameActual === fullName && (visibleBirthdayAfter || visibleBirthdayBefore || digitsOnly(ageActual) === ageDigits)))) {
+              if (typedSomething && (submitState.found !== true || submitState.disabled === false) && nameActual === fullName && (visibleBirthdayAfter || visibleBirthdayBefore || digitsOnly(ageActual) === ageDigits)) {
                 return {
                   ok: true,
                   name_value: nameActual || null,
@@ -1913,9 +1937,9 @@ use:
             const nameActual = normalize(await readInputValue(nameField));
             const birthdayActual = birthdayField ? normalize(await readInputValue(birthdayField)) : null;
             const ageActual = ageField ? normalize(await readInputValue(ageField)) : null;
-            const submitState = await readSubmitState();
+            const submitState = await reinforceAboutYouFieldsIfNeeded(nameField, birthdayField, ageField);
             const result = {
-              ok: submitState.disabled === false || (
+              ok: (submitState.found !== true || submitState.disabled === false) && (
                 nameActual === fullName
                   && (
                     (birthdayField && digitsOnly(birthdayActual) === birthdayDigits)
@@ -2438,8 +2462,12 @@ use:
                 label: label || null,
               };
             };
-            const passwordField = page.locator('input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]').first();
+            const passwordSelector = 'input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]';
             const submitFormFromField = async () => {
+              const passwordField = await page.$(passwordSelector);
+              if (!passwordField) {
+                return null;
+              }
               try {
                 const result = await passwordField.evaluate((field) => {
                   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -2502,6 +2530,8 @@ use:
                   };
                 }
                 throw error;
+              } finally {
+                await passwordField.dispose().catch(() => {});
               }
             };
 
@@ -2509,19 +2539,35 @@ use:
               async () => clickVisibleContinue(),
               async () => submitFormFromField(),
               async () => {
-                await passwordField.press("Enter").catch(() => {});
+                const passwordField = await page.$(passwordSelector);
+                if (!passwordField) {
+                  return null;
+                }
+                try {
+                  await passwordField.press("Enter").catch(() => {});
+                } finally {
+                  await passwordField.dispose().catch(() => {});
+                }
                 return { strategy: "press-enter", label: null };
               },
               async () => {
-                await passwordField.evaluate((field) => {
-                  if (field instanceof HTMLElement) {
-                    field.blur();
-                  }
-                  const form = field instanceof Element ? field.closest("form") : null;
-                  if (form instanceof HTMLFormElement) {
-                    form.requestSubmit();
-                  }
-                }).catch(() => {});
+                const passwordField = await page.$(passwordSelector);
+                if (!passwordField) {
+                  return null;
+                }
+                try {
+                  await passwordField.evaluate((field) => {
+                    if (field instanceof HTMLElement) {
+                      field.blur();
+                    }
+                    const form = field instanceof Element ? field.closest("form") : null;
+                    if (form instanceof HTMLFormElement) {
+                      form.requestSubmit();
+                    }
+                  }).catch(() => {});
+                } finally {
+                  await passwordField.dispose().catch(() => {});
+                }
                 return { strategy: "request-submit", label: null };
               },
             ];
@@ -2972,7 +3018,13 @@ use:
             const settleAfterAbort = async (reason) => {
               await page.waitForTimeout(1200).catch(() => {});
               const state = await captureState();
-              if (isSuccessfulLanding(state.current_url) && state.current_url !== priorUrl) {
+              if (
+                isSuccessfulLanding(state.current_url)
+                && (
+                  state.current_url !== priorUrl
+                  || /goto-interrupted/.test(String(reason || ""))
+                )
+              ) {
                 return { ok: true, strategy: reason, prior_url: priorUrl, ...state };
               }
               return null;
@@ -2986,8 +3038,8 @@ use:
               return { ok: true, strategy: "goto", prior_url: priorUrl, ...(await captureState()) };
             } catch (error) {
               const message = String(error?.message || error || "");
-              if (/ERR_ABORTED/i.test(message)) {
-                const abortedLanding = await settleAfterAbort("goto-err-aborted");
+              if (/ERR_ABORTED|interrupted by another navigation/i.test(message)) {
+                const abortedLanding = await settleAfterAbort("goto-interrupted");
                 if (abortedLanding) {
                   return abortedLanding;
                 }
@@ -3590,10 +3642,33 @@ do:
             - https://auth.openai.com
             - https://chatgpt.com
             - https://chat.openai.com
-      call: afn.driver.browser.navigate
+      call: afn.driver.browser.exec_script
       with:
         body:
-          url: https://chatgpt.com/auth/logout
+          script: |
+            const logoutUrl = "https://chatgpt.com/auth/logout";
+            try {
+              await page.goto(logoutUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 20000,
+              });
+              return {
+                ok: true,
+                current_url: page.url(),
+                tolerated_logout_navigation_error: false,
+              };
+            } catch (error) {
+              const message = String(error?.message || error || "");
+              if (/ERR_QUIC_PROTOCOL_ERROR|ERR_ABORTED|interrupted by another navigation/i.test(message)) {
+                return {
+                  ok: true,
+                  current_url: page.url(),
+                  tolerated_logout_navigation_error: true,
+                  logout_navigation_error_message: message,
+                };
+              }
+              throw error;
+            }
   - reopen_public_chatgpt_entry_for_prepare:
       if: "${state.steps.clear_prepare_device_auth_site_state?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state?.action?.skipped !== true}"
       metadata:
@@ -3990,6 +4065,13 @@ do:
                 return {
                   dialog_visible: Boolean(dialog),
                   text: String(root ? (root.innerText || root.textContent || "") : "").replace(/\s+/g, " ").trim(),
+                  security_control_visible: Array.from(root.querySelectorAll("button,a,[role='tab'],[role='button'],[role='link']")).some((node) => {
+                    if (!(node instanceof Element) || !isVisible(node)) {
+                      return false;
+                    }
+                    const text = String(node.innerText || node.textContent || node.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+                    return /^Security$/i.test(text);
+                  }),
                 };
               }).catch(() => ({ dialog_visible: false, text: "" }));
               const normalizedText = String(panel.text || "").replace(/\s+/g, " ").trim();
@@ -4111,10 +4193,33 @@ do:
             - https://auth.openai.com
             - https://chatgpt.com
             - https://chat.openai.com
-      call: afn.driver.browser.navigate
+      call: afn.driver.browser.exec_script
       with:
         body:
-          url: https://chatgpt.com/auth/logout
+          script: |
+            const logoutUrl = "https://chatgpt.com/auth/logout";
+            try {
+              await page.goto(logoutUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 20000,
+              });
+              return {
+                ok: true,
+                current_url: page.url(),
+                tolerated_logout_navigation_error: false,
+              };
+            } catch (error) {
+              const message = String(error?.message || error || "");
+              if (/ERR_QUIC_PROTOCOL_ERROR|ERR_ABORTED|interrupted by another navigation/i.test(message)) {
+                return {
+                  ok: true,
+                  current_url: page.url(),
+                  tolerated_logout_navigation_error: true,
+                  logout_navigation_error_message: message,
+                };
+              }
+              throw error;
+            }
   - reopen_public_chatgpt_entry_after_ui_logout:
       if: "${state.steps.clear_prepare_device_auth_site_state_after_ui_logout?.action?.ok === true && state.steps.clear_prepare_device_auth_site_state_after_ui_logout?.action?.skipped !== true}"
       metadata:
@@ -4640,6 +4745,22 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: Refresh the prepare login surface after the signup invalid-state fallback submits the login email.
+  - retry_prepare_login_email_after_signup_invalid_state_fallback:
+      if: "${state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'login_email' || (state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.email_input === true)}"
+      metadata:
+        templateRef: submit_login_email_form
+        description: Retry the prepare login email submit once more when the signup invalid-state fallback still leaves the auth flow on the email step.
+  - wait_after_prepare_login_email_signup_invalid_state_fallback_retry:
+      if: "${state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true}"
+      metadata:
+        description: Allow the retried signup invalid-state fallback email submit to settle before classifying the next page.
+      wait:
+        milliseconds: 900
+  - classify_prepare_after_login_email_signup_invalid_state_fallback_retry:
+      if: "${state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Refresh the prepare login surface after retrying the signup invalid-state fallback email submit.
   - cache_effective_prepare_after_login_email_state:
       metadata:
         description: Cache the effective prepare auth state immediately after the email step and any retryable timeout recovery.
@@ -4648,6 +4769,7 @@ do:
           language: javascript
           code: |
             const candidates = [
+              state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback_retry?.action,
               state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback?.action,
               state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action,
               state.steps?.classify_prepare_after_forced_signup_email_timeout_retry_submit?.action,
@@ -4907,11 +5029,18 @@ do:
             const passwordAuthPrompt =
               afterEmail.stage === "auth_prompt"
               && afterEmail.password_input === true;
+            const directLoginShell =
+              /\/log-in(?:[/?#]|$)/i.test(String(afterEmail.current_url || ""))
+              || /\/log-in(?:[/?#]|$)/i.test(String(state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.current_url || ""));
             const existingAccountFallbackActive =
               state.steps?.classify_prepare_after_signup_password_gate?.action?.existing_account_prompt === true
               || state.steps?.classify_prepare_after_signup_password_gate?.action?.stage === "existing_account_prompt"
               || state.steps?.classify_prepare_after_login_email_existing_account_prompt?.action?.ok === true
               || state.steps?.classify_prepare_login_entry_after_existing_account_prompt?.action?.ok === true;
+            const signupInvalidStateFallbackActive =
+              state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback_retry?.action?.ok === true
+              || state.steps?.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.ok === true
+              || state.steps?.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.ok === true;
             const passwordAttempted =
               (state.steps?.fill_prepare_login_password?.action?.ok === true && state.steps?.fill_prepare_login_password?.action?.skipped !== true)
               || (state.steps?.submit_prepare_login_password?.action?.ok === true && state.steps?.submit_prepare_login_password?.action?.skipped !== true)
@@ -4920,6 +5049,7 @@ do:
               ((!preferPasswordLogin) && (passwordStage || passwordAuthPrompt))
               || ((passwordStage || passwordAuthPrompt) && preferPasswordLogin && passwordAttempted !== true)
               || (existingAccountFallbackActive && (passwordStage || passwordAuthPrompt))
+              || (signupInvalidStateFallbackActive && directLoginShell)
               || afterPassword.invalid_credentials === true
               || afterPassword.reset_password_prompt === true
               || afterPassword.username_not_found === true;
@@ -4929,6 +5059,8 @@ do:
               has_locator: hasLocator,
               prefer_password_login: preferPasswordLogin,
               existing_account_fallback_active: existingAccountFallbackActive,
+              signup_invalid_state_fallback_active: signupInvalidStateFallbackActive,
+              direct_login_shell: directLoginShell,
               password_stage: passwordStage,
               password_auth_prompt: passwordAuthPrompt,
               password_attempted: passwordAttempted,
@@ -5071,8 +5203,34 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the local prepare login surface after restoring the email step from the Gmail return path."
+  - refill_prepare_login_email_after_return_retry:
+      if: "${state.steps.classify_prepare_login_after_return?.action?.stage === 'login_email' && state.steps.classify_prepare_login_after_return?.action?.email_input_editable !== false}"
+      metadata:
+        templateRef: fill_openai_email_field
+        description: Re-enter the email once more when the Gmail return recovery still leaves the local prepare branch on the email step.
+  - continue_prepare_login_email_after_return_retry:
+      if: "${state.steps.classify_prepare_login_after_return?.action?.stage === 'login_email' && state.steps.classify_prepare_login_after_return?.action?.email_input_editable === false && state.steps.classify_prepare_login_after_return?.action?.email_prefilled === true && state.steps.classify_prepare_login_after_return?.action?.continue_button_visible === true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: Continue from the locked prefilled email step when the Gmail return recovery still leaves the local prepare branch on Welcome back.
+  - submit_prepare_login_email_after_return_retry:
+      if: "${state.steps.refill_prepare_login_email_after_return_retry?.action?.ok === true && state.steps.refill_prepare_login_email_after_return_retry?.action?.skipped !== true}"
+      metadata:
+        templateRef: submit_login_email_form
+        description: Submit the restored prepare login email step once more before reopening one-time-code recovery.
+  - wait_after_prepare_login_email_after_return_retry:
+      if: "${(state.steps.submit_prepare_login_email_after_return_retry?.action?.ok === true && state.steps.submit_prepare_login_email_after_return_retry?.action?.skipped !== true) || (state.steps.continue_prepare_login_email_after_return_retry?.action?.ok === true && state.steps.continue_prepare_login_email_after_return_retry?.action?.skipped !== true)}"
+      metadata:
+        description: Allow the second restored prepare login email step to settle before checking whether the password prompt reappeared.
+      wait:
+        milliseconds: 900
+  - classify_prepare_login_after_return_retry:
+      if: "${(state.steps.submit_prepare_login_email_after_return_retry?.action?.ok === true && state.steps.submit_prepare_login_email_after_return_retry?.action?.skipped !== true) || (state.steps.continue_prepare_login_email_after_return_retry?.action?.ok === true && state.steps.continue_prepare_login_email_after_return_retry?.action?.skipped !== true)}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Classify the local prepare login surface after retrying the restored email step from the Gmail return path.
   - reopen_prepare_one_time_code_after_return:
-      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready?.action?.password_input === true) || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.password_input === true) || state.steps.classify_prepare_login_after_return?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_after_return?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_after_return?.action?.password_input === true)}"
+      if: "${state.steps.classify_prepare_login_verification_ready?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready?.action?.password_input === true) || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.password_input === true) || state.steps.classify_prepare_login_after_return?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_after_return?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_after_return?.action?.password_input === true) || state.steps.classify_prepare_login_after_return_retry?.action?.stage === 'login_password' || (state.steps.classify_prepare_login_after_return_retry?.action?.stage === 'auth_prompt' && state.steps.classify_prepare_login_after_return_retry?.action?.password_input === true)}"
       metadata:
         templateRef: click_one_time_code_button
         description: "Reopen one-time-code recovery when the Gmail return path lands back on the password prompt during local device-auth prepare."
@@ -5082,7 +5240,7 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login surface after rebuilding one-time-code recovery from the Gmail return path."
   - fill_prepare_login_verification_code:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.email_verification === true || state.steps.classify_prepare_login_verification_ready?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_return_recovery?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_timeout_reopen?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_signup_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email?.action?.stage === 'email_verification'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.email_verification === true || state.steps.classify_prepare_login_verification_ready?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_verification_ready_after_return_timeout?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_return_recovery?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_recovery_choice?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_timeout_reopen?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_signup_password_gate?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_existing_account_prompt?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_entry_after_signup_invalid_state_fallback?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email_retry?.action?.stage === 'email_verification' || state.steps.classify_prepare_after_login_email?.action?.stage === 'email_verification' || state.steps.classify_prepare_login_after_return_retry?.action?.stage === 'email_verification'}"
       metadata:
         description: "Fill the Gmail OTP into the OpenAI email-verification form during local device-auth prepare."
       call: afn.driver.browser.type
@@ -5139,54 +5297,73 @@ do:
               );
             };
             const verificationSelector = 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]';
-            const detectStage = async () => await page.evaluate((selector) => {
-              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-              const hasVisible = (query) => Array.from(document.querySelectorAll(query)).some((node) => {
-                if (!(node instanceof Element)) {
-                  return false;
+            const detectStage = async () => {
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                  return await page.evaluate((selector) => {
+                    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                    const hasVisible = (query) => Array.from(document.querySelectorAll(query)).some((node) => {
+                      if (!(node instanceof Element)) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    });
+                    const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                    const title = normalize(document.title || "");
+                    const path = location.pathname;
+                    const verificationVisible = hasVisible(selector)
+                      && (/check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
+                        || /email-verification/i.test(path));
+                    let stage = "unknown";
+                    if (/^(localhost|127\.0\.0\.1)$/i.test(location.hostname)) {
+                      stage = "callback_complete";
+                    } else if (/just a moment/i.test(title) || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)) {
+                      stage = "security_verification";
+                    } else if (/rate limit exceeded|too many requests|please try again later/i.test(bodyText)) {
+                      stage = "rate_limit";
+                    } else if (/your session has ended/i.test(bodyText)) {
+                      stage = "session_ended";
+                    } else if (/oops, an error occurred|operation timed out|try again/i.test(bodyText)) {
+                      stage = "retryable_timeout";
+                    } else if (/add-phone/i.test(path) || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText)) {
+                      stage = "add_phone";
+                    } else if (/confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText) || /about-you/i.test(path)) {
+                      stage = "about_you";
+                    } else if (verificationVisible) {
+                      stage = "email_verification";
+                    } else if (/an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText)) {
+                      stage = "existing_account_prompt";
+                    } else if (/continue to codex|continue to openai|authorize|allow|accept/i.test(bodyText)) {
+                      stage = "oauth_consent";
+                    }
+                    return {
+                      stage,
+                      current_url: location.href,
+                      headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                      incorrect_code: /incorrect code/i.test(bodyText),
+                    };
+                  }, verificationSelector);
+                } catch (error) {
+                  const message = String(error?.message || error || "");
+                  if (!/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message) || attempt === 3) {
+                    throw error;
+                  }
+                  await page.waitForLoadState("domcontentloaded").catch(() => {});
+                  await page.waitForTimeout(250).catch(() => {});
                 }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              });
-              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
-              const title = normalize(document.title || "");
-              const path = location.pathname;
-              const verificationVisible = hasVisible(selector)
-                && (/check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
-                  || /email-verification/i.test(path));
-              let stage = "unknown";
-              if (/^(localhost|127\.0\.0\.1)$/i.test(location.hostname)) {
-                stage = "callback_complete";
-              } else if (/just a moment/i.test(title) || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)) {
-                stage = "security_verification";
-              } else if (/rate limit exceeded|too many requests|please try again later/i.test(bodyText)) {
-                stage = "rate_limit";
-              } else if (/your session has ended/i.test(bodyText)) {
-                stage = "session_ended";
-              } else if (/oops, an error occurred|operation timed out|try again/i.test(bodyText)) {
-                stage = "retryable_timeout";
-              } else if (/add-phone/i.test(path) || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText)) {
-                stage = "add_phone";
-              } else if (/confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText) || /about-you/i.test(path)) {
-                stage = "about_you";
-              } else if (verificationVisible) {
-                stage = "email_verification";
-              } else if (/an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText)) {
-                stage = "existing_account_prompt";
-              } else if (/continue to codex|continue to openai|authorize|allow|accept/i.test(bodyText)) {
-                stage = "oauth_consent";
               }
               return {
-                stage,
-                current_url: location.href,
-                headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-                incorrect_code: /incorrect code/i.test(bodyText),
+                stage: "unknown",
+                current_url: page.url(),
+                headline: null,
+                incorrect_code: false,
               };
-            }, verificationSelector);
+            };
             const inputLocator = page.locator(verificationSelector);
             const inputCount = await inputLocator.count().catch(() => 0);
             const inputs = [];
@@ -5303,7 +5480,17 @@ do:
                   };
                 }
                 return null;
-              }).catch(() => null);
+              }).catch((error) => {
+                const message = String(error?.message || error || "");
+                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached|Timeout \d+ms exceeded/i.test(message)) {
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click-navigation",
+                    label: null,
+                  };
+                }
+                return null;
+              });
             };
             const attempts = [
               async () => clickVisibleContinue(),
@@ -5375,34 +5562,6 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after submitting the verification OTP."
-  - delete_prepare_login_verification_artifact:
-      if: "${state.steps.collect_prepare_login_verification_artifact?.action?.ok === true && state.steps.collect_prepare_login_verification_artifact?.action?.skipped !== true && state.steps.submit_prepare_login_verification_code?.action?.ok === true && state.steps.classify_prepare_after_login_verification_submit?.action?.stage !== 'email_verification'}"
-      metadata:
-        description: Delete the used prepare-branch OTP email from Gmail after the verification step succeeds.
-        ref:
-          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
-      call: workflow.sys.web.mail-google-com.delete-verification-artifact
-      with:
-        version: 1.0.0
-        input:
-          enabled: true
-          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
-          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
-          message_subject: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_prepare_login_verification_artifact?.action?.output?.message_subject || null}"
-          message_preview: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_prepare_login_verification_artifact?.action?.output?.message_preview || null}"
-          gmail_message_id: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_message_id || null}"
-          gmail_thread_id: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_thread_id || null}"
-          gmail_message_url: "${state.steps.collect_prepare_login_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_prepare_login_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_prepare_login_verification_artifact?.action?.output?.gmail_message_url || null}"
-  - return_to_prepare_after_delete_prepare_login_verification_artifact:
-      if: "${state.steps.delete_prepare_login_verification_artifact?.action?.ok === true && state.steps.delete_prepare_login_verification_artifact?.action?.skipped !== true}"
-      metadata:
-        description: Return from Gmail to the active prepare verification page after deleting the used OTP email.
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "${state.steps.classify_prepare_after_login_verification_submit?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recollect_prepare_login_verification_artifact_after_incorrect_code:
       if: "${state.steps.classify_prepare_after_login_verification_submit?.action?.stage === 'email_verification'}"
       metadata:
@@ -5538,54 +5697,73 @@ do:
               throw new Error("prepare-verification-code-missing");
             }
             const verificationSelector = 'input[name*="code" i], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[inputmode="numeric"]';
-            const detectStage = async () => await page.evaluate((selector) => {
-              const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-              const hasVisible = (query) => Array.from(document.querySelectorAll(query)).some((node) => {
-                if (!(node instanceof Element)) {
-                  return false;
+            const detectStage = async () => {
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                  return await page.evaluate((selector) => {
+                    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+                    const hasVisible = (query) => Array.from(document.querySelectorAll(query)).some((node) => {
+                      if (!(node instanceof Element)) {
+                        return false;
+                      }
+                      const style = window.getComputedStyle(node);
+                      if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                      }
+                      const rect = node.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    });
+                    const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
+                    const title = normalize(document.title || "");
+                    const path = location.pathname;
+                    const verificationVisible = hasVisible(selector)
+                      && (/check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
+                        || /email-verification/i.test(path));
+                    let stage = "unknown";
+                    if (/^(localhost|127\.0\.0\.1)$/i.test(location.hostname)) {
+                      stage = "callback_complete";
+                    } else if (/just a moment/i.test(title) || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)) {
+                      stage = "security_verification";
+                    } else if (/rate limit exceeded|too many requests|please try again later/i.test(bodyText)) {
+                      stage = "rate_limit";
+                    } else if (/your session has ended/i.test(bodyText)) {
+                      stage = "session_ended";
+                    } else if (/oops, an error occurred|operation timed out|try again/i.test(bodyText)) {
+                      stage = "retryable_timeout";
+                    } else if (/add-phone/i.test(path) || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText)) {
+                      stage = "add_phone";
+                    } else if (/confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText) || /about-you/i.test(path)) {
+                      stage = "about_you";
+                    } else if (verificationVisible) {
+                      stage = "email_verification";
+                    } else if (/an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText)) {
+                      stage = "existing_account_prompt";
+                    } else if (/continue to codex|continue to openai|authorize|allow|accept/i.test(bodyText)) {
+                      stage = "oauth_consent";
+                    }
+                    return {
+                      stage,
+                      current_url: location.href,
+                      headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
+                      incorrect_code: /incorrect code/i.test(bodyText),
+                    };
+                  }, verificationSelector);
+                } catch (error) {
+                  const message = String(error?.message || error || "");
+                  if (!/Execution context was destroyed|Cannot find context|Target closed|Frame was detached/i.test(message) || attempt === 3) {
+                    throw error;
+                  }
+                  await page.waitForLoadState("domcontentloaded").catch(() => {});
+                  await page.waitForTimeout(250).catch(() => {});
                 }
-                const style = window.getComputedStyle(node);
-                if (!style || style.display === "none" || style.visibility === "hidden") {
-                  return false;
-                }
-                const rect = node.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-              });
-              const bodyText = normalize(document.body ? (document.body.innerText || document.body.textContent || "") : "");
-              const title = normalize(document.title || "");
-              const path = location.pathname;
-              const verificationVisible = hasVisible(selector)
-                && (/check your inbox|check your email|verify your email|verification code|enter the verification code|enter your code|temporary verification code|resend email/i.test(bodyText)
-                  || /email-verification/i.test(path));
-              let stage = "unknown";
-              if (/^(localhost|127\.0\.0\.1)$/i.test(location.hostname)) {
-                stage = "callback_complete";
-              } else if (/just a moment/i.test(title) || /performing security verification|verify you are not a bot|verifying you are human|verify you are human/i.test(bodyText)) {
-                stage = "security_verification";
-              } else if (/rate limit exceeded|too many requests|please try again later/i.test(bodyText)) {
-                stage = "rate_limit";
-              } else if (/your session has ended/i.test(bodyText)) {
-                stage = "session_ended";
-              } else if (/oops, an error occurred|operation timed out|try again/i.test(bodyText)) {
-                stage = "retryable_timeout";
-              } else if (/add-phone/i.test(path) || /phone number required|add your phone number|verify your phone number|enter your phone number/i.test(bodyText)) {
-                stage = "add_phone";
-              } else if (/confirm your age|full name|birthday|finish creating account|what should we call you|tell us about yourself|about you/i.test(bodyText) || /about-you/i.test(path)) {
-                stage = "about_you";
-              } else if (verificationVisible) {
-                stage = "email_verification";
-              } else if (/an account for this email address already exists|this email address already exists|account already exists|already registered/i.test(bodyText)) {
-                stage = "existing_account_prompt";
-              } else if (/continue to codex|continue to openai|authorize|allow|accept/i.test(bodyText)) {
-                stage = "oauth_consent";
               }
               return {
-                stage,
-                current_url: location.href,
-                headline: bodyText.split("\n").map((value) => value.trim()).filter(Boolean)[0] || title || null,
-                incorrect_code: /incorrect code/i.test(bodyText),
+                stage: "unknown",
+                current_url: page.url(),
+                headline: null,
+                incorrect_code: false,
               };
-            }, verificationSelector);
+            };
             const inputLocator = page.locator(verificationSelector);
             const inputCount = await inputLocator.count().catch(() => 0);
             const inputs = [];
@@ -5691,7 +5869,17 @@ do:
                   };
                 }
                 return null;
-              }).catch(() => null);
+              }).catch((error) => {
+                const message = String(error?.message || error || "");
+                if (/Execution context was destroyed|Cannot find context|Target closed|Frame was detached|Timeout \d+ms exceeded/i.test(message)) {
+                  return {
+                    ok: true,
+                    strategy: "form-dom-click-navigation",
+                    label: null,
+                  };
+                }
+                return null;
+              });
             };
             const attempts = [
               async () => clickVisibleContinue(),
@@ -5750,34 +5938,6 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare flow after retrying the verification OTP."
-  - delete_prepare_login_verification_artifact_after_incorrect_code:
-      if: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.skipped !== true && state.steps.submit_prepare_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.classify_prepare_after_login_verification_retry?.action?.stage !== 'email_verification'}"
-      metadata:
-        description: Delete the replacement prepare-branch OTP email from Gmail after the retry succeeds.
-        ref:
-          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
-      call: workflow.sys.web.mail-google-com.delete-verification-artifact
-      with:
-        version: 1.0.0
-        input:
-          enabled: true
-          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
-          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
-          message_subject: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_subject || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.message_subject || null}"
-          message_preview: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_preview || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.message_preview || null}"
-          gmail_message_id: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_id || null}"
-          gmail_thread_id: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_thread_id || null}"
-          gmail_message_url: "${state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_prepare_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_url || null}"
-  - return_to_prepare_after_delete_prepare_login_verification_artifact_after_incorrect_code:
-      if: "${state.steps.delete_prepare_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.delete_prepare_login_verification_artifact_after_incorrect_code?.action?.skipped !== true}"
-      metadata:
-        description: Return from Gmail to the active prepare verification page after deleting the replacement OTP email.
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "${state.steps.classify_prepare_after_login_verification_retry?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - fill_prepare_signup_about_you:
       if: "${state.steps.classify_prepare_after_signup_password_gate?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_submit?.action?.follow_up_step === true || state.steps.classify_prepare_after_login_verification_retry?.action?.follow_up_step === true}"
       metadata:
@@ -6448,6 +6608,7 @@ do:
                 dialog_visible: panel.dialog_visible === true,
                 settings_shell: /general|notifications|apps|data controls|security|account|appearance/i.test(normalizedText),
                 logged_in_settings_shell: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices|multi-factor authentication|security keys & passkeys/i.test(normalizedText) || /new chat|search chats|projects|chat history/i.test(normalizedText),
+                security_control_visible: panel.security_control_visible === true,
                 security_open: /secure sign in with chatgpt|trusted devices|enable device code authorization for codex|log out of all devices/i.test(normalizedText),
               };
             };
@@ -6455,7 +6616,7 @@ do:
               const deadline = Date.now() + 10000;
               while (Date.now() < deadline) {
                 const panelBefore = await inspectPanel();
-                if (panelBefore.logged_in_settings_shell !== true && panelBefore.security_open !== true) {
+                if (panelBefore.security_open !== true && panelBefore.settings_shell !== true) {
                   await page.waitForTimeout(500).catch(() => {});
                   continue;
                 }
@@ -7721,34 +7882,6 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login flow after submitting the verification OTP."
-  - delete_device_auth_login_verification_artifact:
-      if: "${state.steps.collect_device_auth_login_verification_artifact?.action?.ok === true && state.steps.collect_device_auth_login_verification_artifact?.action?.skipped !== true && state.steps.submit_device_auth_login_verification_code?.action?.ok === true && state.steps.classify_device_auth_after_login_verification_submit?.action?.stage !== 'email_verification'}"
-      metadata:
-        description: Delete the used device-auth login OTP email from Gmail after the verification step succeeds.
-        ref:
-          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
-      call: workflow.sys.web.mail-google-com.delete-verification-artifact
-      with:
-        version: 1.0.0
-        input:
-          enabled: true
-          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
-          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
-          message_subject: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.message_subject || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.message_subject || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.message_subject || null}"
-          message_preview: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.message_preview || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.message_preview || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.message_preview || null}"
-          gmail_message_id: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_message_id || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_message_id || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_message_id || null}"
-          gmail_thread_id: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_thread_id || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_thread_id || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_thread_id || null}"
-          gmail_message_url: "${state.steps.collect_device_auth_login_verification_artifact?.action?.result?.result?.output?.gmail_message_url || state.steps.collect_device_auth_login_verification_artifact?.action?.result?.output?.gmail_message_url || state.steps.collect_device_auth_login_verification_artifact?.action?.output?.gmail_message_url || null}"
-  - return_to_device_auth_after_delete_login_verification_artifact:
-      if: "${state.steps.delete_device_auth_login_verification_artifact?.action?.ok === true && state.steps.delete_device_auth_login_verification_artifact?.action?.skipped !== true}"
-      metadata:
-        description: Return from Gmail to the active device-auth verification page after deleting the used OTP email.
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "${state.steps.classify_device_auth_after_login_verification_submit?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recover_device_auth_login_verification_timeout:
       if: "${state.steps.classify_device_auth_after_login_verification_submit?.action?.retryable_timeout === true}"
       metadata:
@@ -8194,34 +8327,6 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login flow after retrying the verification OTP."
-  - delete_device_auth_login_verification_artifact_after_incorrect_code:
-      if: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.skipped !== true && state.steps.submit_device_auth_login_verification_code_after_incorrect_code?.action?.ok === true && state.steps.classify_device_auth_after_login_verification_retry?.action?.stage !== 'email_verification'}"
-      metadata:
-        description: Delete the replacement device-auth login OTP email from Gmail after the retry succeeds.
-        ref:
-          digest: sha256:6d6a3345a35bdda97b0b830c1145f89fd527d1ade4cf22428e64819333d2e439
-      call: workflow.sys.web.mail-google-com.delete-verification-artifact
-      with:
-        version: 1.0.0
-        input:
-          enabled: true
-          search_query: "${'from:openai to:' + String(inputs.email || '').trim() + ' newer_than:7d'}"
-          message_match_text: "${String(inputs.email || '').trim() || 'OpenAI'}"
-          message_subject: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_subject || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.message_subject || null}"
-          message_preview: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.message_preview || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.message_preview || null}"
-          gmail_message_id: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_id || null}"
-          gmail_thread_id: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_thread_id || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_thread_id || null}"
-          gmail_message_url: "${state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code_missing_code?.action?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.result?.output?.gmail_message_url || state.steps.recollect_device_auth_login_verification_artifact_after_incorrect_code?.action?.output?.gmail_message_url || null}"
-  - return_to_device_auth_after_delete_login_verification_artifact_after_incorrect_code:
-      if: "${state.steps.delete_device_auth_login_verification_artifact_after_incorrect_code?.action?.ok === true && state.steps.delete_device_auth_login_verification_artifact_after_incorrect_code?.action?.skipped !== true}"
-      metadata:
-        description: Return from Gmail to the active device-auth verification page after deleting the replacement OTP email.
-        mode: headless_ok
-        targetRef: primary
-      call: afn.driver.browser.navigate
-      with:
-        body:
-          url: "${state.steps.classify_device_auth_after_login_verification_retry?.action?.current_url || 'https://auth.openai.com/email-verification'}"
   - recover_device_auth_login_verification_retry_timeout:
       if: "${state.steps.classify_device_auth_after_login_verification_retry?.action?.retryable_timeout === true}"
       metadata:
