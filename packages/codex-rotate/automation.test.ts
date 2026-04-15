@@ -5916,6 +5916,45 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("device-auth reopens direct OpenAI login when the pre-security ChatGPT auth landing falls into log-in-or-create-account", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openStep = workflow.do?.find(
+      (entry) =>
+        "open_chatgpt_direct_login_before_security_settings_after_auth_landing" in
+        entry,
+    )?.open_chatgpt_direct_login_before_security_settings_after_auth_landing as
+      | { if?: string; with?: { body?: { url?: string } } }
+      | undefined;
+    const classifyStep = workflow.do?.find(
+      (entry) =>
+        "classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen" in
+        entry,
+    )
+      ?.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen as
+      | { if?: string }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) =>
+        "cache_effective_chatgpt_login_entry_before_security_settings" in entry,
+    )?.cache_effective_chatgpt_login_entry_before_security_settings as
+      | { set?: Record<string, string> }
+      | undefined;
+
+    expect(openStep?.if).toContain(
+      "/auth\\.openai\\.com\\/log-in-or-create-account/i.test",
+    );
+    expect(openStep?.if).toContain(
+      "classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.login_cta_visible === true",
+    );
+    expect(openStep?.with?.body?.url).toBe("https://auth.openai.com/log-in");
+    expect(classifyStep?.if).toContain(
+      "open_chatgpt_direct_login_before_security_settings_after_auth_landing?.action?.ok === true",
+    );
+    expect(cacheStep?.set?.pre_settings_login_entry).toContain(
+      "classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen",
+    );
+  });
+
   test("device-auth promotes prepare_flow_ready only after its own pre-security login branch proves an authenticated ChatGPT shell", async () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
