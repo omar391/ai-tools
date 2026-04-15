@@ -1577,13 +1577,13 @@ fn classify_selection_invalid_reasons(
     if normalized_target.is_none() {
         reasons.push("missing_target_email".to_string());
     }
-    if displayed_created_label.is_none() {
-        reasons.push("missing_displayed_created_label".to_string());
-    }
-    if displayed_created_email.is_none() {
-        reasons.push("missing_displayed_created_email".to_string());
-    }
     if matches!(operation, BenchmarkOperation::Create) {
+        if displayed_created_label.is_none() {
+            reasons.push("missing_displayed_created_label".to_string());
+        }
+        if displayed_created_email.is_none() {
+            reasons.push("missing_displayed_created_email".to_string());
+        }
         if created_emails.len() != 1 {
             reasons.push(format!(
                 "expected_single_pooled_email_found_{}",
@@ -2071,6 +2071,22 @@ mod tests {
             &[],
             Some("dev3astronlab+1@gmail.com_free"),
             Some("dev3astronlab+1@gmail.com"),
+            &[],
+        );
+
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn classify_selection_invalid_reasons_allows_environment_blocked_relogin_without_displayed_create_fields(
+    ) {
+        let reasons = classify_selection_invalid_reasons(
+            BenchmarkOperation::Relogin,
+            true,
+            Some("dev3astronlab+5@gmail.com"),
+            &[],
+            None,
+            None,
             &[],
         );
 

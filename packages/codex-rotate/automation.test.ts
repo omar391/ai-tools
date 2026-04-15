@@ -1472,7 +1472,7 @@ describe("active auth workflows", () => {
     }
   });
 
-  test("original flow keeps a bounded final add-phone reentry ladder", async () => {
+  test("original flow keeps a two-step final add-phone reentry ladder", async () => {
     const workflow = await loadWorkflow(originalWorkflowPath);
     const stepIds = (workflow.do || []).flatMap((entry) => Object.keys(entry));
     const workflowText = readFileSync(originalWorkflowPath, "utf8");
@@ -1485,12 +1485,6 @@ describe("active auth workflows", () => {
         "wait_before_consent_add_phone_retry_2",
         "reopen_auth_url_before_consent_retry_2",
         "classify_before_consent_retry_2",
-        "wait_before_consent_add_phone_retry_3",
-        "reopen_auth_url_before_consent_retry_3",
-        "classify_before_consent_retry_3",
-        "wait_before_consent_add_phone_retry_4",
-        "reopen_auth_url_before_consent_retry_4",
-        "classify_before_consent_retry_4",
         "cache_effective_before_consent_surface",
       ]),
     );
@@ -1498,8 +1492,9 @@ describe("active auth workflows", () => {
       "wait_before_consent_add_phone_retry_1?.action?.skipped !== true",
     );
     expect(workflowText).toContain(
-      "wait_before_consent_add_phone_retry_4?.action?.skipped !== true",
+      "wait_before_consent_add_phone_retry_2?.action?.skipped !== true",
     );
+    expect(workflowText).not.toContain("wait_before_consent_add_phone_retry_3");
   });
 
   test("all non-device flows clear OpenAI and ChatGPT auth state before detached codex login starts", async () => {
@@ -1567,9 +1562,9 @@ describe("active auth workflows", () => {
         (match) => match[0],
       );
 
-      expect(new Set(waitStepIds).size).toBe(10);
+      expect(new Set(waitStepIds).size).toBe(2);
 
-      for (let attempt = 1; attempt <= 10; attempt += 1) {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
         const reopenStep = findWorkflowStep<{
           metadata?: {
             browser?: {
@@ -4620,6 +4615,21 @@ describe("stepwise workflow verification helper", () => {
       expect(workflowText).toContain(
         "classify_after_login_about_you_timeout_retry",
       );
+    }
+  });
+
+  test("non-device flows never route replayed about-you recovery on create-account password pages", async () => {
+    for (const workflowPath of [
+      originalWorkflowPath,
+      minimalWorkflowPath,
+      stepwiseWorkflowPath,
+    ]) {
+      const workflowText = readFileSync(workflowPath, "utf8");
+      expect(workflowText).toContain(
+        "!/\\\\/create-account(?:[/?#]|$)/i.test(",
+      );
+      expect(workflowText).toContain("fill_login_about_you");
+      expect(workflowText).toContain("fill_login_about_you_retry");
     }
   });
 
