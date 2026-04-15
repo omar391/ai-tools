@@ -575,10 +575,6 @@ fn spawn_quit_flow(app: AppHandle) {
     });
 }
 
-fn toggled_checked_state(current: bool) -> bool {
-    !current
-}
-
 fn check_action_label(recheck: bool) -> &'static str {
     if recheck {
         RECHECK_NOW_LABEL
@@ -587,8 +583,12 @@ fn check_action_label(recheck: bool) -> &'static str {
     }
 }
 
-fn next_auto_create_enabled(app: &AppHandle) -> bool {
-    toggled_checked_state(
+fn resolved_auto_create_enabled(current: bool) -> bool {
+    current
+}
+
+fn current_auto_create_enabled(app: &AppHandle) -> bool {
+    resolved_auto_create_enabled(
         app.state::<MenuHandles>()
             .auto_create_item
             .is_checked()
@@ -686,7 +686,7 @@ fn main() {
                         }
                         "rotate" => spawn_invoke(app.clone(), InvokeAction::Next),
                         "auto_create" => {
-                            let enabled = next_auto_create_enabled(&app);
+                            let enabled = current_auto_create_enabled(&app);
                             let _ = app
                                 .state::<MenuHandles>()
                                 .auto_create_item
@@ -746,9 +746,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toggled_checked_state_inverts_the_current_menu_value() {
-        assert!(toggled_checked_state(false));
-        assert!(!toggled_checked_state(true));
+    fn current_auto_create_enabled_matches_the_native_checked_state() {
+        assert!(!resolved_auto_create_enabled(false));
+        assert!(resolved_auto_create_enabled(true));
     }
 
     #[test]

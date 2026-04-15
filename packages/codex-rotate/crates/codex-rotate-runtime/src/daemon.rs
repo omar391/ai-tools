@@ -31,7 +31,8 @@ use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::cancel;
 use codex_rotate_core::pool::{
     cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
-    rotate_next_internal_with_progress, sync_pool_active_account_from_current_auth, NextResult,
+    restore_codex_auth_from_active_pool, rotate_next_internal_with_progress,
+    sync_pool_active_account_from_current_auth, NextResult,
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
@@ -1097,6 +1098,9 @@ fn refresh_auth_summary(snapshot: &mut StatusSnapshot) -> bool {
         Ok(paths) => paths,
         Err(_) => return false,
     };
+    if !paths.codex_auth_file.exists() {
+        let _ = restore_codex_auth_from_active_pool();
+    }
     if let Ok(auth) = load_codex_auth(&paths.codex_auth_file) {
         let summary = summarize_codex_auth(&auth);
         snapshot.current_email = Some(summary.email);
@@ -1796,6 +1800,64 @@ mod tests {
         }
 
         result.expect("refresh_static_snapshot should auto-add the missing auth account");
+    }
+
+    #[test]
+    fn refresh_static_snapshot_restores_missing_auth_from_active_pool() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            fs::write(
+                paths.rotate_home.join("accounts.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "accounts": [{
+                        "label": "dev.1@astronlab.com_free",
+                        "email": "dev.1@astronlab.com",
+                        "account_id": "acct-1",
+                        "plan_type": "free",
+                        "auth": make_test_auth_with_email("dev.1@astronlab.com", "acct-1", "free"),
+                        "added_at": "2026-04-15T00:00:00.000Z"
+                    }],
+                    "active_index": 0
+                }))?,
+            )?;
+
+            let mut state = DaemonState::new();
+            refresh_static_snapshot(&mut state);
+
+            assert_eq!(
+                state.snapshot.current_email.as_deref(),
+                Some("dev.1@astronlab.com")
+            );
+            assert_eq!(state.snapshot.current_plan.as_deref(), Some("free"));
+            assert!(paths.codex_auth_file.exists());
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        result.expect("refresh_static_snapshot should restore missing auth from the active pool");
     }
 
     #[test]

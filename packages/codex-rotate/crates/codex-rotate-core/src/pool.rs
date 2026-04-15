@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -1570,6 +1571,38 @@ pub fn sync_pool_active_account_from_current_auth() -> Result<bool> {
         save_pool(&pool)?;
     }
     Ok(changed)
+}
+
+pub fn restore_codex_auth_from_active_pool() -> Result<bool> {
+    let paths = resolve_paths()?;
+    if paths.codex_auth_file.exists() {
+        return Ok(false);
+    }
+
+    let mut pool = load_pool()?;
+    if pool.accounts.is_empty() {
+        return Ok(false);
+    }
+
+    let mut dirty = normalize_pool_entries(&mut pool);
+    let active_index = pool.active_index.min(pool.accounts.len().saturating_sub(1));
+    if pool.active_index != active_index {
+        pool.active_index = active_index;
+        dirty = true;
+    }
+    if dirty {
+        save_pool(&pool)?;
+    }
+
+    let Some(parent) = paths.codex_auth_file.parent() else {
+        return Ok(false);
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}.", parent.display()))?;
+
+    let active = &pool.accounts[active_index];
+    write_codex_auth(&paths.codex_auth_file, &active.auth)?;
+    Ok(true)
 }
 
 fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) -> Result<bool> {
@@ -3457,6 +3490,58 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("current auth sync should persist the missing pool entry");
+    }
+
+    #[test]
+    fn restore_codex_auth_from_active_pool_restores_missing_auth_file() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![AccountEntry {
+                    label: "dev.restore@astronlab.com_free".to_string(),
+                    alias: None,
+                    email: "dev.restore@astronlab.com".to_string(),
+                    account_id: "acct-restore".to_string(),
+                    plan_type: "free".to_string(),
+                    auth: make_auth("dev.restore@astronlab.com", "acct-restore", "free"),
+                    added_at: "2026-04-15T00:00:00.000Z".to_string(),
+                    last_quota_usable: None,
+                    last_quota_summary: None,
+                    last_quota_blocker: None,
+                    last_quota_checked_at: None,
+                    last_quota_primary_left_percent: None,
+                    last_quota_next_refresh_at: None,
+                }],
+            })?;
+
+            let paths = resolve_paths()?;
+            assert!(!paths.codex_auth_file.exists());
+
+            let restored = restore_codex_auth_from_active_pool()?;
+            assert!(restored);
+            assert!(paths.codex_auth_file.exists());
+
+            let auth = load_codex_auth(&paths.codex_auth_file)?;
+            assert_eq!(extract_account_id_from_auth(&auth), "acct-restore");
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("active pool auth should restore missing codex auth");
     }
 
     #[test]

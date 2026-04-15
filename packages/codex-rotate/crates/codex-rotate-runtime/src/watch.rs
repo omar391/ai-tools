@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,7 +7,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::fs_security::write_private_string;
 use codex_rotate_core::pool::{
-    load_pool, other_usable_account_exists, rotate_next_internal_with_progress, NextResult, Pool,
+    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool,
+    rotate_next_internal_with_progress, NextResult, Pool,
 };
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
@@ -168,7 +170,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id = latest_codex_signal_id;
     }
 
-    let current_auth = load_codex_auth(&paths.codex_auth_file)?;
+    let current_auth = load_or_restore_codex_auth(&paths.codex_auth_file)?;
     let current_summary = summarize_codex_auth(&current_auth);
     let (mut decision, mut quota_cache) = decide_rotation(
         &current_auth,
@@ -504,9 +506,23 @@ pub fn refresh_quota_cache(
     previous: Option<&CachedQuotaState>,
 ) -> Result<CachedQuotaState> {
     let paths = resolve_paths()?;
-    let auth = load_codex_auth(&paths.codex_auth_file)?;
+    let auth = load_or_restore_codex_auth(&paths.codex_auth_file)?;
     let summary = summarize_codex_auth(&auth);
     refresh_quota_cache_for_auth(&auth, &summary, force_refresh, previous)
+}
+
+fn load_or_restore_codex_auth(path: &Path) -> Result<CodexAuth> {
+    match load_codex_auth(path) {
+        Ok(auth) => Ok(auth),
+        Err(error) if !path.exists() => {
+            if restore_codex_auth_from_active_pool()? {
+                load_codex_auth(path)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn refresh_quota_cache_for_auth(
@@ -761,6 +777,9 @@ fn should_persist_watch_state(previous: &WatchState, next: &WatchState) -> bool 
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn plan_rotation_uses_create_for_low_quota() {
@@ -837,6 +856,71 @@ mod tests {
     fn retryable_watch_create_error_ignores_non_transient_failures() {
         let error = anyhow!("quota inspection unavailable");
         assert!(!is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn load_or_restore_codex_auth_restores_missing_file_from_active_pool() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let restored_auth = codex_rotate_core::auth::CodexAuth {
+                auth_mode: "chatgpt".to_string(),
+                openai_api_key: None,
+                tokens: codex_rotate_core::auth::AuthTokens {
+                    id_token: "id".to_string(),
+                    access_token: "access".to_string(),
+                    refresh_token: None,
+                    account_id: "acct-restore".to_string(),
+                },
+                last_refresh: "2026-04-15T00:00:00.000Z".to_string(),
+            };
+
+            let paths = resolve_paths()?;
+            fs::write(
+                paths.rotate_home.join("accounts.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "accounts": [{
+                        "label": "dev.restore@astronlab.com_free",
+                        "email": "dev.restore@astronlab.com",
+                        "account_id": "acct-restore",
+                        "plan_type": "free",
+                        "auth": restored_auth,
+                        "added_at": "2026-04-15T00:00:00.000Z"
+                    }],
+                    "active_index": 0
+                }))?,
+            )?;
+            assert!(!paths.codex_auth_file.exists());
+
+            let auth = load_or_restore_codex_auth(&paths.codex_auth_file)?;
+            assert_eq!(auth.tokens.account_id, "acct-restore");
+            assert!(paths.codex_auth_file.exists());
+            Ok(())
+        })();
+
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+
+        result.expect("missing auth should be restored from the active pool");
     }
 
     #[test]
