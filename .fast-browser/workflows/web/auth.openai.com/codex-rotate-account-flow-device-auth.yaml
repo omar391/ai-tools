@@ -4826,12 +4826,12 @@ do:
               },
             };
   - fill_prepare_login_password:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the stored password on the prepare login branch before falling back to recovery."
   - submit_prepare_login_password:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && state.steps.fill_prepare_login_password?.action?.ok === true && state.steps.fill_prepare_login_password?.action?.skipped !== true}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null && state.steps.fill_prepare_login_password?.action?.ok === true && state.steps.fill_prepare_login_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the stored password on the prepare login branch."
@@ -4842,12 +4842,12 @@ do:
       wait:
         milliseconds: 900
   - classify_prepare_after_login_password:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the prepare login surface after submitting the stored password."
   - classify_prepare_after_login_password_gate:
-      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the prepare login state after any password-step handling."
@@ -7339,12 +7339,12 @@ do:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login surface after retrying the email submit."
   - fill_device_auth_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: fill_openai_password_field
         description: "Fill the stored password on the device-auth login branch before falling back to recovery."
   - submit_device_auth_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null && state.steps.fill_device_auth_login_password?.action?.ok === true && state.steps.fill_device_auth_login_password?.action?.skipped !== true}"
       metadata:
         templateRef: submit_openai_password_form
         description: "Submit the stored password on the device-auth login branch."
@@ -7355,12 +7355,12 @@ do:
       wait:
         milliseconds: 900
   - classify_device_auth_after_login_password:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Classify the device-auth login surface after submitting the stored password."
   - classify_device_auth_after_login_password_gate:
-      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true'}"
+      if: "${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: "Refresh the device-auth login state after any password-step handling."

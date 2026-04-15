@@ -4713,11 +4713,14 @@ describe("device-auth workflow", () => {
     );
   });
 
-  test("does not gate device-auth password attempts on a visible locator expression", () => {
+  test("gates device-auth password attempts on a resolved locator input", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
-    expect(workflowText).not.toContain(
-      "fill_device_auth_login_password:\n      if: \"${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && inputs.account_login_locator != null",
+    expect(workflowText).toContain(
+      "fill_prepare_login_password:\n      if: \"${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}\"",
+    );
+    expect(workflowText).toContain(
+      "fill_device_auth_login_password:\n      if: \"${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}\"",
     );
     expect(workflowText).toContain("password_attempted");
   });
