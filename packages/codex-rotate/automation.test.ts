@@ -1945,6 +1945,51 @@ describe("device-auth recovery preference", () => {
     expect(result.should_recover).toBe(true);
   });
 
+  test("does not force prepare one-time-code recovery from a plain direct login shell after signup invalid-state fallback", async () => {
+    const result = await runWorkflowRunScript(
+      deviceAuthWorkflowPath,
+      "compute_prepare_one_time_code_recovery_flag",
+      {},
+      {
+        steps: {
+          classify_prepare_after_login_email_signup_invalid_state_fallback: {
+            action: {
+              ok: true,
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              one_time_code_cta: false,
+            },
+          },
+          classify_prepare_login_entry_after_signup_invalid_state_fallback: {
+            action: {
+              ok: true,
+              stage: "login_email",
+              current_url: "https://auth.openai.com/log-in",
+              one_time_code_cta: false,
+            },
+          },
+          cache_effective_prepare_after_login_email_state: {
+            action: {
+              value: {
+                effective_prepare_after_login_email_state: {
+                  stage: "login_email",
+                  current_url: "https://auth.openai.com/log-in",
+                  one_time_code_cta: false,
+                },
+              },
+            },
+          },
+        },
+      },
+      {},
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.direct_login_shell).toBe(true);
+    expect(result.one_time_code_visible).toBe(false);
+    expect(result.should_recover).toBe(false);
+  });
+
   test("prefers manual one-time-code recovery on the device-auth login branch even when a stored-password locator exists", async () => {
     const result = await runWorkflowRunScript(
       deviceAuthWorkflowPath,
@@ -5913,6 +5958,40 @@ describe("device-auth workflow", () => {
     );
     expect(openWarmupStep?.if).toContain(
       "state.vars.prepare_security_login_recovery_required === true",
+    );
+  });
+
+  test("device-auth reopens direct OpenAI login when the device-auth auth landing falls into log-in-or-create-account", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const openStep = workflow.do?.find(
+      (entry) => "open_device_auth_direct_login_after_auth_landing" in entry,
+    )?.open_device_auth_direct_login_after_auth_landing as
+      | { if?: string; with?: { body?: { url?: string } } }
+      | undefined;
+    const classifyStep = workflow.do?.find(
+      (entry) =>
+        "classify_device_auth_login_entry_after_auth_landing_reopen" in entry,
+    )?.classify_device_auth_login_entry_after_auth_landing_reopen as
+      | { if?: string }
+      | undefined;
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_device_auth_login_entry_state" in entry,
+    )?.cache_effective_device_auth_login_entry_state as
+      | { set?: Record<string, string> }
+      | undefined;
+
+    expect(openStep?.if).toContain(
+      "/auth\\.openai\\.com\\/log-in-or-create-account/i.test",
+    );
+    expect(openStep?.if).toContain(
+      "classify_device_auth_login_entry_after_auth_landing?.action?.login_cta_visible === true",
+    );
+    expect(openStep?.with?.body?.url).toBe("https://auth.openai.com/log-in");
+    expect(classifyStep?.if).toContain(
+      "open_device_auth_direct_login_after_auth_landing?.action?.ok === true",
+    );
+    expect(cacheStep?.set?.effective_device_auth_login_entry_state).toContain(
+      "classify_device_auth_login_entry_after_auth_landing_reopen",
     );
   });
 
