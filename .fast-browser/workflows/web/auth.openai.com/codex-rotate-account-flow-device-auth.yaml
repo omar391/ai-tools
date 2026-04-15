@@ -6261,12 +6261,25 @@ do:
       metadata:
         templateRef: classify_openai_auth_surface
         description: Reclassify the explicit ChatGPT login surface after the auth landing's secondary login step.
+  - open_chatgpt_direct_login_before_security_settings_after_auth_landing:
+      if: "${/auth\\.openai\\.com\\/log-in-or-create-account/i.test(String(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url || '')) && state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.login_cta_visible === true}"
+      metadata:
+        description: Reopen the direct OpenAI login form when the pre-security ChatGPT auth landing still resolves to the combined log-in-or-create-account shell.
+      call: afn.driver.browser.navigate
+      with:
+        body:
+          url: https://auth.openai.com/log-in
+  - classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen:
+      if: "${state.steps.open_chatgpt_direct_login_before_security_settings_after_auth_landing?.action?.ok === true && state.steps.open_chatgpt_direct_login_before_security_settings_after_auth_landing?.action?.skipped !== true}"
+      metadata:
+        templateRef: classify_openai_auth_surface
+        description: Reclassify the explicit ChatGPT login surface after reopening direct OpenAI login from the combined auth shell.
   - cache_effective_chatgpt_login_entry_before_security_settings:
       if: "${state.steps.open_chatgpt_login_entry_before_security_settings?.action?.ok === true && state.steps.open_chatgpt_login_entry_before_security_settings?.action?.skipped !== true}"
       metadata:
         description: Cache the effective explicit ChatGPT login-entry state before the Security-settings login branch continues.
       set:
-        pre_settings_login_entry: "${(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action : (state.steps.classify_chatgpt_login_entry_before_security_settings?.action || {})}"
+        pre_settings_login_entry: "${(state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing_reopen?.action : ((state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.stage || state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action?.current_url) ? state.steps.classify_chatgpt_login_entry_before_security_settings_after_auth_landing?.action : (state.steps.classify_chatgpt_login_entry_before_security_settings?.action || {}))}"
   - fill_chatgpt_login_email_before_security_settings:
       if: "${state.vars.reuse_device_auth_session !== true && (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'login_email' || (state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.stage === 'auth_prompt' && state.steps.cache_effective_chatgpt_login_entry_before_security_settings?.action?.value?.pre_settings_login_entry?.email_input === true))}"
       metadata:
