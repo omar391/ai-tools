@@ -4758,16 +4758,38 @@ describe("device-auth workflow", () => {
     );
   });
 
-  test("gates device-auth password attempts on a resolved locator input", () => {
+  test("keeps signup-recovery defaults aligned across device-auth guards", () => {
     const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
 
     expect(workflowText).toContain(
-      "fill_prepare_login_password:\n      if: \"${state.steps.cache_effective_prepare_after_login_email_state?.action?.value?.effective_prepare_after_login_email_state?.stage === 'login_password' && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}\"",
+      'prefer_signup_recovery:\n          default: "true"',
     );
-    expect(workflowText).toContain(
-      "fill_device_auth_login_password:\n      if: \"${state.vars.device_auth_login_branch_started === 'true' && (state.steps.classify_device_auth_after_login_email_retry?.action?.stage === 'login_password' || state.steps.classify_device_auth_after_login_email?.action?.stage === 'login_password') && String(inputs.prefer_password_login ?? 'true') === 'true' && inputs.account_login_locator != null}\"",
+    expect(workflowText.includes("prefer_signup_recovery ?? 'false'")).toBe(
+      false,
     );
-    expect(workflowText).toContain("password_attempted");
+  });
+
+  test("tracks locator availability and password attempts for device-auth recovery", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const computeStep = workflow.do?.find(
+      (entry) => "compute_device_auth_one_time_code_recovery_flag" in entry,
+    )?.compute_device_auth_one_time_code_recovery_flag as
+      | {
+          run?: {
+            script?: {
+              code?: string;
+            };
+          };
+        }
+      | undefined;
+
+    expect(computeStep?.run?.script?.code).toContain(
+      "const hasLocator = args.account_login_locator != null;",
+    );
+    expect(computeStep?.run?.script?.code).toContain(
+      'const preferPasswordLogin = String(args.prefer_password_login ?? "true").trim().toLowerCase() !== "false";',
+    );
+    expect(computeStep?.run?.script?.code).toContain("passwordAttempted");
   });
 
   test("preserves an omitted preferPasswordLogin flag instead of coercing it to false", () => {
@@ -5192,6 +5214,40 @@ describe("device-auth workflow", () => {
     );
     expect(openSecurityStep?.if).toContain(
       "cache_effective_authenticated_chatgpt_shell_before_security_settings",
+    );
+  });
+
+  test("clicks through the ChatGPT auth-landing before Security settings", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const clickLoginStep = workflow.do?.find(
+      (entry) =>
+        "click_chatgpt_login_button_before_security_settings_from_auth_landing" in
+        entry,
+    )?.click_chatgpt_login_button_before_security_settings_from_auth_landing as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(clickLoginStep?.if).toContain("chatgpt\\.com\\/auth\\/login");
+  });
+
+  test("caches the reclassified ChatGPT auth entry after the auth-landing login click", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const cacheStep = workflow.do?.find(
+      (entry) =>
+        "cache_effective_chatgpt_login_entry_before_security_settings" in entry,
+    )?.cache_effective_chatgpt_login_entry_before_security_settings as
+      | {
+          set?: { pre_settings_login_entry?: string };
+        }
+      | undefined;
+
+    expect(cacheStep?.set?.pre_settings_login_entry).toContain(
+      "classify_chatgpt_login_entry_before_security_settings_after_auth_landing",
+    );
+    expect(cacheStep?.set?.pre_settings_login_entry).toContain(
+      "classify_chatgpt_login_entry_before_security_settings",
     );
   });
 
@@ -5660,6 +5716,12 @@ describe("device-auth workflow", () => {
       "classify_prepare_after_forced_signup_email_timeout_retry_submit?.action?.retryable_timeout === true",
     );
     expect(fallbackStep?.if).toContain("/create-account/i.test");
+    expect(fallbackStep?.if).toContain(
+      "classify_prepare_after_forced_signup_recovery_email_submit?.action?.retryable_timeout === true",
+    );
+    expect(fallbackStep?.if).toContain(
+      "click_prepare_forced_signup_email_timeout_retry?.action?.ok !== true",
+    );
     expect(fallbackStep?.with?.body?.url).toBe(
       "https://auth.openai.com/log-in",
     );
