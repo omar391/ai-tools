@@ -1276,6 +1276,7 @@ pub fn read_watch_state_file() -> Result<WatchState> {
 mod tests {
     use super::*;
     use codex_rotate_core::auth::{write_codex_auth, AuthTokens, CodexAuth};
+    use codex_rotate_core::pool::load_pool;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1303,6 +1304,31 @@ mod tests {
             tokens: AuthTokens {
                 id_token: "id-token".to_string(),
                 access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                account_id: account_id.to_string(),
+            },
+            last_refresh: "2026-04-08T00:00:00.000Z".to_string(),
+        }
+    }
+
+    fn make_test_auth_with_email(email: &str, account_id: &str, plan_type: &str) -> CodexAuth {
+        let (access_token, id_token) = match (email, account_id, plan_type) {
+            ("dev.1@astronlab.com", "acct-1", "free") => (
+                "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJkZXYuMUBhc3Ryb25sYWIuY29tIn0sImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0LTEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6ImZyZWUifX0.signature",
+                "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImRldi4xQGFzdHJvbmxhYi5jb20ifQ.signature",
+            ),
+            ("dev.2@astronlab.com", "acct-2", "free") => (
+                "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJkZXYuMkBhc3Ryb25sYWIuY29tIn0sImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0LTIiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6ImZyZWUifX0.signature",
+                "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImRldi4yQGFzdHJvbmxhYi5jb20ifQ.signature",
+            ),
+            _ => panic!("unexpected auth fixture {email}/{account_id}/{plan_type}"),
+        };
+        CodexAuth {
+            auth_mode: "chatgpt".to_string(),
+            openai_api_key: None,
+            tokens: AuthTokens {
+                access_token: access_token.to_string(),
+                id_token: id_token.to_string(),
                 refresh_token: Some("refresh-token".to_string()),
                 account_id: account_id.to_string(),
             },
@@ -1553,6 +1579,72 @@ mod tests {
             .with_state_mut(|state| Ok(state.snapshot.current_quota.clone()))
             .expect("read daemon state");
         assert_eq!(cached_summary.as_deref(), Some("5h 60% left"));
+    }
+
+    #[test]
+    fn refresh_static_snapshot_auto_adds_missing_auth_account_into_pool() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            let pool_file = paths.rotate_home.join("accounts.json");
+            fs::write(
+                &pool_file,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "accounts": [{
+                        "label": "dev.1@astronlab.com_free",
+                        "email": "dev.1@astronlab.com",
+                        "account_id": "acct-1",
+                        "plan_type": "free",
+                        "auth": make_test_auth_with_email("dev.1@astronlab.com", "acct-1", "free"),
+                        "added_at": "2026-04-08T00:00:00.000Z"
+                    }],
+                    "active_index": 0
+                }))?,
+            )?;
+            write_codex_auth(
+                &codex_home.join("auth.json"),
+                &make_test_auth_with_email("dev.2@astronlab.com", "acct-2", "free"),
+            )?;
+
+            let mut state = DaemonState::new();
+            refresh_static_snapshot(&mut state);
+
+            let pool = load_pool()?;
+            assert_eq!(pool.accounts.len(), 2);
+            assert_eq!(pool.active_index, 1);
+            assert_eq!(pool.accounts[1].email, "dev.2@astronlab.com");
+            assert_eq!(pool.accounts[1].account_id, "acct-2");
+
+            let snapshot = state.snapshot;
+            assert_eq!(snapshot.inventory_count, Some(2));
+            assert_eq!(snapshot.inventory_active_slot, Some(2));
+            Ok(())
+        })();
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        result.expect("refresh_static_snapshot should auto-add the missing auth account");
     }
 
     #[test]

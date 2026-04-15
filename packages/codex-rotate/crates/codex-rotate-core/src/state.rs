@@ -11,6 +11,8 @@ use serde_json::{Map, Value};
 
 use crate::fs_security::write_private_string;
 use crate::paths::{resolve_paths, CorePaths};
+use crate::pool::AccountEntry;
+use crate::workflow::{CredentialFamily, DomainConfig, PendingCredential};
 
 const ROTATE_STATE_BACKUP_PREFIX: &str = "accounts.json.bak.";
 const ROTATE_STATE_BACKUP_RETENTION: usize = 20;
@@ -56,6 +58,28 @@ struct RotateStateWriteHooks<'a> {
 
 struct RotateStateLock {
     _file: File,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateStateSchema {
+    #[serde(default)]
+    accounts: Option<Vec<AccountEntry>>,
+    #[serde(default)]
+    active_index: Option<usize>,
+    #[serde(default)]
+    version: Option<u8>,
+    #[serde(default)]
+    default_create_base_email: Option<String>,
+    #[serde(default)]
+    domain: Option<std::collections::HashMap<String, DomainConfig>>,
+    #[serde(default)]
+    families: Option<std::collections::HashMap<String, CredentialFamily>>,
+    #[serde(default)]
+    pending: Option<std::collections::HashMap<String, PendingCredential>>,
+    #[serde(default)]
+    skipped: Option<std::collections::HashSet<String>>,
 }
 
 impl RotateStateLock {
@@ -129,6 +153,7 @@ where
     let mut after = before.clone();
     mutate(&mut after)?;
     ensure_rotate_state_object(&paths.pool_file, &after)?;
+    ensure_rotate_state_schema(&paths.pool_file, &after)?;
 
     if after == before {
         return Ok(());
@@ -194,6 +219,7 @@ fn parse_rotate_state_json(path: &Path, raw: &str) -> Result<Value> {
         )
     })?;
     ensure_rotate_state_object(path, &parsed)?;
+    ensure_rotate_state_schema(path, &parsed)?;
     Ok(parsed)
 }
 
@@ -209,6 +235,57 @@ fn ensure_rotate_state_object(path: &Path, state: &Value) -> Result<()> {
             backup_hint
         ))
     }
+}
+
+fn ensure_rotate_state_schema(path: &Path, state: &Value) -> Result<()> {
+    let parsed: RotateStateSchema = serde_json::from_value(state.clone()).map_err(|error| {
+        let backup_hint =
+            format_backup_hint(latest_valid_rotate_state_backup_path(path).as_deref());
+        anyhow!(
+            "Rotate state file {} does not match the expected schema.{} {}",
+            path.display(),
+            backup_hint,
+            error
+        )
+    })?;
+
+    match (&parsed.accounts, parsed.active_index) {
+        (Some(accounts), Some(active_index)) => {
+            if accounts.is_empty() {
+                if active_index != 0 {
+                    let backup_hint =
+                        format_backup_hint(latest_valid_rotate_state_backup_path(path).as_deref());
+                    return Err(anyhow!(
+                        "Rotate state file {} is invalid: active_index must be 0 when accounts is empty.{}",
+                        path.display(),
+                        backup_hint
+                    ));
+                }
+            } else if active_index >= accounts.len() {
+                let backup_hint =
+                    format_backup_hint(latest_valid_rotate_state_backup_path(path).as_deref());
+                return Err(anyhow!(
+                    "Rotate state file {} is invalid: active_index {} is out of bounds for {} account(s).{}",
+                    path.display(),
+                    active_index,
+                    accounts.len(),
+                    backup_hint
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            let backup_hint =
+                format_backup_hint(latest_valid_rotate_state_backup_path(path).as_deref());
+            return Err(anyhow!(
+                "Rotate state file {} is invalid: accounts and active_index must either both be present or both be absent.{}",
+                path.display(),
+                backup_hint
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn latest_valid_rotate_state_backup_path(path: &Path) -> Option<PathBuf> {
@@ -531,5 +608,46 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("Latest valid backup") || rendered.contains("Backup:"));
         assert!(rendered.contains(backup_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn load_rotate_state_json_rejects_schema_unknown_top_level_keys() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-state-schema-unknown-key");
+        let paths = resolve_paths().expect("resolve paths");
+        write_private_string(
+            &paths.pool_file,
+            r#"{"accounts":[],"active_index":0,"unexpected":true}"#,
+        )
+        .expect("write invalid state");
+
+        let error = load_rotate_state_json().expect_err("unknown top-level key should fail");
+        assert!(error.to_string().contains("expected schema"));
+        assert!(error.to_string().contains("unexpected"));
+    }
+
+    #[test]
+    fn load_rotate_state_json_rejects_accounts_without_active_index() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-state-schema-active-index");
+        let paths = resolve_paths().expect("resolve paths");
+        write_private_string(&paths.pool_file, r#"{"accounts":[]}"#).expect("write invalid state");
+
+        let error = load_rotate_state_json().expect_err("missing active_index should fail");
+        assert!(error
+            .to_string()
+            .contains("accounts and active_index must either both be present or both be absent"));
+    }
+
+    #[test]
+    fn load_rotate_state_json_rejects_out_of_bounds_active_index() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-state-schema-bounds");
+        let paths = resolve_paths().expect("resolve paths");
+        write_private_string(
+            &paths.pool_file,
+            r#"{"accounts":[{"label":"dev.1@astronlab.com_free","email":"dev.1@astronlab.com","account_id":"acct-1","plan_type":"free","auth":{"auth_mode":"chatgpt","tokens":{"id_token":"id-token","access_token":"access-token","refresh_token":"refresh-token","account_id":"acct-1"},"last_refresh":"2026-04-15T00:00:00.000Z"},"added_at":"2026-04-15T00:00:00.000Z"}],"active_index":2}"#,
+        )
+        .expect("write invalid state");
+
+        let error = load_rotate_state_json().expect_err("out-of-bounds active_index should fail");
+        assert!(error.to_string().contains("out of bounds"));
     }
 }
