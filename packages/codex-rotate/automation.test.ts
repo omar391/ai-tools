@@ -5745,6 +5745,9 @@ describe("device-auth workflow", () => {
       "retry_prepare_login_email_after_signup_invalid_state_fallback",
     );
     expect(workflowText).toContain(
+      "continue_prepare_login_email_after_signup_invalid_state_fallback",
+    );
+    expect(workflowText).toContain(
       "classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'login_email'",
     );
     expect(workflowText).toContain(
@@ -7124,6 +7127,31 @@ describe("device-auth workflow", () => {
     expect(result.saw_oauth_consent).toBe(true);
     expect(result.oauth_continue_visible).toBe(true);
     expect(result.auth_prompt).toBe(false);
+  });
+
+  test("does not preserve a stale device-auth-disabled flag once the device-auth surface advances to consent", async () => {
+    const workflow = await loadWorkflow(deviceAuthWorkflowPath);
+    const cacheStep = workflow.do?.find(
+      (entry) => "cache_effective_device_authorization_surface" in entry,
+    )?.cache_effective_device_authorization_surface as
+      | { set?: Record<string, string> }
+      | undefined;
+    const consentStep = workflow.do?.find(
+      (entry) => "submit_device_authorization_consent" in entry,
+    )?.submit_device_authorization_consent as { if?: string } | undefined;
+    const exitStep = workflow.do?.find(
+      (entry) => "wait_for_codex_login_exit" in entry,
+    )?.wait_for_codex_login_exit as { if?: string } | undefined;
+
+    expect(cacheStep?.set?.device_authorization_surface).toContain(
+      "oauth_continue_visible === true",
+    );
+    expect(consentStep?.if).toContain(
+      "state.steps.inspect_device_authorization_after_code?.action?.success === true",
+    );
+    expect(exitStep?.if).toContain(
+      "state.vars.device_authorization_surface?.success === true",
+    );
   });
 });
 
