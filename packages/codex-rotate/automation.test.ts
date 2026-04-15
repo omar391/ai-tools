@@ -6761,6 +6761,20 @@ describe("device-auth workflow", () => {
     );
   });
 
+  test("device-auth reopens prepare one-time-code recovery from a restored login shell when the CTA is visible", async () => {
+    const workflowText = readFileSync(deviceAuthWorkflowPath, "utf8");
+
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return?.action?.stage === 'login_email'",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return?.action?.one_time_code_cta === true",
+    );
+    expect(workflowText).toContain(
+      "state.steps.classify_prepare_login_after_return_retry?.action?.one_time_code_cta === true",
+    );
+  });
+
   test("original signup password submit treats direct navigation to email verification as progress", async () => {
     const result = await runWorkflowStepScript(
       originalWorkflowPath,
