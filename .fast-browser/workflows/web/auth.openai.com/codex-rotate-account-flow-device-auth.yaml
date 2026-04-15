@@ -4771,14 +4771,19 @@ do:
       metadata:
         templateRef: submit_login_email_form
         description: Retry the prepare login email submit once more when the signup invalid-state fallback still leaves the auth flow on the email step.
+  - continue_prepare_login_email_after_signup_invalid_state_fallback:
+      if: "${state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.stage === 'login_email' && state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.email_input_editable === false && state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.email_prefilled === true && state.steps.classify_prepare_after_login_email_signup_invalid_state_fallback?.action?.continue_button_visible === true}"
+      metadata:
+        templateRef: click_primary_continue
+        description: Continue from the locked prefilled email step when the signup invalid-state fallback restores Welcome back instead of an editable login field.
   - wait_after_prepare_login_email_signup_invalid_state_fallback_retry:
-      if: "${state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true}"
+      if: "${(state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true) || (state.steps.continue_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.continue_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true)}"
       metadata:
         description: Allow the retried signup invalid-state fallback email submit to settle before classifying the next page.
       wait:
         milliseconds: 900
   - classify_prepare_after_login_email_signup_invalid_state_fallback_retry:
-      if: "${state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true}"
+      if: "${(state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.retry_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true) || (state.steps.continue_prepare_login_email_after_signup_invalid_state_fallback?.action?.ok === true && state.steps.continue_prepare_login_email_after_signup_invalid_state_fallback?.action?.skipped !== true)}"
       metadata:
         templateRef: classify_openai_auth_surface
         description: Refresh the prepare login surface after retrying the signup invalid-state fallback email submit.
@@ -8684,7 +8689,7 @@ do:
       metadata:
         description: "Cache the current device-authorization surface after any reused login branch."
       set:
-        device_authorization_surface: "${state.steps.inspect_device_authorization_after_login_reopen?.action?.current_url ? state.steps.inspect_device_authorization_after_login_reopen?.action : (state.steps.inspect_device_authorization_after_login?.action?.current_url ? state.steps.inspect_device_authorization_after_login?.action : (state.steps.inspect_device_authorization_surface?.action || {}))}"
+        device_authorization_surface: "${((state.steps.inspect_device_authorization_after_login_reopen?.action?.current_url && state.steps.inspect_device_authorization_after_login_reopen?.action?.device_auth_disabled !== true) || state.steps.inspect_device_authorization_after_login_reopen?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_login_reopen?.action?.saw_oauth_consent === true || state.steps.inspect_device_authorization_after_login_reopen?.action?.success === true) ? state.steps.inspect_device_authorization_after_login_reopen?.action : ((((state.steps.inspect_device_authorization_after_login?.action?.current_url && state.steps.inspect_device_authorization_after_login?.action?.device_auth_disabled !== true) || state.steps.inspect_device_authorization_after_login?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_login?.action?.saw_oauth_consent === true || state.steps.inspect_device_authorization_after_login?.action?.success === true) ? state.steps.inspect_device_authorization_after_login?.action : (state.steps.inspect_device_authorization_surface?.action || {})))}"
   - fill_device_authorization_code:
       if: "${state.vars.device_authorization_surface?.device_code_prompt === true && String(state.vars.codex_login?.device_code || '').trim() !== ''}"
       metadata:
@@ -8823,7 +8828,7 @@ do:
               rate_limit_exceeded: rateLimitExceeded,
             };
   - submit_device_authorization_consent:
-      if: "${(state.steps.inspect_device_authorization_after_code?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_code?.action?.saw_oauth_consent === true || state.vars.device_authorization_surface?.oauth_continue_visible === true || state.vars.device_authorization_surface?.saw_oauth_consent === true) && state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true && state.vars.device_authorization_surface?.device_auth_disabled !== true}"
+      if: "${(state.steps.inspect_device_authorization_after_code?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_code?.action?.saw_oauth_consent === true || state.vars.device_authorization_surface?.oauth_continue_visible === true || state.vars.device_authorization_surface?.saw_oauth_consent === true) && ((state.steps.inspect_device_authorization_after_code?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_code?.action?.saw_oauth_consent === true || state.steps.inspect_device_authorization_after_code?.action?.success === true) ? state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true : true) && ((state.vars.device_authorization_surface?.oauth_continue_visible === true || state.vars.device_authorization_surface?.saw_oauth_consent === true || state.vars.device_authorization_surface?.success === true) ? state.vars.device_authorization_surface?.device_auth_disabled !== true : true)}"
       metadata:
         templateRef: click_oauth_consent_continue
         description: "Approve the final Codex device-authorization consent step."
@@ -9019,7 +9024,7 @@ do:
 
             return surface;
   - wait_for_codex_login_exit:
-      if: "${(state.vars.codex_login?.exit_path || inputs.codex_login_exit_path) && (state.steps.open_device_authorization_entry?.action?.ok === true && state.steps.open_device_authorization_entry?.action?.skipped !== true) && state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true && state.vars.device_authorization_surface?.device_auth_disabled !== true && (state.steps.inspect_device_authorization_final?.action?.device_code_prompt !== true || (state.steps.submit_callback_device_authorization_code?.action?.ok === true && state.steps.submit_callback_device_authorization_code?.action?.skipped !== true))}"
+      if: "${(state.vars.codex_login?.exit_path || inputs.codex_login_exit_path) && (state.steps.open_device_authorization_entry?.action?.ok === true && state.steps.open_device_authorization_entry?.action?.skipped !== true) && (((state.steps.inspect_device_authorization_after_code?.action?.oauth_continue_visible === true || state.steps.inspect_device_authorization_after_code?.action?.saw_oauth_consent === true || state.steps.inspect_device_authorization_after_code?.action?.success === true) ? state.steps.inspect_device_authorization_after_code?.action?.device_auth_disabled !== true : true)) && (((state.vars.device_authorization_surface?.oauth_continue_visible === true || state.vars.device_authorization_surface?.saw_oauth_consent === true || state.vars.device_authorization_surface?.success === true) ? state.vars.device_authorization_surface?.device_auth_disabled !== true : true)) && (state.steps.inspect_device_authorization_final?.action?.device_code_prompt !== true || (state.steps.submit_callback_device_authorization_code?.action?.ok === true && state.steps.submit_callback_device_authorization_code?.action?.skipped !== true))}"
       metadata:
         description: "Wait for the detached codex device-auth process to exit after browser authorization completes."
       run:
