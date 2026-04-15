@@ -100,6 +100,7 @@ pub enum InvokeAction {
     Add { alias: Option<String> },
     SetAutoCreateEnabled { enabled: bool },
     Shutdown,
+    ShutdownWhenIdle,
     Next,
     Prev,
     Create { options: CreateInvocation },

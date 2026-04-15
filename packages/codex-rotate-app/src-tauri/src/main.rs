@@ -1,13 +1,14 @@
 use codex_rotate_refresh::clear_tray_service_registration;
-use codex_rotate_runtime::ipc::{invoke, InvokeAction, StatusSnapshot};
+use codex_rotate_runtime::ipc::{invoke, InvokeAction, SnapshotMessageKind, StatusSnapshot};
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
 use codex_rotate_runtime::watch::set_tray_enabled;
 use codex_rotate_tray::{
     error_snapshot, rendered_snapshot, spawn_subscription_loop_controlled,
     spawn_tray_refresh_loop_controlled, SharedRenderState,
 };
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{
     image::Image,
@@ -15,6 +16,77 @@ use tauri::{
     tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Manager,
 };
+
+const CHECK_NOW_LABEL: &str = "Check Now";
+const RECHECK_NOW_LABEL: &str = "Re-check Now";
+
+#[derive(Clone, Default)]
+struct SharedTrayState {
+    inner: Arc<Mutex<TrayState>>,
+    quit_prompt_open: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+struct TrayState {
+    last_snapshot: StatusSnapshot,
+    deferred_shutdown_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitChoice {
+    ForceQuit,
+    QuitAfterTask,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayQuitStrategy {
+    Immediate,
+    Deferred,
+}
+
+impl SharedTrayState {
+    fn set_snapshot(&self, snapshot: StatusSnapshot) {
+        let mut state = self.inner.lock().expect("tray state mutex");
+        state.last_snapshot = snapshot;
+    }
+
+    fn snapshot(&self) -> StatusSnapshot {
+        self.inner
+            .lock()
+            .expect("tray state mutex")
+            .last_snapshot
+            .clone()
+    }
+
+    fn set_deferred_shutdown_requested(&self, requested: bool) {
+        let mut state = self.inner.lock().expect("tray state mutex");
+        state.deferred_shutdown_requested = requested;
+    }
+
+    fn should_exit_after_deferred_shutdown(&self, snapshot: &StatusSnapshot) -> bool {
+        let mut state = self.inner.lock().expect("tray state mutex");
+        if !state.deferred_shutdown_requested {
+            return false;
+        }
+        let disconnected = snapshot
+            .last_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("daemon disconnected:"));
+        if disconnected {
+            state.deferred_shutdown_requested = false;
+        }
+        disconnected
+    }
+
+    fn begin_quit_prompt(&self) -> bool {
+        !self.quit_prompt_open.swap(true, Ordering::SeqCst)
+    }
+
+    fn finish_quit_prompt(&self) {
+        self.quit_prompt_open.store(false, Ordering::SeqCst);
+    }
+}
 
 fn clamp_unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -340,6 +412,17 @@ struct MenuHandles {
 }
 
 fn update_snapshot(app: &AppHandle, snapshot: StatusSnapshot) {
+    if let Some(tray_state) = app.try_state::<SharedTrayState>() {
+        tray_state.set_snapshot(snapshot.clone());
+        if tray_state.should_exit_after_deferred_shutdown(&snapshot) {
+            let app_handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                app_handle.exit(0);
+            });
+            return;
+        }
+    }
+
     let rendered = rendered_snapshot(&snapshot);
     if let Some(render_state) = app.try_state::<SharedRenderState>() {
         if !render_state.begin_render(&rendered) {
@@ -391,16 +474,125 @@ fn spawn_invoke(app: AppHandle, action: InvokeAction) {
     });
 }
 
+fn snapshot_indicates_active_task(snapshot: &StatusSnapshot) -> bool {
+    snapshot.last_message_kind == Some(SnapshotMessageKind::Progress)
+}
+
+fn active_quit_prompt_message(snapshot: &StatusSnapshot) -> String {
+    let detail = snapshot
+        .last_message
+        .as_deref()
+        .unwrap_or("Codex Rotate is still working.");
+    format!(
+        "A create or refresh task is still running.\n\n{detail}\n\nForce Quit closes now and may cancel the active task. Quit After Task keeps the tray open until the current task finishes, then shuts down the daemon."
+    )
+}
+
+fn apple_script_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn confirm_active_quit_choice(snapshot: &StatusSnapshot) -> QuitChoice {
+    let script = format!(
+        "button returned of (display dialog \"{}\" with title \"Codex Rotate\" buttons {{\"Cancel\", \"Quit After Task\", \"Force Quit\"}} default button \"Quit After Task\")",
+        apple_script_quote(&active_quit_prompt_message(snapshot))
+    );
+    match Command::new("osascript").arg("-e").arg(script).output() {
+        Ok(output) if output.status.success() => {
+            match String::from_utf8_lossy(&output.stdout).trim() {
+                "Force Quit" => QuitChoice::ForceQuit,
+                "Quit After Task" => QuitChoice::QuitAfterTask,
+                _ => QuitChoice::Cancel,
+            }
+        }
+        Ok(output) => {
+            log_tray_error(format!(
+                "quit confirmation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            QuitChoice::Cancel
+        }
+        Err(error) => {
+            log_tray_error(format!("quit confirmation failed: {error}"));
+            QuitChoice::Cancel
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confirm_active_quit_choice(_snapshot: &StatusSnapshot) -> QuitChoice {
+    QuitChoice::QuitAfterTask
+}
+
+fn perform_tray_quit(app: AppHandle, strategy: TrayQuitStrategy) {
+    thread::spawn(move || {
+        let action = match strategy {
+            TrayQuitStrategy::Immediate => InvokeAction::Shutdown,
+            TrayQuitStrategy::Deferred => InvokeAction::ShutdownWhenIdle,
+        };
+        if let Err(error) = set_tray_enabled(false) {
+            log_tray_error(format!("failed to update tray enabled state: {error:#}"));
+        }
+        if let Err(error) = invoke(action) {
+            log_tray_error(format!("tray quit invoke failed: {error}"));
+            run_on_main_thread(&app, error_snapshot(error.to_string()));
+            return;
+        }
+        clear_tray_service_registration();
+        if let Some(state) = app.try_state::<SharedTrayState>() {
+            state.set_deferred_shutdown_requested(matches!(strategy, TrayQuitStrategy::Deferred));
+        }
+        if matches!(strategy, TrayQuitStrategy::Immediate) {
+            let app_handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                app_handle.exit(0);
+            });
+        }
+    });
+}
+
+fn spawn_quit_flow(app: AppHandle) {
+    thread::spawn(move || {
+        let snapshot = app.state::<SharedTrayState>().snapshot();
+        if !snapshot_indicates_active_task(&snapshot) {
+            perform_tray_quit(app, TrayQuitStrategy::Immediate);
+            return;
+        }
+
+        if !app.state::<SharedTrayState>().begin_quit_prompt() {
+            return;
+        }
+
+        let choice = confirm_active_quit_choice(&snapshot);
+        app.state::<SharedTrayState>().finish_quit_prompt();
+
+        match choice {
+            QuitChoice::ForceQuit => perform_tray_quit(app, TrayQuitStrategy::Immediate),
+            QuitChoice::QuitAfterTask => perform_tray_quit(app, TrayQuitStrategy::Deferred),
+            QuitChoice::Cancel => {}
+        }
+    });
+}
+
 fn toggled_checked_state(current: bool) -> bool {
     !current
+}
+
+fn check_action_label(recheck: bool) -> &'static str {
+    if recheck {
+        RECHECK_NOW_LABEL
+    } else {
+        CHECK_NOW_LABEL
+    }
 }
 
 fn next_auto_create_enabled(app: &AppHandle) -> bool {
     toggled_checked_state(
         app.state::<MenuHandles>()
-        .auto_create_item
-        .is_checked()
-        .unwrap_or(true),
+            .auto_create_item
+            .is_checked()
+            .unwrap_or(true),
     )
 }
 
@@ -414,6 +606,7 @@ fn main() {
             let _ = ActivationPolicy::Regular;
 
             app.manage(SharedRenderState::default());
+            app.manage(SharedTrayState::default());
 
             let account_item =
                 MenuItem::with_id(app, "account", "Account: unknown", false, None::<&str>)?;
@@ -441,7 +634,8 @@ fn main() {
             )?;
             let launch_item =
                 MenuItem::with_id(app, "launch", "Open Managed Codex", true, None::<&str>)?;
-            let check_item = MenuItem::with_id(app, "check", "Check Now", true, None::<&str>)?;
+            let check_item =
+                MenuItem::with_id(app, "check", check_action_label(false), true, None::<&str>)?;
             let rotate_item = MenuItem::with_id(app, "rotate", "Rotate Now", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             app.manage(MenuHandles {
@@ -465,10 +659,10 @@ fn main() {
                     &quota_item,
                     &status_item,
                     &last_rotation_item,
-                    &auto_create_item,
                     &inventory_item,
-                    &launch_item,
                     &check_item,
+                    &auto_create_item,
+                    &launch_item,
                     &rotate_item,
                     &quit_item,
                 ],
@@ -483,7 +677,13 @@ fn main() {
                     let app = app.handle().clone();
                     move |app_handle, event| match event.id.as_ref() {
                         "launch" => spawn_invoke(app.clone(), InvokeAction::OpenManaged),
-                        "check" => spawn_invoke(app.clone(), InvokeAction::Refresh),
+                        "check" => {
+                            let _ = app
+                                .state::<MenuHandles>()
+                                .check_item
+                                .set_text(check_action_label(true));
+                            spawn_invoke(app.clone(), InvokeAction::Refresh);
+                        }
                         "rotate" => spawn_invoke(app.clone(), InvokeAction::Next),
                         "auto_create" => {
                             let enabled = next_auto_create_enabled(&app);
@@ -497,10 +697,8 @@ fn main() {
                             );
                         }
                         "quit" => {
-                            let _ = set_tray_enabled(false);
-                            let _ = invoke(InvokeAction::Shutdown);
-                            clear_tray_service_registration();
-                            app_handle.exit(0);
+                            let _ = app_handle;
+                            spawn_quit_flow(app.clone());
                         }
                         _ => {}
                     }
@@ -545,18 +743,45 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::toggled_checked_state;
+    use super::*;
 
     #[test]
     fn toggled_checked_state_inverts_the_current_menu_value() {
         assert!(toggled_checked_state(false));
         assert!(!toggled_checked_state(true));
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[test]
+    fn check_action_label_switches_to_recheck_after_first_manual_refresh() {
+        assert_eq!(check_action_label(false), CHECK_NOW_LABEL);
+        assert_eq!(check_action_label(true), RECHECK_NOW_LABEL);
+    }
+
+    #[test]
+    fn progress_snapshot_requires_quit_confirmation() {
+        let snapshot = StatusSnapshot {
+            last_message: Some("Creating dev.48@astronlab.com.".to_string()),
+            last_message_kind: Some(SnapshotMessageKind::Progress),
+            ..StatusSnapshot::default()
+        };
+
+        assert!(snapshot_indicates_active_task(&snapshot));
+    }
+
+    #[test]
+    fn deferred_shutdown_exits_only_after_disconnect_snapshot() {
+        let state = SharedTrayState::default();
+        state.set_deferred_shutdown_requested(true);
+
+        assert!(!state.should_exit_after_deferred_shutdown(&StatusSnapshot {
+            last_message: Some("watch healthy".to_string()),
+            ..StatusSnapshot::default()
+        }));
+        assert!(state.should_exit_after_deferred_shutdown(&StatusSnapshot {
+            last_message: Some("daemon disconnected: socket closed".to_string()),
+            ..StatusSnapshot::default()
+        }));
+    }
 
     #[test]
     fn tray_icon_activity_badge_changes_pixels() {
