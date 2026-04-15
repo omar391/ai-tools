@@ -1346,7 +1346,7 @@ describe("active auth workflows", () => {
     expect(runtimeSources).not.toContain('"secrets clear"');
   });
 
-  test("main remains ordered stepwise-first with device-auth fallback after benchmarking", async () => {
+  test("main now delegates only to the single active stepwise flow", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -1372,14 +1372,11 @@ describe("active auth workflows", () => {
         call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
         version: "1.1.0",
       },
-      {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-device-auth",
-        version: "1.3.13",
-      },
     ]);
+    expect(workflow.document?.summary).toContain("Single active");
   });
 
-  test("main forwards account_login_ref into both primary and fallback flows", async () => {
+  test("main still accepts the stored login secret inputs directly", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -1391,26 +1388,12 @@ describe("active auth workflows", () => {
       ),
     );
 
-    const runPrimary = findWorkflowStep<{
-      with?: {
-        input?: Record<string, unknown>;
-      };
-    }>(workflow, "run_primary_non_device_flow");
-    const runFallback = findWorkflowStep<{
-      with?: {
-        input?: Record<string, unknown>;
-      };
-    }>(workflow, "run_device_auth_fallback");
-
-    expect(runPrimary?.with?.input?.account_login_ref).toBe(
-      "${inputs.account_login_ref}",
-    );
-    expect(runFallback?.with?.input?.account_login_ref).toBe(
-      "${inputs.account_login_ref}",
-    );
+    const properties = workflow.input?.schema?.document?.properties || {};
+    expect(properties.account_login_ref).toBeDefined();
+    expect(properties.account_login_locator).toBeDefined();
   });
 
-  test("main keeps primary workflow-owned retry and skip outcomes on the stepwise path", () => {
+  test("main keeps only the stepwise single-flow selection contract", () => {
     const workflowText = readFileSync(
       join(
         repoRoot,
@@ -1423,19 +1406,17 @@ describe("active auth workflows", () => {
       "utf8",
     );
 
-    expect(workflowText).toContain("output?.next_action != 'skip_account'");
+    expect(workflowText).toContain("run_active_unified_flow");
     expect(workflowText).toContain(
-      "(state.steps.run_primary_non_device_flow?.action?.result?.output?.next_action != 'replay_auth_url' || state.steps.run_primary_non_device_flow?.action?.result?.output?.replay_reason == 'about_you')",
+      '"workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise"',
     );
-    expect(workflowText).toContain("output?.next_action != 'retry_attempt'");
-    expect(workflowText).toContain("const primarySkip =");
-    expect(workflowText).toContain("const primarySetupBlocked =");
-    expect(workflowText).toContain("const primaryRetryable =");
+    expect(workflowText).toContain("fallback_flow: null");
+    expect(workflowText).toContain("fallback_attempted: false");
     expect(workflowText).toContain(
-      "primaryComplete || primarySkip || primaryRetryable || !fallback",
+      'selection_strategy: "single-stepwise-flow"',
     );
-    expect(workflowText).toContain("!primarySkip");
-    expect(workflowText).toContain("!primaryRetryable");
+    expect(workflowText).not.toContain("run_device_auth_fallback");
+    expect(workflowText).not.toContain("codex-rotate-account-flow-device-auth");
   });
 
   test("minimal flow waits after replayed-login resend before searching Gmail", async () => {
