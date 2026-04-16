@@ -1610,6 +1610,22 @@ pub fn restore_codex_auth_from_active_pool() -> Result<bool> {
     Ok(true)
 }
 
+pub fn restore_pool_active_index(index: usize) -> Result<bool> {
+    let mut pool = load_pool()?;
+    if pool.accounts.is_empty() {
+        return Ok(false);
+    }
+
+    let restored_index = index.min(pool.accounts.len().saturating_sub(1));
+    if pool.active_index == restored_index {
+        return Ok(false);
+    }
+
+    pool.active_index = restored_index;
+    save_pool(&pool)?;
+    Ok(true)
+}
+
 fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) -> Result<bool> {
     let current_account_id = extract_account_id_from_auth(&current_auth);
     let current_email = extract_email_from_auth(&current_auth);

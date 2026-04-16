@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod hook;
 pub mod ipc;
 pub mod launcher;
+pub mod log_isolation;
 pub mod logs;
 pub mod paths;
 pub mod runtime_log;

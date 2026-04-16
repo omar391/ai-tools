@@ -244,6 +244,19 @@ pub fn run_thread_recovery_iteration(
     })
 }
 
+pub fn read_active_thread_ids(port: Option<u16>) -> Result<Vec<String>> {
+    let port = port.unwrap_or(DEFAULT_PORT);
+    let paths = resolve_paths()?;
+    let thread_ids = read_non_archived_thread_ids(&paths.codex_state_db_file)?;
+    active_thread_ids_from_candidates(&thread_ids, |thread_id| {
+        match read_thread_summary(port, thread_id) {
+            Ok(summary) => Ok(summary),
+            Err(error) if is_terminal_thread_recovery_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    })
+}
+
 fn resolve_recoverable_turn_failure_event(
     connection: &Connection,
     port: u16,
@@ -758,6 +771,45 @@ limit ?1
     Ok(events)
 }
 
+fn read_non_archived_thread_ids(state_db_path: &Path) -> Result<Vec<String>> {
+    let Some(connection) = open_state_connection_if_available(state_db_path)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection.prepare(
+        r#"
+select id
+from threads
+where archived = 0
+order by updated_at desc
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut thread_ids = Vec::new();
+    for row in rows {
+        thread_ids.push(row?);
+    }
+    Ok(thread_ids)
+}
+
+fn active_thread_ids_from_candidates<F>(
+    thread_ids: &[String],
+    mut read_thread: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(&str) -> Result<Option<ThreadSummary>>,
+{
+    let mut active = Vec::new();
+    for thread_id in thread_ids {
+        let Some(summary) = read_thread(thread_id)? else {
+            continue;
+        };
+        if summary.status.kind == "active" {
+            active.push(thread_id.clone());
+        }
+    }
+    Ok(active)
+}
+
 fn detect_stalled_turn_snapshot(
     thread_id: &str,
     rollout_path: &Path,
@@ -1249,6 +1301,71 @@ mod tests {
         assert!(open_logs_connection_if_available(&missing)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn read_non_archived_thread_ids_returns_recent_non_archived_threads() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state_file = tempdir.path().join("state_5.sqlite");
+        let connection = Connection::open(&state_file).unwrap();
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+  id text primary key,
+  rollout_path text not null default '',
+  updated_at integer not null,
+  archived integer not null default 0
+);
+insert into threads (id, rollout_path, updated_at, archived) values
+  ('thread-old', '', 10, 0),
+  ('thread-archived', '', 30, 1),
+  ('thread-new', '', 20, 0);
+                "#,
+            )
+            .unwrap();
+
+        let thread_ids = read_non_archived_thread_ids(&state_file).unwrap();
+
+        assert_eq!(
+            thread_ids,
+            vec!["thread-new".to_string(), "thread-old".to_string()]
+        );
+    }
+
+    #[test]
+    fn active_thread_ids_from_candidates_filters_to_active_threads() {
+        let thread_ids = vec![
+            "thread-active".to_string(),
+            "thread-idle".to_string(),
+            "thread-missing".to_string(),
+        ];
+
+        let active_thread_ids = active_thread_ids_from_candidates(&thread_ids, |thread_id| {
+            Ok(match thread_id {
+                "thread-active" => Some(thread_summary("active", Some("/tmp/project"))),
+                "thread-idle" => Some(thread_summary("idle", Some("/tmp/project"))),
+                "thread-missing" => None,
+                other => panic!("unexpected thread {other}"),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(active_thread_ids, vec!["thread-active".to_string()]);
+    }
+
+    #[test]
+    fn active_thread_ids_from_candidates_propagates_non_terminal_errors() {
+        let thread_ids = vec!["thread-active".to_string()];
+
+        let error = active_thread_ids_from_candidates(&thread_ids, |_| {
+            Err(anyhow!("Codex thread/read request failed"))
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Codex thread/read request failed"));
     }
 
     #[test]

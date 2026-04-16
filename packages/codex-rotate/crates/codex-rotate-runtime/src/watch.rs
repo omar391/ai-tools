@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,8 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::fs_security::write_private_string;
 use codex_rotate_core::pool::{
-    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool,
-    rotate_next_internal_with_progress, NextResult, Pool,
+    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool, Pool,
 };
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
@@ -23,6 +23,7 @@ use crate::hook::{
     live_account_matches_summary, read_live_account_if_running,
     switch_live_account_to_current_auth, AccountReadResult, LiveSwitchResult,
 };
+use crate::log_isolation::run_account_operation_with_log_isolation;
 use crate::logs::{
     codex_logs_availability, read_codex_signals, read_latest_codex_signal_id, CodexLogSignal,
     CodexLogsAvailability, CodexSignalKind,
@@ -41,22 +42,67 @@ const THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS: i64 = 2_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct WatchState {
+pub struct AccountWatchState {
     pub last_signal_id: Option<i64>,
     pub last_checked_at: Option<String>,
     pub last_live_email: Option<String>,
-    pub last_rotation_at: Option<String>,
-    pub last_rotation_reason: Option<String>,
-    pub last_rotated_email: Option<String>,
     pub last_thread_recovery_log_id: Option<i64>,
     pub thread_recovery_pending: bool,
     pub thread_recovery_pending_events: Vec<ThreadRecoveryEvent>,
     pub thread_recovery_backfill_complete: bool,
     pub quota: Option<CachedQuotaState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WatchState {
+    pub last_rotation_at: Option<String>,
+    pub last_rotation_reason: Option<String>,
+    pub last_rotated_email: Option<String>,
     #[serde(default = "default_auto_create_enabled")]
     pub auto_create_enabled: bool,
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, AccountWatchState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RawWatchState {
+    last_signal_id: Option<i64>,
+    last_checked_at: Option<String>,
+    last_live_email: Option<String>,
+    last_rotation_at: Option<String>,
+    last_rotation_reason: Option<String>,
+    last_rotated_email: Option<String>,
+    last_thread_recovery_log_id: Option<i64>,
+    thread_recovery_pending: bool,
+    thread_recovery_pending_events: Vec<ThreadRecoveryEvent>,
+    thread_recovery_backfill_complete: bool,
+    quota: Option<CachedQuotaState>,
+    auto_create_enabled: Option<bool>,
+    tray_enabled: Option<bool>,
+    accounts: BTreeMap<String, AccountWatchState>,
+}
+
+impl WatchState {
+    pub fn account_state(&self, account_id: &str) -> AccountWatchState {
+        self.accounts.get(account_id).cloned().unwrap_or_default()
+    }
+
+    pub fn set_account_state(
+        &mut self,
+        account_id: impl Into<String>,
+        account_state: AccountWatchState,
+    ) {
+        let account_id = account_id.into();
+        if account_state == AccountWatchState::default() {
+            self.accounts.remove(&account_id);
+        } else {
+            self.accounts.insert(account_id, account_state);
+        }
+    }
 }
 
 fn default_auto_create_enabled() -> bool {
@@ -99,6 +145,8 @@ pub struct RotationDecision {
 #[serde(rename_all = "camelCase")]
 pub struct WatchIterationResult {
     pub state: WatchState,
+    pub current_account_id: String,
+    pub current_account_state: AccountWatchState,
     pub decision: RotationDecision,
     pub rotated: bool,
     pub rotation: Option<AuthSummary>,
@@ -121,7 +169,9 @@ pub fn read_watch_state() -> Result<WatchState> {
     }
     let raw =
         fs::read_to_string(&paths.watch_state_file).context("Failed to read watch-state.json.")?;
-    let state = serde_json::from_str::<WatchState>(&raw).unwrap_or_default();
+    let state = serde_json::from_str::<RawWatchState>(&raw)
+        .map(|raw| migrate_watch_state(raw, current_watch_account_id().as_deref()))
+        .unwrap_or_default();
     Ok(state)
 }
 
@@ -151,6 +201,56 @@ pub fn set_tray_enabled(enabled: bool) -> Result<()> {
     write_watch_state(&state)
 }
 
+fn migrate_watch_state(raw: RawWatchState, current_account_id: Option<&str>) -> WatchState {
+    let mut state = WatchState {
+        last_rotation_at: raw.last_rotation_at,
+        last_rotation_reason: raw.last_rotation_reason,
+        last_rotated_email: raw.last_rotated_email,
+        auto_create_enabled: raw
+            .auto_create_enabled
+            .unwrap_or_else(default_auto_create_enabled),
+        tray_enabled: raw.tray_enabled.unwrap_or_else(default_tray_enabled),
+        accounts: raw.accounts,
+    };
+
+    if state.accounts.is_empty()
+        && current_account_id.is_some()
+        && (raw.last_signal_id.is_some()
+            || raw.last_checked_at.is_some()
+            || raw.last_live_email.is_some()
+            || raw.last_thread_recovery_log_id.is_some()
+            || raw.thread_recovery_pending
+            || !raw.thread_recovery_pending_events.is_empty()
+            || raw.thread_recovery_backfill_complete
+            || raw.quota.is_some())
+    {
+        let account_state = AccountWatchState {
+            last_signal_id: raw.last_signal_id,
+            last_checked_at: raw.last_checked_at,
+            last_live_email: raw.last_live_email,
+            last_thread_recovery_log_id: raw.last_thread_recovery_log_id,
+            thread_recovery_pending: raw.thread_recovery_pending,
+            thread_recovery_pending_events: raw.thread_recovery_pending_events,
+            thread_recovery_backfill_complete: raw.thread_recovery_backfill_complete,
+            quota: raw.quota,
+        };
+        if let Some(account_id) = current_account_id {
+            state.set_account_state(account_id.to_string(), account_state);
+        }
+    }
+
+    state
+}
+
+fn current_watch_account_id() -> Option<String> {
+    let paths = resolve_paths().ok()?;
+    if !paths.codex_auth_file.exists() {
+        return None;
+    }
+    let auth = load_codex_auth(&paths.codex_auth_file).ok()?;
+    Some(summarize_codex_auth(&auth).account_id)
+}
+
 pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterationResult> {
     let port = options.port.unwrap_or(9333);
     let cooldown_ms = options.cooldown_ms.unwrap_or(DEFAULT_COOLDOWN_MS);
@@ -158,8 +258,15 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let logs_availability = codex_logs_availability(&paths.codex_logs_db_file)?;
 
     let previous_state = read_watch_state()?;
+    let current_auth = load_or_restore_codex_auth(&paths.codex_auth_file)?;
+    let mut current_summary = summarize_codex_auth(&current_auth);
+    let previous_account_id = current_summary.account_id.clone();
+    let previous_account_state = previous_state.account_state(&previous_account_id);
+
     let latest_codex_signal_id = read_latest_codex_signal_id(&paths.codex_logs_db_file)?;
-    let mut after_signal_id = options.after_signal_id.or(previous_state.last_signal_id);
+    let mut after_signal_id = options
+        .after_signal_id
+        .or(previous_account_state.last_signal_id);
     let (normalized_after_signal_id, signal_log_cursor_reset) = normalize_log_cursor(
         after_signal_id,
         latest_codex_signal_id,
@@ -170,16 +277,15 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id = latest_codex_signal_id;
     }
 
-    let current_auth = load_or_restore_codex_auth(&paths.codex_auth_file)?;
-    let current_summary = summarize_codex_auth(&current_auth);
     let (mut decision, mut quota_cache) = decide_rotation(
         &current_auth,
         &current_summary,
         after_signal_id,
-        previous_state.quota.as_ref(),
+        previous_account_state.quota.as_ref(),
         options.force_quota_refresh,
         previous_state.auto_create_enabled,
     )?;
+    let source_quota_cache = quota_cache.clone();
     if signal_log_cursor_reset && decision.signals.is_empty() {
         decision.last_signal_id = latest_codex_signal_id;
     }
@@ -216,20 +322,25 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 account_id: current_summary.account_id.clone(),
             }),
     );
+    let source_live = live.clone();
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
-        rotation = execute_watch_rotation(decision.rotation_command, options.progress.clone())?;
+        rotation = execute_watch_rotation(
+            decision.rotation_command,
+            Some(port),
+            options.progress.clone(),
+        )?;
         if rotation.is_some() {
-            live = Some(switch_live_account_to_current_auth(
-                Some(port),
-                false,
-                15_000,
-            )?);
             let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
-            let refreshed_summary = summarize_codex_auth(&refreshed_auth);
+            current_summary = summarize_codex_auth(&refreshed_auth);
+            live = Some(LiveSwitchResult {
+                email: current_summary.email.clone(),
+                plan_type: current_summary.plan_type.clone(),
+                account_id: current_summary.account_id.clone(),
+            });
             quota_cache = Some(refresh_quota_cache_for_auth(
                 &refreshed_auth,
-                &refreshed_summary,
+                &current_summary,
                 true,
                 None,
             )?);
@@ -241,13 +352,19 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .signals
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
+    let account_changed = current_summary.account_id != previous_account_id;
+    let current_account_previous_state = if account_changed {
+        previous_state.account_state(&current_summary.account_id)
+    } else {
+        previous_account_state.clone()
+    };
     let latest_recoverable_turn_failure_log_id = read_latest_recoverable_turn_failure_log_id()?;
     let (mut thread_recovery_log_id, recoverable_turn_failure_log_reset) = normalize_log_cursor(
-        previous_state.last_thread_recovery_log_id,
+        current_account_previous_state.last_thread_recovery_log_id,
         latest_recoverable_turn_failure_log_id,
         THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS,
     );
-    if !previous_state.thread_recovery_pending
+    if !current_account_previous_state.thread_recovery_pending
         && !usage_limit_signal_seen
         && !rotated
         && thread_recovery_log_id.is_none()
@@ -259,91 +376,122 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .map(|(latest, current)| latest > current)
         .unwrap_or(false)
         || recoverable_turn_failure_log_reset;
-    let bootstrap_thread_recovery = !previous_state.thread_recovery_backfill_complete;
+    let bootstrap_thread_recovery =
+        !current_account_previous_state.thread_recovery_backfill_complete;
+    let now = now_iso();
 
-    let mut next_state = WatchState {
-        last_signal_id: decision.last_signal_id,
-        last_checked_at: Some(now_iso()),
-        last_live_email: live
-            .as_ref()
-            .map(|value| value.email.clone())
-            .or_else(|| {
-                live_account
-                    .account
-                    .as_ref()
-                    .and_then(|account| account.email.clone())
-            })
-            .or_else(|| previous_state.last_live_email.clone()),
-        last_rotation_at: if rotated {
-            Some(now_iso())
-        } else {
-            previous_state.last_rotation_at.clone()
-        },
-        last_rotation_reason: if rotated {
-            decision.reason.clone()
-        } else {
-            previous_state.last_rotation_reason.clone()
-        },
-        last_rotated_email: if rotated {
-            rotation.as_ref().map(|summary| summary.email.clone())
-        } else {
-            previous_state.last_rotated_email.clone()
-        },
-        last_thread_recovery_log_id: thread_recovery_log_id,
-        thread_recovery_pending: previous_state.thread_recovery_pending,
-        thread_recovery_pending_events: previous_state.thread_recovery_pending_events.clone(),
-        thread_recovery_backfill_complete: previous_state.thread_recovery_backfill_complete,
-        quota: quota_cache,
-        auto_create_enabled: previous_state.auto_create_enabled,
-        tray_enabled: previous_state.tray_enabled,
+    let mut next_state = previous_state.clone();
+    next_state.last_rotation_at = if rotated {
+        Some(now.clone())
+    } else {
+        previous_state.last_rotation_at.clone()
     };
+    next_state.last_rotation_reason = if rotated {
+        decision.reason.clone()
+    } else {
+        previous_state.last_rotation_reason.clone()
+    };
+    next_state.last_rotated_email = if rotated {
+        rotation.as_ref().map(|summary| summary.email.clone())
+    } else {
+        previous_state.last_rotated_email.clone()
+    };
+    next_state.auto_create_enabled = previous_state.auto_create_enabled;
+    next_state.tray_enabled = previous_state.tray_enabled;
+
+    let mut source_account_state = previous_account_state.clone();
+    source_account_state.last_signal_id = decision.last_signal_id;
+    source_account_state.last_checked_at = Some(now.clone());
+    source_account_state.last_live_email = source_live
+        .as_ref()
+        .map(|value| value.email.clone())
+        .or_else(|| previous_account_state.last_live_email.clone());
+    source_account_state.quota = source_quota_cache;
+    next_state.set_account_state(previous_account_id.clone(), source_account_state.clone());
+
+    let mut current_account_state = if account_changed {
+        current_account_previous_state.clone()
+    } else {
+        source_account_state
+    };
+    current_account_state.last_checked_at = Some(now.clone());
+    current_account_state.last_live_email = live
+        .as_ref()
+        .map(|value| value.email.clone())
+        .or_else(|| current_account_previous_state.last_live_email.clone());
+    current_account_state.last_thread_recovery_log_id = thread_recovery_log_id;
+    current_account_state.thread_recovery_pending =
+        current_account_previous_state.thread_recovery_pending;
+    current_account_state.thread_recovery_pending_events = current_account_previous_state
+        .thread_recovery_pending_events
+        .clone();
+    current_account_state.thread_recovery_backfill_complete =
+        current_account_previous_state.thread_recovery_backfill_complete;
+    current_account_state.quota = quota_cache.clone();
+    if !account_changed {
+        current_account_state.last_signal_id = decision.last_signal_id;
+    }
     if should_run_thread_recovery(
-        &previous_state,
+        &current_account_previous_state,
         usage_limit_signal_seen,
         rotated,
         recoverable_turn_failure_log_advanced,
     ) {
         let recovery_last_log_id = if bootstrap_thread_recovery {
-            next_state
+            current_account_state
                 .last_thread_recovery_log_id
                 .map(|id| id.saturating_sub(THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS))
         } else {
-            next_state.last_thread_recovery_log_id
+            current_account_state.last_thread_recovery_log_id
         };
         match run_thread_recovery_iteration(RecoveryIterationOptions {
             port: Some(port),
-            current_live_email: live
+            current_live_email: live.as_ref().map(|value| value.email.clone()).or_else(|| {
+                current_account_state
+                    .last_live_email
+                    .as_ref()
+                    .map(ToOwned::to_owned)
+            }),
+            current_quota_usable: current_account_state
+                .quota
                 .as_ref()
-                .map(|value| value.email.clone())
-                .or_else(|| next_state.last_live_email.as_ref().map(ToOwned::to_owned)),
-            current_quota_usable: next_state.quota.as_ref().map(|quota| quota.usable),
-            current_primary_quota_left_percent: next_state
+                .map(|quota| quota.usable),
+            current_primary_quota_left_percent: current_account_state
                 .quota
                 .as_ref()
                 .and_then(|quota| quota.primary_quota_left_percent),
             rotated,
             last_log_id: recovery_last_log_id,
-            pending: next_state.thread_recovery_pending,
-            pending_events: next_state.thread_recovery_pending_events.clone(),
+            pending: current_account_state.thread_recovery_pending,
+            pending_events: current_account_state.thread_recovery_pending_events.clone(),
         }) {
             Ok(recovery) => {
-                next_state.last_thread_recovery_log_id = recovery.last_log_id;
-                next_state.thread_recovery_pending = recovery.pending;
-                next_state.thread_recovery_pending_events = recovery.pending_events;
-                next_state.thread_recovery_backfill_complete = true;
+                current_account_state.last_thread_recovery_log_id = recovery.last_log_id;
+                current_account_state.thread_recovery_pending = recovery.pending;
+                current_account_state.thread_recovery_pending_events = recovery.pending_events;
+                current_account_state.thread_recovery_backfill_complete = true;
             }
             Err(error) => {
                 log_daemon_error(format!("thread recovery iteration failed: {error:#}"));
                 eprintln!("codex-rotate: thread recovery iteration failed: {error:#}");
-                next_state.thread_recovery_pending = next_state.thread_recovery_pending
-                    || !next_state.thread_recovery_pending_events.is_empty();
+                current_account_state.thread_recovery_pending = current_account_state
+                    .thread_recovery_pending
+                    || !current_account_state
+                        .thread_recovery_pending_events
+                        .is_empty();
             }
         }
     }
+    next_state.set_account_state(
+        current_summary.account_id.clone(),
+        current_account_state.clone(),
+    );
     write_watch_state_if_needed(&previous_state, &next_state)?;
 
     Ok(WatchIterationResult {
         state: next_state,
+        current_account_id: current_summary.account_id.clone(),
+        current_account_state,
         decision,
         rotated,
         rotation,
@@ -367,16 +515,17 @@ fn normalize_log_cursor(
 
 fn execute_watch_rotation(
     command: Option<RotationCommand>,
+    port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<Option<AuthSummary>> {
+    let port = port.unwrap_or(9333);
     match command {
         Some(RotationCommand::Next) => {
-            let next_result = rotate_next_internal_with_progress(progress.clone())?;
-            Ok(Some(match next_result {
-                NextResult::Rotated { summary, .. }
-                | NextResult::Stayed { summary, .. }
-                | NextResult::Created { summary, .. } => summary,
-            }))
+            let next_result =
+                run_account_operation_with_log_isolation(Some(port), progress.clone(), || {
+                    codex_rotate_core::pool::rotate_next_internal_with_progress(progress.clone())
+                })?;
+            Ok(next_result.current_summary.or(next_result.previous_summary))
         }
         Some(RotationCommand::Create) => {
             if let Some(progress) = progress.as_ref() {
@@ -391,37 +540,49 @@ fn execute_watch_rotation(
                 None
             };
             let create_attempt = || {
-                cmd_create_with_progress(
-                    CreateCommandOptions {
-                        force: true,
-                        ignore_current: true,
-                        require_usable_quota: true,
-                        restore_previous_auth_after_create: false,
-                        source: CreateCommandSource::Next,
-                        ..CreateCommandOptions::default()
-                    },
-                    progress.clone(),
-                )
+                run_account_operation_with_log_isolation(Some(port), progress.clone(), || {
+                    cmd_create_with_progress(
+                        CreateCommandOptions {
+                            force: true,
+                            ignore_current: true,
+                            require_usable_quota: true,
+                            restore_previous_auth_after_create: false,
+                            source: CreateCommandSource::Next,
+                            ..CreateCommandOptions::default()
+                        },
+                        progress.clone(),
+                    )
+                })
             };
             match create_attempt() {
-                Ok(_) => {}
+                Ok(result) => return Ok(result.current_summary.or(result.previous_summary)),
                 Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
-                    let next_result = rotate_next_internal_with_progress(progress.clone())?;
-                    return Ok(Some(match next_result {
-                        NextResult::Rotated { summary, .. }
-                        | NextResult::Stayed { summary, .. }
-                        | NextResult::Created { summary, .. } => summary,
-                    }));
+                    let next_result = run_account_operation_with_log_isolation(
+                        Some(port),
+                        progress.clone(),
+                        || {
+                            codex_rotate_core::pool::rotate_next_internal_with_progress(
+                                progress.clone(),
+                            )
+                        },
+                    )?;
+                    return Ok(next_result.current_summary.or(next_result.previous_summary));
                 }
                 Err(error) if is_retryable_watch_create_error(&error) => {
                     if let Err(retry_error) = create_attempt() {
                         if is_auto_create_retry_stopped_for_reusable_account(&retry_error) {
-                            let next_result = rotate_next_internal_with_progress(progress.clone())?;
-                            return Ok(Some(match next_result {
-                                NextResult::Rotated { summary, .. }
-                                | NextResult::Stayed { summary, .. }
-                                | NextResult::Created { summary, .. } => summary,
-                            }));
+                            let next_result = run_account_operation_with_log_isolation(
+                                Some(port),
+                                progress.clone(),
+                                || {
+                                    codex_rotate_core::pool::rotate_next_internal_with_progress(
+                                        progress.clone(),
+                                    )
+                                },
+                            )?;
+                            return Ok(next_result
+                                .current_summary
+                                .or(next_result.previous_summary));
                         }
                         if let Some(summary) =
                             recover_completed_watch_create(previous_summary.as_ref())?
@@ -743,7 +904,7 @@ fn now_iso() -> String {
 }
 
 fn should_run_thread_recovery(
-    previous: &WatchState,
+    previous: &AccountWatchState,
     usage_limit_signal_seen: bool,
     rotated: bool,
     recoverable_turn_failure_log_advanced: bool,
@@ -768,8 +929,12 @@ fn should_persist_watch_state(previous: &WatchState, next: &WatchState) -> bool 
     }
     let mut previous_normalized = previous.clone();
     let mut next_normalized = next.clone();
-    previous_normalized.last_checked_at = None;
-    next_normalized.last_checked_at = None;
+    for state in previous_normalized.accounts.values_mut() {
+        state.last_checked_at = None;
+    }
+    for state in next_normalized.accounts.values_mut() {
+        state.last_checked_at = None;
+    }
     previous_normalized != next_normalized
 }
 
@@ -778,6 +943,12 @@ mod tests {
     use super::*;
     use crate::test_support::env_mutex;
     use anyhow::anyhow;
+
+    fn state_for_account(account_id: &str, account_state: AccountWatchState) -> WatchState {
+        let mut state = WatchState::default();
+        state.set_account_state(account_id.to_string(), account_state);
+        state
+    }
 
     #[test]
     fn plan_rotation_uses_create_for_low_quota() {
@@ -1043,55 +1214,73 @@ mod tests {
 
     #[test]
     fn watch_state_write_skips_heartbeat_only_changes() {
-        let previous = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
-            ..WatchState::default()
-        };
-        let next = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
-            ..previous.clone()
-        };
+        let previous = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+                ..AccountWatchState::default()
+            },
+        );
+        let next = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+                ..previous.account_state("acct-123")
+            },
+        );
         assert!(!should_persist_watch_state(&previous, &next));
     }
 
     #[test]
     fn watch_state_write_keeps_signal_progress() {
-        let previous = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
-            last_signal_id: Some(10),
-            ..WatchState::default()
-        };
-        let next = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
-            last_signal_id: Some(11),
-            ..previous.clone()
-        };
+        let previous = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+                last_signal_id: Some(10),
+                ..AccountWatchState::default()
+            },
+        );
+        let next = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+                last_signal_id: Some(11),
+                ..previous.account_state("acct-123")
+            },
+        );
         assert!(should_persist_watch_state(&previous, &next));
     }
 
     #[test]
     fn watch_state_write_keeps_thread_recovery_progress() {
-        let previous = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
-            last_thread_recovery_log_id: Some(10),
-            thread_recovery_pending: true,
-            ..WatchState::default()
-        };
-        let next = WatchState {
-            last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
-            last_thread_recovery_log_id: Some(11),
-            thread_recovery_pending: false,
-            ..previous.clone()
-        };
+        let previous = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:00.000Z".to_string()),
+                last_thread_recovery_log_id: Some(10),
+                thread_recovery_pending: true,
+                ..AccountWatchState::default()
+            },
+        );
+        let next = state_for_account(
+            "acct-123",
+            AccountWatchState {
+                last_checked_at: Some("2026-04-03T12:00:15.000Z".to_string()),
+                last_thread_recovery_log_id: Some(11),
+                thread_recovery_pending: false,
+                ..previous.account_state("acct-123")
+            },
+        );
         assert!(should_persist_watch_state(&previous, &next));
     }
 
     #[test]
     fn thread_recovery_runs_for_pending_state() {
         assert!(should_run_thread_recovery(
-            &WatchState {
+            &AccountWatchState {
                 thread_recovery_pending: true,
-                ..WatchState::default()
+                ..AccountWatchState::default()
             },
             false,
             false,
@@ -1102,7 +1291,7 @@ mod tests {
     #[test]
     fn thread_recovery_runs_for_bootstrap_backfill() {
         assert!(should_run_thread_recovery(
-            &WatchState::default(),
+            &AccountWatchState::default(),
             false,
             false,
             false
@@ -1112,9 +1301,9 @@ mod tests {
     #[test]
     fn thread_recovery_runs_when_recoverable_turn_failure_log_advances() {
         assert!(should_run_thread_recovery(
-            &WatchState {
+            &AccountWatchState {
                 thread_recovery_backfill_complete: true,
-                ..WatchState::default()
+                ..AccountWatchState::default()
             },
             false,
             false,
@@ -1125,14 +1314,87 @@ mod tests {
     #[test]
     fn thread_recovery_stays_idle_without_signal_rotation_pending_or_new_log() {
         assert!(!should_run_thread_recovery(
-            &WatchState {
+            &AccountWatchState {
                 thread_recovery_backfill_complete: true,
-                ..WatchState::default()
+                ..AccountWatchState::default()
             },
             false,
             false,
             false
         ));
+    }
+
+    #[test]
+    fn read_watch_state_migrates_legacy_flat_shape_into_current_account() {
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let auth = codex_rotate_core::auth::CodexAuth {
+                auth_mode: "chatgpt".to_string(),
+                openai_api_key: None,
+                tokens: codex_rotate_core::auth::AuthTokens {
+                    id_token: "id".to_string(),
+                    access_token: "access".to_string(),
+                    refresh_token: None,
+                    account_id: "acct-legacy".to_string(),
+                },
+                last_refresh: "2026-04-15T00:00:00.000Z".to_string(),
+            };
+            write_private_string(
+                &codex_home.join("auth.json"),
+                &serde_json::to_string_pretty(&auth)?,
+            )?;
+            write_private_string(
+                &rotate_home.join("watch-state.json"),
+                &serde_json::json!({
+                    "lastSignalId": 42,
+                    "lastCheckedAt": "2026-04-03T12:00:00.000Z",
+                    "lastLiveEmail": "dev.legacy@astronlab.com",
+                    "threadRecoveryPending": true,
+                    "autoCreateEnabled": false,
+                    "trayEnabled": true
+                })
+                .to_string(),
+            )?;
+
+            let state = read_watch_state()?;
+            let account = state.account_state("acct-legacy");
+            assert_eq!(account.last_signal_id, Some(42));
+            assert_eq!(
+                account.last_live_email.as_deref(),
+                Some("dev.legacy@astronlab.com")
+            );
+            assert!(account.thread_recovery_pending);
+            assert!(!state.auto_create_enabled);
+            assert!(state.tray_enabled);
+            Ok(())
+        })();
+
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+
+        result.expect("legacy watch state should migrate into the current account");
     }
 
     #[test]

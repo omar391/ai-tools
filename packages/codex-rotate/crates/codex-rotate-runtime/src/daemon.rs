@@ -11,14 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::hook::{
-    read_live_account, read_live_account_if_running, switch_live_account_to_current_auth,
-};
+use crate::hook::{read_live_account, read_live_account_if_running};
 use crate::ipc::{
     read_request, write_message, ClientRequest, CreateInvocation, InvokeAction,
     RuntimeCapabilities, ServerMessage, SnapshotMessageKind, StatusSnapshot,
 };
 use crate::launcher::ensure_debug_codex_instance;
+use crate::log_isolation::run_account_operation_with_log_isolation;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
@@ -30,9 +29,8 @@ use chrono::{Duration as ChronoDuration, Local, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::cancel;
 use codex_rotate_core::pool::{
-    cmd_add, cmd_list, cmd_prev, cmd_remove, cmd_status, current_pool_overview,
-    restore_codex_auth_from_active_pool, rotate_next_internal_with_progress,
-    sync_pool_active_account_from_current_auth, NextResult,
+    cmd_add, cmd_list, cmd_remove, cmd_status, current_pool_overview,
+    restore_codex_auth_from_active_pool, sync_pool_active_account_from_current_auth, NextResult,
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
@@ -942,10 +940,10 @@ fn run_watch_check(
     if let Some(live) = result.live.as_ref() {
         state.snapshot.current_email = Some(live.email.clone());
         state.snapshot.current_plan = Some(live.plan_type.clone());
-    } else if let Some(email) = result.state.last_live_email.as_ref() {
+    } else if let Some(email) = result.current_account_state.last_live_email.as_ref() {
         state.snapshot.current_email = Some(email.clone());
     }
-    if let Some(quota) = result.state.quota.as_ref() {
+    if let Some(quota) = result.current_account_state.quota.as_ref() {
         set_quota_summary(state, quota);
     }
     if result.rotated {
@@ -988,21 +986,21 @@ fn run_manual_next(
 ) -> Result<String> {
     let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = rotate_next_internal_with_progress(progress)?;
+    let result = run_account_operation_with_log_isolation(Some(port), progress.clone(), || {
+        codex_rotate_core::pool::rotate_next_internal_with_progress(progress.clone())
+    })?;
     refresh_static_snapshot(state);
-    if let Some(summary) = next_result_summary(&result) {
+    if let Some(summary) = next_result_summary(&result.value) {
         state.snapshot.last_rotation_from_email = previous_displayed_email;
         state.snapshot.last_rotation_to_email = Some(summary.email.clone());
     }
-    if state.snapshot.capabilities.live_account_sync {
-        if let Ok(live) = switch_live_account_to_current_auth(Some(port), false, 15_000) {
-            state.snapshot.current_email = Some(live.email);
-            state.snapshot.current_plan = Some(live.plan_type);
-        }
+    if let Some(summary) = result.current_summary.as_ref() {
+        state.snapshot.current_email = Some(summary.email.clone());
+        state.snapshot.current_plan = Some(summary.plan_type.clone());
     }
     refresh_quota_state(state, false);
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
-    let output = match result {
+    let output = match result.value {
         NextResult::Rotated { message, .. }
         | NextResult::Stayed { message, .. }
         | NextResult::Created {
@@ -1020,24 +1018,30 @@ fn run_manual_next(
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
     let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let output = cmd_prev()?;
+    let result = run_account_operation_with_log_isolation(
+        Some(port),
+        None,
+        codex_rotate_core::pool::cmd_prev,
+    )?;
     refresh_static_snapshot(state);
     state.snapshot.last_rotation_from_email = previous_displayed_email;
-    state.snapshot.last_rotation_to_email = state.snapshot.current_email.clone();
+    state.snapshot.last_rotation_to_email = result
+        .current_summary
+        .as_ref()
+        .map(|summary| summary.email.clone())
+        .or_else(|| state.snapshot.current_email.clone());
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
-    if state.snapshot.capabilities.live_account_sync {
-        if let Ok(live) = switch_live_account_to_current_auth(Some(port), false, 15_000) {
-            state.snapshot.current_email = Some(live.email);
-            state.snapshot.current_plan = Some(live.plan_type);
-        }
+    if let Some(summary) = result.current_summary.as_ref() {
+        state.snapshot.current_email = Some(summary.email.clone());
+        state.snapshot.current_plan = Some(summary.plan_type.clone());
     }
     refresh_quota_state(state, false);
     set_snapshot_message(
         &mut state.snapshot,
         SnapshotMessageKind::Status,
-        first_line(&output),
+        first_line(&result.value),
     );
-    Ok(output)
+    Ok(result.value)
 }
 
 fn run_manual_create(
@@ -1115,7 +1119,14 @@ fn hydrate_quota_cache_from_watch_state(state: &mut DaemonState) {
     let Ok(watch_state) = read_watch_state() else {
         return;
     };
-    let Some(quota) = watch_state.quota.as_ref() else {
+    let Ok(paths) = resolve_paths() else {
+        return;
+    };
+    let Ok(auth) = load_codex_auth(&paths.codex_auth_file) else {
+        return;
+    };
+    let account_state = watch_state.account_state(&summarize_codex_auth(&auth).account_id);
+    let Some(quota) = account_state.quota.as_ref() else {
         return;
     };
     set_quota_summary(state, quota);
@@ -1745,16 +1756,23 @@ mod tests {
         write_codex_auth(&codex_home.join("auth.json"), &make_test_auth("acct-123"))
             .expect("write auth");
         crate::watch::write_watch_state(&crate::watch::WatchState {
-            quota: Some(CachedQuotaState {
-                account_id: "acct-123".to_string(),
-                fetched_at: "2026-04-08T08:00:00.000Z".to_string(),
-                next_refresh_at: "2099-04-08T08:30:00.000Z".to_string(),
-                summary: "5h 60% left".to_string(),
-                usable: true,
-                blocker: None,
-                primary_quota_left_percent: Some(60),
-                error: None,
-            }),
+            accounts: std::iter::once((
+                "acct-123".to_string(),
+                crate::watch::AccountWatchState {
+                    quota: Some(CachedQuotaState {
+                        account_id: "acct-123".to_string(),
+                        fetched_at: "2026-04-08T08:00:00.000Z".to_string(),
+                        next_refresh_at: "2099-04-08T08:30:00.000Z".to_string(),
+                        summary: "5h 60% left".to_string(),
+                        usable: true,
+                        blocker: None,
+                        primary_quota_left_percent: Some(60),
+                        error: None,
+                    }),
+                    ..crate::watch::AccountWatchState::default()
+                },
+            ))
+            .collect(),
             ..crate::watch::WatchState::default()
         })
         .expect("write watch state");

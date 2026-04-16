@@ -251,6 +251,21 @@ fn shared_log_reader() -> &'static Mutex<SharedLogReader> {
     READER.get_or_init(|| Mutex::new(SharedLogReader::default()))
 }
 
+pub fn invalidate_log_connection(logs_db_path: Option<&Path>) {
+    let mut reader = shared_log_reader().lock().expect("shared log reader mutex");
+    match logs_db_path {
+        Some(path) if reader.path.as_deref() == Some(path) => {
+            reader.connection = None;
+            reader.path = None;
+        }
+        Some(_) => {}
+        None => {
+            reader.connection = None;
+            reader.path = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

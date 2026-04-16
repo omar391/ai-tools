@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::paths::{resolve_main_worktree_root, resolve_paths};
-use codex_rotate_core::pool::{
-    cmd_add, cmd_list_stream, cmd_next_with_progress, cmd_prev, cmd_remove, cmd_status_stream,
-};
+use codex_rotate_core::pool::{cmd_add, cmd_list_stream, cmd_remove, cmd_status_stream};
 use codex_rotate_core::workflow::{
     cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions, CreateCommandSource,
     ReloginOptions,
@@ -32,6 +30,7 @@ use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
     ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
 };
+use codex_rotate_runtime::log_isolation::run_account_operation_with_log_isolation;
 use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
 
@@ -76,8 +75,21 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 cli_progress_callback(),
             )?,
         )?,
-        Some("next") => write_output(writer, &cmd_next_with_progress(cli_progress_callback())?)?,
-        Some("prev") => write_output(writer, &cmd_prev()?)?,
+        Some("next") => {
+            let result =
+                run_account_operation_with_log_isolation(None, cli_progress_callback(), || {
+                    codex_rotate_core::pool::cmd_next_with_progress(cli_progress_callback())
+                })?;
+            write_output(writer, &result.value)?
+        }
+        Some("prev") => {
+            let result = run_account_operation_with_log_isolation(
+                None,
+                None,
+                codex_rotate_core::pool::cmd_prev,
+            )?;
+            write_output(writer, &result.value)?
+        }
         Some("list") => cmd_list_stream(writer)?,
         Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
