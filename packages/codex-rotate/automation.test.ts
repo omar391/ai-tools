@@ -1416,12 +1416,12 @@ describe("active auth workflows", () => {
 
     expect(workflowText).toContain("run_active_stepwise_flow");
     expect(workflowText).toContain(
-      "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+      '"workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise"',
     );
     expect(workflowText).toContain("fallback_flow: null");
     expect(workflowText).toContain("fallback_attempted: false");
     expect(workflowText).toContain(
-      'selection_strategy: \\"single-stepwise-flow\\"',
+      'selection_strategy: "single-stepwise-flow"',
     );
     expect(workflowText).not.toContain("run_device_auth_fallback");
     expect(workflowText).not.toContain("codex-rotate-account-flow-device-auth");
