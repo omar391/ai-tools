@@ -1,13 +1,14 @@
 # AGENTS.md
 
-This file has two managed sections:
+This file has one managed section per active spec, followed by one local section:
 
-- `rules:shared` is synced from the `agent-md` active specs: `common`.
+- `rules:spec:common` are synced from the `agent-md` skill.
+- Any `rules:spec:*` block must be updated in the skill's spec folder rather than directly in this file.
 - `rules:local` is reserved for repo-specific rules and is preserved by the sync script.
 
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable MD025 -->
-<!-- BEGIN rules:shared -->
+<!-- BEGIN rules:spec:common -->
 # Shared Rules
 
 - Start each new task from the repository's primary branch.
@@ -16,11 +17,11 @@ This file has two managed sections:
 - When the model determines the current worktree already contains one valid coherent change set that should be committed, auto-land that change before starting further unrelated code edits.
 - After landing and verifying a task, delete any temporary repo-local worktrees and branches created during the current conversation whose contents are already represented on `main`.
 - Use an isolated `bin/`, virtual environment, or equivalent tool environment per active worktree when the repository depends on local tooling.
-- Keep those per-worktree tool artifacts rooted inside the worktree or repo-local task directory, for example `<repo-root>/bin/`, `<repo-root>/.venv/`, or `<repo-root>/.codex-rotate/bin/`, rather than in shared home-level directories.
+- Keep those per-worktree tool artifacts rooted inside the worktree root or repo-local task directory, for example `<worktree-root>/bin/`, `<worktree-root>/.venv/`, or `<worktree-root>/.codex-rotate/bin/`, rather than in shared home-level directories.
 - Do not run mutable tooling from a live shared environment when a repo-local isolated environment is expected.
 - Validate relevant tests, builds, and checks before landing completed changes.
 - Keep repo-specific constraints in the `rules:local` block instead of editing the shared baseline.
-<!-- END rules:shared -->
+<!-- END rules:spec:common -->
 
 <!-- BEGIN rules:local -->
 <!-- END rules:local -->
