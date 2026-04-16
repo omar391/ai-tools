@@ -2,8 +2,7 @@
 
 This file has one managed section per active spec, followed by one local section:
 
-- `rules:spec:*` are synced from the `agent-md` skill's specs collection.
-- Any `rules:spec:*` block must be updated in the skill's spec folder rather than directly in this file.
+- `rules:spec:*` are synced from the `agent-md` skill's specs collection and must be updated there rather than directly in this file.
 - `rules:local` is reserved for repo-specific rules and is preserved by the sync script.
 
 <!-- prettier-ignore-start -->
