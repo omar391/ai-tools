@@ -57,13 +57,13 @@ struct Options {
     profile_name: String,
     operation: BenchmarkOperation,
     relogin_selector_override: Option<String>,
-    base_email_override: HashMap<String, String>,
+    template_override: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
 struct Snapshot {
     auth_email: Option<String>,
-    default_create_base_email: Option<String>,
+    default_create_template: Option<String>,
     account_emails: HashSet<String>,
     pending_emails: HashSet<String>,
 }
@@ -103,7 +103,7 @@ struct BenchmarkRecord {
     auth_before: Option<String>,
     auth_after: Option<String>,
     auth_restored: bool,
-    base_email: String,
+    template: String,
     notes: Option<String>,
     stdout_tail: Option<String>,
     stderr_tail: Option<String>,
@@ -249,12 +249,12 @@ fn run() -> Result<()> {
         for iteration in 1..=options.runs {
             wait_for_managed_profile_idle(&repo_root, &options.profile_name)?;
             let snapshot = read_snapshot(&rotate_state_path, &codex_home);
-            let base_email = resolve_benchmark_base_email(&options, candidate, &snapshot)?;
+            let template = resolve_benchmark_template(&options, candidate, &snapshot)?;
             let record = benchmark_candidate(
                 candidate,
                 iteration,
                 &options,
-                &base_email,
+                &template,
                 &repo_root,
                 &cli_binary,
                 &rotate_state_path,
@@ -349,7 +349,7 @@ fn parse_args(args: &[String]) -> Result<Options> {
     let mut profile_name = DEFAULT_PROFILE.to_string();
     let mut operation = BenchmarkOperation::Create;
     let mut relogin_selector_override = None;
-    let mut base_email_override = HashMap::new();
+    let mut template_override = HashMap::new();
 
     let mut index = 0;
     while index < args.len() {
@@ -398,19 +398,16 @@ fn parse_args(args: &[String]) -> Result<Options> {
                     .parse::<u32>()
                     .context("--runs must be a positive integer")?;
             }
-            "--base-email" => {
+            "--template" => {
                 index += 1;
                 let value = args
                     .get(index)
                     .cloned()
-                    .ok_or_else(|| anyhow!("--base-email requires workflow=value"))?;
-                assign_base_email_override(&mut base_email_override, &value)?;
+                    .ok_or_else(|| anyhow!("--template requires workflow=value"))?;
+                assign_template_override(&mut template_override, &value)?;
             }
-            _ if arg.starts_with("--base-email=") => {
-                assign_base_email_override(
-                    &mut base_email_override,
-                    &arg["--base-email=".len()..],
-                )?;
+            _ if arg.starts_with("--template=") => {
+                assign_template_override(&mut template_override, &arg["--template=".len()..])?;
             }
             _ => return Err(anyhow!("Unknown benchmark option: {arg}")),
         }
@@ -427,16 +424,16 @@ fn parse_args(args: &[String]) -> Result<Options> {
         profile_name,
         operation,
         relogin_selector_override,
-        base_email_override,
+        template_override,
     })
 }
 
-fn assign_base_email_override(overrides: &mut HashMap<String, String>, raw: &str) -> Result<()> {
+fn assign_template_override(overrides: &mut HashMap<String, String>, raw: &str) -> Result<()> {
     if let Some((key, value)) = raw.split_once('=') {
         let key = key.trim();
         let value = value.trim();
         if key.is_empty() || value.is_empty() {
-            return Err(anyhow!("Invalid --base-email override: {raw}"));
+            return Err(anyhow!("Invalid --template override: {raw}"));
         }
         overrides.insert(key.to_string(), value.to_string());
     } else {
@@ -446,26 +443,26 @@ fn assign_base_email_override(overrides: &mut HashMap<String, String>, raw: &str
     Ok(())
 }
 
-fn resolve_benchmark_base_email(
+fn resolve_benchmark_template(
     options: &Options,
     candidate: &BenchmarkCandidate,
     snapshot: &Snapshot,
 ) -> Result<String> {
     if let Some(value) = options
-        .base_email_override
+        .template_override
         .get(candidate.id)
-        .or_else(|| options.base_email_override.get(track_key(candidate.track)))
+        .or_else(|| options.template_override.get(track_key(candidate.track)))
     {
         return Ok(value.clone());
     }
-    if let Some(value) = snapshot.default_create_base_email.as_deref() {
+    if let Some(value) = snapshot.default_create_template.as_deref() {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
     }
     Err(anyhow!(
-        "No default_create_base_email is configured in ~/.codex-rotate/accounts.json and no --base-email override was provided."
+        "No default_create_template is configured in ~/.codex-rotate/accounts.json and no --template override was provided."
     ))
 }
 
@@ -473,7 +470,7 @@ fn benchmark_candidate(
     candidate: &BenchmarkCandidate,
     iteration: u32,
     options: &Options,
-    base_email: &str,
+    template: &str,
     repo_root: &Path,
     cli_binary: &Path,
     rotate_state_path: &Path,
@@ -488,7 +485,7 @@ fn benchmark_candidate(
             let selector = resolve_benchmark_relogin_selector(
                 options,
                 &before,
-                base_email,
+                template,
                 reserved_relogin_selectors,
             )?;
             reserved_relogin_selectors.insert(selector.clone());
@@ -496,7 +493,7 @@ fn benchmark_candidate(
         }
     };
     let command =
-        build_benchmark_command(cli_binary, options, base_email, relogin_selector.as_deref());
+        build_benchmark_command(cli_binary, options, template, relogin_selector.as_deref());
     let mut command_env = env::vars_os().collect::<HashMap<_, _>>();
     command_env.insert(
         "CODEX_ROTATE_ACCOUNT_FLOW_FILE".into(),
@@ -505,11 +502,11 @@ fn benchmark_candidate(
     command_env.insert("CODEX_ROTATE_STOP_ON_FINAL_ADD_PHONE".into(), "1".into());
 
     println!(
-        "[benchmark] starting {} iteration={} flow={} base_email={}",
+        "[benchmark] starting {} iteration={} flow={} template={}",
         candidate.id,
         iteration,
         candidate.file_path.display(),
-        base_email
+        template
     );
 
     let measured_at = iso_now();
@@ -598,7 +595,7 @@ fn benchmark_candidate(
         auth_before: before.auth_email.clone(),
         auth_after: after.auth_email.clone(),
         auth_restored: before.auth_email == after.auth_email,
-        base_email: base_email.to_string(),
+        template: template.to_string(),
         notes: build_notes(
             options.operation,
             success,
@@ -620,7 +617,7 @@ fn benchmark_candidate(
 fn build_benchmark_command(
     cli_binary: &Path,
     options: &Options,
-    base_email: &str,
+    template: &str,
     relogin_selector: Option<&str>,
 ) -> Vec<PathBuf> {
     match options.operation {
@@ -632,8 +629,8 @@ fn build_benchmark_command(
             PathBuf::from("--restore-auth"),
             PathBuf::from("--profile"),
             PathBuf::from(options.profile_name.as_str()),
-            PathBuf::from("--base-email"),
-            PathBuf::from(base_email),
+            PathBuf::from("--template"),
+            PathBuf::from(template),
         ],
         BenchmarkOperation::Relogin => vec![
             cli_binary.to_path_buf(),
@@ -647,7 +644,7 @@ fn build_benchmark_command(
 fn resolve_benchmark_relogin_selector(
     options: &Options,
     snapshot: &Snapshot,
-    base_email: &str,
+    template: &str,
     reserved: &HashSet<String>,
 ) -> Result<String> {
     if let Some(value) = options.relogin_selector_override.as_deref() {
@@ -658,14 +655,14 @@ fn resolve_benchmark_relogin_selector(
         .account_emails
         .iter()
         .chain(snapshot.pending_emails.iter())
-        .filter(|email| email_matches_base_email(email, base_email))
+        .filter(|email| email_matches_template(email, template))
         .cloned()
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.dedup();
     candidates.sort_by(|left, right| {
-        extract_template_suffix(left, base_email)
-            .cmp(&extract_template_suffix(right, base_email))
+        extract_template_suffix(left, template)
+            .cmp(&extract_template_suffix(right, template))
             .then_with(|| left.cmp(right))
     });
     let selector = candidates
@@ -676,7 +673,7 @@ fn resolve_benchmark_relogin_selector(
         .ok_or_else(|| {
             anyhow!(
                 "No pooled or pending account matches {} for relogin benchmarking.",
-                base_email
+                template
             )
         })?;
     Ok(selector)
@@ -904,8 +901,8 @@ fn stream_output<R: Read>(reader: R, label: &str, is_stderr: bool) -> Result<Str
 fn read_snapshot(rotate_state_path: &Path, codex_home: &Path) -> Snapshot {
     let state = read_rotate_state(rotate_state_path);
     let auth_email = read_auth_email(codex_home);
-    let default_create_base_email = state
-        .get("default_create_base_email")
+    let default_create_template = state
+        .get("default_create_template")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -926,7 +923,7 @@ fn read_snapshot(rotate_state_path: &Path, codex_home: &Path) -> Snapshot {
         .collect::<HashSet<_>>();
     Snapshot {
         auth_email,
-        default_create_base_email,
+        default_create_template,
         account_emails,
         pending_emails,
     }
@@ -1434,7 +1431,7 @@ fn normalize_text(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
-fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
+fn normalize_template(value: impl AsRef<str>) -> Option<String> {
     let trimmed = value.as_ref().trim().to_lowercase();
     if trimmed.is_empty() {
         None
@@ -1443,12 +1440,12 @@ fn normalize_base_email(value: impl AsRef<str>) -> Option<String> {
     }
 }
 
-fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
+fn extract_template_suffix(email: &str, template: &str) -> Option<u32> {
     let normalized_email = normalize_email(Some(email))?;
-    let normalized_base_email = normalize_base_email(base_email)?;
-    let marker_index = normalized_base_email.find("{n}")?;
-    let prefix = &normalized_base_email[..marker_index];
-    let suffix = &normalized_base_email[marker_index + 3..];
+    let normalized_template = normalize_template(template)?;
+    let marker_index = normalized_template.find("{n}")?;
+    let prefix = &normalized_template[..marker_index];
+    let suffix = &normalized_template[marker_index + 3..];
     if !normalized_email.starts_with(prefix)
         || !normalized_email.ends_with(suffix)
         || normalized_email.len() <= prefix.len() + suffix.len()
@@ -1459,8 +1456,8 @@ fn extract_template_suffix(email: &str, base_email: &str) -> Option<u32> {
     numeric.parse::<u32>().ok()
 }
 
-fn email_matches_base_email(email: &str, base_email: &str) -> bool {
-    extract_template_suffix(email, base_email).is_some()
+fn email_matches_template(email: &str, template: &str) -> bool {
+    extract_template_suffix(email, template).is_some()
 }
 
 fn extract_intended_target_email(output: &str) -> Option<String> {
@@ -1770,7 +1767,7 @@ mod tests {
             auth_before: None,
             auth_after: None,
             auth_restored: true,
-            base_email: "dev3astronlab+{n}@gmail.com".to_string(),
+            template: "dev3astronlab+{n}@gmail.com".to_string(),
             notes: None,
             stdout_tail: None,
             stderr_tail: None,
@@ -1785,7 +1782,7 @@ mod tests {
             "--runs=3".to_string(),
             "--profile".to_string(),
             "dev-2".to_string(),
-            "--base-email".to_string(),
+            "--template".to_string(),
             "device_auth=qa.{n}@astronlab.com".to_string(),
         ])
         .expect("parse args");
@@ -1796,7 +1793,7 @@ mod tests {
         assert_eq!(options.profile_name, "dev-2");
         assert_eq!(
             options
-                .base_email_override
+                .template_override
                 .get("device_auth")
                 .map(String::as_str),
             Some("qa.{n}@astronlab.com")
@@ -1833,14 +1830,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_benchmark_base_email_prefers_store_default_without_override() {
+    fn resolve_benchmark_template_prefers_store_default_without_override() {
         let options = Options {
             mode: Mode::All,
             runs: 1,
             profile_name: "dev-1".to_string(),
             operation: BenchmarkOperation::Create,
             relogin_selector_override: None,
-            base_email_override: HashMap::new(),
+            template_override: HashMap::new(),
         };
         let workflow_root = Path::new("/tmp/auth-workflows");
         let candidate = benchmark_candidates(workflow_root)
@@ -1849,14 +1846,14 @@ mod tests {
             .expect("candidate");
         let snapshot = Snapshot {
             auth_email: None,
-            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            default_create_template: Some("dev3astronlab+{n}@gmail.com".to_string()),
             account_emails: HashSet::new(),
             pending_emails: HashSet::new(),
         };
 
-        let base_email =
-            resolve_benchmark_base_email(&options, &candidate, &snapshot).expect("base email");
-        assert_eq!(base_email, "dev3astronlab+{n}@gmail.com");
+        let template =
+            resolve_benchmark_template(&options, &candidate, &snapshot).expect("base email");
+        assert_eq!(template, "dev3astronlab+{n}@gmail.com");
     }
 
     #[test]
@@ -1913,7 +1910,7 @@ mod tests {
             profile_name: "dev-1".to_string(),
             operation: BenchmarkOperation::Create,
             relogin_selector_override: None,
-            base_email_override: HashMap::new(),
+            template_override: HashMap::new(),
         };
         let mut reserved_relogin_selectors = HashSet::new();
 
@@ -2104,11 +2101,11 @@ mod tests {
             profile_name: "dev-1".to_string(),
             operation: BenchmarkOperation::Relogin,
             relogin_selector_override: None,
-            base_email_override: HashMap::new(),
+            template_override: HashMap::new(),
         };
         let snapshot = Snapshot {
             auth_email: None,
-            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            default_create_template: Some("dev3astronlab+{n}@gmail.com".to_string()),
             account_emails: HashSet::from([
                 "other@gmail.com".to_string(),
                 "dev3astronlab+2@gmail.com".to_string(),
@@ -2136,11 +2133,11 @@ mod tests {
             profile_name: "dev-1".to_string(),
             operation: BenchmarkOperation::Relogin,
             relogin_selector_override: None,
-            base_email_override: HashMap::new(),
+            template_override: HashMap::new(),
         };
         let snapshot = Snapshot {
             auth_email: None,
-            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            default_create_template: Some("dev3astronlab+{n}@gmail.com".to_string()),
             account_emails: HashSet::new(),
             pending_emails: HashSet::from(["dev3astronlab+5@gmail.com".to_string()]),
         };
@@ -2164,11 +2161,11 @@ mod tests {
             profile_name: "dev-1".to_string(),
             operation: BenchmarkOperation::Relogin,
             relogin_selector_override: None,
-            base_email_override: HashMap::new(),
+            template_override: HashMap::new(),
         };
         let snapshot = Snapshot {
             auth_email: None,
-            default_create_base_email: Some("dev3astronlab+{n}@gmail.com".to_string()),
+            default_create_template: Some("dev3astronlab+{n}@gmail.com".to_string()),
             account_emails: HashSet::from([
                 "dev3astronlab+1@gmail.com".to_string(),
                 "dev3astronlab+2@gmail.com".to_string(),

@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use codex_rotate_core::paths::resolve_main_worktree_root;
 use codex_rotate_runtime::ipc::{
     daemon_socket_path, invoke, subscribe, InvokeAction, RuntimeCapabilities,
 };
@@ -24,6 +25,16 @@ fn env_mutex() -> &'static Mutex<()> {
 
 fn cli_binary() -> &'static str {
     env!("CARGO_BIN_EXE_codex-rotate")
+}
+
+fn command_workdir() -> PathBuf {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root");
+    resolve_main_worktree_root(&repo_root).unwrap_or(repo_root)
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -49,6 +60,7 @@ struct EnvGuard {
     home: Option<OsString>,
     rotate_home: Option<OsString>,
     codex_home: Option<OsString>,
+    repo_root: Option<OsString>,
     debug_port: Option<OsString>,
     disable_managed_launch: Option<OsString>,
     disable_local_refresh: Option<OsString>,
@@ -60,6 +72,7 @@ impl EnvGuard {
             home: std::env::var_os("HOME"),
             rotate_home: std::env::var_os("CODEX_ROTATE_HOME"),
             codex_home: std::env::var_os("CODEX_HOME"),
+            repo_root: std::env::var_os("CODEX_ROTATE_REPO_ROOT"),
             debug_port: std::env::var_os("CODEX_ROTATE_DEBUG_PORT"),
             disable_managed_launch: std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH"),
             disable_local_refresh: std::env::var_os("CODEX_ROTATE_DISABLE_LOCAL_REFRESH"),
@@ -68,10 +81,12 @@ impl EnvGuard {
             .parent()
             .expect("rotate home parent")
             .to_path_buf();
+        let repo_root = command_workdir();
         unsafe {
             std::env::set_var("HOME", fake_home);
             std::env::set_var("CODEX_ROTATE_HOME", rotate_home);
             std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", repo_root);
             std::env::set_var("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
             std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
             std::env::set_var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH", "1");
@@ -85,6 +100,7 @@ impl Drop for EnvGuard {
         restore_var("HOME", self.home.take());
         restore_var("CODEX_ROTATE_HOME", self.rotate_home.take());
         restore_var("CODEX_HOME", self.codex_home.take());
+        restore_var("CODEX_ROTATE_REPO_ROOT", self.repo_root.take());
         restore_var("CODEX_ROTATE_DEBUG_PORT", self.debug_port.take());
         restore_var(
             "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
@@ -323,7 +339,7 @@ else:
             .arg("--force")
             .arg("--profile")
             .arg("dev-1")
-            .arg("--base-email")
+            .arg("--template")
             .arg("dev.{n}@astronlab.com")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -418,10 +434,13 @@ impl Drop for DaemonCreateHarness {
 }
 
 fn configured_command(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Command {
+    let repo_root = command_workdir();
     let mut command = Command::new(cli_binary());
     command
+        .current_dir(&repo_root)
         .env("CODEX_ROTATE_HOME", rotate_home)
         .env("CODEX_HOME", codex_home)
+        .env("CODEX_ROTATE_REPO_ROOT", repo_root)
         .env("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
     command
 }

@@ -2577,14 +2577,14 @@ mod tests {
     fn save_pool_preserves_credential_store_sections() {
         let _guard = RotateHomeGuard::enter("codex-rotate-save-pool-preserve");
         write_rotate_state_json(&json!({
-            "accounts": [{ "email": "dev.1@astronlab.com", "account_id": "acct-1" }],
+            "accounts": [configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None)],
             "active_index": 0,
             "version": 7,
-            "default_create_base_email": "dev.{n}@astronlab.com",
+            "default_create_template": "dev.{n}@astronlab.com",
             "families": {
                 "dev-1::dev.{n}@astronlab.com": {
                     "profile_name": "dev-1",
-                    "base_email": "dev.{n}@astronlab.com",
+                    "template": "dev.{n}@astronlab.com",
                     "next_suffix": 3,
                     "created_at": "2026-04-05T00:00:00.000Z",
                     "updated_at": "2026-04-05T00:00:00.000Z",
@@ -2596,7 +2596,7 @@ mod tests {
                 "dev.3@astronlab.com": {
                     "email": "dev.3@astronlab.com",
                     "profile_name": "dev-1",
-                    "base_email": "dev.{n}@astronlab.com",
+                    "template": "dev.{n}@astronlab.com",
                     "suffix": 3,
                     "selector": null,
                     "alias": null,
@@ -2626,7 +2626,7 @@ mod tests {
         let state = load_rotate_state_json().expect("load rotate state");
         assert_eq!(state["version"], json!(7));
         assert_eq!(
-            state["default_create_base_email"],
+            state["default_create_template"],
             json!("dev.{n}@astronlab.com")
         );
         assert!(state["families"].is_object());
@@ -3160,7 +3160,7 @@ mod tests {
                 "families": {
                     "dev-1::devbench.{n}@astronlab.com": {
                         "profile_name": "dev-1",
-                        "base_email": "devbench.{n}@astronlab.com",
+                        "template": "devbench.{n}@astronlab.com",
                         "next_suffix": 10,
                         "max_skipped_slots": 0,
                         "created_at": "2026-04-13T05:00:00.000Z",
@@ -3387,8 +3387,14 @@ mod tests {
                 cmd_list_stream(&mut writer)
             });
 
-            thread::sleep(StdDuration::from_millis(100));
-            let partial = probe_writer.snapshot();
+            let mut partial = String::new();
+            for _ in 0..10 {
+                thread::sleep(StdDuration::from_millis(100));
+                partial = probe_writer.snapshot();
+                if partial.contains("Codex OAuth Account Pool") {
+                    break;
+                }
+            }
             assert!(partial.contains("Codex OAuth Account Pool"));
             assert!(partial.contains("dev.61@astronlab.com"));
             assert!(!partial.contains("    \u{1b}[2mquota"));

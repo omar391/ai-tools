@@ -1053,7 +1053,7 @@ fn run_manual_create(
         CreateCommandOptions {
             alias: options.alias,
             profile_name: options.profile_name,
-            base_email: options.base_email,
+            template: options.template,
             force: options.force,
             ignore_current: options.ignore_current,
             restore_previous_auth_after_create: options.restore_previous_auth_after_create,

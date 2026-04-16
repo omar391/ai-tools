@@ -76,7 +76,7 @@ pub struct StatusSnapshot {
 pub struct CreateInvocation {
     pub alias: Option<String>,
     pub profile_name: Option<String>,
-    pub base_email: Option<String>,
+    pub template: Option<String>,
     pub force: bool,
     pub ignore_current: bool,
     pub restore_previous_auth_after_create: bool,

@@ -918,7 +918,7 @@ fn parse_create_options(
 ) -> Result<CreateCommandOptions> {
     let mut positionals = Vec::new();
     let mut profile_name = None;
-    let mut base_email = None;
+    let mut template = None;
     let mut force = false;
     let mut ignore_current = false;
     let mut restore_previous_auth_after_create = false;
@@ -949,18 +949,18 @@ fn parse_create_options(
                 profile_name = Some(value.clone());
                 index += 1;
             }
-            "--base-email" => {
+            "--template" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| anyhow!("{}", create_usage(allow_internal_flags)))?;
-                base_email = Some(value.clone());
+                template = Some(value.clone());
                 index += 1;
             }
             _ if arg.starts_with("--profile=") => {
                 profile_name = Some(arg["--profile=".len()..].to_string());
             }
-            _ if arg.starts_with("--base-email=") => {
-                base_email = Some(arg["--base-email=".len()..].to_string());
+            _ if arg.starts_with("--template=") => {
+                template = Some(arg["--template=".len()..].to_string());
             }
             _ if arg.starts_with('-') => return Err(anyhow!("Unknown create option: \"{arg}\"")),
             _ => positionals.push(arg.to_string()),
@@ -980,7 +980,7 @@ fn parse_create_options(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
         profile_name,
-        base_email,
+        template,
         force,
         ignore_current,
         restore_previous_auth_after_create,
@@ -991,9 +991,9 @@ fn parse_create_options(
 
 fn create_usage(allow_internal_flags: bool) -> &'static str {
     if allow_internal_flags {
-        "Usage: codex-rotate internal create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--base-email <email-family>]"
+        "Usage: codex-rotate internal create [alias] [--force] [--ignore-current] [--restore-auth] [--profile <managed-name>] [--template <email-family>]"
     } else {
-        "Usage: codex-rotate create [alias] [--force] [--profile <managed-name>] [--base-email <email-family>]"
+        "Usage: codex-rotate create [alias] [--force] [--profile <managed-name>] [--template <email-family>]"
     }
 }
 
@@ -1010,7 +1010,7 @@ fn parse_public_create_invocation(args: &[String]) -> Result<CreateInvocation> {
     Ok(CreateInvocation {
         alias: options.alias,
         profile_name: options.profile_name,
-        base_email: options.base_email,
+        template: options.template,
         force: options.force,
         ignore_current: options.ignore_current,
         restore_previous_auth_after_create: options.restore_previous_auth_after_create,
@@ -1437,14 +1437,14 @@ mod tests {
             "--restore-auth".to_string(),
             "--profile".to_string(),
             "dev-1".to_string(),
-            "--base-email".to_string(),
+            "--template".to_string(),
             "dev.{n}@astronlab.com".to_string(),
         ])
         .expect("create options");
 
         assert_eq!(options.alias.as_deref(), Some("bench"));
         assert_eq!(options.profile_name.as_deref(), Some("dev-1"));
-        assert_eq!(options.base_email.as_deref(), Some("dev.{n}@astronlab.com"));
+        assert_eq!(options.template.as_deref(), Some("dev.{n}@astronlab.com"));
         assert!(options.force);
         assert!(options.ignore_current);
         assert!(options.restore_previous_auth_after_create);
@@ -1868,14 +1868,14 @@ mod tests {
                     "--force".to_string(),
                     "--profile".to_string(),
                     "dev-1".to_string(),
-                    "--base-email".to_string(),
+                    "--template".to_string(),
                     "dev.{n}@astronlab.com".to_string(),
                 ],
                 InvokeAction::Create {
                     options: CreateInvocation {
                         alias: Some("bench".to_string()),
                         profile_name: Some("dev-1".to_string()),
-                        base_email: Some("dev.{n}@astronlab.com".to_string()),
+                        template: Some("dev.{n}@astronlab.com".to_string()),
                         force: true,
                         ignore_current: false,
                         restore_previous_auth_after_create: false,
@@ -2016,7 +2016,7 @@ mod tests {
                         "--force".to_string(),
                         "--profile".to_string(),
                         "dev-1".to_string(),
-                        "--base-email".to_string(),
+                        "--template".to_string(),
                         "dev.{n}@astronlab.com".to_string(),
                     ];
                     let mut output = Vec::new();
@@ -2046,7 +2046,7 @@ mod tests {
                                     options: CreateInvocation {
                                         alias: Some("bench".to_string()),
                                         profile_name: Some("dev-1".to_string()),
-                                        base_email: Some("dev.{n}@astronlab.com".to_string()),
+                                        template: Some("dev.{n}@astronlab.com".to_string()),
                                         force: true,
                                         ignore_current: false,
                                         restore_previous_auth_after_create: false,

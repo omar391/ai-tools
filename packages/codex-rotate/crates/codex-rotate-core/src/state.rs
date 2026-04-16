@@ -40,7 +40,7 @@ impl RotateStateOwner {
             Self::Pool => Some(&["accounts", "active_index"]),
             Self::CredentialStore => Some(&[
                 "version",
-                "default_create_base_email",
+                "default_create_template",
                 "domain",
                 "families",
                 "pending",
@@ -71,7 +71,8 @@ struct RotateStateSchema {
     #[serde(default)]
     version: Option<u8>,
     #[serde(default)]
-    default_create_base_email: Option<String>,
+    #[serde(alias = "default_create_base_email")]
+    default_create_template: Option<String>,
     #[serde(default)]
     domain: Option<std::collections::HashMap<String, DomainConfig>>,
     #[serde(default)]
@@ -466,8 +467,37 @@ fn format_backup_hint(backup_path: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{AuthTokens, CodexAuth};
     use crate::test_support::RotateHomeGuard;
     use serde_json::json;
+
+    fn make_account_entry(email: &str, account_id: &str) -> AccountEntry {
+        AccountEntry {
+            label: format!("{email}_free"),
+            alias: None,
+            email: email.to_string(),
+            account_id: account_id.to_string(),
+            plan_type: "free".to_string(),
+            auth: CodexAuth {
+                auth_mode: "chatgpt".to_string(),
+                openai_api_key: None,
+                tokens: AuthTokens {
+                    id_token: "id".to_string(),
+                    access_token: "access".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    account_id: account_id.to_string(),
+                },
+                last_refresh: "2026-04-05T00:00:00.000Z".to_string(),
+            },
+            added_at: "2026-04-05T00:00:00.000Z".to_string(),
+            last_quota_usable: None,
+            last_quota_summary: None,
+            last_quota_blocker: None,
+            last_quota_checked_at: None,
+            last_quota_primary_left_percent: None,
+            last_quota_next_refresh_at: None,
+        }
+    }
 
     #[test]
     fn rotate_state_backup_is_created_before_replace() {
@@ -475,7 +505,10 @@ mod tests {
         let paths = resolve_paths().expect("resolve paths");
 
         write_rotate_state_json(&json!({
-            "accounts": [{ "email": "dev.1@astronlab.com" }],
+            "accounts": [
+                make_account_entry("dev.1@astronlab.com", "acct-1"),
+                make_account_entry("dev.2@astronlab.com", "acct-2")
+            ],
             "active_index": 0,
         }))
         .expect("write initial state");
@@ -505,9 +538,17 @@ mod tests {
     fn rotate_state_backup_retention_prunes_to_twenty_managed_files() {
         let _guard = RotateHomeGuard::enter("codex-rotate-state-backup-prune");
         let paths = resolve_paths().expect("resolve paths");
+        let accounts = (1..=26usize)
+            .map(|index| {
+                make_account_entry(
+                    &format!("dev.{index}@astronlab.com"),
+                    &format!("acct-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
 
         write_rotate_state_json(&json!({
-            "accounts": [],
+            "accounts": accounts,
             "active_index": 0,
         }))
         .expect("write initial state");
@@ -536,7 +577,15 @@ mod tests {
         write_rotate_state_json(&json!({
             "accounts": [],
             "active_index": 0,
-            "families": { "keep": { "profile_name": "dev-1" } }
+            "families": {
+                "keep": {
+                    "profile_name": "dev-1",
+                    "template": "dev.{n}@astronlab.com",
+                    "next_suffix": 1,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z"
+                }
+            }
         }))
         .expect("write initial state");
         let before = load_rotate_state_json().expect("load before");
@@ -558,7 +607,10 @@ mod tests {
         let _guard = RotateHomeGuard::enter("codex-rotate-state-verify");
         let paths = resolve_paths().expect("resolve paths");
         write_rotate_state_json(&json!({
-            "accounts": [],
+            "accounts": [
+                make_account_entry("dev.1@astronlab.com", "acct-1"),
+                make_account_entry("dev.2@astronlab.com", "acct-2")
+            ],
             "active_index": 0,
         }))
         .expect("write initial state");
