@@ -4546,6 +4546,9 @@ fn extract_account_family_suffix(candidate_email: &str, base_email: &str) -> Res
                 .and_then(|value| value.parse::<u32>().ok())
         }
         EmailFamilyMode::GmailPlus => {
+            if normalized_candidate == format!("{}@{}", parsed.local_part, parsed.domain_part) {
+                return Ok(Some(0));
+            }
             let expected_prefix = format!("{}+", parsed.local_part);
             let expected_suffix = format!("@{}", parsed.domain_part);
             let middle = normalized_candidate
@@ -8646,6 +8649,29 @@ end
     }
 
     #[test]
+    fn relogin_family_match_supports_bare_gmail_base_email() {
+        let mut store = CredentialStore::default();
+        store.families.insert(
+            "dev-1::dev.user@gmail.com".to_string(),
+            CredentialFamily {
+                profile_name: "dev-1".to_string(),
+                base_email: "dev.user@gmail.com".to_string(),
+                next_suffix: 4,
+                max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+                created_at: "2026-03-20T00:00:00.000Z".to_string(),
+                updated_at: "2026-03-20T01:00:00.000Z".to_string(),
+                last_created_email: Some("dev.user+3@gmail.com".to_string()),
+                deleted: Vec::new(),
+            },
+        );
+
+        let match_result = select_family_for_account_email(&store, "dev.user@gmail.com")
+            .expect("expected bare gmail family match");
+        assert_eq!(match_result.family.profile_name, "dev-1");
+        assert_eq!(match_result.suffix, 0);
+    }
+
+    #[test]
     fn add_reconciliation_moves_matching_pending_into_family_state() {
         let mut store = CredentialStore::default();
         store.pending.insert(
@@ -8717,6 +8743,62 @@ end
             Some("dev.24@astronlab.com")
         );
         assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn add_reconciliation_updates_matching_bare_gmail_family_state() {
+        with_rotate_home("codex-rotate-add-reconcile-bare-gmail", |_| {
+            let mut store = CredentialStore::default();
+            store.families.insert(
+                "dev-1::supplyprima1@gmail.com".to_string(),
+                CredentialFamily {
+                    profile_name: "dev-1".to_string(),
+                    base_email: "supplyprima1@gmail.com".to_string(),
+                    next_suffix: 3,
+                    max_skipped_slots: DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY,
+                    created_at: "2026-04-05T05:51:09.049Z".to_string(),
+                    updated_at: "2026-04-05T05:51:09.049Z".to_string(),
+                    last_created_email: Some("supplyprima1+2@gmail.com".to_string()),
+                    deleted: Vec::new(),
+                },
+            );
+            save_credential_store(&store).expect("save credential store");
+
+            let entry = AccountEntry {
+                label: "supplyprima1@gmail.com_free".to_string(),
+                alias: None,
+                email: "supplyprima1@gmail.com".to_string(),
+                account_id: "acct-supplyprima1".to_string(),
+                plan_type: "free".to_string(),
+                auth: make_auth("supplyprima1@gmail.com", "acct-supplyprima1"),
+                added_at: "2026-04-05T05:51:09.049Z".to_string(),
+                last_quota_usable: None,
+                last_quota_summary: None,
+                last_quota_blocker: None,
+                last_quota_checked_at: None,
+                last_quota_primary_left_percent: None,
+                last_quota_next_refresh_at: None,
+            };
+
+            let changed = reconcile_added_account_credential_state(&entry)
+                .expect("reconcile added account should succeed");
+            assert!(changed);
+
+            let updated_store = load_credential_store().expect("load credential store");
+            let family = updated_store
+                .families
+                .get("dev-1::supplyprima1@gmail.com")
+                .expect("gmail family should remain");
+            assert_eq!(family.next_suffix, 3);
+            assert_eq!(
+                family.last_created_email.as_deref(),
+                Some("supplyprima1@gmail.com")
+            );
+            assert!(
+                parse_sortable_timestamp(Some(family.updated_at.as_str()))
+                    > parse_sortable_timestamp(Some("2026-04-05T05:51:09.049Z"))
+            );
+        });
     }
 
     #[test]
