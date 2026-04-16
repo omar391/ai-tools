@@ -54,6 +54,7 @@ const LOW_QUOTA_WATCH_THRESHOLD_PERCENT: u8 = 20;
 const DAEMON_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TRAY_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
+const LOCAL_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_TAKEOVER_ARG: &str = "--takeover";
@@ -218,6 +219,7 @@ pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
 
         initialize_runtime(&daemon);
         daemon.publish_state_snapshot();
+        spawn_local_source_refresh_loop(daemon.clone());
         spawn_tray_supervisor_loop();
         spawn_watch_loop(daemon.clone());
 
@@ -367,6 +369,28 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
         let interval = next_watch_interval(daemon.snapshot().current_quota_percent);
         daemon.set_next_tick(next_tick_label(interval));
         thread::sleep(interval);
+    });
+}
+
+fn spawn_local_source_refresh_loop(daemon: SharedDaemon) {
+    thread::spawn(move || loop {
+        if poll_shutdown_request(&daemon) {
+            break;
+        }
+        match maybe_refresh_local_daemon_process(Some(&daemon), false) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => {}
+            Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
+        }
+        match maybe_refresh_local_tray_process() {
+            Ok(true) => log_daemon_info("Refreshed Codex Rotate tray after local changes."),
+            Ok(false) => {}
+            Err(error) => {
+                let message = format!("tray refresh failed: {error}");
+                log_daemon_error(&message);
+            }
+        }
+        thread::sleep(LOCAL_SOURCE_REFRESH_INTERVAL);
     });
 }
 
@@ -722,6 +746,9 @@ fn maybe_refresh_local_daemon_process(
         return Ok(false);
     }
     if daemon.is_some_and(SharedDaemon::has_in_flight_invocations) {
+        return Ok(false);
+    }
+    if daemon.is_some_and(SharedDaemon::has_active_operations) {
         return Ok(false);
     }
     let Some(build) = current_process_local_build(TargetKind::Cli) else {
@@ -1385,6 +1412,7 @@ pub fn read_watch_state_file() -> Result<WatchState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_mutex;
     use codex_rotate_core::auth::{write_codex_auth, AuthTokens, CodexAuth};
     use codex_rotate_core::pool::load_pool;
     use std::fs;
@@ -1395,10 +1423,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -1510,7 +1535,9 @@ mod tests {
 
     #[test]
     fn migrates_legacy_tray_home_into_rotate_home() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let fake_home = unique_temp_dir("codex-rotate-home");
         let rotate_home = fake_home.join(".codex-rotate");
         let legacy_home = fake_home.join(".codex-rotate-app");
@@ -1555,7 +1582,9 @@ mod tests {
 
     #[test]
     fn takeover_child_skips_local_daemon_refresh() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let result = maybe_refresh_local_daemon_process(None, true).expect("refresh result");
 
         assert!(!result);
@@ -1563,7 +1592,9 @@ mod tests {
 
     #[test]
     fn tray_supervisor_uses_explicit_tray_binary_override() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let previous_tray_bin = std::env::var_os("CODEX_ROTATE_TRAY_BIN");
         let fake_tray = unique_temp_dir("codex-rotate-tray-binary");
         fs::write(&fake_tray, "").expect("write fake tray");
@@ -1585,7 +1616,9 @@ mod tests {
 
     #[test]
     fn instance_home_override_updates_resolved_rotate_home() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let override_home = tempdir.path().join("rotate-instance");
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
@@ -1687,7 +1720,9 @@ mod tests {
 
     #[test]
     fn initialize_runtime_reuses_fresh_watch_quota_cache_without_probe() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let rotate_home = tempdir.path().join("rotate");
         let codex_home = tempdir.path().join("codex");
@@ -1753,7 +1788,9 @@ mod tests {
 
     #[test]
     fn refresh_static_snapshot_auto_adds_missing_auth_account_into_pool() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let rotate_home = tempdir.path().join("rotate");
         let codex_home = tempdir.path().join("codex");
@@ -1819,7 +1856,9 @@ mod tests {
 
     #[test]
     fn refresh_static_snapshot_restores_missing_auth_from_active_pool() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let rotate_home = tempdir.path().join("rotate");
         let codex_home = tempdir.path().join("codex");
@@ -1877,7 +1916,9 @@ mod tests {
 
     #[test]
     fn refresh_quota_state_skips_probe_when_in_memory_cache_is_fresh() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let rotate_home = tempdir.path().join("rotate");
         let codex_home = tempdir.path().join("codex");

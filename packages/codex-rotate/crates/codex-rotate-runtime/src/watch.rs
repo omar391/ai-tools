@@ -776,10 +776,8 @@ fn should_persist_watch_state(previous: &WatchState, next: &WatchState) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_mutex;
     use anyhow::anyhow;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn plan_rotation_uses_create_for_low_quota() {
@@ -860,7 +858,9 @@ mod tests {
 
     #[test]
     fn load_or_restore_codex_auth_restores_missing_file_from_active_pool() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let rotate_home = tempdir.path().join("rotate");
         let codex_home = tempdir.path().join("codex");

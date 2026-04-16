@@ -143,7 +143,10 @@ fn detect_local_build_layout(
         _ => return None,
     };
     let target_dir = profile_dir.parent()?;
-    if target_dir.file_name()?.to_str()? != "target" {
+    if !matches!(
+        target_dir.file_name()?.to_str()?,
+        "target" | ".worktree-target"
+    ) {
         return None;
     }
     let repo_root = target_dir.parent()?.to_path_buf();
@@ -250,6 +253,38 @@ mod tests {
         assert_eq!(detected.repo_root, repo_root);
         assert_eq!(detected.profile, BuildProfile::Debug);
         assert_eq!(detected.target, TargetKind::Tray);
+
+        fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn detect_local_cli_build_reads_worktree_target_layout() {
+        let path = PathBuf::from("/tmp/demo-worktree/.worktree-target/debug/codex-rotate");
+        let repo_root = PathBuf::from("/tmp/demo-worktree");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli"),
+        )
+        .expect("create cli crate dir");
+        fs::write(repo_root.join("Cargo.toml"), "").expect("write root cargo");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("write cli cargo");
+
+        let detected = detect_local_build(&path, TargetKind::Cli).expect("detect worktree build");
+        assert_eq!(detected.repo_root, repo_root);
+        assert_eq!(detected.profile, BuildProfile::Debug);
+        assert_eq!(detected.target, TargetKind::Cli);
 
         fs::remove_dir_all(&repo_root).ok();
     }
