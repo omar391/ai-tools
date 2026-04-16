@@ -12,7 +12,9 @@ use serde_json::{Map, Value};
 use crate::fs_security::write_private_string;
 use crate::paths::{resolve_paths, CorePaths};
 use crate::pool::AccountEntry;
-use crate::workflow::{CredentialFamily, DomainConfig, PendingCredential};
+use crate::workflow::{
+    migrate_rotate_state_credential_sections, CredentialFamily, DomainConfig, PendingCredential,
+};
 
 const ROTATE_STATE_BACKUP_PREFIX: &str = "accounts.json.bak.";
 const ROTATE_STATE_BACKUP_RETENTION: usize = 20;
@@ -114,6 +116,7 @@ impl RotateStateLock {
 
 pub(crate) fn load_rotate_state_json() -> Result<Value> {
     let paths = resolve_paths()?;
+    maybe_migrate_rotate_state_json(&paths)?;
     load_rotate_state_json_from_path(&paths.pool_file)
 }
 
@@ -196,6 +199,23 @@ fn load_rotate_state_json_from_path(path: &Path) -> Result<Value> {
         Some(raw) => parse_rotate_state_json(path, &raw),
         None => Ok(empty_rotate_state()),
     }
+}
+
+fn maybe_migrate_rotate_state_json(paths: &CorePaths) -> Result<()> {
+    let parsed = load_rotate_state_json_from_path(&paths.pool_file)?;
+    let Some(migrated) = migrate_rotate_state_credential_sections(&parsed) else {
+        return Ok(());
+    };
+
+    update_rotate_state_json_with_hooks(
+        paths,
+        RotateStateOwner::FullState,
+        move |state| {
+            *state = migrated.clone();
+            Ok(())
+        },
+        RotateStateWriteHooks::default(),
+    )
 }
 
 fn read_rotate_state_raw(path: &Path) -> Result<Option<String>> {
@@ -532,6 +552,88 @@ mod tests {
             Value::Number(1usize.into())
         );
         drop(guard);
+    }
+
+    #[test]
+    fn load_rotate_state_json_migrates_legacy_credential_store_sections() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-state-template-migration");
+        let paths = resolve_paths().expect("resolve paths");
+        write_private_string(
+            &paths.pool_file,
+            &serde_json::to_string_pretty(&json!({
+                "accounts": [make_account_entry("dev.1@astronlab.com", "acct-1")],
+                "active_index": 0,
+                "version": 8,
+                "default_create_base_email": "supplyprima1@gmail.com",
+                "families": {
+                    "dev-1::supplyprima1@gmail.com": {
+                        "profile_name": "dev-1",
+                        "base_email": "supplyprima1@gmail.com",
+                        "next_suffix": 2,
+                        "max_skipped_slots": 0,
+                        "deleted": [],
+                        "last_created_email": "supplyprima1+1@gmail.com",
+                        "created_at": "2026-04-05T00:00:00.000Z",
+                        "updated_at": "2026-04-05T00:00:00.000Z"
+                    }
+                },
+                "pending": {
+                    "supplyprima1+2@gmail.com": {
+                        "email": "supplyprima1+2@gmail.com",
+                        "profile_name": "dev-1",
+                        "base_email": "supplyprima1@gmail.com",
+                        "suffix": 2,
+                        "selector": "supplyprima1+2@gmail.com",
+                        "alias": null,
+                        "created_at": "2026-04-05T00:00:00.000Z",
+                        "updated_at": "2026-04-05T00:00:00.000Z"
+                    }
+                }
+            }))
+            .expect("serialize legacy state"),
+        )
+        .expect("write legacy state");
+
+        let migrated = load_rotate_state_json().expect("load migrated state");
+        let object = migrated.as_object().expect("object");
+        assert_eq!(object.get("version"), Some(&Value::Number(9u8.into())));
+        assert_eq!(
+            object.get("default_create_template"),
+            Some(&Value::String("supplyprima1+{n}@gmail.com".to_string()))
+        );
+        assert!(!object.contains_key("default_create_base_email"));
+
+        let families = object
+            .get("families")
+            .and_then(Value::as_object)
+            .expect("families");
+        let family = families
+            .get("dev-1::supplyprima1+{n}@gmail.com")
+            .expect("gmail template family");
+        assert_eq!(
+            family.get("template"),
+            Some(&Value::String("supplyprima1+{n}@gmail.com".to_string()))
+        );
+        assert!(family.get("base_email").is_none());
+
+        let pending = object
+            .get("pending")
+            .and_then(Value::as_object)
+            .expect("pending");
+        let pending_record = pending
+            .get("supplyprima1+2@gmail.com")
+            .expect("pending record");
+        assert_eq!(
+            pending_record.get("template"),
+            Some(&Value::String("supplyprima1+{n}@gmail.com".to_string()))
+        );
+        assert!(pending_record.get("base_email").is_none());
+
+        let persisted: Value = serde_json::from_str(
+            &fs::read_to_string(&paths.pool_file).expect("read migrated state"),
+        )
+        .expect("parse migrated state");
+        assert_eq!(persisted, migrated);
     }
 
     #[test]

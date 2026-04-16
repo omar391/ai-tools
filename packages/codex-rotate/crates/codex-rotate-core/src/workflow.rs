@@ -3659,6 +3659,56 @@ fn save_credential_store(store: &CredentialStore) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_rotate_state_credential_sections(raw: &Value) -> Option<Value> {
+    if !rotate_state_requires_template_migration(raw) {
+        return None;
+    }
+
+    let store = normalize_credential_store(raw.clone());
+    let credential_state = serialize_credential_store(&store);
+    let mut migrated = raw.clone();
+    if !migrated.is_object() {
+        migrated = Value::Object(Map::new());
+    }
+    let object = migrated
+        .as_object_mut()
+        .expect("rotate state must be a JSON object");
+    object.remove("default_create_base_email");
+    if let Some(version) = credential_state.get("version").cloned() {
+        object.insert("version".to_string(), version);
+    }
+    if let Some(default_create_template) = credential_state.get("default_create_template").cloned()
+    {
+        object.insert(
+            "default_create_template".to_string(),
+            default_create_template,
+        );
+    } else {
+        object.remove("default_create_template");
+    }
+    if store.domain.is_empty() {
+        object.remove("domain");
+    } else if let Some(domain) = credential_state.get("domain").cloned() {
+        object.insert("domain".to_string(), domain);
+    }
+    if store.families.is_empty() {
+        object.remove("families");
+    } else if let Some(families) = credential_state.get("families").cloned() {
+        object.insert("families".to_string(), families);
+    }
+    if store.pending.is_empty() {
+        object.remove("pending");
+    } else if let Some(pending) = credential_state.get("pending").cloned() {
+        object.insert("pending".to_string(), pending);
+    }
+    if store.skipped.is_empty() {
+        object.remove("skipped");
+    } else if let Some(skipped) = credential_state.get("skipped").cloned() {
+        object.insert("skipped".to_string(), skipped);
+    }
+    Some(migrated)
+}
+
 fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
     for record in records {
         let result = run_automation_bridge::<_, bool>(

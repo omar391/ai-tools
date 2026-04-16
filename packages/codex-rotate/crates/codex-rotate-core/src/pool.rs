@@ -2624,7 +2624,7 @@ mod tests {
         .expect("save pool");
 
         let state = load_rotate_state_json().expect("load rotate state");
-        assert_eq!(state["version"], json!(7));
+        assert_eq!(state["version"], json!(9));
         assert_eq!(
             state["default_create_template"],
             json!("dev.{n}@astronlab.com")
