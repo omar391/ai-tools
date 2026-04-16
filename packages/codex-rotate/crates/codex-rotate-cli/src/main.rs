@@ -163,7 +163,11 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
             if let Some(printer) = progress_printer {
                 printer.stop();
             }
-            Some(result?)
+            match result {
+                Ok(output) => Some(output),
+                Err(error) if error.to_string().starts_with("Daemon repo root mismatch:") => None,
+                Err(error) => return Err(error),
+            }
         }
         None => None,
     })
@@ -1337,6 +1341,50 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn spawn_proxy_error_server(
+        response_error: &str,
+    ) -> std::thread::JoinHandle<Result<ClientRequest>> {
+        let socket_path = daemon_socket_path().expect("daemon socket path");
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent).expect("create daemon socket dir");
+        }
+        let listener = UnixListener::bind(&socket_path).expect("bind daemon socket");
+        let response_error = response_error.to_string();
+        thread::spawn(move || -> Result<ClientRequest> {
+            loop {
+                let (mut stream, _) = listener.accept().context("accept request")?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let request = match read_request(&mut reader) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                match request {
+                    ClientRequest::Subscribe => {
+                        write_message(
+                            &mut stream,
+                            &ServerMessage::Snapshot {
+                                snapshot: StatusSnapshot::default(),
+                            },
+                        )?;
+                    }
+                    ClientRequest::Invoke { .. } => {
+                        write_message(
+                            &mut stream,
+                            &ServerMessage::Result {
+                                ok: false,
+                                output: None,
+                                error: Some(response_error),
+                            },
+                        )?;
+                        fs::remove_file(&socket_path).ok();
+                        return Ok(request);
+                    }
+                }
+            }
+        })
+    }
+
+    #[cfg(unix)]
     fn spawn_reachable_daemon() -> std::thread::JoinHandle<Result<()>> {
         let socket_path = daemon_socket_path().expect("daemon socket path");
         if let Some(parent) = socket_path.parent() {
@@ -1832,7 +1880,7 @@ mod tests {
                     options: ReloginInvocation {
                         selector: "acct-123".to_string(),
                         allow_email_change: false,
-                        logout_first: true,
+                        logout_first: false,
                         manual_login: false,
                     },
                 },
@@ -1853,12 +1901,13 @@ mod tests {
                     try_run_via_daemon(command, &args).expect("proxy dispatch should succeed");
                 let request = handle.join().expect("proxy thread")?;
                 assert_eq!(output.as_deref(), Some("daemon-ok"));
-                assert_eq!(
-                    request,
-                    ClientRequest::Invoke {
-                        action: expected_action
+                match request {
+                    ClientRequest::Invoke { action, repo_root } => {
+                        assert_eq!(action, expected_action);
+                        assert!(repo_root.is_some());
                     }
-                );
+                    other => panic!("unexpected request: {other:?}"),
+                }
             }
             Ok(())
         })
@@ -1976,26 +2025,62 @@ mod tests {
                     run_with_args(&args, &mut output)?;
                     let request = handle.join().expect("proxy thread")?;
                     assert_eq!(String::from_utf8(output).expect("utf8").trim(), "daemon-ok");
-                    assert_eq!(
-                        request,
-                        ClientRequest::Invoke {
-                            action: InvokeAction::Create {
-                                options: CreateInvocation {
-                                    alias: Some("bench".to_string()),
-                                    profile_name: Some("dev-1".to_string()),
-                                    base_email: Some("dev.{n}@astronlab.com".to_string()),
-                                    force: true,
-                                    ignore_current: false,
-                                    restore_previous_auth_after_create: false,
-                                    require_usable_quota: false,
+                    match request {
+                        ClientRequest::Invoke { action, repo_root } => {
+                            assert!(repo_root.is_some());
+                            assert_eq!(
+                                action,
+                                InvokeAction::Create {
+                                    options: CreateInvocation {
+                                        alias: Some("bench".to_string()),
+                                        profile_name: Some("dev-1".to_string()),
+                                        base_email: Some("dev.{n}@astronlab.com".to_string()),
+                                        force: true,
+                                        ignore_current: false,
+                                        restore_previous_auth_after_create: false,
+                                        require_usable_quota: false,
+                                    }
                                 }
-                            }
+                            );
                         }
-                    );
+                        other => panic!("unexpected request: {other:?}"),
+                    }
                     Ok(())
                 },
             )
         })
         .expect("create should obey worktree safety preflight");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_dispatch_falls_back_to_local_when_daemon_repo_root_mismatches() {
+        with_rotate_home(|| {
+            let handle = spawn_proxy_error_server(
+                "Daemon repo root mismatch: daemon=/tmp/main, request=/tmp/worktree",
+            );
+            let output = try_run_via_daemon(Some("relogin"), &["acct-123".to_string()])?;
+            let request = handle.join().expect("proxy thread")?;
+            assert!(output.is_none());
+            match request {
+                ClientRequest::Invoke { action, repo_root } => {
+                    assert_eq!(
+                        action,
+                        InvokeAction::Relogin {
+                            options: ReloginInvocation {
+                                selector: "acct-123".to_string(),
+                                allow_email_change: false,
+                                logout_first: false,
+                                manual_login: false,
+                            },
+                        }
+                    );
+                    assert!(repo_root.is_some());
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+            Ok(())
+        })
+        .expect("repo-root mismatch should fall back to local execution");
     }
 }

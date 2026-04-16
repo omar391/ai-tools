@@ -3,7 +3,7 @@ document:
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
   version: 1.1.0
-  summary: "Single active codex-rotate OpenAI auth flow pinned to the hardened stepwise control path."
+  summary: "Single active codex-rotate OpenAI auth flow pinned to the hardened unified control path."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -29,7 +29,10 @@ input:
         auth_url: {}
         callback_url: {}
         callback_port: {}
+        device_code: {}
         codex_session_dir: {}
+        codex_home_path: {}
+        codex_auth_file_path: {}
         codex_login_pid: {}
         codex_login_stdout_path: {}
         codex_login_stderr_path: {}
@@ -41,6 +44,9 @@ input:
         account_login_locator:
           type: object
           format: secret-locator
+        prefer_password_login:
+          default: "true"
+        password: {}
         full_name:
           default: "Dev Astronlab"
         birth_month:
@@ -56,8 +62,8 @@ input:
 do:
   - run_active_unified_flow:
       metadata:
-        description: "Run the single active stepwise-derived OpenAI auth flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise
+        description: "Run the single active unified OpenAI auth flow."
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-unified
       with:
         version: 1.1.0
         input:
@@ -67,7 +73,10 @@ do:
           auth_url: "${inputs.auth_url}"
           callback_url: "${inputs.callback_url}"
           callback_port: "${inputs.callback_port}"
+          device_code: "${inputs.device_code}"
           codex_session_dir: "${inputs.codex_session_dir}"
+          codex_home_path: "${inputs.codex_home_path}"
+          codex_auth_file_path: "${inputs.codex_auth_file_path}"
           codex_login_pid: "${inputs.codex_login_pid}"
           codex_login_stdout_path: "${inputs.codex_login_stdout_path}"
           codex_login_stderr_path: "${inputs.codex_login_stderr_path}"
@@ -75,6 +84,8 @@ do:
           email: "${inputs.email}"
           account_login_ref: "${inputs.account_login_ref}"
           account_login_locator: "${inputs.account_login_locator}"
+          prefer_password_login: "${inputs.prefer_password_login}"
+          password: "${inputs.password}"
           full_name: "${inputs.full_name}"
           birth_month: "${inputs.birth_month}"
           birth_day: "${inputs.birth_day}"
@@ -82,7 +93,7 @@ do:
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the single active stepwise-derived flow outcome."
+        description: "Return the single active unified flow outcome."
       run:
         script:
           language: javascript
@@ -93,13 +104,13 @@ do:
             return {
               ...(selected && typeof selected === "object" ? selected : {}),
               selected_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
               primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+                "workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
               fallback_flow: null,
               fallback_attempted: false,
               fallback_selected: false,
-              selection_strategy: "single-stepwise-flow",
+              selection_strategy: "single-unified-flow",
             };
 output:
   as: "${state.steps.finalize_selected_flow?.action?.value || {}}"

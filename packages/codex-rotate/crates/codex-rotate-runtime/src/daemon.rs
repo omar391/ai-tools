@@ -25,7 +25,7 @@ use crate::watch::{
     auto_create_enabled, read_watch_state, refresh_quota_cache, run_watch_iteration,
     set_auto_create_enabled, tray_enabled, WatchIterationOptions, WatchState,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::cancel;
@@ -520,13 +520,28 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
                 write_message(&mut writer, &ServerMessage::Snapshot { snapshot })?;
             }
         }
-        ClientRequest::Invoke { action } => {
+        ClientRequest::Invoke { action, repo_root } => {
             let mut writer = stream;
             let action_name = format!("{action:?}");
             let disconnect_monitor = ClientDisconnectMonitor::attach(&writer)?;
             let cancel_token = disconnect_monitor.cancel_token();
             let response = match panic::catch_unwind(AssertUnwindSafe(|| {
-                cancel::with_cancel_token(cancel_token, || daemon.handle_invoke(action))
+                cancel::with_cancel_token(cancel_token, || {
+                    if let Some(request_repo_root) = repo_root.as_deref() {
+                        let daemon_repo_root = codex_rotate_core::paths::resolve_paths()?
+                            .repo_root
+                            .to_string_lossy()
+                            .into_owned();
+                        if request_repo_root != daemon_repo_root {
+                            return Err(anyhow!(
+                                "Daemon repo root mismatch: daemon={}, request={}",
+                                daemon_repo_root,
+                                request_repo_root
+                            ));
+                        }
+                    }
+                    daemon.handle_invoke(action)
+                })
             })) {
                 Ok(Ok(output)) => ServerMessage::Result {
                     ok: true,

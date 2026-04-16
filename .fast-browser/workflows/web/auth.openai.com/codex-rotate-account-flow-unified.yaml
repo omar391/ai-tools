@@ -1,9 +1,10 @@
+# trunk-ignore-all(yamllint/quoted-strings)
 document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
-  name: codex-rotate-account-flow-stepwise
+  name: codex-rotate-account-flow-unified
   version: 1.1.0
-  summary: "Pure non-device stepwise OpenAI auth state machine with the former shared logic inlined."
+  summary: "Unified non-device candidate that keeps the proven stepwise state machine while replacing the hottest form interactions with smaller Playwright-native steps."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -505,7 +506,7 @@ use:
           settle_ms: 250
     submit_openai_current_form_compact:
       metadata:
-        description: Submit the active OpenAI form with a compact Playwright-side interaction and leave transition classification to the surrounding workflow steps.
+        description: "Submit the active OpenAI form with a compact Playwright-side interaction and leave transition classification to the surrounding workflow steps."
         mode: headless_ok
         targetRef: primary
       call: afn.driver.browser.exec_script
@@ -1421,91 +1422,15 @@ use:
         description: Fill the OpenAI password field from the generated workflow password.
         mode: headless_ok
         targetRef: primary
-      call: afn.driver.browser.exec_script
+      call: afn.driver.browser.type
       with:
         body:
-          password: "${inputs.password}"
-          # trunk-ignore(checkov/CKV_SECRET_6)
-          script: |
-            const password = String(args.password || "");
-            if (!password) {
-              throw new Error("generated-password-missing");
-            }
-            const selectors = [
-              'input[type="password"]',
-              'input[name="password"]',
-              'input[name="new-password"]',
-              'input[autocomplete="current-password"]',
-              'input[autocomplete="new-password"]',
-            ];
-            const input = await page.locator(selectors.join(", ")).filter({ visible: true }).first();
-            if (!(await input.count().catch(() => 0))) {
-              throw new Error("generated-password-field-not-found");
-            }
-            await input.scrollIntoViewIfNeeded().catch(() => {});
-            await input.click({ timeout: 1500 }).catch(() => {});
-            const result = await input.evaluate((node, value) => {
-              if (!(node instanceof HTMLInputElement)) {
-                return {
-                  ok: false,
-                  reason: "generated-password-field-not-input",
-                };
-              }
-              const prototype = Object.getPrototypeOf(node);
-              const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
-              const setter = descriptor && typeof descriptor.set === "function"
-                ? descriptor.set.bind(node)
-                : null;
-              if (setter) {
-                setter("");
-              } else {
-                node.value = "";
-              }
-              node.dispatchEvent(new Event("input", { bubbles: true }));
-              if (setter) {
-                setter(String(value || ""));
-              } else {
-                node.value = String(value || "");
-              }
-              node.dispatchEvent(new Event("input", { bubbles: true }));
-              node.dispatchEvent(new Event("change", { bubbles: true }));
-              if (node instanceof HTMLElement) {
-                node.blur();
-              }
-              const normalize = (raw) => String(raw || "").replace(/\s+/g, " ").trim();
-              const submit = Array.from(document.querySelectorAll("button[type='submit'], input[type='submit'], button, [role='button']"))
-                .find((candidate) => {
-                  if (!(candidate instanceof Element)) {
-                    return false;
-                  }
-                  const style = window.getComputedStyle(candidate);
-                  if (!style || style.display === "none" || style.visibility === "hidden") {
-                    return false;
-                  }
-                  const rect = candidate.getBoundingClientRect();
-                  if (!(rect.width > 0 && rect.height > 0)) {
-                    return false;
-                  }
-                  const label = normalize(candidate instanceof HTMLInputElement ? candidate.value : (candidate.innerText || candidate.textContent || ""));
-                  return /continue|next|create account|sign up|submit|verify|log in|sign in/i.test(label);
-                });
-              const submitDisabled = submit instanceof Element
-                ? (submit.hasAttribute("disabled") || submit.getAttribute("aria-disabled") === "true")
-                : null;
-              return {
-                ok: String(node.value || "").length > 0 && submitDisabled === false,
-                value_length: String(node.value || "").length,
-                submit_disabled: submitDisabled,
-              };
-            }, password).catch((error) => ({
-              ok: false,
-              reason: error instanceof Error ? error.message : String(error || "generated-password-fill-failed"),
-            }));
-            if (!result || result.ok !== true) {
-              throw new Error(String(result && result.reason ? result.reason : "generated-password-fill-failed"));
-            }
-            await page.waitForTimeout(250).catch(() => {});
-            return result;
+          selector: input[type="password"], input[name="password"], input[name="new-password"], input[autocomplete="current-password"], input[autocomplete="new-password"]
+          text: ${inputs.password}
+          dispatch_events_after_fill: true
+          blur_after_fill: true
+          click_away_after_fill: true
+          settle_ms: 250
     fill_openai_about_you_form:
       metadata:
         description: "Fill the OpenAI about-you form and verify that its primary submit control becomes enabled."

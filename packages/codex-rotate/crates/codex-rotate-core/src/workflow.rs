@@ -109,7 +109,7 @@ impl Default for ReloginOptions {
     fn default() -> Self {
         Self {
             allow_email_change: false,
-            logout_first: true,
+            logout_first: false,
             manual_login: false,
         }
     }
@@ -488,6 +488,8 @@ struct BridgeLoginOptions<'a> {
     prefer_signup_recovery: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_password_login: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     full_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -982,23 +984,66 @@ pub fn cmd_relogin_with_progress(
         .unwrap_or_else(|| expected_email.clone());
     reconcile_pending_relogin_target(&mut store, pending.as_ref())?;
     ensure_rotation_enabled_for_email_in_store(&store, &expected_email)?;
-    let stored_credential = existing
+    let resolved_stored_credential = existing
         .as_ref()
         .and_then(|entry| resolve_relogin_credential(&store, entry))
         .or_else(|| pending.as_ref().map(|pending| pending.stored.clone()));
     let relogin_birth_date = relogin_birth_date_for_pending(pending.as_ref());
     let prefer_signup_recovery = Some(prefer_signup_recovery_for_relogin(
         pending.as_ref(),
-        stored_credential.as_ref(),
+        existing
+            .as_ref()
+            .and_then(|entry| resolve_relogin_credential(&store, entry))
+            .as_ref(),
     ));
+    let mut prepared_account_login_locator: Option<CodexRotateSecretLocator> = None;
+    let mut prepared_skip_locator_preflight = false;
+    let mut prepared_password: Option<String> = None;
 
-    if should_use_stored_credential_relogin(stored_credential.as_ref(), &options) {
-        let stored_credential = stored_credential.ok_or_else(|| {
-            anyhow!("Stored credential lookup unexpectedly failed for {expected_email}.")
-        })?;
+    if should_prepare_signup_recovery_password(
+        pending.as_ref(),
+        prefer_signup_recovery == Some(true),
+        options.manual_login,
+    ) {
+        let profile_name = pending
+            .as_ref()
+            .map(|record| record.stored.profile_name.as_str())
+            .ok_or_else(|| {
+                anyhow!("Signup-recovery relogin is missing a profile for {expected_email}.")
+            })?;
+        report_progress(
+            progress.as_ref(),
+            format!("Preparing password for {}.", expected_email),
+        );
+        let generated_password = generate_password(18);
+        let _: CodexRotateSecretRef = run_automation_bridge(
+            "prepare-account-secret-ref",
+            BridgeEnsureSecretPayload {
+                profile_name,
+                email: &expected_email,
+                password: generated_password.as_str(),
+            },
+        )?;
+        prepared_account_login_locator = Some(build_openai_account_login_locator(&expected_email));
+        prepared_skip_locator_preflight = true;
+        prepared_password = Some(generated_password);
+    }
+
+    let stored_credential = resolved_stored_credential;
+
+    if prepared_account_login_locator.is_some()
+        || should_use_stored_credential_relogin(stored_credential.as_ref(), &options)
+    {
+        let stored_credential = stored_credential
+            .or_else(|| pending.as_ref().map(|pending| pending.stored.clone()))
+            .ok_or_else(|| {
+                anyhow!("Stored credential lookup unexpectedly failed for {expected_email}.")
+            })?;
         let mut updated_stored = stored_credential.clone();
         updated_stored.updated_at = now_iso();
-        let account_login_locator = build_openai_account_login_locator(&updated_stored.email);
+        let account_login_locator = prepared_account_login_locator
+            .clone()
+            .unwrap_or_else(|| build_openai_account_login_locator(&updated_stored.email));
 
         let previous_auth = load_codex_auth_if_exists()?;
         let login_result = (|| -> Result<CompleteCodexLoginOutcome> {
@@ -1016,9 +1061,10 @@ pub fn cmd_relogin_with_progress(
                 workflow_ref: None,
                 codex_bin: None,
                 workflow_run_stamp: None,
-                skip_locator_preflight: None,
+                skip_locator_preflight: prepared_skip_locator_preflight.then_some(true),
                 prefer_signup_recovery,
-                prefer_password_login: None,
+                prefer_password_login: prepared_skip_locator_preflight.then_some(true),
+                password: prepared_password.as_deref(),
                 treat_final_add_phone_as_environment_blocker: Some(true),
                 birth_date: relogin_birth_date.as_ref(),
                 progress: progress.clone(),
@@ -1239,6 +1285,14 @@ fn prefer_signup_recovery_for_relogin(
     stored_credential: Option<&StoredCredential>,
 ) -> bool {
     pending.is_some() && stored_credential.is_none()
+}
+
+fn should_prepare_signup_recovery_password(
+    pending: Option<&PendingCredential>,
+    prefer_signup_recovery: bool,
+    manual_login: bool,
+) -> bool {
+    prefer_signup_recovery && pending.is_some() && !manual_login
 }
 
 fn relogin_birth_date_for_pending(pending: Option<&PendingCredential>) -> Option<AdultBirthDate> {
@@ -1544,8 +1598,8 @@ fn skip_pending_account_and_advance_family(
     save_credential_store(store)
 }
 
-fn prefer_signup_recovery_for_create(_reusing_pending: bool) -> bool {
-    true
+fn prefer_signup_recovery_for_create(reusing_pending: bool) -> bool {
+    !reusing_pending
 }
 
 fn execute_create_flow_attempt(
@@ -1731,22 +1785,24 @@ fn execute_create_flow_attempt(
     }
     let account_login_locator = build_openai_account_login_locator(&created_email);
     let mut skip_locator_preflight = false;
+    let mut generated_password: Option<String> = None;
     if !reusing_pending {
         report_progress(
             progress.as_ref(),
             format!("Preparing password for {}.", created_email),
         );
-        let generated_password = generate_password(18);
+        let password = generate_password(18);
         let _: CodexRotateSecretRef = run_automation_bridge(
             "prepare-account-secret-ref",
             BridgeEnsureSecretPayload {
                 profile_name: &profile_name,
                 email: &created_email,
-                password: generated_password.as_str(),
+                password: password.as_str(),
             },
         )
         .map_err(CreateFlowAttemptFailure::Fatal)?;
         skip_locator_preflight = true;
+        generated_password = Some(password);
     }
     let pending = PendingCredential {
         stored: StoredCredential {
@@ -1790,6 +1846,7 @@ fn execute_create_flow_attempt(
         skip_locator_preflight: Some(skip_locator_preflight),
         prefer_signup_recovery: Some(prefer_signup_recovery_for_create(reusing_pending)),
         prefer_password_login: skip_locator_preflight.then_some(true),
+        password: generated_password.as_deref(),
         treat_final_add_phone_as_environment_blocker: Some(true),
         birth_date: Some(&birth_date),
         progress: progress.clone(),
@@ -2213,6 +2270,7 @@ struct CompleteCodexLoginArgs<'a> {
     skip_locator_preflight: Option<bool>,
     prefer_signup_recovery: Option<bool>,
     prefer_password_login: Option<bool>,
+    password: Option<&'a str>,
     treat_final_add_phone_as_environment_blocker: Option<bool>,
     birth_date: Option<&'a AdultBirthDate>,
     progress: Option<AutomationProgressCallback>,
@@ -2235,6 +2293,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         skip_locator_preflight,
         prefer_signup_recovery,
         prefer_password_login,
+        password,
         treat_final_add_phone_as_environment_blocker,
         birth_date,
         progress,
@@ -2300,6 +2359,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     skip_locator_preflight,
                     prefer_signup_recovery: Some(allow_signup_recovery),
                     prefer_password_login,
+                    password,
                     full_name: Some(workflow_defaults.full_name.as_str()),
                     birth_month: Some(birth_date.birth_month),
                     birth_day: Some(birth_date.birth_day),
@@ -3236,6 +3296,7 @@ fn codex_login_retry_delay_ms(reason: Option<&str>, attempt: usize) -> u64 {
 
 fn should_reset_codex_login_session_for_retry(retry_reason: Option<&str>, attempt: usize) -> bool {
     retry_reason == Some("state_mismatch")
+        || retry_reason == Some("username_not_found")
         || retry_reason == Some("final_add_phone")
         || (retry_reason == Some("retryable_timeout") && attempt >= 2)
 }
@@ -4043,17 +4104,40 @@ fn read_yaml_u16(value: &YamlValue) -> Option<u16> {
 fn derive_workflow_ref_from_file_path(file_path: &Path) -> Option<String> {
     let canonical_path = file_path.canonicalize().ok()?;
     let paths = resolve_paths().ok()?;
-    let workspace_root = paths.repo_root.join(".fast-browser").join("workflows");
-    derive_workflow_ref_from_root(&canonical_path, &workspace_root, "workspace").or_else(|| {
-        paths.repo_root.parent().and_then(|parent| {
+    let mut repo_roots = vec![paths.repo_root.clone()];
+    if let Some(bridge_repo_root) = std::env::var_os("CODEX_ROTATE_BRIDGE_REPO_ROOT")
+        .map(PathBuf::from)
+        .filter(|value| value.exists())
+    {
+        let canonical_bridge_root = bridge_repo_root.canonicalize().ok()?;
+        if !repo_roots.contains(&canonical_bridge_root) {
+            repo_roots.push(canonical_bridge_root);
+        }
+    }
+
+    for repo_root in &repo_roots {
+        let workspace_root = repo_root.join(".fast-browser").join("workflows");
+        if let Some(workflow_ref) =
+            derive_workflow_ref_from_root(&canonical_path, &workspace_root, "workspace")
+        {
+            return Some(workflow_ref);
+        }
+    }
+
+    for repo_root in &repo_roots {
+        if let Some(workflow_ref) = repo_root.parent().and_then(|parent| {
             let global_root = parent
                 .join("ai-rules")
                 .join("skills")
                 .join("fast-browser")
                 .join("workflows");
             derive_workflow_ref_from_root(&canonical_path, &global_root, "sys")
-        })
-    })
+        }) {
+            return Some(workflow_ref);
+        }
+    }
+
+    None
 }
 
 fn derive_workflow_ref_from_root(
@@ -5549,6 +5633,34 @@ mod tests {
     }
 
     #[test]
+    fn pending_signup_recovery_relogin_prepares_password_only_when_needed() {
+        let pending = make_pending(
+            "dev3astronlab+6@gmail.com",
+            "dev-1",
+            "dev3astronlab+{n}@gmail.com",
+            6,
+            "2026-04-14T16:12:25.003Z",
+        );
+
+        assert!(should_prepare_signup_recovery_password(
+            Some(&pending),
+            true,
+            false
+        ));
+        assert!(!should_prepare_signup_recovery_password(
+            Some(&pending),
+            false,
+            false
+        ));
+        assert!(!should_prepare_signup_recovery_password(
+            Some(&pending),
+            true,
+            true
+        ));
+        assert!(!should_prepare_signup_recovery_password(None, true, false));
+    }
+
+    #[test]
     fn read_workflow_file_metadata_reads_preferred_profile_from_main_workflow() {
         let workflow_file = repo_root()
             .join(".fast-browser")
@@ -5583,6 +5695,61 @@ mod tests {
         assert_eq!(
             derive_workflow_ref_from_file_path(&workflow_file).as_deref(),
             Some("workspace.web.auth-openai-com.codex-rotate-account-flow-minimal")
+        );
+    }
+
+    #[test]
+    fn derive_workflow_ref_from_file_path_honors_bridge_repo_root_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let main_root = tempdir.path().join("main-root");
+        let bridge_root = tempdir.path().join("bridge-root");
+
+        for root in [&main_root, &bridge_root] {
+            fs::create_dir_all(root.join("packages").join("codex-rotate"))
+                .expect("create asset root");
+            fs::create_dir_all(
+                root.join(".fast-browser")
+                    .join("workflows")
+                    .join("web")
+                    .join("auth.openai.com"),
+            )
+            .expect("create workflow dir");
+        }
+
+        let workflow_file = bridge_root
+            .join(".fast-browser")
+            .join("workflows")
+            .join("web")
+            .join("auth.openai.com")
+            .join("codex-rotate-account-flow-main.yaml");
+        fs::write(
+            &workflow_file,
+            "document:\n  metadata:\n    preferredProfile: dev-1\n",
+        )
+        .expect("write workflow file");
+
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        let previous_bridge_root = std::env::var_os("CODEX_ROTATE_BRIDGE_REPO_ROOT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", &main_root);
+            std::env::set_var("CODEX_ROTATE_BRIDGE_REPO_ROOT", &bridge_root);
+        }
+
+        let derived = derive_workflow_ref_from_file_path(&workflow_file);
+
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
+        }
+        match previous_bridge_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BRIDGE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_BRIDGE_REPO_ROOT") },
+        }
+
+        assert_eq!(
+            derived.as_deref(),
+            Some("workspace.web.auth-openai-com.codex-rotate-account-flow-main")
         );
     }
 
@@ -6732,9 +6899,9 @@ input:
     }
 
     #[test]
-    fn create_always_prefers_signup_recovery() {
+    fn fresh_create_prefers_signup_recovery_but_reused_pending_create_does_not() {
         assert!(prefer_signup_recovery_for_create(false));
-        assert!(prefer_signup_recovery_for_create(true));
+        assert!(!prefer_signup_recovery_for_create(true));
     }
 
     #[test]
@@ -6960,9 +7127,13 @@ end
 
     #[test]
     fn stored_relogin_honors_logout_setting() {
-        assert!(should_logout_before_stored_relogin(
+        assert!(!should_logout_before_stored_relogin(
             &ReloginOptions::default()
         ));
+        assert!(should_logout_before_stored_relogin(&ReloginOptions {
+            logout_first: true,
+            ..ReloginOptions::default()
+        }));
         assert!(!should_logout_before_stored_relogin(&ReloginOptions {
             logout_first: false,
             ..ReloginOptions::default()
@@ -8309,6 +8480,10 @@ end
         assert!(should_reset_codex_login_session_for_retry(
             Some("state_mismatch"),
             2
+        ));
+        assert!(should_reset_codex_login_session_for_retry(
+            Some("username_not_found"),
+            1
         ));
         assert!(should_reset_codex_login_session_for_retry(
             Some("final_add_phone"),

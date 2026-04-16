@@ -33,6 +33,8 @@ type BridgeRequest =
           workflowRef?: string;
           workflowRunStamp?: string;
           preferSignupRecovery?: boolean;
+          preferPasswordLogin?: boolean;
+          password?: string;
           fullName?: string;
           birthMonth?: number;
           birthDay?: number;

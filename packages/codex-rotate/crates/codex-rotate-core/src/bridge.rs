@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -60,6 +61,25 @@ where
     cancel::check_canceled()?;
     let paths = resolve_paths()?;
     cleanup_legacy_rotate_home_artifacts(&paths.rotate_home)?;
+    let bridge_repo_root = resolve_bridge_repo_root(&paths.repo_root);
+    let bridge_asset_root = std::env::var_os("CODEX_ROTATE_ASSET_ROOT")
+        .map(PathBuf::from)
+        .filter(|value| value.exists())
+        .unwrap_or_else(|| bridge_repo_root.join("packages").join("codex-rotate"));
+    if std::env::var("CODEX_ROTATE_DEBUG_BRIDGE_ROOT").as_deref() == Ok("1") {
+        eprintln!(
+            "[codex-rotate-rust] bridge repo_root={} asset_root={} default_repo_root={} cwd={} current_exe={}",
+            bridge_repo_root.display(),
+            bridge_asset_root.display(),
+            paths.repo_root.display(),
+            std::env::current_dir()
+                .map(|value| value.display().to_string())
+                .unwrap_or_else(|_| "<cwd-unavailable>".to_string()),
+            std::env::current_exe()
+                .map(|value| value.display().to_string())
+                .unwrap_or_else(|_| "<exe-unavailable>".to_string())
+        );
+    }
     let request = serde_json::to_vec(&BridgeRequest { command, payload })?;
     let mut request_file =
         NamedTempFile::new().context("Failed to create automation bridge request file.")?;
@@ -80,9 +100,9 @@ where
         .arg(&paths.automation_bridge_entrypoint)
         .arg("--request-file")
         .arg(request_file.path())
-        .current_dir(&paths.asset_root)
-        .env("CODEX_ROTATE_REPO_ROOT", paths.repo_root.as_os_str())
-        .env("CODEX_ROTATE_ASSET_ROOT", paths.asset_root.as_os_str())
+        .current_dir(&bridge_asset_root)
+        .env("CODEX_ROTATE_REPO_ROOT", bridge_repo_root.as_os_str())
+        .env("CODEX_ROTATE_ASSET_ROOT", bridge_asset_root.as_os_str())
         .env("CODEX_ROTATE_ALLOW_INTERACTIVE_SECRET_UNLOCK", "1")
         .env(
             "CODEX_ROTATE_BRIDGE_OWNER_PID",
@@ -203,6 +223,58 @@ where
             "Automation bridge returned invalid JSON for {command}. stdout tail: {stdout_preview}"
         )
     }))
+}
+
+fn resolve_bridge_repo_root(default_repo_root: &Path) -> PathBuf {
+    if let Some(value) = std::env::var_os("CODEX_ROTATE_BRIDGE_REPO_ROOT")
+        .map(PathBuf::from)
+        .filter(|value| is_valid_repo_root(value))
+    {
+        return value;
+    }
+
+    if let Some(value) = std::env::var_os("CODEX_ROTATE_REPO_ROOT")
+        .map(PathBuf::from)
+        .filter(|value| is_valid_repo_root(value))
+    {
+        return value;
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        if is_valid_repo_root(&current_dir) {
+            return current_dir;
+        }
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(repo_root) = repo_root_from_binary_path(&current_exe) {
+            return repo_root;
+        }
+    }
+
+    default_repo_root.to_path_buf()
+}
+
+fn repo_root_from_binary_path(binary_path: &Path) -> Option<PathBuf> {
+    let profile_dir = binary_path.parent()?;
+    let target_dir = profile_dir.parent()?;
+    let target_name = target_dir.file_name()?.to_str()?;
+    if !matches!(target_name, "target" | ".worktree-target") {
+        return None;
+    }
+    let candidate = target_dir.parent()?.canonicalize().ok()?;
+    is_valid_repo_root(&candidate).then_some(candidate)
+}
+
+fn is_valid_repo_root(candidate: &Path) -> bool {
+    candidate.join("Cargo.toml").is_file()
+        && candidate
+            .join("packages")
+            .join("codex-rotate")
+            .join("crates")
+            .join("codex-rotate-cli")
+            .join("Cargo.toml")
+            .is_file()
 }
 
 #[cfg(unix)]
@@ -530,8 +602,9 @@ fn stdout_tail_preview(stdout: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         bridge_progress_line_for_cli, format_fast_browser_progress_event_line,
-        parse_bridge_response, stdout_tail_preview,
+        parse_bridge_response, resolve_bridge_repo_root, stdout_tail_preview,
     };
+    use std::fs;
 
     #[test]
     fn formats_fast_browser_progress_events_in_rust() {
@@ -589,5 +662,84 @@ __CODEX_ROTATE_BRIDGE__{"ok":true,"result":{"value":"final"}}
     fn trims_stdout_tail_preview_for_invalid_bridge_debugging() {
         let preview = stdout_tail_preview("line-1\nline-2\nline-3", 8);
         assert_eq!(preview, "2\\nline-3");
+    }
+
+    #[test]
+    fn resolve_bridge_repo_root_prefers_current_worktree_checkout() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo-root");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli"),
+        )
+        .expect("create cli crate dir");
+        fs::write(repo_root.join("Cargo.toml"), "").expect("write root cargo");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("write cli cargo");
+
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("set cwd");
+        let resolved = resolve_bridge_repo_root(std::path::Path::new("/tmp/fallback"));
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+
+        assert_eq!(
+            resolved,
+            repo_root.canonicalize().expect("canonical repo root")
+        );
+    }
+
+    #[test]
+    fn resolve_bridge_repo_root_prefers_explicit_bridge_override() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let default_root = tempdir.path().join("default-root");
+        let bridge_root = tempdir.path().join("bridge-root");
+
+        for root in [&default_root, &bridge_root] {
+            fs::create_dir_all(
+                root.join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli"),
+            )
+            .expect("create cli crate dir");
+            fs::write(root.join("Cargo.toml"), "").expect("write root cargo");
+            fs::write(
+                root.join("packages")
+                    .join("codex-rotate")
+                    .join("crates")
+                    .join("codex-rotate-cli")
+                    .join("Cargo.toml"),
+                "",
+            )
+            .expect("write cli cargo");
+        }
+
+        let previous = std::env::var_os("CODEX_ROTATE_BRIDGE_REPO_ROOT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_BRIDGE_REPO_ROOT", &bridge_root);
+        }
+        let resolved = resolve_bridge_repo_root(&default_root);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BRIDGE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_BRIDGE_REPO_ROOT") },
+        }
+
+        assert_eq!(
+            resolved
+                .canonicalize()
+                .expect("canonical resolved bridge root"),
+            bridge_root.canonicalize().expect("canonical bridge root")
+        );
     }
 }

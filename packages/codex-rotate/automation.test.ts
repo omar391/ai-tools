@@ -55,6 +55,14 @@ const stepwiseWorkflowPath = join(
   "auth.openai.com",
   "codex-rotate-account-flow-stepwise.yaml",
 );
+const unifiedWorkflowPath = join(
+  repoRoot,
+  ".fast-browser",
+  "workflows",
+  "web",
+  "auth.openai.com",
+  "codex-rotate-account-flow-unified.yaml",
+);
 const deviceAuthWorkflowPath = join(
   repoRoot,
   ".fast-browser",
@@ -1346,7 +1354,7 @@ describe("active auth workflows", () => {
     expect(runtimeSources).not.toContain('"secrets clear"');
   });
 
-  test("main now delegates only to the single active stepwise flow", async () => {
+  test("main now delegates only to the single active unified flow", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -1369,7 +1377,7 @@ describe("active auth workflows", () => {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
         version: "1.1.0",
       },
     ]);
@@ -1393,7 +1401,7 @@ describe("active auth workflows", () => {
     expect(properties.account_login_locator).toBeDefined();
   });
 
-  test("main keeps only the stepwise single-flow selection contract", () => {
+  test("main keeps only the unified single-flow selection contract", () => {
     const workflowText = readFileSync(
       join(
         repoRoot,
@@ -1408,15 +1416,34 @@ describe("active auth workflows", () => {
 
     expect(workflowText).toContain("run_active_unified_flow");
     expect(workflowText).toContain(
-      '"workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise"',
+      '"workspace.web.auth-openai-com.codex-rotate-account-flow-unified"',
     );
     expect(workflowText).toContain("fallback_flow: null");
     expect(workflowText).toContain("fallback_attempted: false");
-    expect(workflowText).toContain(
-      'selection_strategy: "single-stepwise-flow"',
-    );
+    expect(workflowText).toContain('selection_strategy: "single-unified-flow"');
     expect(workflowText).not.toContain("run_device_auth_fallback");
     expect(workflowText).not.toContain("codex-rotate-account-flow-device-auth");
+  });
+
+  test("main forwards password-first relogin inputs into the unified wrapper", () => {
+    const workflowText = readFileSync(
+      join(
+        repoRoot,
+        ".fast-browser",
+        "workflows",
+        "web",
+        "auth.openai.com",
+        "codex-rotate-account-flow-main.yaml",
+      ),
+      "utf8",
+    );
+
+    expect(workflowText).toContain("prefer_password_login:");
+    expect(workflowText).toContain(
+      'prefer_password_login: "${inputs.prefer_password_login}"',
+    );
+    expect(workflowText).toContain("password: {}");
+    expect(workflowText).toContain('password: "${inputs.password}"');
   });
 
   test("minimal flow waits after replayed-login resend before searching Gmail", async () => {
@@ -4431,6 +4458,56 @@ describe("stepwise workflow verification helper", () => {
     expect(result.error_message).toContain("phone setup");
   });
 
+  test("unified candidate keeps a single shared OpenAI surface classifier", () => {
+    const workflowText = readFileSync(unifiedWorkflowPath, "utf8");
+    const classifierDefinitions = workflowText.match(
+      /^\s{4}classify_openai_surface:\s*$/gm,
+    );
+
+    expect(Array.isArray(classifierDefinitions)).toBe(true);
+    expect(classifierDefinitions?.length).toBe(1);
+    expect(workflowText).toContain("name: codex-rotate-account-flow-unified");
+  });
+
+  test("unified candidate swaps hot email and submit steps to smaller Playwright-first helpers", () => {
+    const workflowText = readFileSync(unifiedWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("fill_openai_email_field:");
+    expect(workflowText).toContain("call: afn.driver.browser.type");
+    expect(workflowText).toContain("submit_openai_current_form_compact:");
+
+    for (const stepId of [
+      "submit_signup_email",
+      "submit_signup_password",
+      "submit_signup_about_you",
+      "submit_login_email",
+      "submit_login_password",
+      "submit_login_about_you",
+      "submit_login_about_you_retry",
+    ]) {
+      const marker = `- ${stepId}:`;
+      const start = workflowText.indexOf(marker);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const next = workflowText.indexOf("\n  - ", start + marker.length);
+      const section = workflowText.slice(start, next === -1 ? undefined : next);
+      expect(section).toContain(
+        "templateRef: submit_openai_current_form_compact",
+      );
+    }
+  });
+
+  test("unified candidate keeps bounded final add-phone retries with clean auth resets", () => {
+    const workflowText = readFileSync(unifiedWorkflowPath, "utf8");
+
+    expect(workflowText).toContain("wait_before_consent_add_phone_retry_1");
+    expect(workflowText).toContain("wait_before_consent_add_phone_retry_2");
+    expect(workflowText).toContain("reopen_auth_url_before_consent_retry_1");
+    expect(workflowText).toContain("reopen_auth_url_before_consent_retry_2");
+    expect(workflowText).toContain("https://auth.openai.com");
+    expect(workflowText).toContain("https://chatgpt.com");
+    expect(workflowText).toContain("https://chat.openai.com");
+  });
+
   test("original retries the same account when bounded final add-phone bounces back to login", async () => {
     const result = await runWorkflowRunScript(
       originalWorkflowPath,
@@ -4653,6 +4730,67 @@ describe("stepwise workflow verification helper", () => {
     expect(result.retry_reason).toBeNull();
   });
 
+  test("stepwise converts reset-password username_not_found into a fresh signup-recovery retry when enabled", async () => {
+    const result = await runWorkflowRunScript(
+      stepwiseWorkflowPath,
+      "finalize_flow_summary",
+      {
+        email: "dev3astronlab+6@gmail.com",
+        prefer_signup_recovery: true,
+      },
+      {
+        steps: {
+          complete_login_or_consent: {
+            action: {
+              current_url: "https://auth.openai.com/reset-password",
+              headline: "Oops, an error occurred!",
+              reset_password_prompt: true,
+              retryable_timeout: true,
+              username_not_found: true,
+              stage: "retryable_timeout",
+            },
+          },
+        },
+      },
+    );
+
+    expect(result.next_action).toBe("retry_attempt");
+    expect(result.retry_reason).toBe("username_not_found");
+    expect(result.replay_reason).toBeNull();
+    expect(String(result.error_message || "")).toContain("username_not_found");
+  });
+
+  test("stepwise generated signup password fill enables the create-account submit control", async () => {
+    const result = await runWorkflowFunctionScriptOnContent(
+      stepwiseWorkflowPath,
+      "fill_generated_openai_password_field",
+      `
+        <html>
+          <body style="min-height: 100vh;">
+            <h1>Create account</h1>
+            <input id="password" name="new-password" type="password" autocomplete="new-password" />
+            <button id="submit" type="submit" disabled>Continue</button>
+            <script>
+              const password = document.getElementById("password");
+              const submit = document.getElementById("submit");
+              password.addEventListener("input", () => {
+                submit.disabled = password.value.trim().length === 0;
+              });
+            </script>
+          </body>
+        </html>
+      `,
+      {
+        password: "AstronlabPass123!",
+      },
+      "https://auth.openai.com/create-account/password",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.value_length).toBeGreaterThan(0);
+    expect(result.submit_disabled).toBe(false);
+  });
+
   test("non-device flows retry the replayed about-you form in-place before falling back to full auth replay", async () => {
     for (const workflowPath of [
       originalWorkflowPath,
@@ -4669,6 +4807,31 @@ describe("stepwise workflow verification helper", () => {
         "classify_after_login_about_you_timeout_retry",
       );
     }
+  });
+
+  test("stepwise only submits replayed about-you after a non-skipped fill", async () => {
+    const workflow = await loadWorkflow(stepwiseWorkflowPath);
+    const submitLoginAboutYou = workflow.do?.find(
+      (entry) => "submit_login_about_you" in entry,
+    )?.submit_login_about_you as
+      | {
+          if?: string;
+        }
+      | undefined;
+    const submitLoginAboutYouRetry = workflow.do?.find(
+      (entry) => "submit_login_about_you_retry" in entry,
+    )?.submit_login_about_you_retry as
+      | {
+          if?: string;
+        }
+      | undefined;
+
+    expect(submitLoginAboutYou?.if).toContain(
+      "state.steps.fill_login_about_you?.action?.skipped !== true",
+    );
+    expect(submitLoginAboutYouRetry?.if).toContain(
+      "state.steps.fill_login_about_you_retry?.action?.skipped !== true",
+    );
   });
 
   test("non-device flows never route replayed about-you recovery on create-account password pages", async () => {

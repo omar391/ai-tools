@@ -30,6 +30,7 @@ const OPENAI_ACCOUNT_SECRET_URIS = [
   "https://chatgpt.com",
 ];
 const OPENAI_ACCOUNT_SECRET_FIELD_PATH = "/password";
+const DEBUG_BRIDGE_ROOT = process.env.CODEX_ROTATE_DEBUG_BRIDGE_ROOT === "1";
 
 function getProcessCwdSafe(): string | null {
   try {
@@ -129,6 +130,12 @@ function ensureProcessWorkingDirectory(): void {
 }
 
 ensureProcessWorkingDirectory();
+
+if (DEBUG_BRIDGE_ROOT) {
+  process.stderr.write(
+    `[codex-rotate-ts] repoRoot=${REPO_ROOT} cwd=${process.cwd()} fastBrowserScript=${FAST_BROWSER_SCRIPT}\n`,
+  );
+}
 
 export function shouldPromptForCodexRotateSecretUnlock(): boolean {
   return (
@@ -433,6 +440,11 @@ async function runFastBrowserCliCommand(
   },
 ): Promise<FastBrowserCommandResult> {
   return await new Promise((resolve, reject) => {
+    if (DEBUG_BRIDGE_ROOT) {
+      process.stderr.write(
+        `[codex-rotate-ts] fast-browser spawn cwd=${REPO_ROOT} workspaceEnv=${REPO_ROOT} args=${JSON.stringify(args)}\n`,
+      );
+    }
     const child = spawn(NODE_BINARY, [FAST_BROWSER_SCRIPT, ...args], {
       cwd: REPO_ROOT,
       env: {
@@ -1387,6 +1399,7 @@ async function runCodexBrowserLoginWorkflow(
     codexSession?: CodexRotateAuthFlowSession | null;
     preferSignupRecovery?: boolean;
     preferPasswordLogin?: boolean;
+    password?: string;
     fullName?: string;
     birthMonth?: number;
     birthDay?: number;
@@ -1456,6 +1469,11 @@ async function runCodexBrowserLoginWorkflow(
               options.preferPasswordLogin === true ? "true" : "false",
           }
         : {}),
+      ...(options?.password
+        ? {
+            password: String(options.password),
+          }
+        : {}),
       birth_month: String(birthMonth),
       birth_day: String(birthDay),
       birth_year: String(birthYear),
@@ -1481,6 +1499,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
     workflowRunStamp?: string;
     preferSignupRecovery?: boolean;
     preferPasswordLogin?: boolean;
+    password?: string;
     fullName?: string;
     birthMonth?: number;
     birthDay?: number;
@@ -1514,6 +1533,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
         codexSession: options?.codexSession ?? null,
         preferSignupRecovery: options?.preferSignupRecovery === true,
         preferPasswordLogin: options?.preferPasswordLogin,
+        password: options?.password,
         fullName: options?.fullName,
         birthMonth: options?.birthMonth,
         birthDay: options?.birthDay,

@@ -114,7 +114,11 @@ pub enum InvokeAction {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientRequest {
     Subscribe,
-    Invoke { action: InvokeAction },
+    Invoke {
+        action: InvokeAction,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repo_root: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,8 +223,15 @@ pub fn subscribe() -> Result<SnapshotSubscription> {
 pub fn invoke(action: InvokeAction) -> Result<String> {
     #[cfg(unix)]
     {
+        let repo_root = resolve_paths()?.repo_root.to_string_lossy().into_owned();
         let mut stream = connect()?;
-        write_message(&mut stream, &ClientRequest::Invoke { action })?;
+        write_message(
+            &mut stream,
+            &ClientRequest::Invoke {
+                action,
+                repo_root: Some(repo_root),
+            },
+        )?;
         let mut reader = BufReader::new(stream);
         match read_message(&mut reader)? {
             ServerMessage::Result {

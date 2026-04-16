@@ -5,6 +5,7 @@ use codex_rotate_core::paths::resolve_paths as resolve_core_paths;
 
 #[derive(Clone, Debug)]
 pub struct RuntimePaths {
+    pub repo_root: PathBuf,
     pub codex_auth_file: PathBuf,
     pub codex_logs_db_file: PathBuf,
     pub codex_state_db_file: PathBuf,
@@ -17,6 +18,7 @@ pub struct RuntimePaths {
 pub fn resolve_paths() -> Result<RuntimePaths> {
     let core = resolve_core_paths()?;
     Ok(RuntimePaths {
+        repo_root: core.repo_root,
         codex_auth_file: core.codex_auth_file,
         codex_logs_db_file: core.codex_logs_db_file,
         codex_state_db_file: core.codex_state_db_file,

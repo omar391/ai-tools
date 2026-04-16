@@ -347,13 +347,74 @@ pub fn cleanup_legacy_rotate_home_artifacts(root_dir: &Path) -> Result<()> {
 }
 
 fn repo_root() -> Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    if let Some(root) = repo_root_from_current_exe() {
+        return Ok(root);
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        if let Some(root) = git_repo_root(&current_dir) {
+            return Ok(root);
+        }
+    }
+
+    let compiled_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("..")
         .join("..")
         .canonicalize()
-        .context("Failed to resolve repository root.")
+        .context("Failed to resolve repository root.")?;
+
+    if let Some(root) = git_repo_root(&compiled_root) {
+        return Ok(root);
+    }
+
+    Ok(compiled_root)
+}
+
+fn repo_root_from_current_exe() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    repo_root_from_binary_path(&current_exe)
+}
+
+fn repo_root_from_binary_path(binary_path: &Path) -> Option<PathBuf> {
+    let profile_dir = binary_path.parent()?;
+    let target_dir = profile_dir.parent()?;
+    let target_name = target_dir.file_name()?.to_str()?;
+    if !matches!(target_name, "target" | ".worktree-target") {
+        return None;
+    }
+    let candidate = target_dir.parent()?.canonicalize().ok()?;
+    is_valid_repo_root(&candidate).then_some(candidate)
+}
+
+fn is_valid_repo_root(candidate: &Path) -> bool {
+    candidate.join("Cargo.toml").is_file()
+        && candidate
+            .join("packages")
+            .join("codex-rotate")
+            .join("crates")
+            .join("codex-rotate-cli")
+            .join("Cargo.toml")
+            .is_file()
+}
+
+fn git_repo_root(start_dir: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(start_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    PathBuf::from(trimmed).canonicalize().ok()
 }
 
 fn resolve_node_binary() -> String {
@@ -479,6 +540,97 @@ mod tests {
                 .join("web")
                 .join("auth.openai.com")
                 .join("codex-rotate-account-flow-main.yaml")
+        );
+    }
+
+    #[test]
+    fn resolve_paths_prefers_current_git_toplevel_for_worktree_like_cwd() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo-root");
+        let nested_dir = repo_root.join("worktrees").join("branch-1");
+        fs::create_dir_all(repo_root.join("packages").join("codex-rotate"))
+            .expect("create asset root");
+        fs::create_dir_all(
+            repo_root
+                .join(".fast-browser")
+                .join("workflows")
+                .join("web")
+                .join("auth.openai.com"),
+        )
+        .expect("create workflow dir");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo_root)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed: {:?}", init);
+
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        unsafe {
+            std::env::remove_var("CODEX_ROTATE_REPO_ROOT");
+        }
+        std::env::set_current_dir(&nested_dir).expect("set nested cwd");
+
+        let resolved = resolve_paths().expect("resolve paths");
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
+        }
+
+        assert_eq!(
+            resolved.repo_root,
+            repo_root.canonicalize().expect("canonical repo root")
+        );
+        assert_eq!(
+            resolved.asset_root,
+            repo_root
+                .canonicalize()
+                .expect("canonical repo root")
+                .join("packages")
+                .join("codex-rotate")
+        );
+    }
+
+    #[test]
+    fn repo_root_from_binary_path_prefers_worktree_target_layout() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo-root");
+        let binary_path = repo_root
+            .join(".worktree-target")
+            .join("release")
+            .join("codex-rotate");
+        fs::create_dir_all(binary_path.parent().expect("binary parent"))
+            .expect("create binary dir");
+        fs::create_dir_all(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli"),
+        )
+        .expect("create cli crate dir");
+        fs::write(repo_root.join("Cargo.toml"), "").expect("write root cargo");
+        fs::write(
+            repo_root
+                .join("packages")
+                .join("codex-rotate")
+                .join("crates")
+                .join("codex-rotate-cli")
+                .join("Cargo.toml"),
+            "",
+        )
+        .expect("write cli cargo");
+        fs::write(&binary_path, "").expect("write binary");
+
+        assert_eq!(
+            super::repo_root_from_binary_path(&binary_path),
+            Some(repo_root.canonicalize().expect("canonical repo root"))
         );
     }
 

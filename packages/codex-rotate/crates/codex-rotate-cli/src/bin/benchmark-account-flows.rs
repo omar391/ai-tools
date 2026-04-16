@@ -640,7 +640,6 @@ fn build_benchmark_command(
             PathBuf::from("internal"),
             PathBuf::from("relogin"),
             PathBuf::from(relogin_selector.unwrap_or_default()),
-            PathBuf::from("--logout-first"),
         ],
     }
 }
@@ -1687,13 +1686,7 @@ fn iso_now() -> String {
 }
 
 fn repo_root() -> Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .context("resolve repo root")
+    Ok(resolve_paths()?.repo_root)
 }
 
 fn resolve_home_override(env_name: &str, default_suffix: &str) -> Result<PathBuf> {
