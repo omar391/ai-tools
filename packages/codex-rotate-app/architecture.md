@@ -59,11 +59,13 @@ flowchart LR
 | `~/.codex-rotate/watch-state.json` | CLI daemon runtime | Watch cursor, cooldown, cached quota assessment, thread-recovery state   |
 | `~/.codex-rotate/profile/`         | CLI daemon runtime | Dedicated managed Codex `--user-data-dir`                                |
 | `~/.codex-rotate/daemon.sock`      | CLI daemon runtime | Local IPC transport for CLI proxying and tray subscriptions              |
+| `<repo-root>/.codex-rotate/bin/`   | Rust core          | Worktree-local managed login wrappers and opener shims                   |
 
 Removed files:
 
 - `~/.codex-rotate/credentials.json`
 - `~/.codex-rotate/session.json`
+- `~/.codex-rotate/bin/`
 - `~/.codex-rotate-app/*`
 
 ## Hot Paths

@@ -8,6 +8,7 @@ pub struct CorePaths {
     pub repo_root: PathBuf,
     pub codex_home: PathBuf,
     pub rotate_home: PathBuf,
+    pub generated_bin_dir: PathBuf,
     pub codex_auth_file: PathBuf,
     pub codex_logs_db_file: PathBuf,
     pub codex_state_db_file: PathBuf,
@@ -27,7 +28,6 @@ pub struct CorePaths {
 const LEGACY_ROTATE_HOME_FILE_PATTERNS: &[&str] =
     &["codex-login-browser-capture-", "fast-browser-"];
 const LEGACY_ROTATE_HOME_DIR_PATTERNS: &[&str] = &["codex-login-browser-shim-"];
-const LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS: &[&str] = &["codex-login-managed-"];
 const DEFAULT_CODEX_LOGS_DB_FILE: &str = "logs_1.sqlite";
 const DEFAULT_CODEX_STATE_DB_FILE: &str = "state_5.sqlite";
 
@@ -67,6 +67,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
     Ok(CorePaths {
         codex_home: codex_home.clone(),
         rotate_home: rotate_home.clone(),
+        generated_bin_dir: repo_root.join(".codex-rotate").join("bin"),
         codex_auth_file: codex_home.join("auth.json"),
         codex_logs_db_file: resolve_codex_logs_db_file(&codex_home),
         codex_state_db_file: resolve_codex_state_db_file(&codex_home),
@@ -299,47 +300,13 @@ pub fn cleanup_legacy_rotate_home_artifacts(root_dir: &Path) -> Result<()> {
             continue;
         }
 
-        if !file_type.is_dir() || entry_name.as_ref() != "bin" {
-            continue;
-        }
-
-        for bin_entry in fs::read_dir(&entry_path)
-            .with_context(|| format!("Failed to read rotate-home bin {}.", entry_path.display()))?
-        {
-            let bin_entry = bin_entry.with_context(|| {
+        if file_type.is_dir() && entry_name.as_ref() == "bin" {
+            fs::remove_dir_all(&entry_path).with_context(|| {
                 format!(
-                    "Failed to iterate rotate-home bin {}.",
+                    "Failed to remove obsolete rotate-home bin directory {}.",
                     entry_path.display()
                 )
             })?;
-            let bin_entry_path = bin_entry.path();
-            let bin_type = bin_entry.file_type().with_context(|| {
-                format!(
-                    "Failed to inspect rotate-home bin entry {}.",
-                    bin_entry_path.display()
-                )
-            })?;
-            if !bin_type.is_file() {
-                continue;
-            }
-            let bin_name = bin_entry.file_name();
-            let bin_name = bin_name.to_string_lossy();
-            let should_remove = LEGACY_ROTATE_HOME_BIN_FILE_PATTERNS
-                .iter()
-                .any(|prefix| bin_name.starts_with(prefix))
-                || (bin_name.starts_with("codex-login-")
-                    && bin_name.len() > "codex-login-".len()
-                    && fs::read_to_string(&bin_entry_path)
-                        .map(|contents| !contents.contains("internal managed-login"))
-                        .unwrap_or(false));
-            if should_remove {
-                fs::remove_file(&bin_entry_path).with_context(|| {
-                    format!(
-                        "Failed to remove legacy rotate-home bin entry {}.",
-                        bin_entry_path.display()
-                    )
-                })?;
-            }
         }
     }
 
@@ -533,6 +500,10 @@ mod tests {
             repo_root.join("packages").join("codex-rotate")
         );
         assert_eq!(
+            resolved.generated_bin_dir,
+            repo_root.join(".codex-rotate").join("bin")
+        );
+        assert_eq!(
             resolved.account_flow_file,
             repo_root
                 .join(".fast-browser")
@@ -594,6 +565,14 @@ mod tests {
                 .expect("canonical repo root")
                 .join("packages")
                 .join("codex-rotate")
+        );
+        assert_eq!(
+            resolved.generated_bin_dir,
+            repo_root
+                .canonicalize()
+                .expect("canonical repo root")
+                .join(".codex-rotate")
+                .join("bin")
         );
     }
 
@@ -733,12 +712,10 @@ mod tests {
         cleanup_legacy_rotate_home_artifacts(root).expect("cleanup legacy artifacts");
 
         assert!(root.join("accounts.json").exists());
-        assert!(bin_dir.join("codex-login-dev-1-123456789abc").exists());
+        assert!(!bin_dir.exists());
         assert!(!root.join("codex-login-browser-capture-1.js").exists());
         assert!(!root.join("fast-browser-1.json").exists());
         assert!(!root.join("codex-login-browser-shim-123").exists());
-        assert!(!bin_dir.join("codex-login-managed-dev-1-deadbeef").exists());
-        assert!(!bin_dir.join("codex-login-dev-1-deadbeefcafe").exists());
     }
 
     #[test]

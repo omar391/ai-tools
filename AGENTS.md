@@ -15,6 +15,7 @@ This file has two managed sections:
 - Keep mutable task work in the task worktree rather than in the primary checkout.
 - After landing and verifying a task, delete any temporary repo-local worktrees and branches created during the current conversation whose contents are already represented on `main`.
 - Use an isolated `bin/`, virtual environment, or equivalent tool environment per active worktree when the repository depends on local tooling.
+- Keep those per-worktree tool artifacts rooted inside the worktree or repo-local task directory, for example `<repo-root>/bin/`, `<repo-root>/.venv/`, or `<repo-root>/.codex-rotate/bin/`, rather than in shared home-level directories.
 - Do not run mutable tooling from a live shared environment when a repo-local isolated environment is expected.
 - Validate relevant tests, builds, and checks before landing completed changes.
 - Keep repo-specific constraints in the `rules:local` block instead of editing the shared baseline.

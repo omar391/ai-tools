@@ -21,7 +21,7 @@ pub fn ensure_managed_browser_wrapper(profile_name: &str, codex_bin: &str) -> Re
     let rotate_cli_bin = resolve_rotate_cli_binary_path()?;
     ensure_existing_file(&rotate_cli_bin, "codex-rotate CLI binary not found")?;
 
-    let bin_dir = paths.rotate_home.join("bin");
+    let bin_dir = paths.generated_bin_dir.clone();
     fs::create_dir_all(&bin_dir).with_context(|| {
         format!(
             "Failed to create Codex Rotate bin directory at {}.",
@@ -31,12 +31,8 @@ pub fn ensure_managed_browser_wrapper(profile_name: &str, codex_bin: &str) -> Re
     let shim_dir = bin_dir.join("codex-login-shims");
     ensure_managed_browser_shims(&shim_dir, &paths.node_bin, &opener_path)?;
 
-    let wrapper_path = build_managed_browser_wrapper_path(
-        &paths.rotate_home,
-        profile_name,
-        codex_bin,
-        &opener_path,
-    );
+    let wrapper_path =
+        build_managed_browser_wrapper_path(&bin_dir, profile_name, codex_bin, &opener_path);
     let content = render_managed_browser_wrapper(
         codex_bin,
         profile_name,
@@ -79,7 +75,7 @@ fn ensure_existing_file(path: &Path, prefix: &str) -> Result<()> {
 }
 
 fn build_managed_browser_wrapper_path(
-    rotate_home: &Path,
+    bin_dir: &Path,
     profile_name: &str,
     codex_bin: &str,
     opener_path: &Path,
@@ -91,9 +87,7 @@ fn build_managed_browser_wrapper_path(
     opener_path.to_string_lossy().hash(&mut hasher);
     "rust-managed-login".hash(&mut hasher);
     let hash = format!("{:016x}", hasher.finish());
-    rotate_home
-        .join("bin")
-        .join(format!("codex-login-{profile_token}-{}", &hash[..12]))
+    bin_dir.join(format!("codex-login-{profile_token}-{}", &hash[..12]))
 }
 
 fn normalize_profile_token(profile_name: &str) -> String {
@@ -216,21 +210,21 @@ mod tests {
 
     #[test]
     fn wrapper_path_is_stable_for_same_profile_and_codex_binary() {
-        let rotate_home = PathBuf::from("/tmp/codex-rotate-home");
+        let bin_dir = PathBuf::from("/tmp/repo/.codex-rotate/bin");
         let opener_path = PathBuf::from("/tmp/opener.ts");
         assert_eq!(
-            build_managed_browser_wrapper_path(&rotate_home, "dev-1", "codex", &opener_path),
-            build_managed_browser_wrapper_path(&rotate_home, "dev-1", "codex", &opener_path)
+            build_managed_browser_wrapper_path(&bin_dir, "dev-1", "codex", &opener_path),
+            build_managed_browser_wrapper_path(&bin_dir, "dev-1", "codex", &opener_path)
         );
     }
 
     #[test]
     fn wrapper_path_changes_when_profile_changes() {
-        let rotate_home = PathBuf::from("/tmp/codex-rotate-home");
+        let bin_dir = PathBuf::from("/tmp/repo/.codex-rotate/bin");
         let opener_path = PathBuf::from("/tmp/opener.ts");
         assert_ne!(
-            build_managed_browser_wrapper_path(&rotate_home, "dev-1", "codex", &opener_path),
-            build_managed_browser_wrapper_path(&rotate_home, "dev-2", "codex", &opener_path)
+            build_managed_browser_wrapper_path(&bin_dir, "dev-1", "codex", &opener_path),
+            build_managed_browser_wrapper_path(&bin_dir, "dev-2", "codex", &opener_path)
         );
     }
 
@@ -238,11 +232,19 @@ mod tests {
     fn wrapper_intercepts_login_through_internal_managed_login_entrypoint() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = tempfile::tempdir().expect("tempdir");
+        let repo_root = fixture.path().join("repo-root");
         let rotate_home = fixture.path().join("rotate-home");
+        let asset_root = fixture.path().join("assets");
         let cli_log_path = fixture.path().join("cli-log.json");
         let cli_path = fixture.path().join("fake-codex-rotate.mjs");
         let codex_marker_path = fixture.path().join("codex-invoked.txt");
         let codex_path = fixture.path().join("fake-codex.sh");
+        let opener_path = asset_root.join("codex-login-managed-browser-opener.ts");
+
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&asset_root).expect("create asset root");
+        fs::write(&opener_path, "#!/usr/bin/env node\nprocess.exit(0)\n").expect("write opener");
+        make_executable(&opener_path).expect("chmod opener");
 
         fs::write(
             &codex_path,
@@ -266,10 +268,14 @@ mod tests {
         make_executable(&cli_path).expect("chmod fake cli");
 
         let previous_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        let previous_asset_root = std::env::var_os("CODEX_ROTATE_ASSET_ROOT");
         let previous_cli = std::env::var_os("CODEX_ROTATE_CLI_BIN");
 
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", &repo_root);
+            std::env::set_var("CODEX_ROTATE_ASSET_ROOT", &asset_root);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", &cli_path);
         }
 
@@ -285,12 +291,24 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
         }
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
+        }
+        match previous_asset_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_ASSET_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_ASSET_ROOT") },
+        }
         match previous_cli {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_CLI_BIN", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_CLI_BIN") },
         }
 
         assert!(status.success());
+        assert_eq!(
+            wrapper_path.parent().expect("wrapper parent"),
+            repo_root.join(".codex-rotate").join("bin")
+        );
         let logged: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cli_log_path).expect("read cli log"))
                 .expect("parse cli log");
@@ -311,6 +329,7 @@ mod tests {
     fn wrapper_routes_open_based_launches_through_managed_browser_opener() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = tempfile::tempdir().expect("tempdir");
+        let repo_root = fixture.path().join("repo-root");
         let rotate_home = fixture.path().join("rotate-home");
         let asset_root = fixture.path().join("assets");
         let opener_log_path = fixture.path().join("opener-log.json");
@@ -318,6 +337,7 @@ mod tests {
         let cli_path = fixture.path().join("fake-codex-rotate.sh");
         let codex_path = fixture.path().join("fake-codex.sh");
 
+        fs::create_dir_all(&repo_root).expect("create repo root");
         fs::create_dir_all(&asset_root).expect("create asset root");
         fs::write(
             &opener_path,
@@ -340,11 +360,13 @@ mod tests {
         make_executable(&codex_path).expect("chmod fake codex");
 
         let previous_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
         let previous_asset_root = std::env::var_os("CODEX_ROTATE_ASSET_ROOT");
         let previous_cli = std::env::var_os("CODEX_ROTATE_CLI_BIN");
 
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", &repo_root);
             std::env::set_var("CODEX_ROTATE_ASSET_ROOT", &asset_root);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", &cli_path);
         }
@@ -360,6 +382,10 @@ mod tests {
         match previous_home {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
             None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
         }
         match previous_asset_root {
             Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_ASSET_ROOT", value) },

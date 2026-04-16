@@ -23,7 +23,7 @@ codex-rotate daemon run         # Start the background daemon used by the tray s
 
 `add` defaults the pool key to `{email}_{plan-type}`. Old manual labels are preserved as optional aliases, and `relogin` / `remove` accept either the composite key, the alias, the full account id, the short account id shown in `list`, or the email when it is unique in the pool.
 
-`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. Account inventory and credential metadata now live in `~/.codex-rotate/accounts.json`; the daemon-owned runtime state is `~/.codex-rotate/watch-state.json`, `~/.codex-rotate/profile/`, and `~/.codex-rotate/daemon.sock`.
+`create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. Account inventory and credential metadata now live in `~/.codex-rotate/accounts.json`; the daemon-owned runtime state is `~/.codex-rotate/watch-state.json`, `~/.codex-rotate/profile/`, and `~/.codex-rotate/daemon.sock`. Managed login wrapper scripts are generated per checkout under `<repo-root>/.codex-rotate/bin/` instead of `~/.codex-rotate/bin/`.
 
 The tray is only a UI shell over the daemon. The CLI owns the watch loop, managed Codex launch, live account sync, and create/relogin orchestration.
 
