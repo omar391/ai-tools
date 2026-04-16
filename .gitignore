@@ -46,3 +46,4 @@ packages/codex-rotate/benchmarks/results/
 !.trunk/configs/**
 .worktree-target/
 worktrees/
+.codex-rotate/
