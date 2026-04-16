@@ -1,9 +1,10 @@
+# trunk-ignore-all(yamllint/quoted-strings)
 document:
   dsl: 1.0.0
   namespace: web-auth-openai-com
   name: codex-rotate-account-flow-main
   version: 1.1.0
-  summary: "Single active codex-rotate OpenAI auth flow pinned to the hardened unified control path."
+  summary: "Single active codex-rotate OpenAI auth flow pinned to the hardened stepwise control path."
   metadata:
     preferredProfile: dev-1
     primaryTarget: primary
@@ -60,15 +61,17 @@ input:
       required:
         - email
 do:
-  - run_active_unified_flow:
+  - run_active_stepwise_flow:
       metadata:
-        description: "Run the single active unified OpenAI auth flow."
-      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-unified
+        description: "Run the single active stepwise OpenAI auth flow."
+        ref:
+          digest: sha256:247cc74bd6faf96d4a1afff43a7d4ad3d7cc08ae8113b612f55791281e0272cf
+      call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise
       with:
         version: 1.1.0
         input:
           enabled: "${inputs.enabled}"
-          mode: "codex_login"
+          mode: codex_login
           codex_bin: "${inputs.codex_bin}"
           auth_url: "${inputs.auth_url}"
           callback_url: "${inputs.callback_url}"
@@ -93,24 +96,10 @@ do:
           prefer_signup_recovery: "${inputs.prefer_signup_recovery}"
   - finalize_selected_flow:
       metadata:
-        description: "Return the single active unified flow outcome."
+        description: "Return the single active stepwise flow outcome."
       run:
         script:
           language: javascript
-          code: |
-            const selected =
-              state.steps.run_active_unified_flow?.action?.result?.output || {};
-
-            return {
-              ...(selected && typeof selected === "object" ? selected : {}),
-              selected_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
-              primary_flow:
-                "workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
-              fallback_flow: null,
-              fallback_attempted: false,
-              fallback_selected: false,
-              selection_strategy: "single-unified-flow",
-            };
+          code: "const selected =\n  state.steps.run_active_stepwise_flow?.action?.result?.output || {};\n\nreturn {\n  ...(selected && typeof selected === \"object\" ? selected : {}),\n  selected_flow:\n    \"workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise\",\n  primary_flow:\n    \"workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise\",\n  fallback_flow: null,\n  fallback_attempted: false,\n  fallback_selected: false,\n  selection_strategy: \"single-stepwise-flow\",\n};\n"
 output:
   as: "${state.steps.finalize_selected_flow?.action?.value || {}}"

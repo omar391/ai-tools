@@ -1354,7 +1354,7 @@ describe("active auth workflows", () => {
     expect(runtimeSources).not.toContain('"secrets clear"');
   });
 
-  test("main now delegates only to the single active unified flow", async () => {
+  test("main now delegates only to the single active stepwise flow", async () => {
     const workflow = await loadWorkflow(
       join(
         repoRoot,
@@ -1377,7 +1377,7 @@ describe("active auth workflows", () => {
 
     expect(calls).toEqual([
       {
-        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-unified",
+        call: "workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
         version: "1.1.0",
       },
     ]);
@@ -1401,7 +1401,7 @@ describe("active auth workflows", () => {
     expect(properties.account_login_locator).toBeDefined();
   });
 
-  test("main keeps only the unified single-flow selection contract", () => {
+  test("main keeps only the stepwise single-flow selection contract", () => {
     const workflowText = readFileSync(
       join(
         repoRoot,
@@ -1414,18 +1414,50 @@ describe("active auth workflows", () => {
       "utf8",
     );
 
-    expect(workflowText).toContain("run_active_unified_flow");
+    expect(workflowText).toContain("run_active_stepwise_flow");
     expect(workflowText).toContain(
-      '"workspace.web.auth-openai-com.codex-rotate-account-flow-unified"',
+      "workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise",
     );
     expect(workflowText).toContain("fallback_flow: null");
     expect(workflowText).toContain("fallback_attempted: false");
-    expect(workflowText).toContain('selection_strategy: "single-unified-flow"');
+    expect(workflowText).toContain(
+      'selection_strategy: \\"single-stepwise-flow\\"',
+    );
     expect(workflowText).not.toContain("run_device_auth_fallback");
     expect(workflowText).not.toContain("codex-rotate-account-flow-device-auth");
   });
 
-  test("main forwards password-first relogin inputs into the unified wrapper", () => {
+  test("stepwise and unified begin by delegating to the shared Cloudflare WARP workflow", async () => {
+    for (const workflowPath of [stepwiseWorkflowPath, unifiedWorkflowPath]) {
+      const workflow = await loadWorkflow(workflowPath);
+      const firstStepEntry = workflow.do?.[0] as
+        | Record<
+            string,
+            {
+              call?: string;
+              with?: {
+                version?: string;
+                input?: {
+                  enabled?: string;
+                };
+              };
+            }
+          >
+        | undefined;
+
+      const [stepId, step] = firstStepEntry
+        ? Object.entries(firstStepEntry)[0]
+        : [];
+      expect(stepId).toBe("ensure_cloudflare_warp_vpn");
+      expect(step?.call).toBe(
+        "workflow.sys.macos.com-cloudflare-1dot1dot1dot1-macos.use-cloudflare-warp-vpn",
+      );
+      expect(step?.with?.version).toBe("1.0.0");
+      expect(step?.with?.input?.enabled).toBe("${inputs.enabled ?? true}");
+    }
+  });
+
+  test("main forwards password-first relogin inputs into the stepwise wrapper", () => {
     const workflowText = readFileSync(
       join(
         repoRoot,
