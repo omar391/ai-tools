@@ -11,7 +11,7 @@ This file has two managed sections:
 # Shared Rules
 
 - Start each new task from the repository's primary branch.
-- Prefer a dedicated, repo-local task worktree under `<repo-root>/worktrees/<name>/` when the repository uses worktree-based task isolation.
+- Unless already inside an appropriate task worktree, any task that will perform file edits must first create a dedicated repo-local task worktree under `<repo-root>/worktrees/<name>/` from the repository's primary branch when the repository uses worktree-based task isolation.
 - Keep mutable task work in the task worktree rather than in the primary checkout.
 - After landing and verifying a task, delete any temporary repo-local worktrees and branches created during the current conversation whose contents are already represented on `main`.
 - Use an isolated `bin/`, virtual environment, or equivalent tool environment per active worktree when the repository depends on local tooling.
