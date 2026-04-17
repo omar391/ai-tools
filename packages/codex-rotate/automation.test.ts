@@ -691,6 +691,20 @@ describe("optional secret locator fallback", () => {
       ),
     ).toBe(false);
   });
+
+  test("optional secret resolution swallows secret-session preflight failures", () => {
+    const automationText = readFileSync(
+      join(repoRoot, "packages", "codex-rotate", "automation.ts"),
+      "utf8",
+    );
+
+    expect(automationText).toMatch(
+      /async function resolveOptionalCodexRotateSecretLocator[\s\S]*?try \{\s*await ensureFastBrowserSecretSession\(/,
+    );
+    expect(automationText).toMatch(
+      /async function resolveOptionalCodexRotateSecretRef[\s\S]*?try \{\s*await ensureFastBrowserSecretSession\(/,
+    );
+  });
 });
 
 describe("codex login managed-browser wrapper", () => {

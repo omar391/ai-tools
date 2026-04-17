@@ -276,7 +276,7 @@ do:
       metadata:
         description: "Enable or disable Cloudflare WARP before the OpenAI auth workflow starts."
         ref:
-          digest: "sha256:e648cedddb7cc6891f373254dc1925916e5a1fd0bb589b6c613c64efefdf0a6a"
+          digest: "sha256:4ecb1d1304204591f6dafe88b6821892c4e17a26058157530ee53e2decca7adf"
       call: workflow.sys.macos.com-cloudflare-1dot1dot1dot1-macos.use-cloudflare-warp-vpn
       with:
         version: 1.0.0

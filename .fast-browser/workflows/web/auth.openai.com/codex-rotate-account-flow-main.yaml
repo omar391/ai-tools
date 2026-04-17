@@ -65,7 +65,7 @@ do:
       metadata:
         description: "Run the single active stepwise OpenAI auth flow."
         ref:
-          digest: "sha256:247cc74bd6faf96d4a1afff43a7d4ad3d7cc08ae8113b612f55791281e0272cf"
+          digest: "sha256:5c03763d1f97b731c212c079369b3b59276598ff76f30e69ca697398607e8b56"
       call: workflow.workspace.web.auth-openai-com.codex-rotate-account-flow-stepwise
       with:
         version: 1.1.0

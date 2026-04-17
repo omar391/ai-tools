@@ -627,12 +627,12 @@ async function resolveOptionalCodexRotateSecretLocator(
   if (!locator) {
     return null;
   }
-  await ensureFastBrowserSecretSession(
-    profileName,
-    locator.store ?? "bitwarden-cli",
-    shouldPromptForCodexRotateSecretUnlock(),
-  );
   try {
+    await ensureFastBrowserSecretSession(
+      profileName,
+      locator.store ?? "bitwarden-cli",
+      shouldPromptForCodexRotateSecretUnlock(),
+    );
     const response = await runFastBrowserCliJsonRequest<
       Record<string, unknown>
     >(
@@ -671,12 +671,12 @@ async function resolveOptionalCodexRotateSecretRef(
   if (!locator) {
     return null;
   }
-  await ensureFastBrowserSecretSession(
-    profileName,
-    locator.store ?? "bitwarden-cli",
-    shouldPromptForCodexRotateSecretUnlock(),
-  );
   try {
+    await ensureFastBrowserSecretSession(
+      profileName,
+      locator.store ?? "bitwarden-cli",
+      shouldPromptForCodexRotateSecretUnlock(),
+    );
     const selector = buildFastBrowserSecretRefResolveSelector(locator);
     const response = await runFastBrowserCliJsonRequest<
       Record<string, unknown>

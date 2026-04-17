@@ -1013,16 +1013,30 @@ pub fn cmd_relogin_with_progress(
             format!("Preparing password for {}.", expected_email),
         );
         let generated_password = generate_password(18);
-        let _: CodexRotateSecretRef = run_automation_bridge(
+        match run_automation_bridge::<_, CodexRotateSecretRef>(
             "prepare-account-secret-ref",
             BridgeEnsureSecretPayload {
                 profile_name,
                 email: &expected_email,
                 password: generated_password.as_str(),
             },
-        )?;
-        prepared_account_login_locator = Some(build_openai_account_login_locator(&expected_email));
-        prepared_skip_locator_preflight = true;
+        ) {
+            Ok(_) => {
+                prepared_account_login_locator =
+                    Some(build_openai_account_login_locator(&expected_email));
+                prepared_skip_locator_preflight = true;
+            }
+            Err(error) if is_optional_account_secret_prepare_error(&error) => {
+                report_progress(
+                    progress.as_ref(),
+                    format!(
+                        "{YELLOW}WARN{RESET} Bitwarden is unavailable for {}. Continuing with the generated recovery password without storing a vault secret.",
+                        expected_email
+                    ),
+                );
+            }
+            Err(error) => return Err(error),
+        }
         prepared_password = Some(generated_password);
     }
 
@@ -1777,7 +1791,7 @@ fn execute_create_flow_attempt(
         }
         return Ok(result);
     }
-    let account_login_locator = build_openai_account_login_locator(&created_email);
+    let mut account_login_locator = Some(build_openai_account_login_locator(&created_email));
     let mut skip_locator_preflight = false;
     let mut generated_password: Option<String> = None;
     if !reusing_pending {
@@ -1786,16 +1800,29 @@ fn execute_create_flow_attempt(
             format!("Preparing password for {}.", created_email),
         );
         let password = generate_password(18);
-        let _: CodexRotateSecretRef = run_automation_bridge(
+        match run_automation_bridge::<_, CodexRotateSecretRef>(
             "prepare-account-secret-ref",
             BridgeEnsureSecretPayload {
                 profile_name: &profile_name,
                 email: &created_email,
                 password: password.as_str(),
             },
-        )
-        .map_err(CreateFlowAttemptFailure::Fatal)?;
-        skip_locator_preflight = true;
+        ) {
+            Ok(_) => {
+                skip_locator_preflight = true;
+            }
+            Err(error) if is_optional_account_secret_prepare_error(&error) => {
+                report_progress(
+                    progress.as_ref(),
+                    format!(
+                        "{YELLOW}WARN{RESET} Bitwarden is unavailable for {}. Continuing with the generated signup password without storing a vault secret.",
+                        created_email
+                    ),
+                );
+                account_login_locator = None;
+            }
+            Err(error) => return Err(CreateFlowAttemptFailure::Fatal(error)),
+        }
         generated_password = Some(password);
     }
     let pending = PendingCredential {
@@ -1833,7 +1860,7 @@ fn execute_create_flow_attempt(
     let login_result = run_complete_codex_login(CompleteCodexLoginArgs {
         profile_name: &profile_name,
         email: &created_email,
-        account_login_locator: Some(&account_login_locator),
+        account_login_locator: account_login_locator.as_ref(),
         workflow_ref: workflow_metadata.workflow_ref.as_deref(),
         codex_bin: Some(codex_bin().as_str()),
         workflow_run_stamp: Some(started_at.as_str()),
@@ -2310,6 +2337,12 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
             progress.as_ref(),
             format!(
                 "Using a freshly generated OpenAI password for {email}; attempting password login first."
+            ),
+        ),
+        None if password.is_some() => report_progress(
+            progress.as_ref(),
+            format!(
+                "Bitwarden is unavailable for {email}; continuing with the generated OpenAI password without a stored vault secret."
             ),
         ),
         Some(_) => report_progress(
@@ -3244,6 +3277,16 @@ fn is_missing_account_login_ref_error(error: &anyhow::Error) -> bool {
     error
         .to_string()
         .contains("Workflow input 'account_login_ref' must be a secret ref")
+}
+
+fn is_optional_account_secret_prepare_error(error: &anyhow::Error) -> bool {
+    let normalized = error.to_string().trim().to_lowercase();
+    !normalized.is_empty()
+        && (normalized.contains("bitwarden cli is locked")
+            || normalized.contains("bitwarden cli is not logged in")
+            || normalized.contains("bitwarden cli is not ready")
+            || normalized.contains("timed out while trying to read bitwarden cli status")
+            || normalized.contains("failed to read secret-store status"))
 }
 
 fn is_final_add_phone_environment_blocker_error(error: &anyhow::Error) -> bool {
@@ -7348,10 +7391,27 @@ end
         let error = anyhow!("Codex browser login did not reach the callback.");
         assert!(!is_workflow_skip_account_error(&error));
         assert!(!is_missing_account_login_ref_error(&error));
+        assert!(!is_optional_account_secret_prepare_error(&error));
         assert!(!should_retry_create_after_error(
             &CreateCommandOptions::default(),
             &error
         ));
+    }
+
+    #[test]
+    fn optional_account_secret_prepare_errors_match_bitwarden_unavailability() {
+        assert!(is_optional_account_secret_prepare_error(&anyhow!(
+            "Bitwarden CLI is locked. Re-run this command interactively."
+        )));
+        assert!(is_optional_account_secret_prepare_error(&anyhow!(
+            "Bitwarden CLI timed out while trying to read Bitwarden CLI status."
+        )));
+        assert!(is_optional_account_secret_prepare_error(&anyhow!(
+            "Fast-browser secret broker failed to read secret-store status."
+        )));
+        assert!(!is_optional_account_secret_prepare_error(&anyhow!(
+            "Bitwarden item already exists with a different password."
+        )));
     }
 
     #[test]
