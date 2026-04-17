@@ -353,6 +353,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
     let account_changed = current_summary.account_id != previous_account_id;
+    let should_record_rotation_metadata = should_record_rotation_metadata(rotated, account_changed);
     let current_account_previous_state = if account_changed {
         previous_state.account_state(&current_summary.account_id)
     } else {
@@ -381,17 +382,17 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let now = now_iso();
 
     let mut next_state = previous_state.clone();
-    next_state.last_rotation_at = if rotated {
+    next_state.last_rotation_at = if should_record_rotation_metadata {
         Some(now.clone())
     } else {
         previous_state.last_rotation_at.clone()
     };
-    next_state.last_rotation_reason = if rotated {
+    next_state.last_rotation_reason = if should_record_rotation_metadata {
         decision.reason.clone()
     } else {
         previous_state.last_rotation_reason.clone()
     };
-    next_state.last_rotated_email = if rotated {
+    next_state.last_rotated_email = if should_record_rotation_metadata {
         rotation.as_ref().map(|summary| summary.email.clone())
     } else {
         previous_state.last_rotated_email.clone()
@@ -916,6 +917,10 @@ fn should_run_thread_recovery(
         || recoverable_turn_failure_log_advanced
 }
 
+fn should_record_rotation_metadata(rotated: bool, account_changed: bool) -> bool {
+    rotated && account_changed
+}
+
 fn write_watch_state_if_needed(previous: &WatchState, next: &WatchState) -> Result<()> {
     if should_persist_watch_state(previous, next) {
         write_watch_state(next)?;
@@ -1296,6 +1301,13 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn rotation_metadata_requires_an_actual_account_change() {
+        assert!(!should_record_rotation_metadata(true, false));
+        assert!(!should_record_rotation_metadata(false, true));
+        assert!(should_record_rotation_metadata(true, true));
     }
 
     #[test]
