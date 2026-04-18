@@ -36,6 +36,45 @@ cargo build --package codex-rotate-cli
 node /path/to/ai-tools/packages/codex-rotate/index.ts help
 ```
 
+## Proxy Rnd
+
+The proxy audit script and architecture notes now live under
+`packages/codex-rotate/crates/codex-rotate-core/proxy-rnd/`.
+
+Use [`packages/codex-rotate/crates/codex-rotate-core/proxy-rnd/codex_proxy_audit.py`](packages/codex-rotate/crates/codex-rotate-core/proxy-rnd/codex_proxy_audit.py) to audit three things in one run:
+
+- whether public echo services see metadata added by your proxy
+- whether a Codex CLI command keeps all network traffic pinned to the proxy
+- whether Codex Desktop and its helper processes keep all network traffic pinned to the proxy
+
+Recommended invocation:
+
+```sh
+python3 packages/codex-rotate/crates/codex-rotate-core/proxy-rnd/codex_proxy_audit.py \
+  --proxy-url 'socks5h://127.0.0.1:1080' \
+  --cli-command 'codex exec "Reply exactly: proxy-audit-ok"'
+```
+
+Useful flags:
+
+- `--skip-app`: only run the metadata and CLI checks
+- `--skip-cli`: only run the metadata and desktop-app checks
+- `--no-direct-baseline`: skip non-proxied baseline calls to public echo services
+- `--leave-app-open`: keep the launched Codex app instance running after the audit
+- `--output-json /path/to/report.json`: choose where the JSON report is written
+
+What the script flags:
+
+- public services seeing headers such as `Via`, `X-Forwarded-For`, `Forwarded`, or `X-Real-IP`
+- Codex CLI or Codex Desktop processes making direct remote TCP/UDP connections instead of connecting only to the proxy or loopback
+- app helper processes that bypass the proxy even if the main Electron window is configured correctly
+
+Notes:
+
+- close any existing Codex Desktop windows before running the app phase if you want the cleanest result
+- the default CLI command performs a real authenticated Codex request, so it will consume normal usage
+- for env-based clients the script uses `socks5h://` so hostname resolution happens through the proxy
+
 ## Adding a new tool
 
 Create a new package under `packages/`:
