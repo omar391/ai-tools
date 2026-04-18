@@ -54,6 +54,48 @@ fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &Account
         || entry.last_quota_usable != Some(true)
 }
 
+fn normalize_cached_quota_usability(entry: &mut AccountEntry) -> bool {
+    let mut changed = false;
+    if matches!(entry.last_quota_usable, Some(true))
+        && cached_quota_indicates_unusable(entry).unwrap_or(false)
+    {
+        entry.last_quota_usable = Some(false);
+        changed = true;
+    }
+    changed
+}
+
+fn cached_quota_indicates_unusable(entry: &AccountEntry) -> Option<bool> {
+    if entry.last_quota_blocker.is_some() {
+        return Some(true);
+    }
+    let summary = entry.last_quota_summary.as_deref()?;
+    Some(cached_summary_has_exhausted_window(summary))
+}
+
+fn cached_summary_has_exhausted_window(summary: &str) -> bool {
+    let normalized = summary.to_ascii_lowercase();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .windows(2)
+        .filter_map(|window| {
+            let [percent, label] = window else {
+                return None;
+            };
+            let percent = percent.trim_end_matches([',', ';', ')']);
+            let label = label.trim_matches(|ch: char| !ch.is_ascii_alphabetic());
+            if label != "left" || !percent.ends_with('%') {
+                return None;
+            }
+            percent
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .ok()
+                .map(|value| value <= 0.0)
+        })
+        .any(|is_zero| is_zero)
+}
+
 fn is_terminal_refresh_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("refresh_token_invalidated")
@@ -1699,6 +1741,7 @@ fn find_pool_account_index_by_identity(
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
     let mut changed = false;
     for entry in &mut pool.accounts {
+        changed |= normalize_cached_quota_usability(entry);
         let auth_email = extract_email_from_auth(&entry.auth);
         let next_email = if should_preserve_expected_email(&entry.email, &auth_email) {
             entry.email.clone()
@@ -3075,6 +3118,70 @@ mod tests {
     }
 
     #[test]
+    fn cmd_list_excludes_weekly_exhausted_accounts_from_healthy_section() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut weekly_exhausted = stored_entry(Some(true), Some("2099-01-01T00:00:00.000Z"));
+            weekly_exhausted.label = "dev.4@hotspotprime.com_team".to_string();
+            weekly_exhausted.email = "dev.4@hotspotprime.com".to_string();
+            weekly_exhausted.account_id = "acct-4".to_string();
+            weekly_exhausted.plan_type = "team".to_string();
+            weekly_exhausted.auth = make_auth("dev.4@hotspotprime.com", "acct-4", "team");
+            weekly_exhausted.last_quota_summary =
+                Some("5h 100% left, 5h | week 0% left, 3d 11h".to_string());
+            weekly_exhausted.last_quota_primary_left_percent = Some(100);
+            weekly_exhausted.last_quota_next_refresh_at =
+                Some("2099-01-01T00:01:00.000Z".to_string());
+
+            let mut healthy = stored_entry(Some(true), Some("2099-01-01T00:00:00.000Z"));
+            healthy.label = "dev.6@hotspotprime.com_team".to_string();
+            healthy.email = "dev.6@hotspotprime.com".to_string();
+            healthy.account_id = "acct-6".to_string();
+            healthy.plan_type = "team".to_string();
+            healthy.auth = make_auth("dev.6@hotspotprime.com", "acct-6", "team");
+            healthy.last_quota_summary =
+                Some("5h 74% left, 4h 45m | week 96% left, 6d 23h".to_string());
+            healthy.last_quota_primary_left_percent = Some(74);
+            healthy.last_quota_next_refresh_at = Some("2099-01-01T00:01:00.000Z".to_string());
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![weekly_exhausted, healthy],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+
+            assert!(output.contains("Healthy Accounts (1 account(s))"));
+            let healthy_index = output
+                .find("Healthy Accounts (1 account(s))")
+                .expect("healthy section");
+            let healthy_section = &output[healthy_index..];
+            assert!(healthy_section.contains("dev.6@hotspotprime.com_team"));
+            assert!(!healthy_section.contains("dev.4@hotspotprime.com_team"));
+
+            let refreshed = load_pool()?;
+            assert_eq!(refreshed.accounts[0].last_quota_usable, Some(false));
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should exclude weekly exhausted accounts from healthy section");
+    }
+
+    #[test]
     fn cmd_list_hides_healthy_accounts_from_disabled_domains() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -3597,6 +3704,33 @@ mod tests {
         assert!(!changed);
         assert_eq!(pool.accounts[0].email, "devbench.12@astronlab.com");
         assert_eq!(pool.accounts[0].label, "devbench.12@astronlab.com_free");
+    }
+
+    #[test]
+    fn normalize_pool_entries_marks_weekly_exhausted_cached_accounts_unusable() {
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![AccountEntry {
+                label: "dev.4@hotspotprime.com_team".to_string(),
+                alias: None,
+                email: "dev.4@hotspotprime.com".to_string(),
+                account_id: "acct-4".to_string(),
+                plan_type: "team".to_string(),
+                auth: make_auth("dev.4@hotspotprime.com", "acct-4", "team"),
+                added_at: "2026-04-18T00:00:00.000Z".to_string(),
+                last_quota_usable: Some(true),
+                last_quota_summary: Some("5h 100% left, 5h | week 0% left, 3d 11h".to_string()),
+                last_quota_blocker: None,
+                last_quota_checked_at: Some("2026-04-18T02:01:57.804Z".to_string()),
+                last_quota_primary_left_percent: Some(100),
+                last_quota_next_refresh_at: Some("2026-04-18T02:02:57.804Z".to_string()),
+            }],
+        };
+
+        let changed = normalize_pool_entries(&mut pool);
+
+        assert!(changed);
+        assert_eq!(pool.accounts[0].last_quota_usable, Some(false));
     }
 
     #[test]
