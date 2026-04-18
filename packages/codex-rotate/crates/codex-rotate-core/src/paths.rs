@@ -6,7 +6,10 @@ use anyhow::{anyhow, Context, Result};
 #[derive(Clone, Debug)]
 pub struct CorePaths {
     pub repo_root: PathBuf,
+    pub home_dir: PathBuf,
     pub codex_home: PathBuf,
+    pub fast_browser_home: PathBuf,
+    pub codex_app_support_dir: PathBuf,
     pub rotate_home: PathBuf,
     pub generated_bin_dir: PathBuf,
     pub codex_auth_file: PathBuf,
@@ -15,6 +18,7 @@ pub struct CorePaths {
     pub pool_file: PathBuf,
     pub lock_dir: PathBuf,
     pub accounts_lock_file: PathBuf,
+    pub rotation_lock_file: PathBuf,
     pub watch_state_file: PathBuf,
     pub profile_dir: PathBuf,
     pub daemon_socket: PathBuf,
@@ -39,6 +43,16 @@ pub fn resolve_paths() -> Result<CorePaths> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
+    let fast_browser_home = std::env::var_os("FAST_BROWSER_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".fast-browser"));
+    let codex_app_support_dir = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("Library")
+                .join("Application Support")
+                .join("Codex")
+        });
     let rotate_home = std::env::var_os("CODEX_ROTATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex-rotate"));
@@ -65,7 +79,10 @@ pub fn resolve_paths() -> Result<CorePaths> {
         .map(PathBuf::from)
         .unwrap_or(default_automation_bridge_entrypoint);
     Ok(CorePaths {
+        home_dir: home,
         codex_home: codex_home.clone(),
+        fast_browser_home,
+        codex_app_support_dir,
         rotate_home: rotate_home.clone(),
         generated_bin_dir: repo_root.join(".codex-rotate").join("bin"),
         codex_auth_file: codex_home.join("auth.json"),
@@ -75,6 +92,7 @@ pub fn resolve_paths() -> Result<CorePaths> {
         pool_file: rotate_home.join("accounts.json"),
         lock_dir: lock_dir.clone(),
         accounts_lock_file: lock_dir.join("accounts-json.lock"),
+        rotation_lock_file: lock_dir.join("rotation.lock"),
         watch_state_file: rotate_home.join("watch-state.json"),
         profile_dir: rotate_home.join("profile"),
         daemon_socket: rotate_home.join("daemon.sock"),

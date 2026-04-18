@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::paths::{resolve_main_worktree_root, resolve_paths};
-use codex_rotate_core::pool::{cmd_add, cmd_list_stream, cmd_remove, cmd_status_stream};
+use codex_rotate_core::pool::{
+    cmd_add, cmd_list_stream, cmd_remove, cmd_status_stream, NextResult,
+};
 use codex_rotate_core::workflow::{
     cmd_create_with_progress, cmd_relogin_with_progress, CreateCommandOptions, CreateCommandSource,
     ReloginOptions,
@@ -30,7 +32,9 @@ use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
     ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
 };
-use codex_rotate_runtime::log_isolation::run_account_operation_with_log_isolation;
+use codex_rotate_runtime::rotation_hygiene::{
+    relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+};
 use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
 
@@ -76,27 +80,24 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
             )?,
         )?,
         Some("next") => {
-            let result =
-                run_account_operation_with_log_isolation(None, cli_progress_callback(), || {
-                    codex_rotate_core::pool::cmd_next_with_progress(cli_progress_callback())
-                })?;
-            write_output(writer, &result.value)?
+            let result = run_shared_next(None, cli_progress_callback())?;
+            let output = match result {
+                NextResult::Rotated { message, .. }
+                | NextResult::Stayed { message, .. }
+                | NextResult::Created {
+                    output: message, ..
+                } => message,
+            };
+            write_output(writer, &output)?
         }
-        Some("prev") => {
-            let result = run_account_operation_with_log_isolation(
-                None,
-                None,
-                codex_rotate_core::pool::cmd_prev,
-            )?;
-            write_output(writer, &result.value)?
-        }
+        Some("prev") => write_output(writer, &run_shared_prev(None, None)?)?,
         Some("list") => cmd_list_stream(writer)?,
         Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
             let (selector, options) = parse_public_relogin_options(&args[1..])?;
             write_output(
                 writer,
-                &cmd_relogin_with_progress(&selector, options, cli_progress_callback())?,
+                &run_shared_relogin(None, &selector, options, cli_progress_callback())?,
             )?
         }
         Some("remove") => write_output(writer, &cmd_remove(parse_remove_selector(&args[1..])?)?)?,
@@ -452,9 +453,9 @@ fn tray_quit_message() -> Result<String> {
                 "Stopped Codex Rotate tray.".to_string()
             });
         }
-        return Err(anyhow!(
+        Err(anyhow!(
             "Timed out waiting for the Codex Rotate tray to stop."
-        ));
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -548,7 +549,7 @@ fn tray_is_running_with_path(tray_binary: &Path) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
         let _ = tray_binary;
-        return Ok(tray_service_pid()?.is_some());
+        Ok(tray_service_pid()?.is_some())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1331,7 +1332,7 @@ mod tests {
                         write_message(
                             &mut stream,
                             &ServerMessage::Snapshot {
-                                snapshot: StatusSnapshot::default(),
+                                snapshot: Box::new(StatusSnapshot::default()),
                             },
                         )?;
                     }
@@ -1375,7 +1376,7 @@ mod tests {
                         write_message(
                             &mut stream,
                             &ServerMessage::Snapshot {
-                                snapshot: StatusSnapshot::default(),
+                                snapshot: Box::new(StatusSnapshot::default()),
                             },
                         )?;
                     }
@@ -1525,6 +1526,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stable_tray_binary_candidates_accepts_debug_binary_while_release_is_current() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_disable_local_refresh = std::env::var_os("CODEX_ROTATE_DISABLE_LOCAL_REFRESH");
+        unsafe {
+            std::env::remove_var("CODEX_ROTATE_DISABLE_LOCAL_REFRESH");
+        }
         let repo_root = unique_temp_dir("codex-rotate-stable-tray");
         let debug_binary = repo_root
             .join("target")
@@ -1601,6 +1607,10 @@ mod tests {
         assert_eq!(candidates[0], debug_binary);
         assert!(candidates.contains(&release_binary));
 
+        restore_var(
+            "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
+            previous_disable_local_refresh,
+        );
         fs::remove_dir_all(&repo_root).ok();
     }
 

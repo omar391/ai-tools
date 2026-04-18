@@ -26,6 +26,12 @@ struct BridgeRequest<'a, TPayload> {
     payload: TPayload,
 }
 
+#[derive(Debug, Serialize)]
+pub struct GuestBridgeRequest<'a, TPayload> {
+    pub command: &'a str,
+    pub payload: TPayload,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct BridgeResponse {
     ok: bool,
@@ -37,6 +43,19 @@ struct BridgeResponse {
 #[derive(Debug, serde::Deserialize)]
 struct BridgeErrorPayload {
     message: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GuestBridgeResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub result: Value,
+    pub error: Option<GuestBridgeErrorPayload>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GuestBridgeErrorPayload {
+    pub message: Option<String>,
 }
 
 pub type AutomationProgressCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
@@ -604,6 +623,7 @@ mod tests {
         bridge_progress_line_for_cli, format_fast_browser_progress_event_line,
         parse_bridge_response, resolve_bridge_repo_root, stdout_tail_preview,
     };
+    use crate::test_support::ENV_MUTEX;
     use std::fs;
 
     #[test]
@@ -666,6 +686,7 @@ __CODEX_ROTATE_BRIDGE__{"ok":true,"result":{"value":"final"}}
 
     #[test]
     fn resolve_bridge_repo_root_prefers_current_worktree_checkout() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let repo_root = tempdir.path().join("repo-root");
         fs::create_dir_all(
@@ -689,9 +710,23 @@ __CODEX_ROTATE_BRIDGE__{"ok":true,"result":{"value":"final"}}
         .expect("write cli cargo");
 
         let previous_cwd = std::env::current_dir().expect("current dir");
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        let previous_bridge_root = std::env::var_os("CODEX_ROTATE_BRIDGE_REPO_ROOT");
+        unsafe {
+            std::env::remove_var("CODEX_ROTATE_REPO_ROOT");
+            std::env::remove_var("CODEX_ROTATE_BRIDGE_REPO_ROOT");
+        }
         std::env::set_current_dir(&repo_root).expect("set cwd");
         let resolved = resolve_bridge_repo_root(std::path::Path::new("/tmp/fallback"));
         std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_repo_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_REPO_ROOT") },
+        }
+        match previous_bridge_root {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_BRIDGE_REPO_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_BRIDGE_REPO_ROOT") },
+        }
 
         assert_eq!(
             resolved,
@@ -701,6 +736,7 @@ __CODEX_ROTATE_BRIDGE__{"ok":true,"result":{"value":"final"}}
 
     #[test]
     fn resolve_bridge_repo_root_prefers_explicit_bridge_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let default_root = tempdir.path().join("default-root");
         let bridge_root = tempdir.path().join("bridge-root");

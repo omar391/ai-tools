@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -61,11 +61,54 @@ pub struct CodexDesktopMcpRequest<TParams> {
     pub request: JsonRpcRequest<TParams>,
 }
 
+#[derive(Debug)]
+pub enum AuthFileError {
+    Missing(PathBuf),
+    Corrupt(PathBuf, serde_json::Error),
+    Io(PathBuf, std::io::Error),
+}
+
+impl std::fmt::Display for AuthFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(path) => write!(f, "Codex auth file is missing at {}.", path.display()),
+            Self::Corrupt(path, e) => write!(
+                f,
+                "Codex auth file at {} is corrupt or malformed: {}",
+                path.display(),
+                e
+            ),
+            Self::Io(path, e) => write!(
+                f,
+                "Codex auth file at {} cannot be read: {}",
+                path.display(),
+                e
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuthFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Missing(_) => None,
+            Self::Corrupt(_, e) => Some(e),
+            Self::Io(_, e) => Some(e),
+        }
+    }
+}
+
 pub fn load_codex_auth(path: &Path) -> Result<CodexAuth> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Codex auth file not found at {}.", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("Invalid Codex auth file at {}.", path.display()))
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AuthFileError::Missing(path.to_path_buf()).into());
+        }
+        Err(e) => {
+            return Err(AuthFileError::Io(path.to_path_buf(), e).into());
+        }
+    };
+    serde_json::from_str(&raw).map_err(|e| AuthFileError::Corrupt(path.to_path_buf(), e).into())
 }
 
 pub fn write_codex_auth(path: &Path, auth: &CodexAuth) -> Result<()> {

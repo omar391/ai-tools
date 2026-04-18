@@ -263,7 +263,7 @@ fn rollback_auth_selection(
     Ok(())
 }
 
-fn wait_for_all_threads_idle(
+pub(crate) fn wait_for_all_threads_idle(
     port: u16,
     progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<()> {
@@ -601,7 +601,7 @@ fn read_auth_if_exists(path: &Path) -> Result<Option<CodexAuth>> {
     load_codex_auth(path).map(Some)
 }
 
-fn managed_codex_is_running(profile_dir: &Path) -> Result<bool> {
+pub(crate) fn managed_codex_is_running(profile_dir: &Path) -> Result<bool> {
     Ok(!managed_codex_root_pids(profile_dir)?.is_empty())
 }
 
@@ -619,7 +619,7 @@ fn managed_codex_root_pids(profile_dir: &Path) -> Result<Vec<u32>> {
         .collect())
 }
 
-fn stop_managed_codex_instance(port: u16, profile_dir: &Path) -> Result<()> {
+pub(crate) fn stop_managed_codex_instance(port: u16, profile_dir: &Path) -> Result<()> {
     invalidate_local_codex_connection(port, true);
     let root_pids = managed_codex_root_pids(profile_dir)?;
     if root_pids.is_empty() {

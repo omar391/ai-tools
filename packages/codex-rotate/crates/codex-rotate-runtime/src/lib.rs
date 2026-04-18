@@ -6,6 +6,7 @@ pub mod launcher;
 pub mod log_isolation;
 pub mod logs;
 pub mod paths;
+pub mod rotation_hygiene;
 pub mod runtime_log;
 #[cfg(test)]
 pub(crate) mod test_support;

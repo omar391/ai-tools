@@ -466,7 +466,7 @@ limit ?2
         "#,
     )?;
     let rows = statement.query_map(
-        params![after_log_id.unwrap_or(0), limit.max(1).min(200) as i64],
+        params![after_log_id.unwrap_or(0), limit.clamp(1, 200) as i64],
         |row| {
             let id: i64 = row.get(0)?;
             let ts: i64 = row.get(1)?;
@@ -1130,7 +1130,7 @@ fn send_continue_turn(port: u16, thread_id: &str, cwd: Option<String>) -> Result
     Ok(())
 }
 
-fn send_codex_app_request<T>(port: u16, method: &str, params: Value) -> Result<T>
+pub(crate) fn send_codex_app_request<T>(port: u16, method: &str, params: Value) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {

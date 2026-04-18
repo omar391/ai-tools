@@ -17,8 +17,10 @@ use crate::ipc::{
     RuntimeCapabilities, ServerMessage, SnapshotMessageKind, StatusSnapshot,
 };
 use crate::launcher::ensure_debug_codex_instance;
-use crate::log_isolation::run_account_operation_with_log_isolation;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
+use crate::rotation_hygiene::{
+    relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+};
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
     auto_create_enabled, read_watch_state, refresh_quota_cache, run_watch_iteration,
@@ -35,8 +37,8 @@ use codex_rotate_core::pool::{
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
-    cmd_create_with_progress, cmd_relogin_with_progress, migrate_legacy_credential_store_if_needed,
-    CreateCommandOptions, CreateCommandSource, ReloginOptions,
+    cmd_create_with_progress, migrate_legacy_credential_store_if_needed, CreateCommandOptions,
+    CreateCommandSource, ReloginOptions,
 };
 use codex_rotate_refresh::{
     current_process_local_build, daemon_socket_is_older_than_binary,
@@ -540,7 +542,12 @@ fn handle_client(daemon: SharedDaemon, stream: UnixStream) -> Result<()> {
             sender.send(daemon.snapshot()).ok();
             let mut writer = stream;
             for snapshot in receiver {
-                write_message(&mut writer, &ServerMessage::Snapshot { snapshot })?;
+                write_message(
+                    &mut writer,
+                    &ServerMessage::Snapshot {
+                        snapshot: Box::new(snapshot),
+                    },
+                )?;
             }
         }
         ClientRequest::Invoke { action, repo_root } => {
@@ -985,23 +992,20 @@ fn run_manual_next(
     state: &mut DaemonState,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
-    let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = run_account_operation_with_log_isolation(Some(port), progress.clone(), || {
-        codex_rotate_core::pool::rotate_next_internal_with_progress(progress.clone())
-    })?;
+    let result = run_shared_next(Some(managed_codex_port()), progress.clone())?;
     refresh_static_snapshot(state);
-    if let Some(summary) = next_result_summary(&result.value) {
+    if let Some(summary) = next_result_summary(&result) {
         state.snapshot.last_rotation_from_email = previous_displayed_email;
         state.snapshot.last_rotation_to_email = Some(summary.email.clone());
     }
-    if let Some(summary) = result.current_summary.as_ref() {
+    if let Some(summary) = next_result_summary(&result) {
         state.snapshot.current_email = Some(summary.email.clone());
         state.snapshot.current_plan = Some(summary.plan_type.clone());
     }
     refresh_quota_state(state, false);
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
-    let output = match result.value {
+    let output = match result {
         NextResult::Rotated { message, .. }
         | NextResult::Stayed { message, .. }
         | NextResult::Created {
@@ -1017,32 +1021,22 @@ fn run_manual_next(
 }
 
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
-    let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = run_account_operation_with_log_isolation(
-        Some(port),
-        None,
-        codex_rotate_core::pool::cmd_prev,
-    )?;
+    let result = run_shared_prev(Some(managed_codex_port()), None)?;
     refresh_static_snapshot(state);
     state.snapshot.last_rotation_from_email = previous_displayed_email;
-    state.snapshot.last_rotation_to_email = result
-        .current_summary
-        .as_ref()
-        .map(|summary| summary.email.clone())
-        .or_else(|| state.snapshot.current_email.clone());
+    let summary = summarize_codex_auth(&load_codex_auth(&resolve_paths()?.codex_auth_file)?);
+    state.snapshot.last_rotation_to_email = Some(summary.email.clone());
     state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
-    if let Some(summary) = result.current_summary.as_ref() {
-        state.snapshot.current_email = Some(summary.email.clone());
-        state.snapshot.current_plan = Some(summary.plan_type.clone());
-    }
+    state.snapshot.current_email = Some(summary.email.clone());
+    state.snapshot.current_plan = Some(summary.plan_type.clone());
     refresh_quota_state(state, false);
     set_snapshot_message(
         &mut state.snapshot,
         SnapshotMessageKind::Status,
-        first_line(&result.value),
+        first_line(&result),
     );
-    Ok(result.value)
+    Ok(result)
 }
 
 fn run_manual_create(
@@ -1079,7 +1073,8 @@ fn run_manual_relogin(
     options: crate::ipc::ReloginInvocation,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
-    let output = cmd_relogin_with_progress(
+    let output = run_shared_relogin(
+        Some(managed_codex_port()),
         &options.selector,
         ReloginOptions {
             allow_email_change: options.allow_email_change,

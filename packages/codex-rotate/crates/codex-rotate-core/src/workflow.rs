@@ -28,11 +28,12 @@ use crate::managed_browser::ensure_managed_browser_wrapper;
 use crate::paths::{
     ensure_main_worktree_operation_allowed, legacy_credentials_file, resolve_paths,
 };
+use crate::persona::OsFamily;
 use crate::pool::{
     cmd_add_expected_email, find_next_usable_account, format_account_summary_for_display,
-    inspect_account, load_pool, normalize_pool_entries, resolve_account_selector, save_pool,
-    sync_pool_active_account_from_codex, AccountEntry, AccountInspection, Pool,
-    ReusableAccountProbeMode,
+    inspect_account, load_pool, normalize_pool_entries, resolve_account_selector,
+    resolve_persona_profile, save_pool, sync_pool_active_account_from_codex, AccountEntry,
+    AccountInspection, PersonaProfile, Pool, ReusableAccountProbeMode,
 };
 use crate::quota::{describe_quota_blocker, format_compact_quota, has_usable_quota};
 #[cfg(test)]
@@ -98,21 +99,11 @@ impl Default for CreateCommandOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct ReloginOptions {
     pub allow_email_change: bool,
     pub logout_first: bool,
     pub manual_login: bool,
-}
-
-impl Default for ReloginOptions {
-    fn default() -> Self {
-        Self {
-            allow_email_change: false,
-            logout_first: false,
-            manual_login: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,7 +250,7 @@ pub struct PendingCredential {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum CodexRotateSecretLocator {
+pub enum CodexRotateSecretLocator {
     LoginLookup {
         store: String,
         username: String,
@@ -269,18 +260,18 @@ enum CodexRotateSecretLocator {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct CodexRotateAuthFlowSession {
-    auth_url: Option<String>,
-    callback_url: Option<String>,
-    callback_port: Option<u16>,
-    device_code: Option<String>,
-    session_dir: Option<String>,
-    codex_home_path: Option<String>,
-    auth_file_path: Option<String>,
-    pid: Option<u32>,
-    stdout_path: Option<String>,
-    stderr_path: Option<String>,
-    exit_path: Option<String>,
+pub struct CodexRotateAuthFlowSession {
+    pub auth_url: Option<String>,
+    pub callback_url: Option<String>,
+    pub callback_port: Option<u16>,
+    pub device_code: Option<String>,
+    pub session_dir: Option<String>,
+    pub codex_home_path: Option<String>,
+    pub auth_file_path: Option<String>,
+    pub pid: Option<u32>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+    pub exit_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -465,6 +456,8 @@ struct SystemChromeProfileMatch {
 #[serde(rename_all = "camelCase")]
 struct BridgeEnsureSecretPayload<'a> {
     profile_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_dir: Option<&'a str>,
     email: &'a str,
     password: &'a str,
 }
@@ -473,52 +466,80 @@ struct BridgeEnsureSecretPayload<'a> {
 #[serde(rename_all = "camelCase")]
 struct BridgeDeleteSecretPayload<'a> {
     profile_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_dir: Option<&'a str>,
     email: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BridgeLoginOptions<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codex_bin: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workflow_ref: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workflow_run_stamp: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    skip_locator_preflight: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prefer_signup_recovery: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prefer_password_login: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    full_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    birth_month: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    birth_day: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    birth_year: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codex_session: Option<&'a CodexRotateAuthFlowSession>,
+pub struct BridgeGenerateFingerprintPayload<'a> {
+    pub persona_id: &'a str,
+    pub options: BridgeGenerateFingerprintOptions<'a>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BridgeCompleteLoginAttemptPayload<'a> {
-    profile_name: &'a str,
-    email: &'a str,
+pub struct BridgeGenerateFingerprintOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_login_locator: Option<&'a CodexRotateSecretLocator>,
+    pub user_agent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    options: Option<BridgeLoginOptions<'a>>,
+    pub screen_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_height: Option<u32>,
+    pub os_family: OsFamily,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeLoginOptions<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_bin: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_run_stamp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_locator_preflight: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer_signup_recovery: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer_password_login: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub birth_month: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub birth_day: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub birth_year: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_session: Option<&'a CodexRotateAuthFlowSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona_profile: Option<PersonaProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeCompleteLoginAttemptPayload<'a> {
+    pub profile_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<&'a str>,
+    pub email: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_login_locator: Option<&'a CodexRotateSecretLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<BridgeLoginOptions<'a>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct BridgeLoginAttemptResult {
     result: Option<FastBrowserRunResult>,
+    browser_fingerprint: Option<Value>,
     error_message: Option<String>,
 }
 
@@ -543,10 +564,15 @@ fn normalize_bridge_login_attempt_result(raw: Value) -> BridgeLoginAttemptResult
                 .then(|| Value::Object(record.clone()))
         })
         .and_then(normalize_bridge_fast_browser_run_result);
+    let browser_fingerprint = record
+        .get("browser_fingerprint")
+        .or_else(|| record.get("browserFingerprint"))
+        .cloned();
     let error_message = read_string_value(&record, "error_message")
         .or_else(|| read_string_value(&record, "errorMessage"));
     BridgeLoginAttemptResult {
         result,
+        browser_fingerprint,
         error_message,
     }
 }
@@ -1013,10 +1039,32 @@ pub fn cmd_relogin_with_progress(
             format!("Preparing password for {}.", expected_email),
         );
         let generated_password = generate_password(18);
+        let paths = resolve_paths()?;
+        let pool = load_pool()?;
+        let current_account = pool.accounts.get(pool.active_index);
+        let persona_paths = current_account
+            .and_then(|entry| entry.persona.as_ref())
+            .map(|persona| {
+                persona
+                    .host_root_rel_path
+                    .as_deref()
+                    .map(|relative| paths.rotate_home.join(relative))
+                    .unwrap_or_else(|| {
+                        paths
+                            .rotate_home
+                            .join("personas")
+                            .join("host")
+                            .join(&persona.persona_id)
+                    })
+            })
+            .map(|root| root.join("managed-profile"));
+        let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
+
         match run_automation_bridge::<_, CodexRotateSecretRef>(
             "prepare-account-secret-ref",
             BridgeEnsureSecretPayload {
                 profile_name,
+                profile_dir: profile_dir.as_ref().map(|s| s.as_ref()),
                 email: &expected_email,
                 password: generated_password.as_str(),
             },
@@ -1056,6 +1104,14 @@ pub fn cmd_relogin_with_progress(
             .clone()
             .unwrap_or_else(|| build_openai_account_login_locator(&updated_stored.email));
 
+        let persona_profile = existing.as_ref().and_then(|entry| {
+            let persona = entry.persona.as_ref()?;
+            resolve_persona_profile(
+                persona.persona_profile_id.as_deref()?,
+                persona.browser_fingerprint.clone(),
+            )
+        });
+
         let previous_auth = load_codex_auth_if_exists()?;
         let login_result = (|| -> Result<CompleteCodexLoginOutcome> {
             if should_logout_before_stored_relogin(&options) {
@@ -1078,6 +1134,7 @@ pub fn cmd_relogin_with_progress(
                 password: prepared_password.as_deref(),
                 treat_final_add_phone_as_environment_blocker: Some(true),
                 birth_date: relogin_birth_date.as_ref(),
+                persona_profile,
                 progress: progress.clone(),
             })
         })();
@@ -1140,6 +1197,21 @@ pub fn cmd_relogin_with_progress(
         }
 
         let _ = cmd_add_expected_email(&expected_email, existing_alias.as_deref())?;
+        if let Some(fingerprint) = login_outcome.browser_fingerprint {
+            let mut pool = load_pool()?;
+            let account_id = extract_account_id_from_auth(&auth);
+            if let Some(entry) = pool
+                .accounts
+                .iter_mut()
+                .find(|a| a.account_id == account_id)
+            {
+                if let Some(persona) = entry.persona.as_mut() {
+                    persona.browser_fingerprint = Some(fingerprint);
+                    save_pool(&pool)?;
+                }
+            }
+        }
+
         if let Some(inspected) =
             inspect_pool_entry_by_account_id(&extract_account_id_from_auth(&auth))?
         {
@@ -1800,10 +1872,32 @@ fn execute_create_flow_attempt(
             format!("Preparing password for {}.", created_email),
         );
         let password = generate_password(18);
+        let paths = resolve_paths().map_err(CreateFlowAttemptFailure::Fatal)?;
+        let pool = load_pool().map_err(CreateFlowAttemptFailure::Fatal)?;
+        let current_account = pool.accounts.get(pool.active_index);
+        let persona_paths = current_account
+            .and_then(|entry| entry.persona.as_ref())
+            .map(|persona| {
+                persona
+                    .host_root_rel_path
+                    .as_deref()
+                    .map(|relative| paths.rotate_home.join(relative))
+                    .unwrap_or_else(|| {
+                        paths
+                            .rotate_home
+                            .join("personas")
+                            .join("host")
+                            .join(&persona.persona_id)
+                    })
+            })
+            .map(|root| root.join("managed-profile"));
+        let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
+
         match run_automation_bridge::<_, CodexRotateSecretRef>(
             "prepare-account-secret-ref",
             BridgeEnsureSecretPayload {
                 profile_name: &profile_name,
+                profile_dir: profile_dir.as_ref().map(|s| s.as_ref()),
                 email: &created_email,
                 password: password.as_str(),
             },
@@ -1853,6 +1947,18 @@ fn execute_create_flow_attempt(
         .insert(normalize_email_key(&created_email), pending.clone());
     fatal(save_credential_store(&store))?;
 
+    let persona_profile = load_pool()
+        .map_err(CreateFlowAttemptFailure::Fatal)?
+        .accounts
+        .last()
+        .and_then(|entry| {
+            let persona = entry.persona.as_ref()?;
+            resolve_persona_profile(
+                persona.persona_profile_id.as_deref()?,
+                persona.browser_fingerprint.clone(),
+            )
+        });
+
     report_progress(
         progress.as_ref(),
         format!("Starting managed login for {}.", created_email),
@@ -1870,6 +1976,7 @@ fn execute_create_flow_attempt(
         password: generated_password.as_deref(),
         treat_final_add_phone_as_environment_blocker: Some(true),
         birth_date: Some(&birth_date),
+        persona_profile,
         progress: progress.clone(),
     });
     let login_outcome = match login_result {
@@ -1899,6 +2006,16 @@ fn execute_create_flow_attempt(
             return Err(CreateFlowAttemptFailure::Fatal(error));
         }
     };
+
+    if let Some(fingerprint) = login_outcome.browser_fingerprint.clone() {
+        let mut pool = fatal(load_pool())?;
+        if let Some(entry) = pool.accounts.last_mut() {
+            if let Some(persona) = entry.persona.as_mut() {
+                persona.browser_fingerprint = Some(fingerprint);
+            }
+        }
+        fatal(save_pool(&pool))?;
+    }
 
     let auth = fatal(load_auth_for_completed_login(&login_outcome))?;
     let logged_in_email = summarize_codex_auth(&auth).email;
@@ -2294,6 +2411,7 @@ struct CompleteCodexLoginArgs<'a> {
     password: Option<&'a str>,
     treat_final_add_phone_as_environment_blocker: Option<bool>,
     birth_date: Option<&'a AdultBirthDate>,
+    persona_profile: Option<PersonaProfile>,
     progress: Option<AutomationProgressCallback>,
 }
 
@@ -2301,6 +2419,7 @@ struct CompleteCodexLoginArgs<'a> {
 struct CompleteCodexLoginOutcome {
     verified_account_email: Option<String>,
     codex_session: Option<CodexRotateAuthFlowSession>,
+    browser_fingerprint: Option<Value>,
 }
 
 fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<CompleteCodexLoginOutcome> {
@@ -2317,6 +2436,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         password,
         treat_final_add_phone_as_environment_blocker,
         birth_date,
+        persona_profile,
         progress,
     } = args;
     let workflow_defaults = resolve_login_workflow_defaults(workflow_ref)?;
@@ -2357,6 +2477,27 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         ),
     }
 
+    let paths = resolve_paths()?;
+    let pool = load_pool()?;
+    let current_account = pool.accounts.get(pool.active_index);
+    let persona_paths = current_account
+        .and_then(|entry| entry.persona.as_ref())
+        .map(|persona| {
+            persona
+                .host_root_rel_path
+                .as_deref()
+                .map(|relative| paths.rotate_home.join(relative))
+                .unwrap_or_else(|| {
+                    paths
+                        .rotate_home
+                        .join("personas")
+                        .join("host")
+                        .join(&persona.persona_id)
+                })
+        })
+        .map(|root| root.join("managed-profile"));
+    let profile_dir_str = persona_paths.as_ref().map(|path| path.to_string_lossy());
+
     let mut allow_signup_recovery = prefer_signup_recovery.unwrap_or(false);
     let mut codex_session: Option<CodexRotateAuthFlowSession> = None;
     let result = (|| -> Result<CompleteCodexLoginOutcome> {
@@ -2380,6 +2521,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 let login_workflow_run_stamp = workflow_run_stamp
                     .map(|stamp| format!("{stamp}-codex-login-{attempt}-{replay_pass}"));
                 let options = BridgeLoginOptions {
+                    profile_dir: profile_dir_str.as_ref().map(|s| s.as_ref()),
                     codex_bin: Some(wrapped_codex_bin.as_str()),
                     workflow_ref: Some(workflow_ref.as_str()),
                     workflow_run_stamp: login_workflow_run_stamp.as_deref(),
@@ -2392,20 +2534,19 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                     birth_day: Some(birth_date.birth_day),
                     birth_year: Some(birth_date.birth_year),
                     codex_session: codex_session.as_ref(),
+                    persona_profile: persona_profile.clone(),
                 };
-                let attempt_result_raw: Value = match run_automation_bridge_with_progress(
+                let attempt_result_raw: Value = run_automation_bridge_with_progress(
                     "complete-codex-login-attempt",
                     BridgeCompleteLoginAttemptPayload {
                         profile_name,
+                        profile_dir: profile_dir_str.as_ref().map(|s| s.as_ref()),
                         email,
                         account_login_locator,
                         options: Some(options),
                     },
                     progress.clone(),
-                ) {
-                    Ok(result) => result,
-                    Err(error) => return Err(error),
-                };
+                )?;
                 maybe_debug_codex_auth_flow_raw(workflow_ref.as_str(), email, &attempt_result_raw);
                 let attempt_result = normalize_bridge_login_attempt_result(attempt_result_raw);
                 let bridge_error_message = attempt_result.error_message.clone();
@@ -2677,6 +2818,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
                 return Ok(CompleteCodexLoginOutcome {
                     verified_account_email: flow.verified_account_email.clone(),
                     codex_session: codex_session.clone().or(flow.codex_session.clone()),
+                    browser_fingerprint: attempt_result.browser_fingerprint.clone(),
                 });
             }
             attempt += 1;
@@ -2687,6 +2829,24 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
     })();
     cancel_codex_browser_login_session(codex_session.as_ref());
     result
+}
+
+pub fn cmd_generate_browser_fingerprint(
+    persona_id: &str,
+    profile: &PersonaProfile,
+) -> Result<Value> {
+    run_automation_bridge::<_, Value>(
+        "generate-browser-fingerprint",
+        BridgeGenerateFingerprintPayload {
+            persona_id,
+            options: BridgeGenerateFingerprintOptions {
+                user_agent: Some(&profile.user_agent),
+                screen_width: Some(profile.screen_width),
+                screen_height: Some(profile.screen_height),
+                os_family: serde_json::from_str(&format!("\"{}\"", profile.os_family))?,
+            },
+        },
+    )
 }
 
 fn resolve_login_workflow_defaults(workflow_ref: Option<&str>) -> Result<LoginWorkflowDefaults> {
@@ -3637,7 +3797,7 @@ pub fn auto_disable_domain_for_account(email: &str) -> Result<bool> {
     Ok(changed)
 }
 
-pub(crate) fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
+pub fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
     Ok(load_credential_store()?
         .domain
         .into_iter()
@@ -3753,11 +3913,37 @@ pub(crate) fn migrate_rotate_state_credential_sections(raw: &Value) -> Option<Va
 }
 
 fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
+    let Ok(paths) = resolve_paths() else {
+        return;
+    };
+    let Ok(pool) = load_pool() else {
+        return;
+    };
+    let current_account = pool.accounts.get(pool.active_index);
+    let persona_paths = current_account
+        .and_then(|entry| entry.persona.as_ref())
+        .map(|persona| {
+            persona
+                .host_root_rel_path
+                .as_deref()
+                .map(|relative| paths.rotate_home.join(relative))
+                .unwrap_or_else(|| {
+                    paths
+                        .rotate_home
+                        .join("personas")
+                        .join("host")
+                        .join(&persona.persona_id)
+                })
+        })
+        .map(|root| root.join("managed-profile"));
+    let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
+
     for record in records {
         let result = run_automation_bridge::<_, bool>(
             "delete-account-secret-ref",
             BridgeDeleteSecretPayload {
                 profile_name: &record.stored.profile_name,
+                profile_dir: profile_dir.as_ref().map(|s| s.as_ref()),
                 email: &record.stored.email,
             },
         );
@@ -5541,7 +5727,7 @@ pub fn record_deleted_account(email: &str) -> Result<bool> {
     Ok(dirty)
 }
 
-pub(crate) fn extract_email_domain(email: &str) -> Option<String> {
+pub fn extract_email_domain(email: &str) -> Option<String> {
     let normalized = normalize_email_key(email);
     let (_, domain) = normalized.split_once('@')?;
     normalize_domain_key(domain)
@@ -5727,6 +5913,7 @@ mod tests {
             last_quota_checked_at: Some("2026-04-13T02:52:15.012Z".to_string()),
             last_quota_primary_left_percent: Some(90),
             last_quota_next_refresh_at: Some("2026-04-13T03:52:15.012Z".to_string()),
+            persona: None,
         }
     }
 
@@ -8930,6 +9117,7 @@ end
             last_quota_checked_at: None,
             last_quota_primary_left_percent: None,
             last_quota_next_refresh_at: None,
+            persona: None,
         };
 
         let pending = store.pending.remove("dev.24@astronlab.com").unwrap();
@@ -8991,6 +9179,7 @@ end
                 last_quota_checked_at: None,
                 last_quota_primary_left_percent: None,
                 last_quota_next_refresh_at: None,
+                persona: None,
             };
 
             let changed = reconcile_added_account_credential_state(&entry)
@@ -9043,6 +9232,7 @@ end
                     last_quota_checked_at: None,
                     last_quota_primary_left_percent: None,
                     last_quota_next_refresh_at: None,
+                    persona: None,
                 },
                 AccountEntry {
                     label: "devbench.17@astronlab.com_free".to_string(),
@@ -9068,6 +9258,7 @@ end
                     last_quota_checked_at: None,
                     last_quota_primary_left_percent: None,
                     last_quota_next_refresh_at: None,
+                    persona: None,
                 },
             ],
         };
@@ -9112,6 +9303,7 @@ end
                     last_quota_checked_at: None,
                     last_quota_primary_left_percent: None,
                     last_quota_next_refresh_at: None,
+                    persona: None,
                 },
                 AccountEntry {
                     label: "dev.1@hotspotprime.com_free".to_string(),
@@ -9137,6 +9329,7 @@ end
                     last_quota_checked_at: None,
                     last_quota_primary_left_percent: None,
                     last_quota_next_refresh_at: None,
+                    persona: None,
                 },
             ],
         };

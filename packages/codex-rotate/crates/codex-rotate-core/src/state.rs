@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::fs_security::write_private_string;
 use crate::paths::{resolve_paths, CorePaths};
-use crate::pool::AccountEntry;
+use crate::pool::{AccountEntry, RotationEnvironment, VmEnvironmentConfig};
 use crate::workflow::{
     migrate_rotate_state_credential_sections, CredentialFamily, DomainConfig, PendingCredential,
 };
@@ -71,6 +71,10 @@ struct RotateStateSchema {
     #[serde(default)]
     active_index: Option<usize>,
     #[serde(default)]
+    environment: Option<RotationEnvironment>,
+    #[serde(default)]
+    vm: Option<VmEnvironmentConfig>,
+    #[serde(default)]
     version: Option<u8>,
     #[serde(default)]
     #[serde(alias = "default_create_base_email")]
@@ -109,6 +113,43 @@ impl RotateStateLock {
 
         file.lock_exclusive()
             .with_context(|| format!("Failed to lock {}.", paths.accounts_lock_file.display()))?;
+
+        Ok(Self { _file: file })
+    }
+}
+
+pub struct RotationLock {
+    _file: File,
+}
+
+impl RotationLock {
+    pub fn acquire() -> Result<Self> {
+        let paths = resolve_paths()?;
+        fs::create_dir_all(&paths.lock_dir)
+            .with_context(|| format!("Failed to create {}.", paths.lock_dir.display()))?;
+
+        #[cfg(unix)]
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.rotation_lock_file)
+            .with_context(|| format!("Failed to open {}.", paths.rotation_lock_file.display()))?;
+
+        #[cfg(not(unix))]
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&paths.rotation_lock_file)
+            .with_context(|| format!("Failed to open {}.", paths.rotation_lock_file.display()))?;
+
+        if file.try_lock_exclusive().is_err() {
+            return Err(anyhow!(
+                "Another rotation is already in progress. Please wait for it to complete."
+            ));
+        }
 
         Ok(Self { _file: file })
     }
@@ -516,6 +557,7 @@ mod tests {
             last_quota_checked_at: None,
             last_quota_primary_left_percent: None,
             last_quota_next_refresh_at: None,
+            persona: None,
         }
     }
 

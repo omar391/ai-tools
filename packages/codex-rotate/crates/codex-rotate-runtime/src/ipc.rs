@@ -125,7 +125,7 @@ pub enum ClientRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerMessage {
     Snapshot {
-        snapshot: StatusSnapshot,
+        snapshot: Box<StatusSnapshot>,
     },
     Result {
         ok: bool,
@@ -168,7 +168,7 @@ impl SnapshotSubscription {
         #[cfg(unix)]
         {
             match read_message(&mut self.reader)? {
-                ServerMessage::Snapshot { snapshot } => Ok(snapshot),
+                ServerMessage::Snapshot { snapshot } => Ok(*snapshot),
                 ServerMessage::Result { error, .. } => Err(anyhow!(
                     "{}",
                     error.unwrap_or_else(|| "Daemon returned an unexpected response.".to_string())
@@ -191,7 +191,7 @@ impl SnapshotSubscription {
             .set_read_timeout(Some(timeout))
             .context("Failed to configure daemon subscription timeout.")?;
         match read_message(&mut self.reader) {
-            Ok(ServerMessage::Snapshot { snapshot }) => Ok(Some(snapshot)),
+            Ok(ServerMessage::Snapshot { snapshot }) => Ok(Some(*snapshot)),
             Ok(ServerMessage::Result { error, .. }) => Err(anyhow!(
                 "{}",
                 error.unwrap_or_else(|| "Daemon returned an unexpected response.".to_string())

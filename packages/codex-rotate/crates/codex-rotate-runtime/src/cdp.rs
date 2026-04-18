@@ -103,10 +103,10 @@ fn has_codex_page_target(targets: &[CdpTargetInfo]) -> bool {
         .any(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
 }
 
-fn ensure_shared_connection<'a>(
-    session: &'a mut SharedCdpSession,
+fn ensure_shared_connection(
+    session: &mut SharedCdpSession,
     port: u16,
-) -> Result<&'a mut CdpConnection> {
+) -> Result<&mut CdpConnection> {
     if session.port != Some(port) {
         *session = SharedCdpSession {
             port: Some(port),

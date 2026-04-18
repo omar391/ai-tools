@@ -17,6 +17,10 @@
   "engines": {
     "node": ">=22.6.0"
   },
+  "dependencies": {
+    "fingerprint-generator": "^2.1.60",
+    "fingerprint-injector": "^2.1.58"
+  },
   "devDependencies": {
     "@types/node": "^25.3.0"
   }

@@ -71,7 +71,7 @@ fn append_log_line_to_path(
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("Failed to open {}.", path.display()))?;
         file.write_all(line.as_bytes())
             .with_context(|| format!("Failed to write {}.", path.display()))?;

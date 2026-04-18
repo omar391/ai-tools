@@ -34,7 +34,7 @@ pub fn launch_tray_process(tray_binary: &Path) -> Result<()> {
             return Ok(());
         }
         kickstart_tray_launch_agent(&label, "Failed to start Codex Rotate tray launch agent.")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -75,7 +75,7 @@ pub fn ensure_tray_process_registered() -> Result<bool> {
             &label,
             "Failed to kickstart Codex Rotate tray launch agent.",
         )?;
-        return Ok(true);
+        Ok(true)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -94,7 +94,7 @@ pub fn schedule_tray_relaunch_process(tray_binary: &Path) -> Result<()> {
         let label = tray_launchd_label();
         let plist_path = write_tray_launch_agent_plist(tray_binary)?;
         let script = build_tray_launch_agent_reset_script(&plist_path, &label);
-        return spawn_detached_process(Path::new("/bin/sh"), &["-c", script.as_str()]);
+        spawn_detached_process(Path::new("/bin/sh"), &["-c", script.as_str()])
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

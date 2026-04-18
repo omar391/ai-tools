@@ -1,9 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+import { FingerprintGenerator } from "fingerprint-generator";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(
@@ -111,7 +114,9 @@ export function resolveFastBrowserSkillPath(
     relativeParts,
     mainWorktreeRoot,
   );
-  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+  return (
+    candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!
+  );
 }
 
 export function resolveCodexRotateRepoRoot(): string {
@@ -380,6 +385,7 @@ export interface CodexRotateAuthFlowSession {
 
 interface CodexRotateLoginWorkflowAttemptResult {
   result?: FastBrowserRunResult | null;
+  browser_fingerprint?: Record<string, unknown> | null;
   error_message?: string | null;
 }
 
@@ -407,10 +413,7 @@ function parseFastBrowserEventLine(
     return null;
   }
   try {
-    return JSON.parse(raw) as {
-      phase?: unknown;
-      status?: unknown;
-    };
+    return JSON.parse(raw) as { phase?: string; status?: string };
   } catch {
     return null;
   }
@@ -572,18 +575,19 @@ async function runFastBrowserCliJsonRequest<TResult>(
     actionLabel,
   );
 }
-
 async function ensureFastBrowserSecretSession(
   profileName: string,
   store: "bitwarden-cli",
   promptIfLocked: boolean,
+  profileDir?: string,
 ): Promise<void> {
-  void profileName;
   const response = await runFastBrowserCliJsonRequest<Record<string, unknown>>(
     ["secrets", "session"],
     {
       action: "ensure",
       store,
+      profileName,
+      profileDir: profileDir ?? null,
       promptIfLocked,
     },
     "fast-browser secrets session ensure",
@@ -600,7 +604,7 @@ function isMissingOptionalSecretLocatorError(
   locator: CodexRotateSecretLocator,
   error: unknown,
 ): boolean {
-  const message = error instanceof Error ? error.message : String(error || "");
+  const message = formatUnknownError(error);
   return (
     /No Bitwarden login item matched/i.test(message) ||
     /No Bitwarden item matched the exact name/i.test(message)
@@ -610,7 +614,7 @@ function isMissingOptionalSecretLocatorError(
 export function isUnavailableOptionalSecretLocatorError(
   error: unknown,
 ): boolean {
-  const message = error instanceof Error ? error.message : String(error || "");
+  const message = formatUnknownError(error);
   return (
     /Bitwarden CLI is locked/i.test(message) ||
     /Bitwarden CLI is not logged in/i.test(message) ||
@@ -618,6 +622,23 @@ export function isUnavailableOptionalSecretLocatorError(
     /timed out while trying to read Bitwarden CLI status/i.test(message) ||
     /failed to read secret-store status/i.test(message)
   );
+}
+
+function formatUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error ?? "");
 }
 
 async function resolveOptionalCodexRotateSecretLocator(
@@ -784,11 +805,13 @@ async function withReadyBitwardenSecretBroker<T>(
   profileName: string,
   promptIfLocked: boolean,
   operation: () => Promise<T>,
+  profileDir?: string,
 ): Promise<T> {
   await ensureFastBrowserSecretSession(
     profileName,
     "bitwarden-cli",
     promptIfLocked,
+    profileDir,
   );
   return await operation();
 }
@@ -797,6 +820,7 @@ export async function prepareBitwardenCliAccountSecretRef(
   profileName: string,
   email: string,
   password: string,
+  profileDir?: string,
 ): Promise<CodexRotateSecretRef> {
   const normalized = normalizeBitwardenCliAccountSecretIdentity(
     profileName,
@@ -819,6 +843,8 @@ export async function prepareBitwardenCliAccountSecretRef(
         ["secrets", "item"],
         {
           action: "resolve",
+          profileName: normalized.profileName,
+          profileDir: profileDir ?? null,
           selector: {
             kind: "login",
             store: "bitwarden-cli",
@@ -838,7 +864,7 @@ export async function prepareBitwardenCliAccountSecretRef(
         extractFastBrowserCliResult(existing)?.ref,
       );
       if (existingRef) {
-        return applyAccountPasswordFieldPath(existingRef);
+        return applyAccountPasswordFieldPath(existingRef)!;
       }
 
       const created = await runFastBrowserCliJsonRequest<{
@@ -847,6 +873,8 @@ export async function prepareBitwardenCliAccountSecretRef(
         ["secrets", "item"],
         {
           action: "ensure",
+          profileName: normalized.profileName,
+          profileDir: profileDir ?? null,
           kind: "login",
           store: "bitwarden-cli",
           name: buildCodexRotateAccountSecretName(normalized.email),
@@ -871,8 +899,9 @@ export async function prepareBitwardenCliAccountSecretRef(
           `Fast-browser Bitwarden adapter did not return a secret ref for ${normalized.email}.`,
         );
       }
-      return applyAccountPasswordFieldPath(createdRef);
+      return applyAccountPasswordFieldPath(createdRef)!;
     },
+    profileDir,
   );
 }
 
@@ -934,6 +963,7 @@ export async function findBitwardenCliAccountSecretRef(
 export async function deleteBitwardenCliAccountSecretRef(
   profileName: string,
   email: string,
+  profileDir?: string,
 ): Promise<boolean> {
   const normalized = normalizeBitwardenCliAccountSecretIdentity(
     profileName,
@@ -950,6 +980,8 @@ export async function deleteBitwardenCliAccountSecretRef(
         ["secrets", "item"],
         {
           action: "resolve",
+          profileName: normalized.profileName,
+          profileDir: profileDir ?? null,
           selector: {
             kind: "login",
             store: "bitwarden-cli",
@@ -978,6 +1010,8 @@ export async function deleteBitwardenCliAccountSecretRef(
         ["secrets", "item"],
         {
           action: "delete",
+          profileName: normalized.profileName,
+          profileDir: profileDir ?? null,
           store: "bitwarden-cli",
           objectId: ref.object_id,
         },
@@ -991,6 +1025,7 @@ export async function deleteBitwardenCliAccountSecretRef(
       }
       return true;
     },
+    profileDir,
   );
 }
 
@@ -1026,7 +1061,7 @@ function parseJsonFromMixedStdout<T>(
     .filter(Boolean);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     try {
-      return JSON.parse(lines[index]) as T;
+      return JSON.parse(lines[index]!) as T;
     } catch {}
   }
 
@@ -1269,6 +1304,7 @@ async function runFastBrowserDaemonWorkflow(
   options?: {
     headed?: boolean;
     workflowRunStamp?: string;
+    profileDir?: string;
     retainTemporaryProfilesOnSuccess?: boolean;
     artifactMode?: "minimal" | "full";
     debugMode?: "off" | "step";
@@ -1281,6 +1317,7 @@ async function runFastBrowserDaemonWorkflow(
       workflowRef,
       inputs,
       profileName,
+      profileDir: options?.profileDir ?? null,
       headed: Boolean(options?.headed),
       workflowRunStamp: options?.workflowRunStamp ?? null,
       retainTemporaryProfilesOnSuccess: Boolean(
@@ -1381,9 +1418,79 @@ function requireWorkflowInputInteger(
   field: string,
 ): number {
   if (!Number.isInteger(value)) {
-    throw new Error(`Automation bridge requires an integer ${field}.`);
+    throw new TypeError(`Automation bridge requires an integer ${field}.`);
   }
   return Number(value);
+}
+
+const FINGERPRINT_GENERATOR = new FingerprintGenerator();
+export type BrowserOsFamily = "macos" | "windows" | "linux";
+
+/**
+ * Generates a realistic but deterministic browser fingerprint for a persona.
+ *
+ * NOTE: We use a manual combination of BrowserForge's generator and our own seeding
+ * because the library's internal `seed` support in Node.js is currently non-deterministic.
+ */
+export function generateDeterministicFingerprint(
+  personaId: string,
+  options: {
+    userAgent?: string;
+    screenWidth?: number;
+    screenHeight?: number;
+    osFamily: BrowserOsFamily;
+  },
+) {
+  // We use the personaId to pick one consistent fingerprint from the generator.
+  // Since we can't reliably seed the library, we generate a small pool and pick one.
+  const POOL_SIZE = 10;
+  const pool = [];
+
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const operatingSystems: BrowserOsFamily[] = [];
+    if (options.osFamily === "macos") {
+      operatingSystems.push("macos");
+    } else if (options.osFamily === "windows") {
+      operatingSystems.push("windows");
+    } else {
+      operatingSystems.push("linux");
+    }
+    const { fingerprint } = FINGERPRINT_GENERATOR.getFingerprint({
+      browsers: [{ name: "chrome", minVersion: 120 }],
+      devices: ["desktop"],
+      operatingSystems,
+      locales: ["en-US"],
+    });
+    pool.push(fingerprint);
+  }
+
+  // Deterministically pick one from the pool based on personaId hash
+  const hash = createHash("sha256").update(personaId).digest();
+  const index = Math.abs(hash.readInt32BE(0)) % POOL_SIZE;
+  const selected = pool[index];
+  if (!selected) {
+    throw new Error("Fingerprint generator did not return a candidate.");
+  }
+
+  // We override the generated fingerprint with our specific profile constraints if provided.
+  // This ensures the fingerprint is realistic (BrowserForge) but still coherent with our contract.
+  return {
+    ...selected,
+    userAgent: options.userAgent || selected.navigator.userAgent,
+    screen: {
+      ...selected.screen,
+      width: options.screenWidth || selected.screen.width,
+      height: options.screenHeight || selected.screen.height,
+    },
+  };
+}
+
+function isGoogleWorkflow(workflowRef: string): boolean {
+  return (
+    workflowRef.includes("google") ||
+    workflowRef.includes("gmail") ||
+    workflowRef.includes("mail.google.com")
+  );
 }
 
 async function runCodexBrowserLoginWorkflow(
@@ -1404,13 +1511,40 @@ async function runCodexBrowserLoginWorkflow(
     birthMonth?: number;
     birthDay?: number;
     birthYear?: number;
+    profileDir?: string;
+    personaProfile?: {
+      id: string;
+      osFamily: BrowserOsFamily;
+      userAgent: string;
+      acceptLanguage: string;
+      timezone: string;
+      screenWidth: number;
+      screenHeight: number;
+      deviceScaleFactor: number;
+    } | null;
   },
-): Promise<FastBrowserRunResult> {
+): Promise<{
+  result: FastBrowserRunResult;
+  fingerprint: Record<string, unknown> | null;
+}> {
   const codexBin = String(options?.codexBin || "codex").trim() || "codex";
   const workflowRef = requireWorkflowInputString(
     options?.workflowRef,
     "workflowRef",
   );
+
+  const applyPersona =
+    options?.personaProfile && !isGoogleWorkflow(workflowRef);
+  const fingerprint =
+    applyPersona && options.personaProfile
+      ? generateDeterministicFingerprint(options.personaProfile.id, {
+          userAgent: options.personaProfile.userAgent,
+          screenWidth: options.personaProfile.screenWidth,
+          screenHeight: options.personaProfile.screenHeight,
+          osFamily: options.personaProfile.osFamily,
+        })
+      : null;
+
   const fullName = requireWorkflowInputString(options?.fullName, "fullName");
   const birthMonth = requireWorkflowInputInteger(
     options?.birthMonth,
@@ -1421,7 +1555,8 @@ async function runCodexBrowserLoginWorkflow(
     options?.birthYear,
     "birthYear",
   );
-  return await runFastBrowserDaemonWorkflow(
+
+  const result = await runFastBrowserDaemonWorkflow(
     workflowRef,
     {
       mode: "codex_login",
@@ -1477,16 +1612,31 @@ async function runCodexBrowserLoginWorkflow(
       birth_month: String(birthMonth),
       birth_day: String(birthDay),
       birth_year: String(birthYear),
+      ...(fingerprint && options?.personaProfile
+        ? {
+            browser_user_agent: fingerprint.userAgent,
+            browser_accept_language: options.personaProfile.acceptLanguage,
+            browser_timezone: options.personaProfile.timezone,
+            browser_screen_width: String(fingerprint.screen.width),
+            browser_screen_height: String(fingerprint.screen.height),
+            browser_device_scale_factor: String(
+              options.personaProfile.deviceScaleFactor,
+            ),
+          }
+        : {}),
     },
     profileName,
     {
       workflowRunStamp,
+      profileDir: options?.profileDir,
       retainTemporaryProfilesOnSuccess: Boolean(workflowRunStamp),
       artifactMode:
         options?.artifactMode ?? CODEX_ROTATE_AUTH_FLOW_ARTIFACT_MODE,
       responseMode: "action_only",
     },
   );
+
+  return { result, fingerprint };
 }
 
 export async function completeCodexLoginViaWorkflowAttempt(
@@ -1506,6 +1656,17 @@ export async function completeCodexLoginViaWorkflowAttempt(
     birthYear?: number;
     skipLocatorPreflight?: boolean;
     codexSession?: CodexRotateAuthFlowSession | null;
+    profileDir?: string;
+    personaProfile?: {
+      id: string;
+      osFamily: "macos" | "windows" | "linux";
+      userAgent: string;
+      acceptLanguage: string;
+      timezone: string;
+      screenWidth: number;
+      screenHeight: number;
+      deviceScaleFactor: number;
+    } | null;
   },
 ): Promise<CodexRotateLoginWorkflowAttemptResult> {
   const workflowAccountLoginLocator =
@@ -1521,7 +1682,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
   );
 
   try {
-    const loginResult = await runCodexBrowserLoginWorkflow(
+    const { result, fingerprint } = await runCodexBrowserLoginWorkflow(
       profileName,
       email,
       workflowAccountLoginLocator,
@@ -1538,15 +1699,18 @@ export async function completeCodexLoginViaWorkflowAttempt(
         birthMonth: options?.birthMonth,
         birthDay: options?.birthDay,
         birthYear: options?.birthYear,
+        profileDir: options?.profileDir,
+        personaProfile: options?.personaProfile,
       },
     );
     await deleteVerificationArtifactsAfterSuccessfulLogin(
       profileName,
       email,
-      loginResult,
+      result,
     );
     return {
-      result: loginResult,
+      result,
+      browser_fingerprint: fingerprint,
       error_message: null,
     };
   } catch (error) {
@@ -1554,6 +1718,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
     const message = error instanceof Error ? error.message : String(error);
     return {
       result: failedResult,
+      browser_fingerprint: null,
       error_message: message,
     };
   }

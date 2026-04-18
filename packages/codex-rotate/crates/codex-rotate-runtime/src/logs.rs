@@ -109,7 +109,7 @@ limit ?2
         "#,
     )?;
     let rows = statement.query_map(
-        params![after_id.unwrap_or(0), (limit.max(1).min(500)) as i64],
+        params![after_id.unwrap_or(0), limit.clamp(1, 500) as i64],
         |row| {
             let id: i64 = row.get(0)?;
             let ts: i64 = row.get(1)?;

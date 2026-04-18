@@ -8,7 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::fs_security::write_private_string;
 use codex_rotate_core::pool::{
-    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool, Pool,
+    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool, NextResult, Pool,
 };
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
@@ -29,6 +29,7 @@ use crate::logs::{
     CodexLogsAvailability, CodexSignalKind,
 };
 use crate::paths::resolve_paths;
+use crate::rotation_hygiene::rotate_next as run_shared_next;
 use crate::runtime_log::log_daemon_error;
 use crate::thread_recovery::{
     read_latest_recoverable_turn_failure_log_id, run_thread_recovery_iteration,
@@ -522,11 +523,12 @@ fn execute_watch_rotation(
     let port = port.unwrap_or(9333);
     match command {
         Some(RotationCommand::Next) => {
-            let next_result =
-                run_account_operation_with_log_isolation(Some(port), progress.clone(), || {
-                    codex_rotate_core::pool::rotate_next_internal_with_progress(progress.clone())
-                })?;
-            Ok(next_result.current_summary.or(next_result.previous_summary))
+            let next_result = run_shared_next(Some(port), progress.clone())?;
+            Ok(match next_result {
+                NextResult::Rotated { summary, .. }
+                | NextResult::Stayed { summary, .. }
+                | NextResult::Created { summary, .. } => Some(summary),
+            })
         }
         Some(RotationCommand::Create) => {
             if let Some(progress) = progress.as_ref() {
@@ -720,7 +722,7 @@ fn ensure_live_account_matches_current_auth(
     summary: &AuthSummary,
     live_account: AccountReadResult,
 ) -> Result<AccountReadResult> {
-    if live_account_matches_summary(&live_account, &summary) {
+    if live_account_matches_summary(&live_account, summary) {
         return Ok(live_account);
     }
     let switched = switch_live_account_to_current_auth(Some(port), false, 15_000)?;
@@ -1155,6 +1157,7 @@ mod tests {
                 last_quota_checked_at: None,
                 last_quota_primary_left_percent: None,
                 last_quota_next_refresh_at: None,
+                persona: None,
             }],
         };
         assert!(created_account_already_materialized(

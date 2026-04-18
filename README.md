@@ -27,6 +27,29 @@ codex-rotate daemon run         # Start the background daemon used by the tray s
 
 The tray is only a UI shell over the daemon. The CLI owns the watch loop, managed Codex launch, live account sync, and create/relogin orchestration.
 
+#### VM Operations
+
+`codex-rotate` supports running account personas inside isolated macOS VMs using [UTM](https://getutm.app/). This provides kernel-level identity separation for high-risk or strictly isolated accounts.
+
+**Configuration (`~/.codex-rotate/accounts.json`)**:
+
+- `environment`: Set to `"vm"` to enable VM mode globally. Defaults to `"host"`.
+- `vm.basePackagePath`: Path to your sealed `.utm` base package.
+- `vm.personaRoot`: Directory where persona-specific VM clones are stored.
+- `vm.utmAppPath`: Path to `UTM.app` (e.g., `/Applications/UTM.app`).
+- `vm.expectedEgressMode`: Set to `"validate"` to enforce region checks.
+
+1. **Prepare a Base VM**: Create a fresh macOS VM in UTM.
+2. **Install Tools**: Inside the guest, install Codex Desktop, Codex CLI, Google Chrome, and Node.js.
+3. **Seal the Base**: Mount the guest's disk on your host and run the bootstrap script:
+   ```sh
+   # Assuming guest root is mounted at /Volumes/macOS
+   ./packages/codex-rotate/scripts/bootstrap-vm-base.sh /Volumes/macOS
+   ```
+4. **Configure Host**: Set `basePackagePath` and `personaRoot` in `~/.codex-rotate/accounts.json`.
+
+**APFS Requirement**: The VM backend assumes the `personaRoot` is on an APFS volume. This allows `cp -R` to use "Clone" (Copy-on-Write) semantics, ensuring that each new persona VM takes zero additional disk space until modified.
+
 #### Setup
 
 ```sh

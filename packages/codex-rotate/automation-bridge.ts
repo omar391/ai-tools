@@ -5,27 +5,34 @@ import process from "node:process";
 import type {
   CodexRotateSecretLocator,
   CodexRotateAuthFlowSession,
-  CodexRotateSecretRef,
+  BrowserOsFamily,
 } from "./automation.ts";
 import {
   completeCodexLoginViaWorkflowAttempt,
   deleteBitwardenCliAccountSecretRef,
+  generateDeterministicFingerprint,
   prepareBitwardenCliAccountSecretRef,
 } from "./automation.ts";
 
 type BridgeRequest =
   | {
       command: "prepare-account-secret-ref";
-      payload: { profileName: string; email: string; password: string };
+      payload: {
+        profileName: string;
+        profileDir?: string;
+        email: string;
+        password: string;
+      };
     }
   | {
       command: "delete-account-secret-ref";
-      payload: { profileName: string; email: string };
+      payload: { profileName: string; profileDir?: string; email: string };
     }
   | {
       command: "complete-codex-login-attempt";
       payload: {
         profileName: string;
+        profileDir?: string;
         email: string;
         accountLoginLocator?: CodexRotateSecretLocator | null;
         options?: {
@@ -38,9 +45,32 @@ type BridgeRequest =
           fullName?: string;
           birthMonth?: number;
           birthDay?: number;
-          birthYear?: number;
+          birth_year?: number;
           skipLocatorPreflight?: boolean;
           codexSession?: CodexRotateAuthFlowSession | null;
+          personaProfile?: {
+            id: string;
+            osFamily: BrowserOsFamily;
+            userAgent: string;
+            acceptLanguage: string;
+            timezone: string;
+            screenWidth: number;
+            screenHeight: number;
+            deviceScaleFactor: number;
+            browserFingerprint?: Record<string, unknown> | null;
+          } | null;
+        };
+      };
+    }
+  | {
+      command: "generate-browser-fingerprint";
+      payload: {
+        personaId: string;
+        options: {
+          userAgent?: string;
+          screenWidth?: number;
+          screenHeight?: number;
+          osFamily: BrowserOsFamily;
         };
       };
     };
@@ -130,11 +160,13 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.profileName,
         request.payload.email,
         request.payload.password,
+        request.payload.profileDir,
       );
     case "delete-account-secret-ref":
       return await deleteBitwardenCliAccountSecretRef(
         request.payload.profileName,
         request.payload.email,
+        request.payload.profileDir,
       );
     case "complete-codex-login-attempt":
       return (await completeCodexLoginViaWorkflowAttempt(
@@ -143,8 +175,15 @@ async function handleRequest(request: BridgeRequest): Promise<unknown> {
         request.payload.accountLoginLocator ?? null,
         {
           ...request.payload.options,
+          profileDir: request.payload.profileDir,
         },
       )) as unknown;
+    case "generate-browser-fingerprint":
+      return generateDeterministicFingerprint(
+        request.payload.personaId,
+        request.payload.options,
+      );
+
     default: {
       const label =
         typeof (request as { command?: unknown }).command === "string"
@@ -180,4 +219,4 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+await main();

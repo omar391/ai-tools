@@ -4,6 +4,7 @@ pub mod cancel;
 pub mod fs_security;
 pub mod managed_browser;
 pub mod paths;
+pub mod persona;
 pub mod pool;
 pub mod quota;
 pub mod state;

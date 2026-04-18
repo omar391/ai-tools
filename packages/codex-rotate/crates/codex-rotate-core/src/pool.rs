@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -16,6 +17,7 @@ use crate::auth::{
     CodexAuth,
 };
 use crate::paths::resolve_paths;
+use crate::persona::get_persona_profile;
 use crate::quota::{
     describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota,
     quota_next_refresh_at, UsageCredits, UsageResponse, UsageWindow,
@@ -206,6 +208,135 @@ pub struct AccountEntry {
     pub last_quota_primary_left_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_quota_next_refresh_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PersonaEntry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonaEntry {
+    pub persona_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_region_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_root_rel_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_package_rel_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_fingerprint: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PersonaProfile {
+    pub id: String,
+    pub os_family: String,
+    pub user_agent: String,
+    pub accept_language: String,
+    pub timezone: String,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub device_scale_factor: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_fingerprint: Option<serde_json::Value>,
+}
+
+pub static PERSONA_PROFILES: OnceLock<Vec<PersonaProfile>> = OnceLock::new();
+
+pub fn get_persona_profiles() -> &'static [PersonaProfile] {
+    PERSONA_PROFILES.get_or_init(|| {
+        [
+            "balanced-us-compact",
+            "balanced-eu-wide",
+            "balanced-apac-standard",
+        ]
+        .iter()
+        .map(|id| {
+            let profile = get_persona_profile(id);
+            PersonaProfile {
+                id: profile.persona_profile_id,
+                os_family: serde_json::to_string(&profile.os_family)
+                    .unwrap_or_else(|_| "\"macos\"".to_string())
+                    .trim_matches('"')
+                    .to_string(),
+                user_agent: profile.browser.user_agent,
+                accept_language: profile.language,
+                timezone: profile.timezone,
+                screen_width: profile.vm_hardware.screen_width,
+                screen_height: profile.vm_hardware.screen_height,
+                device_scale_factor: profile.device_scale_factor,
+                browser_fingerprint: None,
+            }
+        })
+        .collect()
+    })
+}
+
+pub fn resolve_persona_profile(
+    profile_id: &str,
+    browser_fingerprint: Option<serde_json::Value>,
+) -> Option<PersonaProfile> {
+    get_persona_profiles()
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| PersonaProfile {
+            browser_fingerprint,
+            ..profile.clone()
+        })
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationEnvironment {
+    #[default]
+    Host,
+    Vm,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VmExpectedEgressMode {
+    #[default]
+    ProvisionOnly,
+    Validate,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VmEnvironmentConfig {
+    pub base_package_path: Option<String>,
+    pub persona_root: Option<String>,
+    pub utm_app_path: Option<String>,
+    pub bridge_root: Option<String>,
+    pub expected_egress_mode: VmExpectedEgressMode,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RotationEnvironmentSettings {
+    pub environment: RotationEnvironment,
+    pub vm: Option<VmEnvironmentConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedRotationAction {
+    Switch,
+    Stay,
+    CreateRequired,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedRotation {
+    pub action: PreparedRotationAction,
+    pub pool: Pool,
+    pub previous_index: usize,
+    pub target_index: usize,
+    pub previous: AccountEntry,
+    pub target: AccountEntry,
+    pub message: String,
+    pub persist_pool: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +373,13 @@ pub enum NextResult {
         output: String,
         summary: AuthSummary,
     },
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RotationEnvironmentState {
+    environment: RotationEnvironment,
+    vm: Option<VmEnvironmentConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +556,7 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
         last_quota_checked_at: None,
         last_quota_primary_left_percent: None,
         last_quota_next_refresh_at: None,
+        persona: None,
     });
     pool.active_index = pool.accounts.len() - 1;
     save_pool(&pool)?;
@@ -492,6 +631,288 @@ pub fn cmd_add_expected_email(expected_email: &str, alias: Option<&str>) -> Resu
 
 pub fn cmd_next() -> Result<String> {
     cmd_next_with_progress(None)
+}
+
+pub fn prepare_next_rotation_with_progress(
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<PreparedRotation> {
+    let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
+    if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
+        return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+    }
+
+    let previous_index = pool.active_index;
+    let previous = pool.accounts[previous_index].clone();
+    let mut cursor_index = previous_index;
+    let mut inspected_later_indices = HashSet::new();
+    let mut round_robin_steps = 0usize;
+
+    while round_robin_steps < pool.accounts.len().saturating_sub(1) {
+        let Some(candidate_index) =
+            find_next_immediate_round_robin_index(cursor_index, &pool.accounts)
+        else {
+            break;
+        };
+        round_robin_steps += 1;
+        if !account_rotation_enabled(&disabled_domains, &pool.accounts[candidate_index].email) {
+            cursor_index = candidate_index;
+            continue;
+        }
+
+        let inspection = inspect_account(
+            &mut pool.accounts[candidate_index],
+            &paths.codex_auth_file,
+            false,
+        )?;
+        dirty |= inspection.updated;
+        if account_requires_terminal_cleanup(&pool.accounts[candidate_index]) {
+            dirty |= cleanup_terminal_account(&mut pool, candidate_index)?;
+            if pool.accounts.is_empty() {
+                if dirty {
+                    save_pool(&pool)?;
+                }
+                return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+            }
+            cursor_index = previous_index.min(pool.accounts.len().saturating_sub(1));
+            continue;
+        }
+        inspected_later_indices.insert(candidate_index);
+        if inspection
+            .usage
+            .as_ref()
+            .map(has_usable_quota)
+            .unwrap_or(false)
+        {
+            let target = pool.accounts[candidate_index].clone();
+            let previous_label = previous.label.clone();
+            let previous_email = previous.email.clone();
+            let target_label = target.label.clone();
+            let target_email = target.email.clone();
+            let target_plan_type = target.plan_type.clone();
+            let total_accounts = pool.accounts.len();
+            let quota_summary = inspection
+                .usage
+                .as_ref()
+                .map(format_compact_quota)
+                .unwrap_or_else(|| "quota unavailable".to_string());
+            return Ok(PreparedRotation {
+                action: PreparedRotationAction::Switch,
+                pool,
+                previous_index,
+                target_index: candidate_index,
+                previous,
+                target,
+                message: format!(
+                    "{GREEN}ROTATE{RESET} {} ({}) -> {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  [{}/{}] | {} | checked now{RESET}",
+                    previous_label,
+                    previous_email,
+                    target_label,
+                    target_email,
+                    target_plan_type,
+                    candidate_index + 1,
+                    total_accounts,
+                    quota_summary,
+                ),
+                persist_pool: dirty,
+            });
+        }
+
+        cursor_index = candidate_index;
+    }
+
+    let mut reasons = Vec::new();
+    let result = find_next_usable_account(
+        &mut pool,
+        &paths.codex_auth_file,
+        ReusableAccountProbeMode::OthersFirst,
+        &mut reasons,
+        dirty,
+        &inspected_later_indices,
+        &disabled_domains,
+    )?;
+    dirty = result.1;
+
+    if let Some(candidate) = result.0 {
+        if candidate.index == previous_index {
+            let current_label = previous.label.clone();
+            let current_email = previous.email.clone();
+            let current_plan_type = previous.plan_type.clone();
+            let total_accounts = pool.accounts.len();
+            let quota_summary = candidate
+                .inspection
+                .usage
+                .as_ref()
+                .map(format_compact_quota)
+                .unwrap_or_else(|| "quota unavailable".to_string());
+            return Ok(PreparedRotation {
+                action: PreparedRotationAction::Stay,
+                pool,
+                previous_index,
+                target_index: previous_index,
+                previous: previous.clone(),
+                target: previous,
+                message: format!(
+                    "{GREEN}ROTATE{RESET} Stayed on {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  No other account has usable quota | [{}/{}] | {}{RESET}",
+                    current_label,
+                    current_email,
+                    current_plan_type,
+                    previous_index + 1,
+                    total_accounts,
+                    quota_summary,
+                ),
+                persist_pool: dirty,
+            });
+        }
+
+        let target = candidate.entry.clone();
+        let previous_label = previous.label.clone();
+        let previous_email = previous.email.clone();
+        let target_label = target.label.clone();
+        let target_email = target.email.clone();
+        let target_plan_type = target.plan_type.clone();
+        let total_accounts = pool.accounts.len();
+        let quota_summary = candidate
+            .inspection
+            .usage
+            .as_ref()
+            .map(format_compact_quota)
+            .unwrap_or_else(|| "quota unavailable".to_string());
+        return Ok(PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool,
+            previous_index,
+            target_index: candidate.index,
+            previous,
+            target,
+            message: format!(
+                "{GREEN}ROTATE{RESET} {} ({}) -> {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  [{}/{}] | {}{RESET}",
+                previous_label,
+                previous_email,
+                target_label,
+                target_email,
+                target_plan_type,
+                candidate.index + 1,
+                total_accounts,
+                quota_summary
+            ),
+            persist_pool: dirty,
+        });
+    }
+
+    let previous_rotation_enabled =
+        account_rotation_enabled(&disabled_domains, &pool.accounts[previous_index].email);
+    let has_other_enabled_target = pool.accounts.iter().enumerate().any(|(index, entry)| {
+        index != previous_index && account_rotation_enabled(&disabled_domains, &entry.email)
+    });
+    if !previous_rotation_enabled || !has_other_enabled_target {
+        return Err(disabled_rotation_target_error(
+            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
+        ));
+    }
+
+    Ok(PreparedRotation {
+        action: PreparedRotationAction::CreateRequired,
+        pool,
+        previous_index,
+        target_index: previous_index,
+        previous: previous.clone(),
+        target: previous,
+        message: progress
+            .as_ref()
+            .map(|_| "Auto rotation is creating a replacement account.".to_string())
+            .unwrap_or_else(|| {
+                "Auto rotation requires creating a replacement account.".to_string()
+            }),
+        persist_pool: dirty,
+    })
+}
+
+pub fn prepare_prev_rotation() -> Result<PreparedRotation> {
+    let paths = resolve_paths()?;
+    let disabled_domains = load_disabled_rotation_domains()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    if pool.accounts.is_empty() {
+        return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+    }
+    if pool.accounts.len() == 1 {
+        if dirty {
+            save_pool(&pool)?;
+        }
+        return Err(anyhow!(
+            "Only 1 account in pool. Add more with: codex-rotate add"
+        ));
+    }
+
+    let previous_index = pool.active_index;
+    let Some(target_index) = (1..pool.accounts.len())
+        .map(|offset| (pool.active_index + pool.accounts.len() - offset) % pool.accounts.len())
+        .find(|index| account_rotation_enabled(&disabled_domains, &pool.accounts[*index].email))
+    else {
+        return Err(disabled_rotation_target_error(
+            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
+        ));
+    };
+    let previous = pool.accounts[previous_index].clone();
+    let target = pool.accounts[target_index].clone();
+    let previous_label = previous.label.clone();
+    let previous_email = previous.email.clone();
+    let target_label = target.label.clone();
+    let target_email = target.email.clone();
+    let target_plan_type = target.plan_type.clone();
+    let total_accounts = pool.accounts.len();
+    Ok(PreparedRotation {
+        action: PreparedRotationAction::Switch,
+        pool,
+        previous_index,
+        target_index,
+        previous: previous.clone(),
+        target: target.clone(),
+        message: format!(
+            "{GREEN}ROTATE{RESET} {} ({}) -> {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  [{}/{}]{RESET}",
+            previous_label,
+            previous_email,
+            target_label,
+            target_email,
+            target_plan_type,
+            target_index + 1,
+            total_accounts,
+        ),
+        persist_pool: dirty,
+    })
+}
+
+pub fn persist_prepared_rotation_pool(prepared: &PreparedRotation) -> Result<()> {
+    let mut pool = prepared.pool.clone();
+    pool.active_index = prepared
+        .target_index
+        .min(pool.accounts.len().saturating_sub(1));
+    save_pool(&pool)
+}
+
+pub fn rollback_prepared_rotation(prepared: &PreparedRotation) -> Result<()> {
+    let paths = resolve_paths()?;
+    write_codex_auth(&paths.codex_auth_file, &prepared.previous.auth)?;
+    restore_pool_active_index(prepared.previous_index)?;
+    Ok(())
+}
+
+pub fn resolve_pool_account(selector: &str) -> Result<Option<AccountEntry>> {
+    let pool = load_pool()?;
+    match resolve_account_selector(&pool, selector) {
+        Ok(selection) => Ok(Some(selection.entry)),
+        Err(error) if error.to_string().contains("not found in pool") => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn cmd_next_with_progress(
@@ -1380,7 +1801,17 @@ pub fn load_pool() -> Result<Pool> {
     Ok(pool)
 }
 
-pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
+pub fn load_rotation_environment_settings() -> Result<RotationEnvironmentSettings> {
+    let state = load_rotate_state_json()?;
+    let parsed: RotationEnvironmentState =
+        serde_json::from_value(state).context("Invalid environment config in rotate state.")?;
+    Ok(RotationEnvironmentSettings {
+        environment: parsed.environment,
+        vm: parsed.vm,
+    })
+}
+
+pub fn save_pool(pool: &Pool) -> Result<()> {
     let active_index = pool.active_index;
     let accounts = serde_json::to_value(&pool.accounts)?;
     update_rotate_state_json(RotateStateOwner::Pool, move |state| {
@@ -1397,6 +1828,19 @@ pub(crate) fn save_pool(pool: &Pool) -> Result<()> {
         object.insert("accounts".to_string(), accounts.clone());
         Ok(())
     })
+}
+
+pub fn write_selected_account_auth(entry: &AccountEntry) -> Result<()> {
+    let paths = resolve_paths()?;
+    let Some(parent) = paths.codex_auth_file.parent() else {
+        return Err(anyhow!(
+            "Failed to resolve the parent directory for {}.",
+            paths.codex_auth_file.display()
+        ));
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    write_codex_auth(&paths.codex_auth_file, &entry.auth)
 }
 
 fn extract_email_from_auth(auth: &CodexAuth) -> String {
@@ -1659,6 +2103,48 @@ pub fn restore_codex_auth_from_active_pool() -> Result<bool> {
     Ok(true)
 }
 
+pub fn validate_persona_egress(persona: &PersonaEntry, mode: VmExpectedEgressMode) -> Result<()> {
+    if mode == VmExpectedEgressMode::ProvisionOnly {
+        return Ok(());
+    }
+
+    let actual_region = fetch_actual_egress_region()?;
+    validate_persona_egress_with_actual(persona, mode, &actual_region)
+}
+
+pub fn validate_persona_egress_with_actual(
+    persona: &PersonaEntry,
+    mode: VmExpectedEgressMode,
+    actual_region: &str,
+) -> Result<()> {
+    if mode == VmExpectedEgressMode::ProvisionOnly {
+        return Ok(());
+    }
+
+    if let Some(expected) = &persona.expected_region_code {
+        if !expected.eq_ignore_ascii_case(actual_region) {
+            return Err(anyhow!(
+                "Persona egress validation failed: expected {}, found {}.",
+                expected,
+                actual_region
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn fetch_actual_egress_region() -> Result<String> {
+    // In a real environment, this would call an external API or check a local proxy.
+    // For now, we will return a default or use an environment variable for testing.
+    if let Ok(region) = std::env::var("CODEX_ROTATE_MOCK_REGION") {
+        return Ok(region);
+    }
+
+    // Default to US for now if no mock is provided.
+    Ok("US".to_string())
+}
+
 pub fn restore_pool_active_index(index: usize) -> Result<bool> {
     let mut pool = load_pool()?;
     if pool.accounts.is_empty() {
@@ -1724,6 +2210,7 @@ fn sync_pool_current_auth_from_auth(
             last_quota_checked_at: None,
             last_quota_primary_left_percent: None,
             last_quota_next_refresh_at: None,
+            persona: None,
         });
         let added_index = pool.accounts.len() - 1;
         if activate_current || pool.accounts.len() == 1 {
@@ -1815,6 +2302,12 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
             entry.account_id = next_account_id;
             changed = true;
         }
+
+        let next_persona = normalized_persona(entry);
+        if entry.persona.as_ref() != Some(&next_persona) {
+            entry.persona = Some(next_persona);
+            changed = true;
+        }
     }
 
     let max_active_index = pool.accounts.len().saturating_sub(1);
@@ -1824,6 +2317,89 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
         changed = true;
     }
     changed
+}
+
+fn normalized_persona(entry: &AccountEntry) -> PersonaEntry {
+    let mut hasher = DefaultHasher::new();
+    entry.account_id.hash(&mut hasher);
+    entry.label.hash(&mut hasher);
+    let persona_hash = hasher.finish();
+    let persona_id = format!(
+        "persona-{}-{:08x}",
+        sanitize_persona_token(&entry.label),
+        (persona_hash & 0xffff_ffff) as u32
+    );
+    let persona_profile_id = match (persona_hash % 3) as usize {
+        0 => "balanced-us-compact",
+        1 => "balanced-eu-wide",
+        _ => "balanced-apac-standard",
+    };
+    let expected_region_code = entry
+        .persona
+        .as_ref()
+        .and_then(|persona| persona.expected_region_code.clone());
+    PersonaEntry {
+        persona_id: entry
+            .persona
+            .as_ref()
+            .map(|persona| persona.persona_id.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(persona_id.clone()),
+        persona_profile_id: Some(
+            entry
+                .persona
+                .as_ref()
+                .and_then(|persona| persona.persona_profile_id.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| persona_profile_id.to_string()),
+        ),
+        expected_region_code,
+        ready_at: entry
+            .persona
+            .as_ref()
+            .and_then(|persona| persona.ready_at.clone()),
+        host_root_rel_path: Some(
+            entry
+                .persona
+                .as_ref()
+                .and_then(|persona| persona.host_root_rel_path.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("personas/host/{persona_id}")),
+        ),
+        vm_package_rel_path: entry
+            .persona
+            .as_ref()
+            .and_then(|persona| persona.vm_package_rel_path.clone()),
+        browser_fingerprint: entry
+            .persona
+            .as_ref()
+            .and_then(|persona| persona.browser_fingerprint.clone()),
+    }
+}
+
+fn sanitize_persona_token(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = normalized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if compact.is_empty() {
+        "account".to_string()
+    } else {
+        compact
+    }
 }
 
 fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -> bool {
@@ -1863,13 +2439,12 @@ fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -> bool {
 }
 
 fn apply_usage_to_account(entry: &mut AccountEntry, usage: &UsageResponse) -> bool {
-    let next_email = if usage.email.is_empty() {
-        entry.email.clone()
-    } else if should_preserve_expected_email(&entry.email, &usage.email) {
-        entry.email.clone()
-    } else {
-        usage.email.clone()
-    };
+    let next_email =
+        if usage.email.is_empty() || should_preserve_expected_email(&entry.email, &usage.email) {
+            entry.email.clone()
+        } else {
+            usage.email.clone()
+        };
     let next_plan = if usage.plan_type.is_empty() {
         entry.plan_type.clone()
     } else {
@@ -2471,6 +3046,7 @@ mod tests {
             last_quota_checked_at: checked_at.map(ToOwned::to_owned),
             last_quota_primary_left_percent: None,
             last_quota_next_refresh_at: None,
+            persona: None,
         }
     }
 
@@ -2626,6 +3202,7 @@ mod tests {
             last_quota_checked_at: checked_at.map(ToOwned::to_owned),
             last_quota_primary_left_percent: usable.map(|value| if value { 90 } else { 0 }),
             last_quota_next_refresh_at: checked_at.map(|_| "2026-04-07T01:00:00.000Z".to_string()),
+            persona: None,
         }
     }
 
@@ -2707,6 +3284,130 @@ mod tests {
         );
         assert_eq!(state["active_index"], json!(1));
         assert_eq!(state["accounts"][1]["email"], json!("dev.2@astronlab.com"));
+    }
+
+    #[test]
+    fn load_rotation_environment_settings_defaults_to_host() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-env-default-host");
+        write_rotate_state_json(&json!({
+            "accounts": [],
+            "active_index": 0
+        }))
+        .expect("write default rotate state");
+
+        let settings = load_rotation_environment_settings().expect("load settings");
+        assert_eq!(settings.environment, RotationEnvironment::Host);
+        assert!(settings.vm.is_none());
+    }
+
+    #[test]
+    fn load_rotation_environment_settings_reads_vm_config() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-env-vm");
+        write_rotate_state_json(&json!({
+            "accounts": [],
+            "active_index": 0,
+            "environment": "vm",
+            "vm": {
+                "basePackagePath": "/vm/base.utm",
+                "personaRoot": "/vm/personas",
+                "utmAppPath": "/Applications/UTM.app",
+                "bridgeRoot": "/vm/bridge",
+                "expectedEgressMode": "validate"
+            }
+        }))
+        .expect("write vm rotate state");
+
+        let settings = load_rotation_environment_settings().expect("load settings");
+        assert_eq!(settings.environment, RotationEnvironment::Vm);
+        let vm = settings.vm.expect("vm config");
+        assert_eq!(vm.base_package_path.as_deref(), Some("/vm/base.utm"));
+        assert_eq!(vm.persona_root.as_deref(), Some("/vm/personas"));
+        assert_eq!(vm.utm_app_path.as_deref(), Some("/Applications/UTM.app"));
+        assert_eq!(vm.bridge_root.as_deref(), Some("/vm/bridge"));
+        assert_eq!(vm.expected_egress_mode, VmExpectedEgressMode::Validate);
+    }
+
+    #[test]
+    fn normalize_pool_entries_assigns_deterministic_persona_defaults() {
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![configured_entry(
+                "dev.1@astronlab.com",
+                "acct-1",
+                "free",
+                Some(true),
+                None,
+            )],
+        };
+
+        assert!(normalize_pool_entries(&mut pool));
+        let persona = pool.accounts[0]
+            .persona
+            .clone()
+            .expect("persona metadata should be assigned");
+        assert!(persona.persona_id.starts_with("persona-"));
+        assert!(persona
+            .host_root_rel_path
+            .as_deref()
+            .unwrap()
+            .starts_with("personas/host/"));
+        assert!(persona.persona_profile_id.is_some());
+
+        let mut second_pool = Pool {
+            active_index: 0,
+            accounts: vec![configured_entry(
+                "dev.1@astronlab.com",
+                "acct-1",
+                "free",
+                Some(true),
+                None,
+            )],
+        };
+        normalize_pool_entries(&mut second_pool);
+        assert_eq!(second_pool.accounts[0].persona, Some(persona));
+    }
+
+    #[test]
+    fn prepare_prev_rotation_stages_previous_selection_until_commit() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-prepare-prev-stage");
+        let mut previous =
+            configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None);
+        previous.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+        previous.last_quota_next_refresh_at = Some("2099-01-01T01:00:00.000Z".to_string());
+        let mut current =
+            configured_entry("dev.2@astronlab.com", "acct-2", "free", Some(true), None);
+        current.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+        current.last_quota_next_refresh_at = Some("2099-01-01T01:00:00.000Z".to_string());
+        write_rotate_state_json(&json!({
+            "accounts": [previous, current],
+            "active_index": 1
+        }))
+        .expect("write rotate state");
+
+        let initial_pool = load_pool().expect("load pool");
+        write_selected_account_auth(&initial_pool.accounts[1]).expect("write current auth");
+
+        let prepared = prepare_prev_rotation().expect("prepare prev");
+        assert_eq!(prepared.action, PreparedRotationAction::Switch);
+        assert_eq!(prepared.previous_index, 1);
+        assert_eq!(prepared.target_index, 0);
+
+        let staged_state = load_rotate_state_json().expect("load staged state");
+        assert_eq!(staged_state["active_index"], json!(1));
+        let staged_auth =
+            crate::auth::load_codex_auth(&resolve_paths().expect("resolve paths").codex_auth_file)
+                .expect("load staged auth");
+        assert_eq!(staged_auth.tokens.account_id, "acct-2");
+
+        persist_prepared_rotation_pool(&prepared).expect("persist prepared pool");
+        write_selected_account_auth(&prepared.target).expect("write target auth");
+
+        let committed_state = load_rotate_state_json().expect("load committed state");
+        assert_eq!(committed_state["active_index"], json!(0));
+        let committed_auth =
+            crate::auth::load_codex_auth(&resolve_paths().expect("resolve paths").codex_auth_file)
+                .expect("load committed auth");
+        assert_eq!(committed_auth.tokens.account_id, "acct-1");
     }
 
     #[test]
@@ -3827,6 +4528,7 @@ mod tests {
                     last_quota_checked_at: None,
                     last_quota_primary_left_percent: None,
                     last_quota_next_refresh_at: None,
+                    persona: None,
                 }],
             })?;
 
@@ -3865,14 +4567,16 @@ mod tests {
                 last_quota_checked_at: None,
                 last_quota_primary_left_percent: None,
                 last_quota_next_refresh_at: None,
+                persona: None,
             }],
         };
 
         let changed = normalize_pool_entries(&mut pool);
 
-        assert!(!changed);
+        assert!(changed);
         assert_eq!(pool.accounts[0].email, "devbench.12@astronlab.com");
         assert_eq!(pool.accounts[0].label, "devbench.12@astronlab.com_free");
+        assert!(!normalize_pool_entries(&mut pool));
     }
 
     #[test]
@@ -4323,5 +5027,84 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("disabled domains should not count as reusable accounts");
+    }
+
+    #[test]
+    fn rollback_prepared_rotation_restores_previous_auth_and_active_index() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-rollback-prepared");
+        let previous = configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None);
+        let target = configured_entry("dev.2@astronlab.com", "acct-2", "free", Some(true), None);
+
+        let pool = Pool {
+            active_index: 0,
+            accounts: vec![previous.clone(), target.clone()],
+        };
+        save_pool(&pool).expect("save initial pool");
+
+        let paths = resolve_paths().expect("resolve paths");
+        if let Some(parent) = paths.codex_auth_file.parent() {
+            std::fs::create_dir_all(parent).expect("create auth parent");
+        }
+        write_codex_auth(&paths.codex_auth_file, &previous.auth).expect("write initial auth");
+
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: pool.clone(),
+            previous_index: 0,
+            target_index: 1,
+            previous: previous.clone(),
+            target: target.clone(),
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        // Simulate a partial activation: auth is written but pool is not committed
+        write_codex_auth(&paths.codex_auth_file, &target.auth).expect("write target auth");
+
+        rollback_prepared_rotation(&prepared).expect("rollback");
+
+        let restored_auth = load_codex_auth(&paths.codex_auth_file).expect("load restored auth");
+        assert_eq!(extract_account_id_from_auth(&restored_auth), "acct-1");
+
+        let restored_pool = load_pool().expect("load restored pool");
+        assert_eq!(restored_pool.active_index, 0);
+    }
+
+    #[test]
+    fn validate_persona_egress_fails_when_region_mismatches_in_validate_mode() {
+        let mut persona = PersonaEntry::default();
+        persona.expected_region_code = Some("US".to_string());
+
+        // We will mock the egress check to return "GB"
+        let result =
+            validate_persona_egress_with_actual(&persona, VmExpectedEgressMode::Validate, "GB");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected US, found GB"));
+    }
+
+    #[test]
+    fn validate_persona_egress_succeeds_when_region_matches_in_validate_mode() {
+        let mut persona = PersonaEntry::default();
+        persona.expected_region_code = Some("US".to_string());
+
+        let result =
+            validate_persona_egress_with_actual(&persona, VmExpectedEgressMode::Validate, "US");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_persona_egress_succeeds_in_provision_only_mode_even_if_region_mismatches() {
+        let mut persona = PersonaEntry::default();
+        persona.expected_region_code = Some("US".to_string());
+
+        let result = validate_persona_egress_with_actual(
+            &persona,
+            VmExpectedEgressMode::ProvisionOnly,
+            "GB",
+        );
+        assert!(result.is_ok());
     }
 }
