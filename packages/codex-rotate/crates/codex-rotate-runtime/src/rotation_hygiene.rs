@@ -2594,6 +2594,20 @@ esac
         );
     }
 
+    fn write_fake_codex_bin(path: &Path, log_file: &Path) {
+        write_executable(
+            path,
+            &format!(
+                r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{log_file}'
+exit 91
+"#,
+                log_file = log_file.display()
+            ),
+        );
+    }
+
     #[test]
     fn current_environment_defaults_to_host_from_state() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -3521,11 +3535,16 @@ esac
 
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
         let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_codex_bin = std::env::var_os("CODEX_ROTATE_CODEX_BIN");
         let previous_account_flow_file = std::env::var_os("CODEX_ROTATE_ACCOUNT_FLOW_FILE");
         let invalid_account_flow = temp.path().join("missing-workflow.yaml");
+        let fake_codex_log = temp.path().join("fake-codex.log");
+        let fake_codex_bin = temp.path().join("bin").join("codex");
+        write_fake_codex_bin(&fake_codex_bin, &fake_codex_log);
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
             std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("CODEX_ROTATE_CODEX_BIN", &fake_codex_bin);
             std::env::set_var("CODEX_ROTATE_ACCOUNT_FLOW_FILE", &invalid_account_flow);
         }
 
@@ -3575,9 +3594,15 @@ esac
             !error.contains("Another rotation is already in progress"),
             "pool-backed relogin should not self-contend on rotation lock; got: {error}"
         );
+        let codex_calls = fs::read_to_string(&fake_codex_log).unwrap_or_default();
+        assert!(
+            codex_calls.trim().is_empty(),
+            "relogin test should not invoke real codex login in this failure path; calls:\n{codex_calls}"
+        );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_CODEX_BIN", previous_codex_bin);
         restore_env("CODEX_ROTATE_ACCOUNT_FLOW_FILE", previous_account_flow_file);
     }
 
@@ -3658,6 +3683,32 @@ insert into threads (id, rollout_path, updated_at, archived) values
         }
         assert!(stopped, "managed codex process should stop cleanly");
         stop_managed_codex_instance(9333, &profile_dir).expect("stop should be a no-op");
+    }
+
+    #[test]
+    fn managed_codex_stop_helper_terminates_running_instance() {
+        let temp = tempdir().expect("tempdir");
+        let profile_dir = temp.path().join("managed-profile");
+        fs::create_dir_all(&profile_dir).expect("create profile");
+
+        let process = ManagedCodexProcess::start(&profile_dir).expect("start managed codex");
+        assert!(managed_codex_is_running(&profile_dir).expect("detect running codex"));
+
+        stop_managed_codex_instance(9333, &profile_dir).expect("stop running codex");
+        let mut stopped = false;
+        for _ in 0..20 {
+            if !managed_codex_is_running(&profile_dir).expect("detect stopped codex") {
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            stopped,
+            "managed codex process should stop after stop helper"
+        );
+
+        drop(process);
     }
 
     #[test]
@@ -3773,11 +3824,16 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
         let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_codex_bin = std::env::var_os("CODEX_ROTATE_CODEX_BIN");
         let previous_account_flow_file = std::env::var_os("CODEX_ROTATE_ACCOUNT_FLOW_FILE");
         let invalid_account_flow = temp.path().join("missing-workflow.yaml");
+        let fake_codex_log = temp.path().join("fake-codex.log");
+        let fake_codex_bin = temp.path().join("bin").join("codex");
+        write_fake_codex_bin(&fake_codex_bin, &fake_codex_log);
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
             std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("CODEX_ROTATE_CODEX_BIN", &fake_codex_bin);
             std::env::set_var("CODEX_ROTATE_ACCOUNT_FLOW_FILE", &invalid_account_flow);
         }
 
@@ -3826,12 +3882,18 @@ insert into threads (id, rollout_path, updated_at, archived) values
             result.is_err(),
             "relogin should fail before browser automation starts"
         );
+        let codex_calls = fs::read_to_string(&fake_codex_log).unwrap_or_default();
+        assert!(
+            codex_calls.trim().is_empty(),
+            "host relogin test should not invoke real codex login in this failure path; calls:\n{codex_calls}"
+        );
 
         // Verify restoration after failure/success
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_CODEX_BIN", previous_codex_bin);
         restore_env("CODEX_ROTATE_ACCOUNT_FLOW_FILE", previous_account_flow_file);
     }
 
