@@ -1083,11 +1083,20 @@ pub fn cmd_status() -> Result<String> {
 }
 
 pub fn current_pool_overview() -> Result<PoolOverview> {
+    current_pool_overview_with_activation(true)
+}
+
+pub fn current_pool_overview_without_activation() -> Result<PoolOverview> {
+    current_pool_overview_with_activation(false)
+}
+
+fn current_pool_overview_with_activation(activate_current: bool) -> Result<PoolOverview> {
     let paths = resolve_paths()?;
     let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
-    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |=
+        sync_pool_current_auth_from_codex(&mut pool, &paths.codex_auth_file, activate_current)?;
     dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if dirty {
         save_pool(&pool)?;
@@ -1603,17 +1612,23 @@ pub(crate) fn sync_pool_active_account_from_codex(
     pool: &mut Pool,
     auth_path: &Path,
 ) -> Result<bool> {
-    if !auth_path.exists() {
-        return Ok(false);
-    }
-    let current_auth = load_codex_auth(auth_path)?;
-    sync_pool_active_account_from_auth(pool, current_auth)
+    sync_pool_current_auth_from_codex(pool, auth_path, true)
 }
 
 pub fn sync_pool_active_account_from_current_auth() -> Result<bool> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let changed = sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    if changed {
+        save_pool(&pool)?;
+    }
+    Ok(changed)
+}
+
+pub fn sync_pool_current_auth_into_pool_without_activation() -> Result<bool> {
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let changed = sync_pool_current_auth_from_codex(&mut pool, &paths.codex_auth_file, false)?;
     if changed {
         save_pool(&pool)?;
     }
@@ -1668,7 +1683,23 @@ pub fn restore_pool_active_index(index: usize) -> Result<bool> {
     Ok(true)
 }
 
-fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) -> Result<bool> {
+fn sync_pool_current_auth_from_codex(
+    pool: &mut Pool,
+    auth_path: &Path,
+    activate_current: bool,
+) -> Result<bool> {
+    if !auth_path.exists() {
+        return Ok(false);
+    }
+    let current_auth = load_codex_auth(auth_path)?;
+    sync_pool_current_auth_from_auth(pool, current_auth, activate_current)
+}
+
+fn sync_pool_current_auth_from_auth(
+    pool: &mut Pool,
+    current_auth: CodexAuth,
+    activate_current: bool,
+) -> Result<bool> {
     let current_account_id = extract_account_id_from_auth(&current_auth);
     let current_email = extract_email_from_auth(&current_auth);
     let normalized_email = normalize_email_for_label(&current_email);
@@ -1702,12 +1733,15 @@ fn sync_pool_active_account_from_auth(pool: &mut Pool, current_auth: CodexAuth) 
             last_quota_primary_left_percent: None,
             last_quota_next_refresh_at: None,
         });
-        pool.active_index = pool.accounts.len() - 1;
-        let _ = reconcile_added_account_credential_state(&pool.accounts[pool.active_index])?;
+        let added_index = pool.accounts.len() - 1;
+        if activate_current || pool.accounts.len() == 1 {
+            pool.active_index = added_index;
+        }
+        let _ = reconcile_added_account_credential_state(&pool.accounts[added_index])?;
         return Ok(true);
     };
 
-    if pool.active_index != current_index {
+    if activate_current && pool.active_index != current_index {
         pool.active_index = current_index;
         changed = true;
     }
@@ -3538,9 +3572,10 @@ mod tests {
                 accounts: vec![stored_entry(Some(true), None)],
             };
 
-            let changed = sync_pool_active_account_from_auth(
+            let changed = sync_pool_current_auth_from_auth(
                 &mut pool,
                 make_auth("dev.35@astronlab.com", "acct-35", "free"),
+                true,
             )?;
 
             assert!(changed);
@@ -3570,9 +3605,12 @@ mod tests {
             accounts: vec![stored_entry(Some(true), None)],
         };
 
-        let changed =
-            sync_pool_active_account_from_auth(&mut pool, make_auth("unknown", "acct-35", "free"))
-                .expect("sync should succeed");
+        let changed = sync_pool_current_auth_from_auth(
+            &mut pool,
+            make_auth("unknown", "acct-35", "free"),
+            true,
+        )
+        .expect("sync should succeed");
 
         assert!(!changed);
         assert_eq!(pool.accounts.len(), 1);
@@ -3624,6 +3662,53 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("current auth sync should persist the missing pool entry");
+    }
+
+    #[test]
+    fn sync_pool_current_auth_into_pool_without_activation_preserves_active_index() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            if let Some(parent) = paths.codex_auth_file.parent() {
+                std::fs::create_dir_all(parent).expect("create auth parent");
+            }
+            write_codex_auth(
+                &paths.codex_auth_file,
+                &make_auth("dev.36@astronlab.com", "acct-36", "free"),
+            )?;
+
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![stored_entry(Some(true), None)],
+            })?;
+
+            let changed = sync_pool_current_auth_into_pool_without_activation()?;
+            let pool = load_pool()?;
+
+            assert!(changed);
+            assert_eq!(pool.accounts.len(), 2);
+            assert_eq!(pool.active_index, 0);
+            assert_eq!(pool.accounts[1].email, "dev.36@astronlab.com");
+            assert_eq!(pool.accounts[1].account_id, "acct-36");
+            assert_eq!(pool.accounts[1].label, "dev.36@astronlab.com_free");
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("passive current auth sync should preserve the active pool entry");
     }
 
     #[test]

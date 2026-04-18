@@ -29,8 +29,9 @@ use chrono::{Duration as ChronoDuration, Local, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::cancel;
 use codex_rotate_core::pool::{
-    cmd_add, cmd_list, cmd_remove, cmd_status, current_pool_overview,
-    restore_codex_auth_from_active_pool, sync_pool_active_account_from_current_auth, NextResult,
+    cmd_add, cmd_list, cmd_remove, cmd_status, current_pool_overview_without_activation,
+    restore_codex_auth_from_active_pool, sync_pool_current_auth_into_pool_without_activation,
+    NextResult,
 };
 use codex_rotate_core::quota::CachedQuotaState;
 use codex_rotate_core::workflow::{
@@ -1106,7 +1107,7 @@ fn next_result_summary(result: &NextResult) -> Option<codex_rotate_core::auth::A
 }
 
 fn refresh_static_snapshot(state: &mut DaemonState) {
-    let _ = sync_pool_active_account_from_current_auth();
+    let _ = sync_pool_current_auth_into_pool_without_activation();
     refresh_inventory_count(&mut state.snapshot);
     refresh_auth_summary(&mut state.snapshot);
     state.snapshot.auto_create_enabled = auto_create_enabled().unwrap_or(true);
@@ -1133,7 +1134,7 @@ fn hydrate_quota_cache_from_watch_state(state: &mut DaemonState) {
 }
 
 fn refresh_inventory_count(snapshot: &mut StatusSnapshot) {
-    if let Ok(overview) = current_pool_overview() {
+    if let Ok(overview) = current_pool_overview_without_activation() {
         snapshot.inventory_count = Some(overview.inventory_count);
         snapshot.inventory_active_slot = overview.inventory_active_slot;
         snapshot.inventory_healthy_count = Some(overview.inventory_healthy_count);
@@ -1850,13 +1851,13 @@ mod tests {
 
             let pool = load_pool()?;
             assert_eq!(pool.accounts.len(), 2);
-            assert_eq!(pool.active_index, 1);
+            assert_eq!(pool.active_index, 0);
             assert_eq!(pool.accounts[1].email, "dev.2@astronlab.com");
             assert_eq!(pool.accounts[1].account_id, "acct-2");
 
             let snapshot = state.snapshot;
             assert_eq!(snapshot.inventory_count, Some(2));
-            assert_eq!(snapshot.inventory_active_slot, Some(2));
+            assert_eq!(snapshot.inventory_active_slot, Some(1));
             Ok(())
         })();
 
