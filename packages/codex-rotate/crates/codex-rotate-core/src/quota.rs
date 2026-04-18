@@ -111,12 +111,7 @@ pub fn inspect_quota(auth: &CodexAuth) -> Result<QuotaAssessment> {
         } else {
             Some(describe_quota_blocker(&usage))
         },
-        primary_quota_left_percent: get_quota_left(
-            usage
-                .rate_limit
-                .as_ref()
-                .and_then(|limits| limits.primary_window.as_ref()),
-        ),
+        primary_quota_left_percent: get_quota_left(primary_window(&usage)),
         usage,
         usable,
     })
@@ -137,19 +132,22 @@ pub fn get_quota_left(window: Option<&UsageWindow>) -> Option<f64> {
     Some((100.0 - window.used_percent).clamp(0.0, 100.0))
 }
 
+pub fn get_effective_quota_left(usage: &UsageResponse) -> Option<f64> {
+    [primary_window(usage), secondary_window(usage)]
+        .into_iter()
+        .flatten()
+        .filter_map(|window| get_quota_left(Some(window)))
+        .min_by(|left, right| left.total_cmp(right))
+}
+
 pub fn has_usable_quota(usage: &UsageResponse) -> bool {
-    let primary_left = get_quota_left(
-        usage
-            .rate_limit
-            .as_ref()
-            .and_then(|limits| limits.primary_window.as_ref()),
-    );
+    let effective_left = get_effective_quota_left(usage);
     if usage
         .rate_limit
         .as_ref()
         .map(|limits| limits.allowed)
         .unwrap_or(false)
-        && primary_left.map(|value| value > 0.0).unwrap_or(false)
+        && effective_left.map(|value| value > 0.0).unwrap_or(false)
     {
         return true;
     }
@@ -162,14 +160,10 @@ pub fn has_usable_quota(usage: &UsageResponse) -> bool {
 }
 
 pub fn describe_quota_blocker(usage: &UsageResponse) -> String {
-    let primary = usage
-        .rate_limit
-        .as_ref()
-        .and_then(|limits| limits.primary_window.as_ref());
-    let primary_left = get_quota_left(primary);
-    if primary_left.map(|value| value <= 0.0).unwrap_or(false) {
-        let label = format_window_label(primary, "current");
-        let reset = primary.and_then(|window| format_reset_suffix(window.reset_after_seconds));
+    let exhausted = exhausted_window(usage);
+    if exhausted.is_some() {
+        let label = format_window_label(exhausted, "current");
+        let reset = exhausted.and_then(|window| format_reset_suffix(window.reset_after_seconds));
         return format!("{} quota exhausted{}", label, reset.unwrap_or_default());
     }
     if usage
@@ -276,17 +270,9 @@ pub fn quota_next_refresh_at(
         return fetched_at + quota_refresh_interval_from_usage(usage);
     }
 
-    if let Some(primary_window) = usage
-        .rate_limit
-        .as_ref()
-        .and_then(|limits| limits.primary_window.as_ref())
-    {
-        if get_quota_left(Some(primary_window))
-            .map(|value| value <= 0.0)
-            .unwrap_or(false)
-            && primary_window.reset_after_seconds >= 0
-        {
-            return fetched_at + chrono::Duration::seconds(primary_window.reset_after_seconds);
+    if let Some(window) = exhausted_window(usage) {
+        if window.reset_after_seconds >= 0 {
+            return fetched_at + chrono::Duration::seconds(window.reset_after_seconds);
         }
     }
 
@@ -342,19 +328,46 @@ pub fn quota_cache_is_stale(
 }
 
 fn quota_refresh_interval_from_usage(usage: &UsageResponse) -> chrono::Duration {
-    match get_quota_left(
-        usage
-            .rate_limit
-            .as_ref()
-            .and_then(|limits| limits.primary_window.as_ref()),
-    )
-    .map(|value| value.round() as u8)
-    .unwrap_or(0)
+    match get_quota_left(primary_window(usage))
+        .map(|value| value.round() as u8)
+        .unwrap_or(0)
     {
         value if value > 20 => chrono::Duration::seconds(60),
         value if value > 10 => chrono::Duration::seconds(30),
         _ => chrono::Duration::seconds(15),
     }
+}
+
+fn primary_window(usage: &UsageResponse) -> Option<&UsageWindow> {
+    usage
+        .rate_limit
+        .as_ref()
+        .and_then(|limits| limits.primary_window.as_ref())
+}
+
+fn secondary_window(usage: &UsageResponse) -> Option<&UsageWindow> {
+    usage
+        .rate_limit
+        .as_ref()
+        .and_then(|limits| limits.secondary_window.as_ref())
+}
+
+fn exhausted_window(usage: &UsageResponse) -> Option<&UsageWindow> {
+    [primary_window(usage), secondary_window(usage)]
+        .into_iter()
+        .flatten()
+        .filter(|window| {
+            get_quota_left(Some(window))
+                .map(|value| value <= 0.0)
+                .unwrap_or(false)
+        })
+        .min_by_key(|window| {
+            if window.reset_after_seconds >= 0 {
+                window.reset_after_seconds
+            } else {
+                i64::MAX
+            }
+        })
 }
 
 fn format_usage_window(window: Option<&UsageWindow>, fallback_label: &str) -> Option<String> {
@@ -487,6 +500,13 @@ mod tests {
     use super::*;
 
     fn make_usage(primary_used_percent: f64) -> UsageResponse {
+        make_usage_with_secondary(primary_used_percent, 0.0)
+    }
+
+    fn make_usage_with_secondary(
+        primary_used_percent: f64,
+        secondary_used_percent: f64,
+    ) -> UsageResponse {
         UsageResponse {
             user_id: "user-1".to_string(),
             account_id: "acct-123".to_string(),
@@ -502,7 +522,7 @@ mod tests {
                     reset_at: 1_775_138_000,
                 }),
                 secondary_window: Some(UsageWindow {
-                    used_percent: 100.0,
+                    used_percent: secondary_used_percent,
                     limit_window_seconds: 604_800,
                     reset_after_seconds: 86_400,
                     reset_at: 1_775_210_000,
@@ -524,6 +544,16 @@ mod tests {
     #[test]
     fn usable_when_primary_window_has_remaining_quota() {
         assert!(has_usable_quota(&make_usage(10.0)));
+    }
+
+    #[test]
+    fn effective_percent_and_usable_state_follow_secondary_window() {
+        let usage = make_usage_with_secondary(0.0, 100.0);
+
+        assert_eq!(get_effective_quota_left(&usage), Some(0.0));
+        assert_eq!(get_quota_left(primary_window(&usage)), Some(100.0));
+        assert!(!has_usable_quota(&usage));
+        assert!(describe_quota_blocker(&usage).contains("7d quota exhausted"));
     }
 
     #[test]
@@ -625,5 +655,20 @@ mod tests {
         let cache = build_cached_quota_state("acct-123", Some(&assessment), None, fetched_at);
 
         assert_eq!(cache.next_refresh_at, "2026-04-03T14:00:00.000Z");
+    }
+
+    #[test]
+    fn quota_next_refresh_waits_until_secondary_reset_for_exhausted_weekly_window() {
+        let fetched_at = DateTime::parse_from_rfc3339("2026-04-03T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = make_usage_with_secondary(0.0, 100.0);
+
+        assert_eq!(
+            quota_next_refresh_at(Some(&usage), None, fetched_at),
+            DateTime::parse_from_rfc3339("2026-04-04T12:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
     }
 }
