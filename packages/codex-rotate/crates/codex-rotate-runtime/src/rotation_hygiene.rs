@@ -363,6 +363,7 @@ impl RotationBackend for VmBackend {
         })?;
 
         let is_active_account = target_index == active_index;
+        let active_persona = pool.accounts[active_index].persona.clone();
 
         if !is_active_account {
             self.stop_all_persona_vms(None)?;
@@ -370,67 +371,79 @@ impl RotationBackend for VmBackend {
         self.ensure_persona_package_ready(persona)?;
         self.launch_vm(persona, None)?;
 
-        // Ask guest to perform relogin
-        let relogin_response: Value = self.send_guest_request(
-            "relogin",
-            json!({
-                "selector": selector,
-                "options": options
-            }),
-        )?;
-
-        let output = relogin_response
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        let guest_auth_val = relogin_response
-            .get("auth")
-            .ok_or_else(|| anyhow!("Guest relogin response did not include auth state."))?;
-
-        let guest_auth: codex_rotate_core::auth::CodexAuth =
-            serde_json::from_value(guest_auth_val.clone())
-                .with_context(|| "Failed to parse guest auth state.")?;
-
-        // Sync auth to host pool
-        if let Some(entry) = pool
-            .accounts
-            .iter_mut()
-            .find(|a| a.account_id == target_account.account_id)
-        {
-            entry.auth = guest_auth.clone();
-        }
-        save_pool(&pool).with_context(|| {
-            format!(
-                "Failed to persist guest auth for {} back to the host pool.",
-                target_account.label
-            )
-        })?;
-
-        // If this is the active account, also update the host's live auth.json
-        if is_active_account {
-            if let Some(active_entry) = pool.accounts.get(pool.active_index) {
-                if let Err(error) = write_selected_account_auth(active_entry) {
-                    let mut failures = vec![format!("host auth sync failed: {error:#}")];
-                    if let Err(rollback_error) =
-                        rollback_vm_relogin_auth_sync_failure(&previous_pool)
-                    {
-                        failures.push(format!("rollback failed: {rollback_error:#}"));
-                    }
-                    return Err(anyhow!(failures.join(" | ")));
-                }
-            }
-        } else {
-            // Restore active VM
+        let restore_active_vm = || {
             self.stop_all_persona_vms(None).ok();
-            let active_persona = pool.accounts[active_index].persona.as_ref().unwrap();
-            self.ensure_persona_package_ready(active_persona).ok();
-            self.launch_vm(active_persona, None).ok();
-            self.start_guest_codex().ok();
+            if let Some(active_persona) = active_persona.as_ref() {
+                self.ensure_persona_package_ready(active_persona).ok();
+                self.launch_vm(active_persona, None).ok();
+                self.start_guest_codex().ok();
+            }
+        };
+
+        let result = (|| -> Result<String> {
+            // Ask guest to perform relogin
+            let relogin_response: Value = self.send_guest_request(
+                "relogin",
+                json!({
+                    "selector": selector,
+                    "options": options
+                }),
+            )?;
+
+            let output = relogin_response
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            let guest_auth_val = relogin_response
+                .get("auth")
+                .ok_or_else(|| anyhow!("Guest relogin response did not include auth state."))?;
+
+            let guest_auth: codex_rotate_core::auth::CodexAuth =
+                serde_json::from_value(guest_auth_val.clone())
+                    .with_context(|| "Failed to parse guest auth state.")?;
+
+            // Sync auth to host pool
+            if let Some(entry) = pool
+                .accounts
+                .iter_mut()
+                .find(|a| a.account_id == target_account.account_id)
+            {
+                entry.auth = guest_auth.clone();
+            }
+            save_pool(&pool).with_context(|| {
+                format!(
+                    "Failed to persist guest auth for {} back to the host pool.",
+                    target_account.label
+                )
+            })?;
+
+            // If this is the active account, also update the host's live auth.json
+            if is_active_account {
+                if let Some(active_entry) = pool.accounts.get(pool.active_index) {
+                    if let Err(error) = write_selected_account_auth(active_entry) {
+                        let mut failures = vec![format!("host auth sync failed: {error:#}")];
+                        if let Err(rollback_error) =
+                            rollback_vm_relogin_auth_sync_failure(&previous_pool)
+                        {
+                            failures.push(format!("rollback failed: {rollback_error:#}"));
+                        }
+                        return Err(anyhow!(failures.join(" | ")));
+                    }
+                }
+            } else {
+                restore_active_vm();
+            }
+
+            Ok(output)
+        })();
+
+        if result.is_err() && !is_active_account {
+            restore_active_vm();
         }
 
-        Ok(output)
+        result
     }
 }
 
@@ -3891,6 +3904,97 @@ insert into threads (id, rollout_path, updated_at, archived) values
         assert!(error_msg.contains("utmctl") || error_msg.contains("guest"));
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn vm_relogin_non_active_failure_restores_active_vm() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let backend = test_vm_backend(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_utmctl = std::env::var_os("CODEX_ROTATE_UTMCTL_BIN");
+        let previous_bridge_url = std::env::var_os("CODEX_ROTATE_GUEST_BRIDGE_URL");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+        }
+
+        let utm_log = temp.path().join("utmctl.log");
+        let fake_utmctl = temp.path().join("bin").join("utmctl");
+        write_executable(
+            &fake_utmctl,
+            &format!(
+                r#"#!/bin/sh
+set -eu
+log_file='{log_file}'
+cmd="${{1-}}"
+shift || true
+printf '%s %s\n' "$cmd" "$*" >> "$log_file"
+case "$cmd" in
+  start)
+    exit 0
+    ;;
+  status)
+    printf '%s\n' started
+    exit 0
+    ;;
+  list)
+    exit 0
+    ;;
+  stop)
+    exit 0
+    ;;
+  *)
+    printf 'unsupported utmctl command: %s\n' "$cmd" >&2
+    exit 1
+    ;;
+esac
+"#,
+                log_file = utm_log.display()
+            ),
+        );
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_UTMCTL_BIN", &fake_utmctl);
+            std::env::set_var(
+                "CODEX_ROTATE_GUEST_BRIDGE_URL",
+                "http://127.0.0.1:9/request",
+            );
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let result = backend.relogin(9333, "acct-target", ReloginOptions::default(), None);
+        assert!(result.is_err());
+
+        let utm_calls = fs::read_to_string(&utm_log).expect("read utmctl log");
+        let target_start = utm_calls.find("persona-target.utm");
+        let source_start = utm_calls.rfind("persona-source.utm");
+        assert!(
+            target_start.is_some(),
+            "relogin should launch target vm; calls:\n{utm_calls}"
+        );
+        assert!(
+            source_start.is_some(),
+            "failed relogin should relaunch the previously active vm; calls:\n{utm_calls}"
+        );
+        assert!(
+            source_start.unwrap_or_default() > target_start.unwrap_or_default(),
+            "active vm should be restored after target relogin attempt; calls:\n{utm_calls}"
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_UTMCTL_BIN", previous_utmctl);
+        restore_env("CODEX_ROTATE_GUEST_BRIDGE_URL", previous_bridge_url);
     }
 
     #[test]
