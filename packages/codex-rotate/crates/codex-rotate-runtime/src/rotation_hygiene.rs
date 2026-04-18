@@ -172,6 +172,7 @@ pub fn relogin(
     options: ReloginOptions,
     progress: Option<AutomationProgressCallback>,
 ) -> Result<String> {
+    let _lock = RotationLock::acquire()?;
     select_rotation_backend()?.relogin(port.unwrap_or(DEFAULT_PORT), selector, options, progress)
 }
 
@@ -1127,7 +1128,9 @@ fn relogin_host(
         return cmd_relogin_with_progress(selector, options, progress);
     };
 
-    recover_incomplete_rotation_state()?;
+    // `relogin` already holds the shared rotation lock at the public entry point.
+    // Use the no-lock variant here to avoid self-contention.
+    recover_incomplete_rotation_state_without_lock()?;
 
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
@@ -3450,6 +3453,119 @@ esac
             .to_string()
             .contains("Another rotation is already in progress"));
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn relogin_respects_rotation_lock() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_account_flow_file = std::env::var_os("CODEX_ROTATE_ACCOUNT_FLOW_FILE");
+        let invalid_account_flow = temp.path().join("missing-workflow.yaml");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("CODEX_ROTATE_ACCOUNT_FLOW_FILE", &invalid_account_flow);
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let _lock = RotationLock::acquire().expect("acquire lock");
+        let result = relogin(
+            Some(9333),
+            "non-pool-selector",
+            ReloginOptions::default(),
+            None,
+        );
+        let error = match result {
+            Ok(_) => panic!("relogin should fail due to lock contention"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("Another rotation is already in progress"));
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_ACCOUNT_FLOW_FILE", previous_account_flow_file);
+    }
+
+    #[test]
+    fn relogin_pool_selector_does_not_self_contend_on_rotation_lock() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_account_flow_file = std::env::var_os("CODEX_ROTATE_ACCOUNT_FLOW_FILE");
+        let invalid_account_flow = temp.path().join("missing-workflow.yaml");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("CODEX_ROTATE_ACCOUNT_FLOW_FILE", &invalid_account_flow);
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+        fs::write(
+            paths.rotate_home.join("accounts.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": 9,
+                "pending": {
+                    target.email.clone(): {
+                        "stored": {
+                            "email": target.email.clone(),
+                            "profile_name": "persona-target",
+                            "template": "acct-target@astronlab.com",
+                            "suffix": 1,
+                            "selector": target.label.clone(),
+                            "alias": null,
+                            "birth_month": 1,
+                            "birth_day": 24,
+                            "birth_year": 1990,
+                            "created_at": "2026-04-13T02:52:15.012Z",
+                            "updated_at": "2026-04-13T02:52:15.012Z"
+                        },
+                        "started_at": "2026-04-13T02:52:15.012Z"
+                    }
+                }
+            }))
+            .expect("serialize credential store"),
+        )
+        .expect("write credential store");
+
+        let result = relogin(Some(9333), "acct-target", ReloginOptions::default(), None);
+        let error = match result {
+            Ok(_) => panic!("relogin should fail because workflow file is missing"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            !error.contains("Another rotation is already in progress"),
+            "pool-backed relogin should not self-contend on rotation lock; got: {error}"
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_ACCOUNT_FLOW_FILE", previous_account_flow_file);
     }
 
     #[test]
