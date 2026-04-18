@@ -71,6 +71,8 @@ struct RotateStateSchema {
     #[serde(default)]
     active_index: Option<usize>,
     #[serde(default)]
+    rotation: Option<Value>,
+    #[serde(default)]
     environment: Option<RotationEnvironment>,
     #[serde(default)]
     vm: Option<VmEnvironmentConfig>,

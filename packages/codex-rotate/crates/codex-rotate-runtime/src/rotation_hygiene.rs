@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -10,11 +11,12 @@ use codex_rotate_core::bridge::{
     AutomationProgressCallback, GuestBridgeRequest, GuestBridgeResponse,
 };
 use codex_rotate_core::pool::{
-    load_pool, load_rotation_environment_settings, persist_prepared_rotation_pool,
-    prepare_next_rotation_with_progress, prepare_prev_rotation, resolve_persona_profile,
-    resolve_pool_account, restore_pool_active_index, rollback_prepared_rotation, save_pool,
-    write_selected_account_auth, AccountEntry, NextResult, PersonaEntry, PreparedRotation,
-    PreparedRotationAction, RotationEnvironment,
+    load_pool, load_rotation_checkpoint, load_rotation_environment_settings,
+    persist_prepared_rotation_pool, prepare_next_rotation_with_progress, prepare_prev_rotation,
+    resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
+    rollback_prepared_rotation, save_pool, save_rotation_checkpoint, write_selected_account_auth,
+    AccountEntry, NextResult, PersonaEntry, PreparedRotation, PreparedRotationAction,
+    RotationCheckpoint, RotationCheckpointPhase, RotationEnvironment,
 };
 use codex_rotate_core::state::RotationLock;
 use codex_rotate_core::workflow::{
@@ -54,6 +56,32 @@ impl std::fmt::Display for RotationPhase {
             Self::Rollback => "rollback",
         };
         write!(f, "{}", label)
+    }
+}
+
+impl From<RotationPhase> for RotationCheckpointPhase {
+    fn from(value: RotationPhase) -> Self {
+        match value {
+            RotationPhase::Prepare => Self::Prepare,
+            RotationPhase::Export => Self::Export,
+            RotationPhase::Activate => Self::Activate,
+            RotationPhase::Import => Self::Import,
+            RotationPhase::Commit => Self::Commit,
+            RotationPhase::Rollback => Self::Rollback,
+        }
+    }
+}
+
+impl From<RotationCheckpointPhase> for RotationPhase {
+    fn from(value: RotationCheckpointPhase) -> Self {
+        match value {
+            RotationCheckpointPhase::Prepare => Self::Prepare,
+            RotationCheckpointPhase::Export => Self::Export,
+            RotationCheckpointPhase::Activate => Self::Activate,
+            RotationCheckpointPhase::Import => Self::Import,
+            RotationCheckpointPhase::Commit => Self::Commit,
+            RotationCheckpointPhase::Rollback => Self::Rollback,
+        }
     }
 }
 
@@ -779,12 +807,151 @@ fn ensure_target_account_still_valid(prepared: &PreparedRotation) -> Result<()> 
     Ok(())
 }
 
+fn host_rotation_checkpointing_enabled() -> Result<bool> {
+    Ok(matches!(current_environment()?, RotationEnvironment::Host))
+}
+
+fn rotation_checkpoint_for_prepared(
+    prepared: &PreparedRotation,
+    phase: RotationCheckpointPhase,
+) -> RotationCheckpoint {
+    RotationCheckpoint {
+        phase,
+        previous_index: prepared.previous_index,
+        target_index: prepared.target_index,
+        previous_account_id: prepared.previous.account_id.clone(),
+        target_account_id: prepared.target.account_id.clone(),
+    }
+}
+
+fn save_rotation_checkpoint_for_prepared(
+    prepared: &PreparedRotation,
+    phase: RotationCheckpointPhase,
+) -> Result<()> {
+    if host_rotation_checkpointing_enabled()? {
+        save_rotation_checkpoint(Some(&rotation_checkpoint_for_prepared(prepared, phase)))?;
+    }
+    Ok(())
+}
+
+fn clear_rotation_checkpoint() -> Result<()> {
+    save_rotation_checkpoint(None)
+}
+
+fn resolve_checkpoint_account_index(
+    pool: &codex_rotate_core::pool::Pool,
+    account_id: &str,
+    fallback_index: usize,
+    role: &str,
+) -> Result<usize> {
+    if let Some(index) = pool
+        .accounts
+        .iter()
+        .position(|entry| entry.account_id == account_id)
+    {
+        return Ok(index);
+    }
+
+    if fallback_index < pool.accounts.len() {
+        return Ok(fallback_index);
+    }
+
+    Err(anyhow!(
+        "Unable to resolve the {role} account for an interrupted rotation."
+    ))
+}
+
+fn live_root_matches_persona(paths: &RuntimePaths, entry: &AccountEntry) -> Result<bool> {
+    let persona = entry
+        .persona
+        .as_ref()
+        .ok_or_else(|| anyhow!("Account {} is missing persona metadata.", entry.label))?;
+    let persona_paths = host_persona_paths(paths, persona)?;
+    Ok(is_symlink_to(&paths.codex_home, &persona_paths.codex_home)?
+        && is_symlink_to(
+            &paths.codex_app_support_dir,
+            &persona_paths.codex_app_support_dir,
+        )?)
+}
+
+fn recover_incomplete_rotation_state_without_lock() -> Result<()> {
+    let Some(checkpoint) = load_rotation_checkpoint()? else {
+        return Ok(());
+    };
+
+    let paths = resolve_paths()?;
+    let pool = load_pool()?;
+    if pool.accounts.is_empty() {
+        clear_rotation_checkpoint()?;
+        return Ok(());
+    }
+
+    let previous_index = resolve_checkpoint_account_index(
+        &pool,
+        &checkpoint.previous_account_id,
+        checkpoint.previous_index,
+        "previous",
+    )?;
+    let target_index = resolve_checkpoint_account_index(
+        &pool,
+        &checkpoint.target_account_id,
+        checkpoint.target_index,
+        "target",
+    )?;
+
+    if previous_index == target_index {
+        clear_rotation_checkpoint()?;
+        return Ok(());
+    }
+
+    let previous = pool.accounts[previous_index].clone();
+    let target = pool.accounts[target_index].clone();
+    let target_is_authoritative = match checkpoint.phase {
+        RotationCheckpointPhase::Prepare
+        | RotationCheckpointPhase::Export
+        | RotationCheckpointPhase::Rollback => false,
+        RotationCheckpointPhase::Activate => live_root_matches_persona(&paths, &target)?,
+        RotationCheckpointPhase::Import | RotationCheckpointPhase::Commit => true,
+    };
+
+    if target_is_authoritative {
+        switch_host_persona(&paths, &previous, &target, false)?;
+        write_selected_account_auth(&target)?;
+        restore_pool_active_index(target_index)?;
+    } else {
+        switch_host_persona(&paths, &target, &previous, false)?;
+        write_selected_account_auth(&previous)?;
+        restore_pool_active_index(previous_index)?;
+    }
+
+    clear_rotation_checkpoint()?;
+    Ok(())
+}
+
+pub(crate) fn recover_incomplete_rotation_state() -> Result<()> {
+    let _lock = RotationLock::acquire()?;
+    recover_incomplete_rotation_state_without_lock()
+}
+
+fn finalize_rotation_after_import(
+    prepared: &PreparedRotation,
+    import_outcome: &ThreadHandoffImportOutcome,
+) -> Result<()> {
+    ensure_no_rotation_drift(prepared)?;
+    if !import_outcome.is_complete() {
+        return Err(anyhow!(import_outcome.describe()));
+    }
+    persist_prepared_rotation_pool(prepared)?;
+    Ok(())
+}
+
 fn rotate_next_impl(
     backend: &dyn RotationBackend,
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
 ) -> Result<NextResult> {
+    recover_incomplete_rotation_state_without_lock()?;
     let mut prepared = prepare_next_rotation_with_progress(progress.clone())?;
     let paths = resolve_paths()?;
     let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
@@ -847,6 +1014,7 @@ fn rotate_next_impl(
     }
 
     ensure_target_account_still_valid(&prepared)?;
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend
         .activate(&prepared, port, progress.clone())
@@ -862,24 +1030,33 @@ fn rotate_next_impl(
             )
         })?;
 
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
+
+    let import_outcome = if handoffs.is_empty() {
+        ThreadHandoffImportOutcome::default()
+    } else {
+        import_thread_handoffs(port, &handoffs, progress.as_ref())?
+    };
+
     let result = (|| -> Result<()> {
-        ensure_no_rotation_drift(&prepared)?;
-        persist_prepared_rotation_pool(&prepared)?;
         if let Some(progress) = progress.as_ref() {
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
-        if !handoffs.is_empty() {
-            import_thread_handoffs(port, &handoffs, progress.as_ref())?;
-        }
+        finalize_rotation_after_import(&prepared, &import_outcome)?;
         Ok(())
     })();
 
     if let Err(error) = result {
-        backend
-            .rollback_after_failed_activation(&prepared, port, progress.clone())
-            .ok();
+        save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Rollback).ok();
+        let rollback_result =
+            backend.rollback_after_failed_activation(&prepared, port, progress.clone());
+        if rollback_result.is_ok() {
+            clear_rotation_checkpoint().ok();
+        }
         return Err(error);
     }
+
+    clear_rotation_checkpoint()?;
 
     Ok(NextResult::Rotated {
         message: prepared.message,
@@ -892,6 +1069,7 @@ fn rotate_prev_impl(
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
+    recover_incomplete_rotation_state_without_lock()?;
     let mut prepared = prepare_prev_rotation()?;
     let paths = resolve_paths()?;
     let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
@@ -904,24 +1082,37 @@ fn rotate_prev_impl(
     }
 
     ensure_target_account_still_valid(&prepared)?;
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend.activate(&prepared, port, progress.clone())?;
 
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
+
+    let import_outcome = if handoffs.is_empty() {
+        ThreadHandoffImportOutcome::default()
+    } else {
+        import_thread_handoffs(port, &handoffs, progress.as_ref())?
+    };
+
     let result = (|| -> Result<()> {
-        ensure_no_rotation_drift(&prepared)?;
-        persist_prepared_rotation_pool(&prepared)?;
-        if !handoffs.is_empty() {
-            import_thread_handoffs(port, &handoffs, progress.as_ref())?;
+        if let Some(progress) = progress.as_ref() {
+            progress(format!("Activated persona for {}.", prepared.target.label));
         }
+        finalize_rotation_after_import(&prepared, &import_outcome)?;
         Ok(())
     })();
 
     if let Err(error) = result {
-        backend
-            .rollback_after_failed_activation(&prepared, port, progress.clone())
-            .ok();
+        save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Rollback).ok();
+        let rollback_result =
+            backend.rollback_after_failed_activation(&prepared, port, progress.clone());
+        if rollback_result.is_ok() {
+            clear_rotation_checkpoint().ok();
+        }
         return Err(error);
     }
+
+    clear_rotation_checkpoint()?;
 
     Ok(prepared.message)
 }
@@ -935,6 +1126,8 @@ fn relogin_host(
     let Some(target_account) = resolve_pool_account(selector)? else {
         return cmd_relogin_with_progress(selector, options, progress);
     };
+
+    recover_incomplete_rotation_state()?;
 
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
@@ -1015,7 +1208,6 @@ fn activate_host_rotation(
     let transition = (|| -> Result<()> {
         switch_host_persona(paths, &prepared.previous, &prepared.target, true)?;
         write_selected_account_auth(&prepared.target)?;
-        persist_prepared_rotation_pool(prepared)?;
 
         Ok(())
     })();
@@ -1290,7 +1482,8 @@ fn import_thread_handoffs(
     port: u16,
     handoffs: &[ThreadHandoff],
     progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
-) -> Result<()> {
+) -> Result<ThreadHandoffImportOutcome> {
+    let mut outcome = ThreadHandoffImportOutcome::default();
     for handoff in handoffs {
         if let Some(progress) = progress {
             progress(format!(
@@ -1298,7 +1491,7 @@ fn import_thread_handoffs(
                 handoff.source_thread_id
             ));
         }
-        let response: Value = send_codex_app_request(
+        let response: Value = match send_codex_app_request(
             port,
             "thread/start",
             json!({
@@ -1311,25 +1504,54 @@ fn import_thread_handoffs(
                 "sandbox": Value::Null,
                 "personality": "pragmatic",
             }),
-        )?;
-        let new_thread_id = response
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: None,
+                    stage: ThreadHandoffImportFailureStage::Start,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let new_thread_id = match response
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("Codex thread/start did not return a thread id."))?
-            .to_string();
+        {
+            Some(thread_id) => thread_id.to_string(),
+            None => {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: None,
+                    stage: ThreadHandoffImportFailureStage::Start,
+                    error: "Codex thread/start did not return a thread id.".to_string(),
+                });
+                continue;
+            }
+        };
         if !handoff.items.is_empty() {
-            let _: Value = send_codex_app_request(
+            if let Err(error) = send_codex_app_request::<Value>(
                 port,
                 "thread/inject_items",
                 json!({
                     "threadId": new_thread_id,
                     "items": handoff.items,
                 }),
-            )?;
+            ) {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: Some(new_thread_id),
+                    stage: ThreadHandoffImportFailureStage::InjectItems,
+                    error: error.to_string(),
+                });
+                continue;
+            }
         }
         if let Some(prompt) = handoff.continue_prompt.as_deref() {
-            let _: Value = send_codex_app_request(
+            if let Err(error) = send_codex_app_request::<Value>(
                 port,
                 "turn/start",
                 json!({
@@ -1354,10 +1576,21 @@ fn import_thread_handoffs(
                     "collaborationMode": Value::Null,
                     "attachments": [],
                 }),
-            )?;
+            ) {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: Some(new_thread_id),
+                    stage: ThreadHandoffImportFailureStage::TurnStart,
+                    error: error.to_string(),
+                });
+                continue;
+            }
         }
+        outcome
+            .completed_source_thread_ids
+            .push(handoff.source_thread_id.clone());
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn map_thread_item_to_response_item(item: &Value) -> Option<Value> {
@@ -1626,6 +1859,13 @@ fn migrate_live_root_if_needed(live_path: &Path, target_path: &Path) -> Result<(
 }
 
 fn ensure_symlink_dir(live_path: &Path, target_path: &Path) -> Result<()> {
+    ensure_symlink_dir_with(live_path, target_path, symlink_dir)
+}
+
+fn ensure_symlink_dir_with<F>(live_path: &Path, target_path: &Path, mut symlink_fn: F) -> Result<()>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
     if is_symlink_to(live_path, target_path)? {
         return Ok(());
     }
@@ -1633,12 +1873,15 @@ fn ensure_symlink_dir(live_path: &Path, target_path: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}.", parent.display()))?;
     }
-    if live_path.exists() || live_path.is_symlink() {
+    let original_target = if live_path.exists() || live_path.is_symlink() {
         let metadata = fs::symlink_metadata(live_path)
             .with_context(|| format!("Failed to inspect {}.", live_path.display()))?;
         if metadata.file_type().is_symlink() {
+            let original_target = fs::read_link(live_path)
+                .with_context(|| format!("Failed to read symlink {}.", live_path.display()))?;
             fs::remove_file(live_path)
                 .with_context(|| format!("Failed to remove symlink {}.", live_path.display()))?;
+            Some(original_target)
         } else {
             return Err(anyhow!(
                 "Unexpected filesystem shape: Expected {} to be a symlink (or absent), but found a real file or directory. \
@@ -1647,8 +1890,44 @@ fn ensure_symlink_dir(live_path: &Path, target_path: &Path) -> Result<()> {
                 target_path.display()
             ));
         }
+    } else {
+        None
+    };
+
+    match symlink_fn(target_path, live_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(original_target) = original_target.as_ref() {
+                let restore_result = symlink_fn(original_target, live_path);
+                if let Err(restore_error) = restore_result {
+                    return Err(anyhow!(
+                        "Failed to replace symlink {} -> {} and restore {} -> {}. Replacement error: {}. Restore error: {}",
+                        live_path.display(),
+                        target_path.display(),
+                        live_path.display(),
+                        original_target.display(),
+                        error,
+                        restore_error
+                    ));
+                }
+            }
+
+            let message = if error.kind() == ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied while replacing symlink {} -> {}.",
+                    live_path.display(),
+                    target_path.display()
+                )
+            } else {
+                format!(
+                    "Failed to replace symlink {} -> {}.",
+                    live_path.display(),
+                    target_path.display()
+                )
+            };
+            Err(anyhow!("{} {}", message, error))
+        }
     }
-    symlink_dir(target_path, live_path)
 }
 
 fn is_symlink_to(path: &Path, target: &Path) -> Result<bool> {
@@ -1666,25 +1945,13 @@ fn is_symlink_to(path: &Path, target: &Path) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).with_context(|| {
-        format!(
-            "Failed to create symlink {} -> {}.",
-            link.display(),
-            target.display()
-        )
-    })
+fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
 }
 
 #[cfg(windows)]
-fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_dir(target, link).with_context(|| {
-        format!(
-            "Failed to create symlink {} -> {}.",
-            link.display(),
-            target.display()
-        )
-    })
+fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
 }
 
 #[derive(Clone, Debug)]
@@ -1693,6 +1960,60 @@ struct ThreadHandoff {
     cwd: Option<String>,
     items: Vec<Value>,
     continue_prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ThreadHandoffImportOutcome {
+    completed_source_thread_ids: Vec<String>,
+    failures: Vec<ThreadHandoffImportFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadHandoffImportFailure {
+    source_thread_id: String,
+    created_thread_id: Option<String>,
+    stage: ThreadHandoffImportFailureStage,
+    error: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadHandoffImportFailureStage {
+    Start,
+    InjectItems,
+    TurnStart,
+}
+
+impl ThreadHandoffImportOutcome {
+    fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        if self.failures.is_empty() {
+            return format!(
+                "Imported {} transferred thread(s).",
+                self.completed_source_thread_ids.len()
+            );
+        }
+
+        let completed = self.completed_source_thread_ids.len();
+        let failed = self.failures.len();
+        let failure = &self.failures[0];
+        let created_thread = failure
+            .created_thread_id
+            .as_ref()
+            .map(|thread_id| format!(" after creating {}", thread_id))
+            .unwrap_or_default();
+        let stage = match failure.stage {
+            ThreadHandoffImportFailureStage::Start => "thread/start",
+            ThreadHandoffImportFailureStage::InjectItems => "thread/inject_items",
+            ThreadHandoffImportFailureStage::TurnStart => "turn/start",
+        };
+        format!(
+            "Partial thread handoff import: {completed} completed, {failed} failed. Source thread {}{created_thread} failed at {stage}: {}",
+            failure.source_thread_id, failure.error
+        )
+    }
 }
 
 fn validate_vm_environment_config(
@@ -1958,6 +2279,147 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("chmod executable");
         }
+    }
+
+    fn summarize_pool_state(pool: &codex_rotate_core::pool::Pool) -> String {
+        let active_index = pool.active_index.min(pool.accounts.len().saturating_sub(1));
+        let active_account = pool
+            .accounts
+            .get(active_index)
+            .map(|entry| format!("{} ({})", entry.label, entry.account_id))
+            .unwrap_or_else(|| "none".to_string());
+        let account_ids = pool
+            .accounts
+            .iter()
+            .map(|entry| entry.account_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "active_index={active_index}, active_account={active_account}, account_ids=[{account_ids}]"
+        )
+    }
+
+    fn summarize_auth_state(auth: &codex_rotate_core::auth::CodexAuth) -> String {
+        format!(
+            "account_id={}, last_refresh={}",
+            auth.tokens.account_id, auth.last_refresh
+        )
+    }
+
+    fn summarize_next_result(result: &NextResult) -> String {
+        match result {
+            NextResult::Rotated { message, summary } => format!(
+                "rotated to {} ({}) | {}",
+                summary.account_id, summary.email, message
+            ),
+            NextResult::Stayed { message, summary } => format!(
+                "stayed on {} ({}) | {}",
+                summary.account_id, summary.email, message
+            ),
+            NextResult::Created { output, summary } => format!(
+                "created for {} ({}) | {}",
+                summary.account_id, summary.email, output
+            ),
+        }
+    }
+
+    fn report_sandbox_rotation_lifecycle(
+        workspace_root: &Path,
+        sandbox_root: &Path,
+        live_snapshot_root: &Path,
+        usage_url: &str,
+        initial_pool: &codex_rotate_core::pool::Pool,
+        initial_auth: &codex_rotate_core::auth::CodexAuth,
+        first_result: &NextResult,
+        first_target_paths: &HostPersonaPaths,
+        first_pool_after: &codex_rotate_core::pool::Pool,
+        first_auth_after: &codex_rotate_core::auth::CodexAuth,
+        first_checkpoint_cleared: bool,
+        second_result: &NextResult,
+        second_target_paths: &HostPersonaPaths,
+        second_pool_after: &codex_rotate_core::pool::Pool,
+        second_auth_after: &codex_rotate_core::auth::CodexAuth,
+        second_checkpoint_cleared: bool,
+        live_accounts_before: &str,
+        live_auth_before: &str,
+    ) {
+        eprintln!();
+        eprintln!("=== Sandbox Rotation Lifecycle Report ===");
+        eprintln!("Purpose: validate host rotation hygiene in an isolated temp sandbox.");
+        eprintln!("Workspace root: {}", workspace_root.display());
+        eprintln!("Sandbox root: {}", sandbox_root.display());
+        eprintln!("Comparison root: {}", live_snapshot_root.display());
+        eprintln!("WHAM usage stub: {usage_url}");
+        eprintln!("1. Initial seed");
+        eprintln!(
+            "  - sandbox/accounts.json before any rotation: {}",
+            summarize_pool_state(initial_pool)
+        );
+        eprintln!(
+            "  - sandbox/.codex/auth.json before any rotation: {}",
+            summarize_auth_state(initial_auth)
+        );
+        eprintln!("  - live-snapshot/accounts.json baseline: {live_accounts_before}");
+        eprintln!("  - live-snapshot/auth.json baseline: {live_auth_before}");
+        eprintln!("  - conversation data is not synthesized in this test; the lifecycle shown here is the real account/auth/symlink/checkpoint path.");
+
+        eprintln!("2. Rotate forward");
+        eprintln!("  - {}", summarize_next_result(first_result));
+        eprintln!(
+            "  - live .codex symlink -> {}",
+            first_target_paths.codex_home.display()
+        );
+        eprintln!(
+            "  - live app-support symlink -> {}",
+            first_target_paths.codex_app_support_dir.display()
+        );
+        eprintln!(
+            "  - sandbox/accounts.json after forward rotation: {}",
+            summarize_pool_state(first_pool_after)
+        );
+        eprintln!(
+            "  - sandbox/.codex/auth.json after forward rotation: {}",
+            summarize_auth_state(first_auth_after)
+        );
+        eprintln!(
+            "  - rotation checkpoint cleared after forward rotation: {first_checkpoint_cleared}"
+        );
+
+        eprintln!("3. Sync back on the target side");
+        eprintln!("  - the sandbox state is now pinned to the target account only.");
+        eprintln!("  - this is where any transferred conversation data would continue from the target persona.");
+
+        eprintln!("4. Rotate back");
+        eprintln!("  - {}", summarize_next_result(second_result));
+        eprintln!(
+            "  - live .codex symlink -> {}",
+            second_target_paths.codex_home.display()
+        );
+        eprintln!(
+            "  - live app-support symlink -> {}",
+            second_target_paths.codex_app_support_dir.display()
+        );
+        eprintln!(
+            "  - sandbox/accounts.json after return rotation: {}",
+            summarize_pool_state(second_pool_after)
+        );
+        eprintln!(
+            "  - sandbox/.codex/auth.json after return rotation: {}",
+            summarize_auth_state(second_auth_after)
+        );
+        eprintln!(
+            "  - rotation checkpoint cleared after return rotation: {second_checkpoint_cleared}"
+        );
+
+        eprintln!("5. Final hygiene checks");
+        eprintln!("  - live snapshot files remained unchanged across the full cycle.");
+        eprintln!(
+            "  - live-snapshot/accounts.json before -> after: unchanged ({live_accounts_before})"
+        );
+        eprintln!("  - live-snapshot/auth.json before -> after: unchanged ({live_auth_before})");
+        eprintln!("  - no state leaked out of the sandbox while the account flipped source -> target -> source.");
+        eprintln!("==============================");
+        eprintln!();
     }
 
     struct TestHttpServer {
@@ -2238,6 +2700,258 @@ esac
     }
 
     #[test]
+    fn finalize_rotation_after_import_commits_pool_after_complete_import() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", temp.path());
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: pool.clone(),
+            previous_index: 0,
+            target_index: 1,
+            previous: source.clone(),
+            target: target.clone(),
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        let import_outcome = ThreadHandoffImportOutcome {
+            completed_source_thread_ids: vec!["thread-source".to_string()],
+            failures: Vec::new(),
+        };
+
+        finalize_rotation_after_import(&prepared, &import_outcome).expect("finalize import");
+
+        let committed_pool = load_pool().expect("load committed pool");
+        assert_eq!(committed_pool.active_index, 1);
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn finalize_rotation_after_import_rejects_partial_import_without_committing_pool() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", temp.path());
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: pool.clone(),
+            previous_index: 0,
+            target_index: 1,
+            previous: source.clone(),
+            target: target.clone(),
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        let import_outcome = ThreadHandoffImportOutcome {
+            completed_source_thread_ids: vec!["thread-source".to_string()],
+            failures: vec![ThreadHandoffImportFailure {
+                source_thread_id: "thread-source".to_string(),
+                created_thread_id: Some("thread-target".to_string()),
+                stage: ThreadHandoffImportFailureStage::InjectItems,
+                error: "permission denied".to_string(),
+            }],
+        };
+
+        let error = finalize_rotation_after_import(&prepared, &import_outcome)
+            .expect_err("partial import should fail");
+        assert!(error.to_string().contains("Partial thread handoff import"));
+
+        let committed_pool = load_pool().expect("load committed pool");
+        assert_eq!(committed_pool.active_index, 0);
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn recover_incomplete_rotation_state_repairs_target_authoritative_checkpoint() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("FAST_BROWSER_HOME", paths.fast_browser_home.clone());
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                paths.codex_app_support_dir.clone(),
+            );
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
+        codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+            .expect("write source auth");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        codex_rotate_core::pool::save_rotation_checkpoint(Some(&RotationCheckpoint {
+            phase: RotationCheckpointPhase::Import,
+            previous_index: 0,
+            target_index: 1,
+            previous_account_id: source.account_id.clone(),
+            target_account_id: target.account_id.clone(),
+        }))
+        .expect("save checkpoint");
+
+        switch_host_persona(&paths, &source, &target, false).expect("switch persona");
+        codex_rotate_core::pool::write_selected_account_auth(&target).expect("write target auth");
+
+        recover_incomplete_rotation_state().expect("recover rotation");
+
+        let recovered_pool = load_pool().expect("load recovered pool");
+        assert_eq!(recovered_pool.active_index, 1);
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).unwrap());
+        let recovered_auth =
+            codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
+        assert_eq!(recovered_auth.tokens.account_id, "acct-target");
+        assert!(load_rotation_checkpoint()
+            .expect("load checkpoint")
+            .is_none());
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+    }
+
+    #[test]
+    fn recover_incomplete_rotation_state_clears_source_authoritative_checkpoint() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("FAST_BROWSER_HOME", paths.fast_browser_home.clone());
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                paths.codex_app_support_dir.clone(),
+            );
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
+        codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+            .expect("write source auth");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        codex_rotate_core::pool::save_rotation_checkpoint(Some(&RotationCheckpoint {
+            phase: RotationCheckpointPhase::Prepare,
+            previous_index: 0,
+            target_index: 1,
+            previous_account_id: source.account_id.clone(),
+            target_account_id: target.account_id.clone(),
+        }))
+        .expect("save checkpoint");
+
+        recover_incomplete_rotation_state().expect("recover rotation");
+
+        let recovered_pool = load_pool().expect("load recovered pool");
+        assert_eq!(recovered_pool.active_index, 0);
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        let recovered_auth =
+            codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
+        assert_eq!(recovered_auth.tokens.account_id, "acct-source");
+        assert!(load_rotation_checkpoint()
+            .expect("load checkpoint")
+            .is_none());
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+    }
+
+    #[test]
+    fn ensure_symlink_dir_restores_original_link_when_replacement_is_denied() {
+        let temp = tempdir().expect("tempdir");
+        let live = temp.path().join(".codex");
+        let original_target = temp.path().join("original");
+        let replacement_target = temp.path().join("replacement");
+        fs::create_dir_all(&original_target).expect("create original target");
+        fs::create_dir_all(&replacement_target).expect("create replacement target");
+
+        symlink_dir(&original_target, &live).expect("create original symlink");
+
+        let mut attempts = 0;
+        let result = ensure_symlink_dir_with(&live, &replacement_target, |target, link| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "permission denied",
+                ))
+            } else {
+                symlink_dir(target, link)
+            }
+        });
+
+        let error = result.expect_err("replacement should fail");
+        assert!(error
+            .to_string()
+            .contains("Permission denied while replacing symlink"));
+        assert_eq!(attempts, 2);
+        assert!(is_symlink_to(&live, &original_target).expect("original symlink restored"));
+    }
+
+    #[test]
     fn vm_environment_reports_guarded_backend_entry_points() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
@@ -2387,7 +3101,7 @@ esac
     }
 
     #[test]
-    fn host_activation_preserves_committed_state_when_relaunch_fails() {
+    fn host_activation_retains_target_state_when_relaunch_fails() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
@@ -2417,7 +3131,7 @@ esac
         };
         codex_rotate_core::pool::save_pool(&pool).expect("save pool");
 
-        let _managed_codex =
+        let managed_codex =
             ManagedCodexProcess::start(&paths.debug_profile_dir).expect("start managed codex");
 
         let prepared = PreparedRotation {
@@ -2443,12 +3157,14 @@ esac
             fs::read_to_string(paths.rotate_home.join("accounts.json"))
                 .expect("read accounts.json")
         );
-        assert_eq!(committed_pool.active_index, 1);
+        assert_eq!(committed_pool.active_index, 0);
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).unwrap());
         let restored_auth =
             codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
         assert_eq!(restored_auth.tokens.account_id, "acct-target");
+
+        drop(managed_codex);
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
@@ -2459,7 +3175,7 @@ esac
     }
 
     #[test]
-    fn host_activation_commits_without_managed_codex_running() {
+    fn host_activation_stages_target_without_committing_pool() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
@@ -2499,12 +3215,219 @@ esac
         assert!(activation.items.is_empty());
 
         let committed_pool = load_pool().expect("load committed pool");
-        assert_eq!(committed_pool.active_index, 1);
+        assert_eq!(committed_pool.active_index, 0);
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).unwrap());
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn host_sandbox_dry_run_next_preserves_live_snapshot() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let sandbox_root = temp.path().join("sandbox");
+        let live_snapshot_root = temp.path().join("live-snapshot");
+        fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        fs::create_dir_all(&live_snapshot_root).expect("create live snapshot root");
+
+        let paths = test_runtime_paths(&sandbox_root);
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root");
+
+        let previous_home = std::env::var_os("HOME");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        let previous_repo_root = std::env::var_os("CODEX_ROTATE_REPO_ROOT");
+        let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+        let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+        let previous_disable_launch = std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH");
+
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "host");
+            std::env::set_var("CODEX_ROTATE_REPO_ROOT", &workspace_root);
+            std::env::set_var("CODEX_ROTATE_HOME", &paths.rotate_home);
+            std::env::set_var("CODEX_HOME", &paths.codex_home);
+            std::env::set_var("FAST_BROWSER_HOME", &paths.fast_browser_home);
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                &paths.codex_app_support_dir,
+            );
+            std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
+        codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+            .expect("write source auth");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save sandbox pool");
+
+        let live_accounts = live_snapshot_root.join("accounts.json");
+        let live_auth = live_snapshot_root.join("auth.json");
+        fs::write(
+            &live_accounts,
+            serde_json::to_string_pretty(&pool).expect("serialize live pool"),
+        )
+        .expect("write live accounts");
+        fs::write(
+            &live_auth,
+            serde_json::to_string_pretty(&source.auth).expect("serialize live auth"),
+        )
+        .expect("write live auth");
+        let live_accounts_before = fs::read_to_string(&live_accounts).expect("read live accounts");
+        let live_auth_before = fs::read_to_string(&live_auth).expect("read live auth");
+
+        let usage_server = start_guest_bridge(
+            json!({
+                "user_id": target.account_id.clone(),
+                "account_id": target.account_id.clone(),
+                "email": target.email.clone(),
+                "plan_type": target.plan_type.clone(),
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "limit_window_seconds": 3600,
+                        "reset_after_seconds": 3600,
+                        "reset_at": 2_000_000_000,
+                    },
+                    "secondary_window": null
+                },
+                "code_review_rate_limit": null,
+                "additional_rate_limits": null,
+                "credits": null,
+                "promo": null
+            })
+            .to_string(),
+        )
+        .expect("start usage server");
+        unsafe {
+            std::env::set_var(
+                "CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE",
+                format!("http://127.0.0.1:{}", usage_server.port),
+            );
+        }
+
+        let first_result = rotate_next(None, None).expect("rotate next");
+        match &first_result {
+            NextResult::Rotated { message, summary } => {
+                assert!(message.contains("ROTATE"));
+                assert_eq!(summary.account_id, target.account_id);
+            }
+            NextResult::Stayed { .. } => panic!("unexpected next result: stayed"),
+            NextResult::Created { .. } => panic!("unexpected next result: created"),
+        }
+
+        let first_pool_after = load_pool().expect("load sandbox pool after forward rotation");
+        assert_eq!(first_pool_after.active_index, 1);
+        let first_auth_after = codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file)
+            .expect("load sandbox auth after forward rotation");
+        assert_eq!(first_auth_after.tokens.account_id, target.account_id);
+
+        let first_target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap())
+            .expect("target persona paths");
+        assert!(is_symlink_to(&paths.codex_home, &first_target_paths.codex_home).unwrap());
+        assert!(is_symlink_to(
+            &paths.codex_app_support_dir,
+            &first_target_paths.codex_app_support_dir
+        )
+        .unwrap());
+        let first_checkpoint_cleared = load_rotation_checkpoint()
+            .expect("load checkpoint")
+            .is_none();
+        assert!(first_checkpoint_cleared);
+
+        let second_result = rotate_next(None, None).expect("rotate back to source");
+        match &second_result {
+            NextResult::Rotated { message, summary } => {
+                assert!(message.contains("ROTATE"));
+                assert_eq!(summary.account_id, source.account_id);
+            }
+            NextResult::Stayed { .. } => panic!("unexpected return result: stayed"),
+            NextResult::Created { .. } => panic!("unexpected return result: created"),
+        }
+
+        let second_pool_after = load_pool().expect("load sandbox pool after return rotation");
+        assert_eq!(second_pool_after.active_index, 0);
+        let second_auth_after = codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file)
+            .expect("load sandbox auth after return rotation");
+        assert_eq!(second_auth_after.tokens.account_id, source.account_id);
+
+        let second_target_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap())
+            .expect("source persona paths");
+        assert!(is_symlink_to(&paths.codex_home, &second_target_paths.codex_home).unwrap());
+        assert!(is_symlink_to(
+            &paths.codex_app_support_dir,
+            &second_target_paths.codex_app_support_dir
+        )
+        .unwrap());
+        let second_checkpoint_cleared = load_rotation_checkpoint()
+            .expect("load checkpoint after return rotation")
+            .is_none();
+        assert!(second_checkpoint_cleared);
+
+        assert_eq!(
+            fs::read_to_string(&live_accounts).expect("read live accounts after lifecycle"),
+            live_accounts_before
+        );
+        assert_eq!(
+            fs::read_to_string(&live_auth).expect("read live auth after lifecycle"),
+            live_auth_before
+        );
+
+        report_sandbox_rotation_lifecycle(
+            &workspace_root,
+            &sandbox_root,
+            &live_snapshot_root,
+            &format!("http://127.0.0.1:{}", usage_server.port),
+            &pool,
+            &source.auth,
+            &first_result,
+            &first_target_paths,
+            &first_pool_after,
+            &first_auth_after,
+            first_checkpoint_cleared,
+            &second_result,
+            &second_target_paths,
+            &second_pool_after,
+            &second_auth_after,
+            second_checkpoint_cleared,
+            &live_accounts_before,
+            &live_auth_before,
+        );
+
+        drop(usage_server);
+        restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
+        restore_env("CODEX_ROTATE_REPO_ROOT", previous_repo_root);
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+        restore_env("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+        restore_env(
+            "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
+            previous_disable_launch,
+        );
+        restore_env("HOME", previous_home);
     }
 
     #[test]

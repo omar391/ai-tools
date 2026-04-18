@@ -1264,7 +1264,7 @@ Acceptance criteria:
 
 ### K13. Handle import partial success without committing broken target state
 
-Status: In Progress
+Status: Done
 Depends on: E06, E07, E09
 Acceptance criteria:
 
@@ -1334,7 +1334,7 @@ Acceptance criteria:
 
 ### K20. Add crash-recovery logic for mid-rotation interruption
 
-Status: In Progress
+Status: Done
 Depends on: C07, I01
 Acceptance criteria:
 
@@ -1354,7 +1354,7 @@ Acceptance criteria:
 
 ### K22. Add permission-error handling for persona roots and live paths
 
-Status: In Progress
+Status: Done
 Depends on: F03, F04, G04, K21
 Acceptance criteria:
 
@@ -1404,7 +1404,7 @@ Acceptance criteria:
 
 ### K26. Add interruption and recovery tests
 
-Status: In Progress
+Status: Done
 Depends on: K07, K19, K20
 Acceptance criteria:
 

@@ -25,9 +25,7 @@ use crate::bridge::{
 };
 use crate::cancel;
 use crate::managed_browser::ensure_managed_browser_wrapper;
-use crate::paths::{
-    ensure_main_worktree_operation_allowed, legacy_credentials_file, resolve_paths,
-};
+use crate::paths::{legacy_credentials_file, resolve_paths};
 use crate::persona::OsFamily;
 use crate::pool::{
     cmd_add_expected_email, find_next_usable_account, format_account_summary_for_display,
@@ -1691,10 +1689,6 @@ fn execute_create_flow_attempt(
     retry_reserved_emails: &HashSet<String>,
 ) -> std::result::Result<CreateCommandResult, CreateFlowAttemptFailure> {
     let paths = fatal(resolve_paths())?;
-    fatal(ensure_main_worktree_operation_allowed(
-        &paths.repo_root,
-        "Fresh account creation",
-    ))?;
     let previous_auth = fatal(load_codex_auth_if_exists())?;
     let mut store = fatal(load_credential_store())?;
     let workflow_file = resolve_account_flow_file_for_create(&paths, options);

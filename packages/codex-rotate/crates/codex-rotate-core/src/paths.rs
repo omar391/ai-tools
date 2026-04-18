@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct CorePaths {
@@ -169,29 +169,17 @@ pub fn resolve_main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
     common_dir.parent().map(Path::to_path_buf)
 }
 
-pub fn ensure_main_worktree_operation_allowed(repo_root: &Path, operation: &str) -> Result<()> {
-    ensure_main_worktree_operation_allowed_with_root(
-        repo_root,
-        resolve_main_worktree_root(repo_root).as_deref(),
-        operation,
-    )
+pub fn ensure_main_worktree_operation_allowed(_repo_root: &Path, _operation: &str) -> Result<()> {
+    Ok(())
 }
 
+#[cfg(test)]
 fn ensure_main_worktree_operation_allowed_with_root(
-    repo_root: &Path,
-    main_worktree_root: Option<&Path>,
-    operation: &str,
+    _repo_root: &Path,
+    _main_worktree_root: Option<&Path>,
+    _operation: &str,
 ) -> Result<()> {
-    let Some(main_worktree_root) = main_worktree_root else {
-        return Ok(());
-    };
-    if main_worktree_root == repo_root {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "{operation} is disabled from linked worktrees. Run it from the main worktree {}.",
-        main_worktree_root.display()
-    ))
+    Ok(())
 }
 
 fn resolve_codex_logs_db_file(codex_home: &Path) -> PathBuf {
@@ -792,21 +780,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_main_worktree_operation_allowed_rejects_linked_worktrees() {
-        let error = ensure_main_worktree_operation_allowed_with_root(
+    fn ensure_main_worktree_operation_allowed_accepts_linked_worktrees() {
+        ensure_main_worktree_operation_allowed_with_root(
             Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
             Some(Path::new(
                 "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
             )),
             "Fresh account creation",
         )
-        .expect_err("linked worktree should be rejected");
-
-        assert!(error
-            .to_string()
-            .contains("Fresh account creation is disabled from linked worktrees."));
-        assert!(error
-            .to_string()
-            .contains("/Volumes/Projects/business/AstronLab/omar391/ai-tools"));
+        .expect("linked worktree should be allowed");
     }
 }

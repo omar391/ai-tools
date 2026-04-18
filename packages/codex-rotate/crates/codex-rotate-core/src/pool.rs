@@ -320,6 +320,28 @@ pub struct RotationEnvironmentSettings {
     pub vm: Option<VmEnvironmentConfig>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationCheckpointPhase {
+    #[default]
+    Prepare,
+    Export,
+    Activate,
+    Import,
+    Commit,
+    Rollback,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RotationCheckpoint {
+    pub phase: RotationCheckpointPhase,
+    pub previous_index: usize,
+    pub target_index: usize,
+    pub previous_account_id: String,
+    pub target_account_id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedRotationAction {
     Switch,
@@ -1826,6 +1848,41 @@ pub fn save_pool(pool: &Pool) -> Result<()> {
             Value::Number(active_index.into()),
         );
         object.insert("accounts".to_string(), accounts.clone());
+        Ok(())
+    })
+}
+
+pub fn load_rotation_checkpoint() -> Result<Option<RotationCheckpoint>> {
+    let state = load_rotate_state_json()?;
+    let Some(rotation) = state.get("rotation") else {
+        return Ok(None);
+    };
+
+    if rotation.is_null() {
+        return Ok(None);
+    }
+
+    serde_json::from_value(rotation.clone())
+        .map(Some)
+        .context("Invalid rotation checkpoint in rotate state.")
+}
+
+pub fn save_rotation_checkpoint(checkpoint: Option<&RotationCheckpoint>) -> Result<()> {
+    update_rotate_state_json(RotateStateOwner::FullState, move |state| {
+        if !state.is_object() {
+            *state = Value::Object(Map::new());
+        }
+        let object = state
+            .as_object_mut()
+            .expect("rotate state must be a JSON object");
+        match checkpoint {
+            Some(checkpoint) => {
+                object.insert("rotation".to_string(), serde_json::to_value(checkpoint)?);
+            }
+            None => {
+                object.remove("rotation");
+            }
+        }
         Ok(())
     })
 }

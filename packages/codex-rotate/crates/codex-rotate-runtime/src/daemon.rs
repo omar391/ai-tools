@@ -19,7 +19,8 @@ use crate::ipc::{
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::rotation_hygiene::{
-    relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+    recover_incomplete_rotation_state, relogin as run_shared_relogin,
+    rotate_next as run_shared_next, rotate_prev as run_shared_prev,
 };
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
@@ -170,6 +171,7 @@ pub fn run_daemon_forever(options: DaemonRunOptions) -> Result<()> {
         return Ok(());
     }
     migrate_runtime_state()?;
+    recover_incomplete_rotation_state()?;
 
     #[cfg(unix)]
     {

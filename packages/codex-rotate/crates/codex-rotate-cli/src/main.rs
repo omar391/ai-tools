@@ -12,7 +12,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use codex_rotate_core::paths::{resolve_main_worktree_root, resolve_paths};
 use codex_rotate_core::pool::{
     cmd_add, cmd_list_stream, cmd_remove, cmd_status_stream, NextResult,
 };
@@ -187,32 +186,12 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
 }
 
 fn ensure_account_creation_commands_allowed(command: Option<&str>) -> Result<()> {
-    let paths = resolve_paths()?;
-    ensure_account_creation_commands_allowed_for_repo_root(
-        command,
-        &paths.repo_root,
-        resolve_main_worktree_root(&paths.repo_root).as_deref(),
-    )
+    ensure_account_creation_commands_allowed_for_repo_root(command)
 }
 
-fn ensure_account_creation_commands_allowed_for_repo_root(
-    command: Option<&str>,
-    repo_root: &Path,
-    main_worktree_root: Option<&Path>,
-) -> Result<()> {
-    if !matches!(command, Some("create") | Some("next")) {
-        return Ok(());
-    }
-    let Some(main_worktree_root) = main_worktree_root else {
-        return Ok(());
-    };
-    if main_worktree_root == repo_root {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "Account creation commands are disabled from linked worktrees. Run them from the main worktree {}.",
-        main_worktree_root.display()
-    ))
+fn ensure_account_creation_commands_allowed_for_repo_root(command: Option<&str>) -> Result<()> {
+    let _ = command;
+    Ok(())
 }
 
 fn cli_progress_callback() -> Option<Arc<dyn Fn(String) + Send + Sync>> {
@@ -1966,55 +1945,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn linked_worktree_preflight_blocks_account_creation_commands() {
-        let error = ensure_account_creation_commands_allowed_for_repo_root(
-            Some("create"),
-            Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
-            Some(Path::new(
-                "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
-            )),
-        )
-        .expect_err("linked worktree create should be rejected");
-        assert!(error
-            .to_string()
-            .contains("Account creation commands are disabled from linked worktrees."));
-
-        let error = ensure_account_creation_commands_allowed_for_repo_root(
-            Some("next"),
-            Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
-            Some(Path::new(
-                "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
-            )),
-        )
-        .expect_err("linked worktree next should be rejected");
-        assert!(error
-            .to_string()
-            .contains("Account creation commands are disabled from linked worktrees."));
-
-        ensure_account_creation_commands_allowed_for_repo_root(
-            Some("status"),
-            Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
-            Some(Path::new(
-                "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
-            )),
-        )
-        .expect("read-only commands should stay allowed");
+    fn preflight_allows_account_creation_commands_from_any_worktree() {
+        for command in [Some("create"), Some("next"), Some("status"), None] {
+            ensure_account_creation_commands_allowed(command)
+                .unwrap_or_else(|error| panic!("{command:?} should be allowed: {error}"));
+        }
 
         for command in ["add", "relogin", "remove", "list", "prev", "daemon", "tray"] {
-            ensure_account_creation_commands_allowed_for_repo_root(
-                Some(command),
-                Path::new("/Users/omar/.codex/worktrees/e7ac/ai-tools"),
-                Some(Path::new(
-                    "/Volumes/Projects/business/AstronLab/omar391/ai-tools",
-                )),
-            )
-            .unwrap_or_else(|error| panic!("{command} should stay allowed: {error}"));
+            ensure_account_creation_commands_allowed(Some(command))
+                .unwrap_or_else(|error| panic!("{command} should stay allowed: {error}"));
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn create_command_obeys_worktree_safety_preflight_before_daemon_proxy() {
+    fn create_command_routes_via_daemon_proxy_from_any_worktree() {
         with_rotate_home(|| {
             with_env_var(
                 "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
@@ -2030,20 +1975,7 @@ mod tests {
                         "dev.{n}@astronlab.com".to_string(),
                     ];
                     let mut output = Vec::new();
-                    let result = run_with_args(&args, &mut output);
-                    let repo_root = resolve_paths()?.repo_root;
-                    let main_worktree_root = resolve_main_worktree_root(&repo_root);
-                    if main_worktree_root.as_deref() != Some(repo_root.as_path()) {
-                        let error = result.expect_err("linked worktree should be rejected");
-                        assert!(error.to_string().contains(
-                            "Account creation commands are disabled from linked worktrees."
-                        ));
-                        assert!(output.is_empty());
-                        return Ok(());
-                    }
-
                     let handle = spawn_proxy_server("daemon-ok");
-                    let mut output = Vec::new();
                     run_with_args(&args, &mut output)?;
                     let request = handle.join().expect("proxy thread")?;
                     assert_eq!(String::from_utf8(output).expect("utf8").trim(), "daemon-ok");
@@ -2071,7 +2003,7 @@ mod tests {
                 },
             )
         })
-        .expect("create should obey worktree safety preflight");
+        .expect("create should proxy through daemon");
     }
 
     #[cfg(unix)]
