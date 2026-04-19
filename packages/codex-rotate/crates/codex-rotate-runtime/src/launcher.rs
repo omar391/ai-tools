@@ -106,7 +106,36 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 fn running_under_test_harness() -> bool {
-    std::env::var_os("RUST_TEST_THREADS").is_some() || std::env::var_os("NEXTEST").is_some()
+    if std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
+    {
+        return true;
+    }
+
+    if std::env::args().any(|arg| {
+        arg == "--nocapture"
+            || arg == "--show-output"
+            || arg.starts_with("--test-threads=")
+            || arg.starts_with("--exact")
+    }) {
+        return true;
+    }
+
+    std::env::current_exe()
+        .ok()
+        .map(|path| path_looks_like_rust_test_binary(&path))
+        .unwrap_or(false)
+}
+
+fn path_looks_like_rust_test_binary(path: &Path) -> bool {
+    let value = path.to_string_lossy();
+    value.contains("/target/debug/deps/")
+        || value.contains("/target/release/deps/")
+        || value.contains("/.worktree-target/debug/deps/")
+        || value.contains("/.worktree-target/release/deps/")
+        || value.contains("\\target\\debug\\deps\\")
+        || value.contains("\\target\\release\\deps\\")
 }
 
 fn should_track_test_managed_launches() -> bool {
@@ -389,5 +418,18 @@ mod tests {
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
         restore_env(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, previous_enable_tests);
+    }
+
+    #[test]
+    fn detects_rust_test_binary_paths() {
+        assert!(path_looks_like_rust_test_binary(Path::new(
+            "/repo/target/debug/deps/codex_rotate_runtime-abc123"
+        )));
+        assert!(path_looks_like_rust_test_binary(Path::new(
+            "/repo/.worktree-target/debug/deps/suite-abc123"
+        )));
+        assert!(!path_looks_like_rust_test_binary(Path::new(
+            "/repo/target/debug/codex-rotate"
+        )));
     }
 }
