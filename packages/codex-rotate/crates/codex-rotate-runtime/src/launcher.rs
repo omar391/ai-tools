@@ -10,7 +10,6 @@ use crate::cdp::is_cdp_page_ready;
 use crate::paths::resolve_paths;
 
 const DISABLE_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH";
-const ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV: &str = "CODEX_ROTATE_ENABLE_MANAGED_LAUNCH_IN_TESTS";
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const PROCESS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -85,16 +84,17 @@ fn managed_launch_disabled_reason() -> Option<&'static str> {
     if env_flag_enabled(DISABLE_MANAGED_LAUNCH_ENV) {
         return Some("Managed Codex launch is disabled by CODEX_ROTATE_DISABLE_MANAGED_LAUNCH.");
     }
-    if running_under_test_harness() && !managed_launch_allowed_in_tests() {
+    if running_under_test_harness() && std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV).is_none() {
         return Some(
-            "Managed Codex launch is disabled while running tests. Set CODEX_ROTATE_ENABLE_MANAGED_LAUNCH_IN_TESTS=1 to opt in.",
+            "Managed Codex launch is disabled while running tests. Set CODEX_ROTATE_DISABLE_MANAGED_LAUNCH=0 to opt in.",
         );
     }
     None
 }
 
 fn managed_launch_allowed_in_tests() -> bool {
-    env_flag_enabled(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV)
+    std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV).is_some()
+        && !env_flag_enabled(DISABLE_MANAGED_LAUNCH_ENV)
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -343,11 +343,9 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let previous_test_threads = std::env::var_os("RUST_TEST_THREADS");
         let previous_disable = std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV);
-        let previous_enable_tests = std::env::var_os(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
         unsafe {
             std::env::set_var("RUST_TEST_THREADS", "1");
             std::env::remove_var(DISABLE_MANAGED_LAUNCH_ENV);
-            std::env::remove_var(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
         }
 
         let reason = managed_launch_disabled_reason().expect("managed launch should be blocked");
@@ -355,7 +353,6 @@ mod tests {
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
         restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);
-        restore_env(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, previous_enable_tests);
     }
 
     #[test]
@@ -365,11 +362,9 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let previous_test_threads = std::env::var_os("RUST_TEST_THREADS");
         let previous_disable = std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV);
-        let previous_enable_tests = std::env::var_os(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
         unsafe {
             std::env::set_var("RUST_TEST_THREADS", "1");
-            std::env::remove_var(DISABLE_MANAGED_LAUNCH_ENV);
-            std::env::set_var(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, "1");
+            std::env::set_var(DISABLE_MANAGED_LAUNCH_ENV, "0");
         }
 
         assert!(managed_launch_disabled_reason().is_none());
@@ -377,7 +372,6 @@ mod tests {
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
         restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);
-        restore_env(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, previous_enable_tests);
     }
 
     #[test]
@@ -387,11 +381,9 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let previous_test_threads = std::env::var_os("RUST_TEST_THREADS");
         let previous_disable = std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV);
-        let previous_enable_tests = std::env::var_os(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
         unsafe {
             std::env::set_var("RUST_TEST_THREADS", "1");
             std::env::set_var(DISABLE_MANAGED_LAUNCH_ENV, "1");
-            std::env::set_var(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, "1");
         }
 
         let reason = managed_launch_disabled_reason().expect("disable env should win");
@@ -399,7 +391,6 @@ mod tests {
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
         restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);
-        restore_env(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, previous_enable_tests);
     }
 
     #[test]
@@ -408,16 +399,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let previous_test_threads = std::env::var_os("RUST_TEST_THREADS");
-        let previous_enable_tests = std::env::var_os(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
+        let previous_disable = std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV);
         unsafe {
             std::env::set_var("RUST_TEST_THREADS", "1");
-            std::env::remove_var(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV);
+            std::env::remove_var(DISABLE_MANAGED_LAUNCH_ENV);
         }
 
         assert!(!should_track_test_managed_launches());
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
-        restore_env(ENABLE_MANAGED_LAUNCH_IN_TESTS_ENV, previous_enable_tests);
+        restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);
     }
 
     #[test]
