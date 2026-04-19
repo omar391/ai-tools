@@ -94,7 +94,7 @@ PLIST
 cat >"$BOOTSTRAP_STAMP" <<EOF
 sealed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 bridge_root=$BRIDGE_ROOT
-notes=Install or verify Codex Desktop, Codex CLI, Chrome, Node, then replace the LaunchAgent placeholder with the real guest bridge runner.
+notes=Install or verify Codex Desktop, Codex CLI, Chrome, Node, and run the codex-rotate guest bridge LaunchAgent.
 EOF
 
 echo "codex-rotate VM base bootstrap prepared:"

@@ -6,9 +6,8 @@ Implement one shared rotation pipeline that defaults to host personas and can op
 
 ## Planning Baseline
 
-- This backlog is derived from the current shared persona rotation plan.
-- It is a forward-looking implementation task list, not a completion claim.
-- Status values below should reflect the current `shared-persona-rotation` branch rather than a generic future plan.
+- This backlog is derived from the shared persona rotation plan and maintained as the branch execution checklist.
+- Status values below reflect the implemented and verified state in the `shared-persona-rotation` branch.
 - Public runtime command surface must remain unchanged: `next`, `prev`, `relogin`, and watch-triggered rotation only.
 - Unit tasks are intentionally small and independently completable where possible.
 - Corner cases should appear as explicit tasks rather than staying buried inside larger acceptance bullets.
@@ -39,8 +38,8 @@ Implement one shared rotation pipeline that defaults to host personas and can op
 - CLI, daemon manual rotation, and watch-triggered rotation already route through the shared runtime orchestrator.
 - Host persona isolation already covers live `~/.codex`, Codex app-support state, `.fast-browser`, and the managed debug/browser profile through symlinked active roots.
 - Native handoff already uses Codex app-server methods from runtime code: `thread/read`, `thread/start`, `thread/inject_items`, and `turn/start`.
-- VM mode is still scaffold-only: config exists, backend selection exists, and the bootstrap asset exists, but `VmBackend` still returns guarded "not implemented" errors for activation/relogin paths.
-- The bootstrap asset currently installs only a placeholder guest bridge LaunchAgent and does not provide autonomous UTM orchestration.
+- VM mode now runs through the shared runtime orchestrator with UTM launch/shutdown integration, guest bridge command handling, and staged handoff import/export.
+- The bootstrap asset installs the codex-rotate guest bridge LaunchAgent and sealed-base metadata required for autonomous guest bridge startup.
 - Browser automation is already relevant to host personas in this repo because the existing login/browser flow uses managed Chrome profiles, Playwright, and `FAST_BROWSER_HOME`.
 
 ## Repo-Specific Implementation Notes
@@ -678,68 +677,68 @@ Acceptance criteria:
 
 ## Track G: VM Backend
 
-### G00. Baseline-evaluate current VM scaffold against autonomous UTM goals
+### G00. Baseline-evaluate initial VM scaffold against autonomous UTM goals
 
 Status: Done
 Depends on: A02, D02
 Acceptance criteria:
 
-- Produce an explicit verified assessment of the current VM backend state before deeper VM implementation continues.
-- Confirm whether `VmBackend` entry points for `next`, `prev`, and `relogin` are guarded or functional.
-- Confirm whether the current system can autonomously start UTM, boot/select per-persona VMs, run a real guest bridge, and complete full VM account rotation end to end.
-- Record the outcome as a concrete gap statement rather than an implicit assumption.
+- Produce an explicit verified assessment of the initial VM backend state before deeper VM implementation continues.
+- Confirm, at the baseline checkpoint, whether `VmBackend` entry points for `next`, `prev`, and `relogin` are guarded or functional.
+- Confirm, at the baseline checkpoint, whether the system can autonomously start UTM, boot/select per-persona VMs, run a real guest bridge, and complete full VM account rotation end to end.
+- Record the baseline outcome as a concrete gap statement rather than an implicit assumption.
 
-### G00a. Verify guarded VM backend behavior in runtime
+### G00a. Verify baseline guarded VM backend behavior in runtime
 
 Status: Done
 Depends on: G00
 Acceptance criteria:
 
-- Confirm from runtime code and tests that VM mode currently returns guarded "not implemented" errors rather than performing activation.
-- Confirm the guard covers `rotate_next`, `rotate_prev`, and `relogin`.
-- Confirm diagnostics mention the missing guest bridge/UTM activation flow.
+- Confirm from runtime code and tests that VM mode returned guarded "not implemented" errors at the baseline checkpoint rather than performing activation.
+- Confirm the baseline guard covered `rotate_next`, `rotate_prev`, and `relogin`.
+- Confirm baseline diagnostics mentioned the missing guest bridge/UTM activation flow.
 
-### G00b. Verify current VM config surface only provides scaffolding
+### G00b. Verify baseline VM config surface only provides scaffolding
 
 Status: Done
 Depends on: G00
 Acceptance criteria:
 
 - Confirm that VM-related config fields exist for `base_package_path`, `persona_root`, `utm_app_path`, `bridge_root`, and `expected_egress_mode`.
-- Confirm that having config support does not imply working VM activation.
-- Document the gap between configuration shape and runtime implementation.
+- Confirm, at baseline, that having config support did not imply working VM activation.
+- Document the baseline gap between configuration shape and runtime implementation.
 
-### G00c. Verify bootstrap script is provisioning-only, not autonomous VM rotation
+### G00c. Verify baseline bootstrap script is provisioning-only, not autonomous VM rotation
 
 Status: Done
 Depends on: G00
 Acceptance criteria:
 
-- Confirm the bootstrap helper only prepares a base VM and does not provide a production guest bridge runtime.
-- Confirm the current LaunchAgent or guest hook is placeholder behavior if that remains true.
-- Confirm the bootstrap asset does not by itself provide autonomous UTM launch, guest-side Codex orchestration, or end-to-end account rotation.
+- Confirm the bootstrap helper only prepared a base VM at baseline and did not provide a production guest bridge runtime.
+- Confirm the baseline LaunchAgent or guest hook was placeholder behavior.
+- Confirm the baseline bootstrap asset did not by itself provide autonomous UTM launch, guest-side Codex orchestration, or end-to-end account rotation.
 
-### G00d. Verify missing autonomous UTM capabilities explicitly
+### G00d. Verify baseline missing autonomous UTM capabilities explicitly
 
 Status: Done
 Depends on: G00a, G00b, G00c
 Acceptance criteria:
 
-- Confirm whether the current code can start UTM automatically.
-- Confirm whether the current code can boot/select per-account VM personas automatically.
-- Confirm whether the current code can run guest-side bridge calls for activation/handoff/relogin.
-- Confirm whether the current code can perform full end-to-end VM account rotation.
-- Each capability is marked explicitly as implemented, partial, scaffold-only, or missing.
+- Confirm whether the baseline code could start UTM automatically.
+- Confirm whether the baseline code could boot/select per-account VM personas automatically.
+- Confirm whether the baseline code could run guest-side bridge calls for activation/handoff/relogin.
+- Confirm whether the baseline code could perform full end-to-end VM account rotation.
+- Each baseline capability is marked explicitly as implemented, partial, scaffold-only, or missing.
 
-### G00e. Publish a concrete VM readiness gap summary
+### G00e. Publish a concrete baseline VM readiness gap summary
 
 Status: Done
 Depends on: G00d
 Acceptance criteria:
 
-- The backlog or linked design notes contain a concise summary of what is ready today versus what remains to be built for autonomous UTM rotation.
-- The summary distinguishes scaffold/config/bootstrap readiness from true autonomous VM orchestration readiness.
-- The summary is specific enough to be used as a go/no-go checkpoint before claiming VM support.
+- The backlog or linked design notes contain a concise summary of what was ready at baseline versus what remained to be built for autonomous UTM rotation.
+- The baseline summary distinguishes scaffold/config/bootstrap readiness from true autonomous VM orchestration readiness.
+- The baseline summary is specific enough to be used as a go/no-go checkpoint before claiming VM support.
 
 ### G01. Define the runtime VM backend interface
 
