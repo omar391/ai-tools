@@ -35,6 +35,7 @@ use codex_rotate_runtime::rotation_hygiene::{
     relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
     run_guest_bridge_server,
 };
+use codex_rotate_runtime::vm_bootstrap::bootstrap_vm_base;
 use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
 
@@ -328,6 +329,7 @@ fn run_internal_command(args: &[String]) -> Result<()> {
         Some("managed-login") => run_managed_login(&args[1..]),
         Some("managed-browser-wrapper") => run_managed_browser_wrapper(&args[1..]),
         Some("guest-bridge") => run_guest_bridge_command(&args[1..]),
+        Some("vm-bootstrap") => run_internal_vm_bootstrap_command(&args[1..]),
         Some("create") => {
             let output = cmd_create_with_progress(
                 parse_internal_create_options(&args[1..])?,
@@ -350,6 +352,61 @@ fn run_internal_command(args: &[String]) -> Result<()> {
 fn run_guest_bridge_command(args: &[String]) -> Result<()> {
     let bind = parse_guest_bridge_bind(args)?;
     run_guest_bridge_server(bind.as_deref())
+}
+
+fn run_internal_vm_bootstrap_command(args: &[String]) -> Result<()> {
+    let (guest_root, bridge_root) = parse_internal_vm_bootstrap_options(args)?;
+    let output = bootstrap_vm_base(&guest_root, bridge_root.as_deref())?;
+    println!("{output}");
+    Ok(())
+}
+
+fn parse_internal_vm_bootstrap_options(args: &[String]) -> Result<(PathBuf, Option<PathBuf>)> {
+    const USAGE: &str =
+        "Usage: codex-rotate internal vm-bootstrap <mounted-guest-root> [--bridge-root <path>]";
+    let mut guest_root = None::<PathBuf>;
+    let mut bridge_root = None::<PathBuf>;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "help" | "--help" | "-h") {
+            return Err(anyhow!(USAGE));
+        }
+        if arg == "--bridge-root" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!(USAGE));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(USAGE));
+            }
+            bridge_root = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--bridge-root=") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(USAGE));
+            }
+            bridge_root = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(anyhow!(USAGE));
+        }
+        if guest_root.is_some() {
+            return Err(anyhow!(USAGE));
+        }
+        guest_root = Some(PathBuf::from(arg));
+        index += 1;
+    }
+
+    let Some(guest_root) = guest_root else {
+        return Err(anyhow!(USAGE));
+    };
+    Ok((guest_root, bridge_root))
 }
 
 fn parse_guest_bridge_bind(args: &[String]) -> Result<Option<String>> {
@@ -1520,6 +1577,27 @@ mod tests {
         let error = parse_guest_bridge_bind(&["--wat".to_string()])
             .expect_err("unknown guest bridge flag should fail");
         assert!(error.to_string().contains("Unknown guest-bridge command"));
+    }
+
+    #[test]
+    fn internal_vm_bootstrap_parser_accepts_guest_root_and_bridge_override() {
+        let (guest_root, bridge_root) = parse_internal_vm_bootstrap_options(&[
+            "/Volumes/VMs/guest-root".to_string(),
+            "--bridge-root".to_string(),
+            "/Volumes/VMs/bridge".to_string(),
+        ])
+        .expect("vm-bootstrap options");
+        assert_eq!(guest_root, PathBuf::from("/Volumes/VMs/guest-root"));
+        assert_eq!(bridge_root, Some(PathBuf::from("/Volumes/VMs/bridge")));
+    }
+
+    #[test]
+    fn internal_vm_bootstrap_parser_requires_guest_root() {
+        let error = parse_internal_vm_bootstrap_options(&[])
+            .expect_err("vm-bootstrap should require guest root");
+        assert!(error
+            .to_string()
+            .contains("internal vm-bootstrap <mounted-guest-root>"));
     }
 
     #[test]

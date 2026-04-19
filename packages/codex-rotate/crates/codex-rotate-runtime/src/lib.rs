@@ -12,4 +12,5 @@ pub mod runtime_log;
 pub(crate) mod test_support;
 #[path = "thread-recovery.rs"]
 pub mod thread_recovery;
+pub mod vm_bootstrap;
 pub mod watch;
