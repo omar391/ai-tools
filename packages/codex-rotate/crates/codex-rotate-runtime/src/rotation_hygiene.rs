@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -106,6 +106,14 @@ fn guest_bridge_request_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:9334/request".to_string())
 }
 
+fn guest_bridge_bind_addr() -> String {
+    std::env::var("CODEX_ROTATE_GUEST_BRIDGE_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:9334".to_string())
+}
+
 trait RotationBackend {
     fn activate(
         &self,
@@ -174,6 +182,241 @@ pub fn relogin(
 ) -> Result<String> {
     let _lock = RotationLock::acquire()?;
     select_rotation_backend()?.relogin(port.unwrap_or(DEFAULT_PORT), selector, options, progress)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IncomingGuestBridgeRequest {
+    command: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OutgoingGuestBridgeError {
+    message: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OutgoingGuestBridgeResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<OutgoingGuestBridgeError>,
+}
+
+pub fn run_guest_bridge_server(bind_addr: Option<&str>) -> Result<()> {
+    let bind_addr = bind_addr
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(guest_bridge_bind_addr);
+    let listener = std::net::TcpListener::bind(&bind_addr)
+        .with_context(|| format!("Failed to bind guest bridge at {bind_addr}."))?;
+    eprintln!("Codex Rotate guest bridge listening on http://{bind_addr}/request");
+    loop {
+        let (mut stream, _) = listener.accept().context("Guest bridge accept failed.")?;
+        if let Err(error) = handle_guest_bridge_stream(&mut stream) {
+            let _ = write_guest_bridge_response(
+                &mut stream,
+                200,
+                &OutgoingGuestBridgeResponse {
+                    ok: false,
+                    result: Value::Null,
+                    error: Some(OutgoingGuestBridgeError {
+                        message: format!("{error:#}"),
+                    }),
+                },
+            );
+        }
+    }
+}
+
+fn handle_guest_bridge_stream(stream: &mut std::net::TcpStream) -> Result<()> {
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .context("Failed to clone guest bridge tcp stream.")?,
+    );
+
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .context("Failed to read guest bridge request line.")?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or_default();
+
+    let mut content_length = 0usize;
+    loop {
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .context("Failed to read guest bridge header.")?;
+        let header = header_line.trim();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader
+            .read_exact(&mut body)
+            .context("Failed to read guest bridge request body.")?;
+    }
+
+    if method != "POST" || path != "/request" {
+        return write_guest_bridge_response(
+            stream,
+            404,
+            &OutgoingGuestBridgeResponse {
+                ok: false,
+                result: Value::Null,
+                error: Some(OutgoingGuestBridgeError {
+                    message: format!("Unsupported guest bridge route: {method} {path}"),
+                }),
+            },
+        );
+    }
+
+    let request: IncomingGuestBridgeRequest =
+        serde_json::from_slice(&body).context("Failed to parse guest bridge request JSON.")?;
+    let response = match handle_guest_bridge_command(&request.command, request.payload) {
+        Ok(result) => OutgoingGuestBridgeResponse {
+            ok: true,
+            result,
+            error: None,
+        },
+        Err(error) => OutgoingGuestBridgeResponse {
+            ok: false,
+            result: Value::Null,
+            error: Some(OutgoingGuestBridgeError {
+                message: format!("{error:#}"),
+            }),
+        },
+    };
+
+    write_guest_bridge_response(stream, 200, &response)
+}
+
+fn write_guest_bridge_response(
+    stream: &mut std::net::TcpStream,
+    status_code: u16,
+    response: &OutgoingGuestBridgeResponse,
+) -> Result<()> {
+    let body = serde_json::to_string(response).context("Failed to encode guest bridge JSON.")?;
+    let status = match status_code {
+        200 => "200 OK",
+        404 => "404 Not Found",
+        400 => "400 Bad Request",
+        _ => "500 Internal Server Error",
+    };
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .context("Failed to write guest bridge response headers.")?;
+    stream
+        .write_all(body.as_bytes())
+        .context("Failed to write guest bridge response body.")?;
+    stream
+        .flush()
+        .context("Failed to flush guest bridge response.")?;
+    Ok(())
+}
+
+fn handle_guest_bridge_command(command: &str, payload: Value) -> Result<Value> {
+    match command {
+        "ping" => Ok(json!({ "pong": true })),
+        "start-codex" => {
+            let port = payload
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(DEFAULT_PORT);
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            Ok(json!({}))
+        }
+        "relogin" => {
+            let selector = payload
+                .get("selector")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Guest relogin requires a non-empty selector."))?;
+            let options: ReloginOptions = payload
+                .get("options")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("Guest relogin options were invalid.")?
+                .unwrap_or_default();
+            let output = cmd_relogin_with_progress(selector, options, None)?;
+            let paths = resolve_paths()?;
+            let auth = codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file)?;
+            Ok(json!({
+                "output": output,
+                "auth": auth,
+            }))
+        }
+        "export-thread-handoffs" => {
+            let account_id = payload
+                .get("account_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Guest handoff export requires account_id."))?;
+            let port = payload
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(DEFAULT_PORT);
+            let handoffs = export_thread_handoffs(port, account_id)?;
+            Ok(json!({ "handoffs": handoffs }))
+        }
+        "import-thread-handoffs" => {
+            let port = payload
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(DEFAULT_PORT);
+            let handoffs: Vec<ThreadHandoff> = payload
+                .get("handoffs")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("Guest handoff import payload was invalid.")?
+                .unwrap_or_default();
+            let outcome = if handoffs.is_empty() {
+                ThreadHandoffImportOutcome::default()
+            } else {
+                import_thread_handoffs(port, &handoffs, None)?
+            };
+            Ok(json!({
+                "completed_source_thread_ids": outcome.completed_source_thread_ids,
+                "failures": outcome.failures.into_iter().map(|failure| {
+                    json!({
+                        "source_thread_id": failure.source_thread_id,
+                        "created_thread_id": failure.created_thread_id,
+                        "stage": thread_handoff_import_stage_label(failure.stage),
+                        "error": failure.error,
+                    })
+                }).collect::<Vec<Value>>()
+            }))
+        }
+        _ => Err(anyhow!("Unsupported guest bridge command \"{command}\".")),
+    }
 }
 
 pub fn current_environment() -> Result<RotationEnvironment> {
@@ -2054,15 +2297,19 @@ impl ThreadHandoffImportOutcome {
             .as_ref()
             .map(|thread_id| format!(" after creating {}", thread_id))
             .unwrap_or_default();
-        let stage = match failure.stage {
-            ThreadHandoffImportFailureStage::Start => "thread/start",
-            ThreadHandoffImportFailureStage::InjectItems => "thread/inject_items",
-            ThreadHandoffImportFailureStage::TurnStart => "turn/start",
-        };
+        let stage = thread_handoff_import_stage_label(failure.stage);
         format!(
             "Partial thread handoff import: {completed} completed, {failed} failed. Source thread {}{created_thread} failed at {stage}: {}",
             failure.source_thread_id, failure.error
         )
+    }
+}
+
+fn thread_handoff_import_stage_label(stage: ThreadHandoffImportFailureStage) -> &'static str {
+    match stage {
+        ThreadHandoffImportFailureStage::Start => "thread/start",
+        ThreadHandoffImportFailureStage::InjectItems => "thread/inject_items",
+        ThreadHandoffImportFailureStage::TurnStart => "turn/start",
     }
 }
 
@@ -3854,6 +4101,35 @@ insert into threads (id, rollout_path, updated_at, archived) values
         );
 
         drop(process);
+    }
+
+    #[test]
+    fn guest_bridge_ping_returns_expected_payload() {
+        let payload = handle_guest_bridge_command("ping", json!({})).expect("guest ping");
+        assert_eq!(payload["pong"], true);
+    }
+
+    #[test]
+    fn guest_bridge_import_accepts_empty_handoffs() {
+        let payload = handle_guest_bridge_command(
+            "import-thread-handoffs",
+            json!({
+                "handoffs": [],
+                "port": 9333
+            }),
+        )
+        .expect("guest import");
+        assert_eq!(payload["completed_source_thread_ids"], json!([]));
+        assert_eq!(payload["failures"], json!([]));
+    }
+
+    #[test]
+    fn guest_bridge_relogin_requires_selector() {
+        let error = handle_guest_bridge_command("relogin", json!({}))
+            .expect_err("missing selector should fail");
+        assert!(error
+            .to_string()
+            .contains("Guest relogin requires a non-empty selector"));
     }
 
     #[test]

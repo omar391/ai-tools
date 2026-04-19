@@ -33,6 +33,7 @@ use codex_rotate_runtime::ipc::{
 };
 use codex_rotate_runtime::rotation_hygiene::{
     relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+    run_guest_bridge_server,
 };
 use codex_rotate_runtime::watch::set_tray_enabled;
 use managed_login::{run_managed_browser_wrapper, run_managed_login};
@@ -68,6 +69,7 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
     match command {
         None | Some("help") | Some("--help") | Some("-h") => write_output(writer, &help_text())?,
         Some("daemon") => run_daemon_command(writer, &args[1..])?,
+        Some("guest-bridge") => run_guest_bridge_command(&args[1..])?,
         Some("internal") => run_internal_command(&args[1..])?,
         Some("tray") => run_tray_command(writer, &args[1..])?,
         Some("add") => write_output(writer, &cmd_add(parse_add_alias(&args[1..])?.as_deref())?)?,
@@ -325,6 +327,7 @@ fn run_internal_command(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("managed-login") => run_managed_login(&args[1..]),
         Some("managed-browser-wrapper") => run_managed_browser_wrapper(&args[1..]),
+        Some("guest-bridge") => run_guest_bridge_command(&args[1..]),
         Some("create") => {
             let output = cmd_create_with_progress(
                 parse_internal_create_options(&args[1..])?,
@@ -342,6 +345,44 @@ fn run_internal_command(args: &[String]) -> Result<()> {
         Some(other) => Err(anyhow!("Unknown internal command: \"{other}\".")),
         None => Err(anyhow!("Usage: codex-rotate internal <subcommand>")),
     }
+}
+
+fn run_guest_bridge_command(args: &[String]) -> Result<()> {
+    let bind = parse_guest_bridge_bind(args)?;
+    run_guest_bridge_server(bind.as_deref())
+}
+
+fn parse_guest_bridge_bind(args: &[String]) -> Result<Option<String>> {
+    let mut bind = None::<String>;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "help" | "--help" | "-h") {
+            return Err(anyhow!(
+                "Usage: codex-rotate guest-bridge [--bind <host:port>]"
+            ));
+        }
+        if arg == "--bind" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!(
+                    "Usage: codex-rotate guest-bridge [--bind <host:port>]"
+                ));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "Usage: codex-rotate guest-bridge [--bind <host:port>]"
+                ));
+            }
+            bind = Some(value.to_string());
+            index += 2;
+            continue;
+        }
+        return Err(anyhow!(
+            "Unknown guest-bridge command: \"{arg}\". Usage: codex-rotate guest-bridge [--bind <host:port>]"
+        ));
+    }
+    Ok(bind)
 }
 
 fn run_tray_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
@@ -1084,6 +1125,7 @@ fn help_text() -> String {
   {CYAN}relogin{RESET} <selector> Repair that account in one step
   {CYAN}remove{RESET} <selector>  Remove that account from the pool
   {CYAN}daemon{RESET}           Start the background runtime daemon
+  {CYAN}guest-bridge{RESET} [--bind <host:port>] Run the VM guest bridge server
   {CYAN}tray{RESET} [subcommand] Manage the Codex Rotate tray app
   {CYAN}help{RESET}             Show this help message
 "#
@@ -1467,10 +1509,25 @@ mod tests {
     }
 
     #[test]
+    fn guest_bridge_parser_accepts_bind_flag() {
+        let bind = parse_guest_bridge_bind(&["--bind".to_string(), "127.0.0.1:9334".to_string()])
+            .expect("guest bridge bind");
+        assert_eq!(bind.as_deref(), Some("127.0.0.1:9334"));
+    }
+
+    #[test]
+    fn guest_bridge_parser_rejects_unknown_flags() {
+        let error = parse_guest_bridge_bind(&["--wat".to_string()])
+            .expect_err("unknown guest bridge flag should fail");
+        assert!(error.to_string().contains("Unknown guest-bridge command"));
+    }
+
+    #[test]
     fn help_text_mentions_daemon_command() {
         let help = help_text();
         assert!(help.contains("daemon"));
         assert!(help.contains("Start the background runtime daemon"));
+        assert!(help.contains("guest-bridge"));
         assert!(help.contains("tray"));
     }
 
