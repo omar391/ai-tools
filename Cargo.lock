@@ -342,6 +342,7 @@ dependencies = [
  "codex-rotate-core",
  "codex-rotate-refresh",
  "codex-rotate-runtime",
+ "codex-rotate-test-support",
  "serde",
  "serde_json",
  "url",
@@ -393,12 +394,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-rotate-test-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "codex-rotate-tray"
 version = "1.0.0"
 dependencies = [
  "codex-rotate-core",
  "codex-rotate-refresh",
  "codex-rotate-runtime",
+ "codex-rotate-test-support",
  "serde",
  "serde_json",
  "tauri",

@@ -19,5 +19,8 @@ serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.0.1", features = ["tray-icon"] }
 
+[dev-dependencies]
+codex-rotate-test-support = { path = "../../codex-rotate/crates/codex-rotate-test-support" }
+
 [features]
 default = []

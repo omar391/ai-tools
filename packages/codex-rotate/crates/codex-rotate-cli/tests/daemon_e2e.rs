@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use codex_rotate_test_support::IsolatedHomeFixture;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use codex_rotate_core::paths::resolve_main_worktree_root;
@@ -37,14 +38,6 @@ fn command_workdir() -> PathBuf {
     resolve_main_worktree_root(&repo_root).unwrap_or(repo_root)
 }
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    PathBuf::from("/tmp").join(format!("{prefix}-{stamp}"))
-}
-
 fn find_binary(binary_name: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set."))?;
     for directory in std::env::split_paths(&path) {
@@ -57,9 +50,6 @@ fn find_binary(binary_name: &str) -> Result<PathBuf> {
 }
 
 struct EnvGuard {
-    home: Option<OsString>,
-    rotate_home: Option<OsString>,
-    codex_home: Option<OsString>,
     repo_root: Option<OsString>,
     debug_port: Option<OsString>,
     disable_managed_launch: Option<OsString>,
@@ -67,25 +57,14 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn set(rotate_home: &Path, codex_home: &Path, debug_port: u16) -> Self {
+    fn set(repo_root: &Path, debug_port: u16) -> Self {
         let previous = Self {
-            home: std::env::var_os("HOME"),
-            rotate_home: std::env::var_os("CODEX_ROTATE_HOME"),
-            codex_home: std::env::var_os("CODEX_HOME"),
             repo_root: std::env::var_os("CODEX_ROTATE_REPO_ROOT"),
             debug_port: std::env::var_os("CODEX_ROTATE_DEBUG_PORT"),
             disable_managed_launch: std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH"),
             disable_local_refresh: std::env::var_os("CODEX_ROTATE_DISABLE_LOCAL_REFRESH"),
         };
-        let fake_home = rotate_home
-            .parent()
-            .expect("rotate home parent")
-            .to_path_buf();
-        let repo_root = command_workdir();
         unsafe {
-            std::env::set_var("HOME", fake_home);
-            std::env::set_var("CODEX_ROTATE_HOME", rotate_home);
-            std::env::set_var("CODEX_HOME", codex_home);
             std::env::set_var("CODEX_ROTATE_REPO_ROOT", repo_root);
             std::env::set_var("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
             std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
@@ -97,9 +76,6 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        restore_var("HOME", self.home.take());
-        restore_var("CODEX_ROTATE_HOME", self.rotate_home.take());
-        restore_var("CODEX_HOME", self.codex_home.take());
         restore_var("CODEX_ROTATE_REPO_ROOT", self.repo_root.take());
         restore_var("CODEX_ROTATE_DEBUG_PORT", self.debug_port.take());
         restore_var(
@@ -226,25 +202,25 @@ struct CommandResult {
 }
 
 struct DaemonCreateHarness {
-    sandbox: PathBuf,
     rotate_home: PathBuf,
     codex_home: PathBuf,
     debug_port: u16,
     _dummy_cdp: DummyCdpServer,
+    _fixture_env: codex_rotate_test_support::IsolatedHomeGuard,
     _env: EnvGuard,
     _extra_env: ExtraEnvGuard,
     daemon: Child,
     create: Child,
     bridge_child_pid: u32,
+    _fixture: IsolatedHomeFixture,
 }
 
 impl DaemonCreateHarness {
     fn start(prefix: &str) -> Result<Self> {
-        let sandbox = unique_temp_dir(prefix);
-        let rotate_home = sandbox.join("rotate-home");
-        let codex_home = sandbox.join("codex-home");
-        fs::create_dir_all(&rotate_home)?;
-        fs::create_dir_all(&codex_home)?;
+        let fixture = IsolatedHomeFixture::new(prefix)?;
+        let sandbox = fixture.sandbox_root().to_path_buf();
+        let rotate_home = fixture.rotate_home().to_path_buf();
+        let codex_home = fixture.codex_home().to_path_buf();
 
         let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
         write_executable(
@@ -314,7 +290,8 @@ else:
         let python3 = find_binary("python3")?;
         let dummy_cdp = DummyCdpServer::start()?;
         let debug_port = dummy_cdp.port;
-        let env = EnvGuard::set(&rotate_home, &codex_home, debug_port);
+        let fixture_env = fixture.install();
+        let env = EnvGuard::set(&command_workdir(), debug_port);
         let extra_env = ExtraEnvGuard::set(&[
             (
                 "CODEX_ROTATE_AUTOMATION_BRIDGE",
@@ -332,9 +309,12 @@ else:
         ]);
 
         let mut daemon = spawn_daemon(&rotate_home, &codex_home, debug_port)?;
-        wait_for_socket(&mut daemon, Duration::from_secs(10))?;
+        if let Err(error) = wait_for_socket(&mut daemon, Duration::from_secs(10)) {
+            let _ = terminate_child(&mut daemon);
+            return Err(error);
+        }
 
-        let mut create = configured_command(&rotate_home, &codex_home, debug_port)
+        let mut create = match configured_command(&rotate_home, &codex_home, debug_port)
             .arg("create")
             .arg("--force")
             .arg("--profile")
@@ -345,27 +325,45 @@ else:
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawn {} create --force", cli_binary()))?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = terminate_child(&mut daemon);
+                return Err(error)
+                    .with_context(|| format!("spawn {} create --force", cli_binary()));
+            }
+        };
 
-        let bridge_child_pid =
-            wait_for_pid_file_from_child(&child_pid_file, &mut create, Duration::from_secs(10))?;
-        assert!(
+        let bridge_child_pid = match wait_for_pid_file_from_child(
+            &child_pid_file,
+            &mut create,
+            Duration::from_secs(10),
+        ) {
+            Ok(pid) => pid,
+            Err(error) => {
+                let _ = terminate_child(&mut create);
+                let _ = terminate_child(&mut daemon);
+                return Err(error);
+            }
+        };
+        anyhow::ensure!(
             process_is_running(bridge_child_pid),
             "expected bridge child {} to be running",
             bridge_child_pid
         );
 
         Ok(Self {
-            sandbox,
             rotate_home,
             codex_home,
             debug_port,
             _dummy_cdp: dummy_cdp,
+            _fixture_env: fixture_env,
             _env: env,
             _extra_env: extra_env,
             daemon,
             create,
             bridge_child_pid,
+            _fixture: fixture,
         })
     }
 
@@ -429,7 +427,6 @@ impl Drop for DaemonCreateHarness {
             .status();
         let _ = terminate_child(&mut self.create);
         let _ = terminate_child(&mut self.daemon);
-        fs::remove_dir_all(&self.sandbox).ok();
     }
 }
 
@@ -645,14 +642,13 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
 #[test]
 fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
     let _guard = env_mutex().lock().expect("env mutex");
-    let sandbox = unique_temp_dir("codex-rotate-e2e");
-    let rotate_home = sandbox.join("rotate-home");
-    let codex_home = sandbox.join("codex-home");
-    fs::create_dir_all(&rotate_home)?;
-    fs::create_dir_all(&codex_home)?;
+    let fixture = IsolatedHomeFixture::new("codex-rotate-e2e")?;
+    let rotate_home = fixture.rotate_home().to_path_buf();
+    let codex_home = fixture.codex_home().to_path_buf();
 
     let dummy_cdp = DummyCdpServer::start()?;
-    let _env = EnvGuard::set(&rotate_home, &codex_home, dummy_cdp.port);
+    let _fixture_env = fixture.install();
+    let _env = EnvGuard::set(&command_workdir(), dummy_cdp.port);
 
     let direct_status = run_cli(&["status"], &rotate_home, &codex_home, dummy_cdp.port)?;
     let direct_list = run_cli(&["list"], &rotate_home, &codex_home, dummy_cdp.port)?;
@@ -722,7 +718,6 @@ fn empty_home_cli_matches_daemon_proxy_and_streams_snapshots() -> Result<()> {
 
     drop(subscription);
     terminate_child(&mut daemon)?;
-    fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
 
@@ -745,14 +740,13 @@ fn sigterm_cancels_only_the_in_flight_daemon_create_request() -> Result<()> {
 #[test]
 fn shutdown_invoke_stops_the_daemon() -> Result<()> {
     let _guard = env_mutex().lock().expect("env mutex");
-    let sandbox = unique_temp_dir("codex-rotate-daemon-shutdown");
-    let rotate_home = sandbox.join("rotate-home");
-    let codex_home = sandbox.join("codex-home");
-    fs::create_dir_all(&rotate_home)?;
-    fs::create_dir_all(&codex_home)?;
+    let fixture = IsolatedHomeFixture::new("codex-rotate-daemon-shutdown")?;
+    let rotate_home = fixture.rotate_home().to_path_buf();
+    let codex_home = fixture.codex_home().to_path_buf();
 
     let dummy_cdp = DummyCdpServer::start()?;
-    let _env = EnvGuard::set(&rotate_home, &codex_home, dummy_cdp.port);
+    let _fixture_env = fixture.install();
+    let _env = EnvGuard::set(&command_workdir(), dummy_cdp.port);
 
     let mut daemon = spawn_daemon(&rotate_home, &codex_home, dummy_cdp.port)?;
     wait_for_socket(&mut daemon, Duration::from_secs(10))?;
@@ -775,8 +769,6 @@ fn shutdown_invoke_stops_the_daemon() -> Result<()> {
         !daemon_socket_path()?.exists(),
         "daemon socket should be removed after shutdown"
     );
-
-    fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
 

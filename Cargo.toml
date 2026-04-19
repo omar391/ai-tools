@@ -2,6 +2,7 @@
 members = [
   "packages/codex-rotate/crates/codex-rotate-core",
   "packages/codex-rotate/crates/codex-rotate-cli",
+  "packages/codex-rotate/crates/codex-rotate-test-support",
   "packages/codex-rotate/crates/codex-rotate-refresh",
   "packages/codex-rotate/crates/codex-rotate-runtime",
   "packages/codex-rotate-app/src-tauri",

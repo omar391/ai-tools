@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use codex_rotate_runtime::ipc::{daemon_is_reachable, invoke, InvokeAction, RuntimeCapabilities};
+use codex_rotate_test_support::IsolatedHomeFixture;
 use codex_rotate_tray::{ensure_daemon_running, spawn_subscription_loop_controlled};
 use std::ffi::OsString;
 use std::fs;
@@ -12,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static BUILD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -30,14 +31,6 @@ fn lock_unpoisoned<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    PathBuf::from("/tmp").join(format!("{prefix}-{stamp}"))
 }
 
 fn workspace_root() -> PathBuf {
@@ -139,34 +132,21 @@ fn recv_snapshot_with_capabilities(
 }
 
 struct EnvGuard {
-    home: Option<OsString>,
-    rotate_home: Option<OsString>,
-    codex_home: Option<OsString>,
-    cli_bin: Option<OsString>,
     debug_port: Option<OsString>,
     disable_managed_launch: Option<OsString>,
     disable_local_refresh: Option<OsString>,
+    cli_bin: Option<OsString>,
 }
 
 impl EnvGuard {
-    fn set(rotate_home: &Path, codex_home: &Path, cli_bin: &Path, debug_port: u16) -> Self {
+    fn set(cli_bin: &Path, debug_port: u16) -> Self {
         let previous = Self {
-            home: std::env::var_os("HOME"),
-            rotate_home: std::env::var_os("CODEX_ROTATE_HOME"),
-            codex_home: std::env::var_os("CODEX_HOME"),
-            cli_bin: std::env::var_os("CODEX_ROTATE_CLI_BIN"),
             debug_port: std::env::var_os("CODEX_ROTATE_DEBUG_PORT"),
             disable_managed_launch: std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH"),
             disable_local_refresh: std::env::var_os("CODEX_ROTATE_DISABLE_LOCAL_REFRESH"),
+            cli_bin: std::env::var_os("CODEX_ROTATE_CLI_BIN"),
         };
-        let fake_home = rotate_home
-            .parent()
-            .expect("rotate home parent")
-            .to_path_buf();
         unsafe {
-            std::env::set_var("HOME", fake_home);
-            std::env::set_var("CODEX_ROTATE_HOME", rotate_home);
-            std::env::set_var("CODEX_HOME", codex_home);
             std::env::set_var("CODEX_ROTATE_CLI_BIN", cli_bin);
             std::env::set_var("CODEX_ROTATE_DEBUG_PORT", debug_port.to_string());
             std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
@@ -178,10 +158,6 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        restore_var("HOME", self.home.take());
-        restore_var("CODEX_ROTATE_HOME", self.rotate_home.take());
-        restore_var("CODEX_HOME", self.codex_home.take());
-        restore_var("CODEX_ROTATE_CLI_BIN", self.cli_bin.take());
         restore_var("CODEX_ROTATE_DEBUG_PORT", self.debug_port.take());
         restore_var(
             "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
@@ -191,6 +167,7 @@ impl Drop for EnvGuard {
             "CODEX_ROTATE_DISABLE_LOCAL_REFRESH",
             self.disable_local_refresh.take(),
         );
+        restore_var("CODEX_ROTATE_CLI_BIN", self.cli_bin.take());
     }
 }
 
@@ -289,19 +266,17 @@ fn kill_daemon_from_pid_file(pid_file: &Path) -> bool {
 #[test]
 fn tray_shell_launches_real_daemon_binary() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock_unpoisoned(env_mutex());
-    let sandbox = unique_temp_dir("codex-rotate-tray-launch");
-    let rotate_home = sandbox.join("rotate-home");
-    let codex_home = sandbox.join("codex-home");
-    fs::create_dir_all(&rotate_home)?;
-    fs::create_dir_all(&codex_home)?;
+    let fixture = IsolatedHomeFixture::new("codex-rotate-tray-launch")?;
+    let rotate_home = fixture.rotate_home().to_path_buf();
 
     let cli_binary = built_cli_binary()?;
-    let wrapper = sandbox.join("codex-rotate-wrapper.sh");
-    let pid_file = sandbox.join("daemon.pid");
+    let wrapper = fixture.sandbox_root().join("codex-rotate-wrapper.sh");
+    let pid_file = fixture.sandbox_root().join("daemon.pid");
     write_cli_wrapper(&wrapper, &cli_binary, &pid_file)?;
 
     let dummy_cdp = DummyCdpServer::start()?;
-    let _env = EnvGuard::set(&rotate_home, &codex_home, &wrapper, dummy_cdp.port);
+    let _fixture_env = fixture.install();
+    let _env = EnvGuard::set(&wrapper, dummy_cdp.port);
 
     ensure_daemon_running()?;
     wait_for(Duration::from_secs(10), daemon_is_reachable)?;
@@ -310,7 +285,6 @@ fn tray_shell_launches_real_daemon_binary() -> Result<(), Box<dyn std::error::Er
 
     assert!(kill_daemon_from_pid_file(&pid_file));
     wait_for(Duration::from_secs(10), || !daemon_is_reachable())?;
-    fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }
 
@@ -318,19 +292,17 @@ fn tray_shell_launches_real_daemon_binary() -> Result<(), Box<dyn std::error::Er
 fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock_unpoisoned(env_mutex());
-    let sandbox = unique_temp_dir("codex-rotate-tray-ipc");
-    let rotate_home = sandbox.join("rotate-home");
-    let codex_home = sandbox.join("codex-home");
-    fs::create_dir_all(&rotate_home)?;
-    fs::create_dir_all(&codex_home)?;
+    let fixture = IsolatedHomeFixture::new("codex-rotate-tray-ipc")?;
+    let rotate_home = fixture.rotate_home().to_path_buf();
 
     let cli_binary = built_cli_binary()?;
-    let wrapper = sandbox.join("codex-rotate-wrapper.sh");
-    let pid_file = sandbox.join("daemon.pid");
+    let wrapper = fixture.sandbox_root().join("codex-rotate-wrapper.sh");
+    let pid_file = fixture.sandbox_root().join("daemon.pid");
     write_cli_wrapper(&wrapper, &cli_binary, &pid_file)?;
 
     let dummy_cdp = DummyCdpServer::start()?;
-    let _env = EnvGuard::set(&rotate_home, &codex_home, &wrapper, dummy_cdp.port);
+    let _fixture_env = fixture.install();
+    let _env = EnvGuard::set(&wrapper, dummy_cdp.port);
 
     let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
@@ -346,6 +318,7 @@ fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
     )?;
     assert_eq!(first.capabilities, RuntimeCapabilities::current());
     wait_for(Duration::from_secs(10), daemon_is_reachable)?;
+    assert!(rotate_home.join("daemon.sock").exists());
     wait_for(Duration::from_secs(5), || pid_file.exists())?;
 
     let _ = invoke(InvokeAction::List)?;
@@ -362,6 +335,5 @@ fn tray_shell_auto_starts_and_streams_real_daemon_snapshots(
 
     assert!(kill_daemon_from_pid_file(&pid_file));
     wait_for(Duration::from_secs(10), || !daemon_is_reachable())?;
-    fs::remove_dir_all(&sandbox).ok();
     Ok(())
 }

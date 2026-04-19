@@ -17,3 +17,6 @@ codex-rotate-runtime = { path = "../codex-rotate-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 url = "2.5.7"
+
+[dev-dependencies]
+codex-rotate-test-support = { path = "../codex-rotate-test-support" }
