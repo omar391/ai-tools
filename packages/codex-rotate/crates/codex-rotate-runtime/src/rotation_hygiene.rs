@@ -271,6 +271,17 @@ impl RotationBackend for VmBackend {
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Result<Vec<ThreadHandoff>> {
         self.validate_config()?;
+        let handoffs = match self.export_guest_handoffs(&prepared.previous.account_id) {
+            Ok(handoffs) => handoffs,
+            Err(error) => {
+                if let Some(progress) = progress.as_ref() {
+                    progress(format!(
+                        "Skipping VM source handoff export because guest bridge export was unavailable: {error:#}"
+                    ));
+                }
+                Vec::new()
+            }
+        };
         self.stop_all_persona_vms(progress.as_ref())?;
 
         let persona = prepared
@@ -283,15 +294,12 @@ impl RotationBackend for VmBackend {
         self.launch_vm(persona, progress.as_ref())?;
         self.start_guest_codex()?;
 
-        // Export handoffs from current (host) Codex to be injected into guest.
-        // NOTE: Task G12 implies VM mode uses the same prepare/export/activate/import flow.
-        // The shared orchestrator handles the host-side export, so we only need to return
-        // a placeholder or implement the guest-side injection if needed.
-        // Actually, the shared orchestrator calls activate() and then uses the returned items
-        // to call import_thread_handoffs(port, ...).
-        // In VM mode, `port` in `rotate_next_impl` is the HOST port.
-        // We need to inject them into the GUEST.
+        if !handoffs.is_empty() {
+            self.import_guest_handoffs(&handoffs)?;
+        }
 
+        // VM mode imports handoffs in-guest through the bridge, so the host-side
+        // shared import stage should no-op for this backend.
         Ok(Vec::new())
     }
 
@@ -448,6 +456,32 @@ impl RotationBackend for VmBackend {
 }
 
 impl VmBackend {
+    fn export_guest_handoffs(&self, account_id: &str) -> Result<Vec<ThreadHandoff>> {
+        let result: GuestThreadHandoffExportResult = self.send_guest_request(
+            "export-thread-handoffs",
+            json!({
+                "account_id": account_id,
+            }),
+        )?;
+        Ok(result.handoffs)
+    }
+
+    fn import_guest_handoffs(&self, handoffs: &[ThreadHandoff]) -> Result<()> {
+        let result: GuestThreadHandoffImportResult = self.send_guest_request(
+            "import-thread-handoffs",
+            json!({
+                "handoffs": handoffs,
+            }),
+        )?;
+        if result.failures.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "Guest handoff import reported {} failure(s).",
+            result.failures.len()
+        ))
+    }
+
     fn rollback_after_failed_activation(
         &self,
         _prepared: &PreparedRotation,
@@ -1970,7 +2004,7 @@ fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ThreadHandoff {
     source_thread_id: String,
     cwd: Option<String>,
@@ -2030,6 +2064,18 @@ impl ThreadHandoffImportOutcome {
             failure.source_thread_id, failure.error
         )
     }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct GuestThreadHandoffExportResult {
+    #[serde(default)]
+    handoffs: Vec<ThreadHandoff>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct GuestThreadHandoffImportResult {
+    #[serde(default)]
+    failures: Vec<Value>,
 }
 
 fn validate_vm_environment_config(
@@ -2270,9 +2316,11 @@ mod tests {
     use crate::test_support::env_mutex;
     use codex_rotate_core::pool::{AccountEntry, PersonaEntry};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -2564,6 +2612,103 @@ while True:
 
     fn start_guest_bridge(response_body: impl Into<String>) -> Result<TestHttpServer> {
         TestHttpServer::start(response_body)
+    }
+
+    struct RecordingGuestBridge {
+        shutdown: std::sync::mpsc::Sender<()>,
+        handle: Option<thread::JoinHandle<()>>,
+        port: u16,
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingGuestBridge {
+        fn start(command_responses: BTreeMap<String, Value>) -> Result<Self> {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").context("bind recording guest bridge")?;
+            listener
+                .set_nonblocking(true)
+                .context("configure recording guest bridge")?;
+            let port = listener
+                .local_addr()
+                .context("recording guest bridge local addr")?
+                .port();
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let commands_for_thread = Arc::clone(&commands);
+            let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+            let handle = thread::spawn(move || loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0u8; 8192];
+                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        let body = request
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        let command = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .as_object()
+                                    .and_then(|record| record.get("command"))
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned)
+                            })
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        {
+                            let mut seen = commands_for_thread
+                                .lock()
+                                .expect("recording guest bridge command mutex");
+                            seen.push(command.clone());
+                        }
+
+                        let response_body = command_responses
+                            .get(&command)
+                            .cloned()
+                            .unwrap_or_else(|| json!({"ok": true, "result": {}}));
+                        let response_text = response_body.to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_text.len(),
+                            response_text
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            });
+            Ok(Self {
+                shutdown: shutdown_tx,
+                handle: Some(handle),
+                port,
+                commands,
+            })
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.commands
+                .lock()
+                .expect("recording guest bridge command mutex")
+                .clone()
+        }
+    }
+
+    impl Drop for RecordingGuestBridge {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     fn write_fake_utmctl(path: &Path) {
@@ -3966,6 +4111,109 @@ insert into threads (id, rollout_path, updated_at, archived) values
         assert!(error_msg.contains("utmctl") || error_msg.contains("guest"));
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn vm_activate_uses_guest_bridge_handoff_export_and_import() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let backend = test_vm_backend(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_utmctl = std::env::var_os("CODEX_ROTATE_UTMCTL_BIN");
+        let previous_bridge_url = std::env::var_os("CODEX_ROTATE_GUEST_BRIDGE_URL");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.home_dir.clone());
+        }
+
+        let fake_utmctl = temp.path().join("bin").join("utmctl");
+        write_fake_utmctl(&fake_utmctl);
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_UTMCTL_BIN", &fake_utmctl);
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let bridge = RecordingGuestBridge::start(BTreeMap::from([
+            (
+                "export-thread-handoffs".to_string(),
+                json!({
+                    "ok": true,
+                    "result": {
+                        "handoffs": [
+                            {
+                                "source_thread_id": "thread-source-1",
+                                "cwd": null,
+                                "items": [],
+                                "continue_prompt": "continue"
+                            }
+                        ]
+                    }
+                }),
+            ),
+            ("start-codex".to_string(), json!({"ok": true, "result": {}})),
+            (
+                "import-thread-handoffs".to_string(),
+                json!({
+                    "ok": true,
+                    "result": {
+                        "completed_source_thread_ids": ["thread-source-1"],
+                        "failures": []
+                    }
+                }),
+            ),
+        ]))
+        .expect("start recording guest bridge");
+        unsafe {
+            std::env::set_var(
+                "CODEX_ROTATE_GUEST_BRIDGE_URL",
+                format!("http://127.0.0.1:{}/request", bridge.port),
+            );
+        }
+
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: pool.clone(),
+            previous_index: 0,
+            target_index: 1,
+            previous: source,
+            target,
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        let handoffs = backend
+            .activate(&prepared, 9333, None)
+            .expect("activate vm");
+        assert!(
+            handoffs.is_empty(),
+            "vm backend should import handoffs in-guest and return no host-side handoffs"
+        );
+
+        let commands = bridge.commands();
+        assert!(
+            commands.windows(3).any(|window| window
+                == [
+                    "export-thread-handoffs",
+                    "start-codex",
+                    "import-thread-handoffs"
+                ]),
+            "vm activation should export + start + import via guest bridge; got: {commands:?}"
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_ROTATE_UTMCTL_BIN", previous_utmctl);
+        restore_env("CODEX_ROTATE_GUEST_BRIDGE_URL", previous_bridge_url);
     }
 
     #[test]
