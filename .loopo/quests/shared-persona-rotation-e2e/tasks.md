@@ -1,7 +1,7 @@
 # Quest
 
 - objective: Define the backlog needed so host and VM rotation can be considered confidenceable through automated system coverage instead of ad hoc manual live testing.
-- scope: Imported from tasks_e2e.md for shared persona rotation confidence execution in task-loop format.
+- scope: Imported from tasks_e2e.md for shared persona rotation confidence execution.
 - constraints: Preserve existing task intent/status; keep legacy ID traceability in titles; refine scope_files during execution.
 
 ## Tasks
