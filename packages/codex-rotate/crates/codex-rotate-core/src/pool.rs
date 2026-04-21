@@ -382,6 +382,8 @@ pub struct RotationCandidate {
     pub inspection: AccountInspection,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
 pub enum NextResult {
     Rotated {
         message: String,
@@ -1183,6 +1185,8 @@ pub fn cmd_list() -> Result<String> {
     Ok(emitter.finish())
 }
 
+// TODO: expose a structured healthy-account list so callers can use this logic directly
+// instead of scraping the rendered account-pool text.
 pub fn cmd_list_stream(writer: &mut dyn Write) -> Result<()> {
     let mut emitter = LineEmitter::streaming(writer);
     cmd_list_impl(&mut emitter)

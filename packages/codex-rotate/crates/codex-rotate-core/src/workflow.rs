@@ -2443,8 +2443,15 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         }
     };
     let workflow_ref = workflow_defaults.workflow_ref;
-    let wrapped_codex_bin =
-        ensure_managed_browser_wrapper(profile_name, codex_bin.unwrap_or(DEFAULT_CODEX_BIN))?;
+    let resolved_codex_bin;
+    let codex_bin_to_use = match codex_bin {
+        Some(value) => value,
+        None => {
+            resolved_codex_bin = crate::workflow::codex_bin();
+            &resolved_codex_bin
+        }
+    };
+    let wrapped_codex_bin = ensure_managed_browser_wrapper(profile_name, codex_bin_to_use)?;
     let wrapped_codex_bin = wrapped_codex_bin.to_string_lossy().into_owned();
     match account_login_locator {
         Some(_) if skip_locator_preflight == Some(true) => report_progress(

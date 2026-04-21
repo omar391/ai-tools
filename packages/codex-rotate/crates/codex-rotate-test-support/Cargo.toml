@@ -5,4 +5,10 @@ edition = "2021"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+codex-rotate-core = { path = "../codex-rotate-core" }
+codex-rotate-refresh = { path = "../codex-rotate-refresh" }
+codex-rotate-runtime = { path = "../codex-rotate-runtime" }
+rusqlite.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

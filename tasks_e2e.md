@@ -66,7 +66,7 @@ Acceptance criteria:
 
 ### A03. Add a shared isolated-account-state fixture
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -76,7 +76,7 @@ Acceptance criteria:
 
 ### A04. Add a fake Codex app-server fixture
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -86,7 +86,7 @@ Acceptance criteria:
 
 ### A05. Add a fake managed-browser opener fixture
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -96,7 +96,7 @@ Acceptance criteria:
 
 ### A06. Add a watch-trigger harness
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -106,7 +106,7 @@ Acceptance criteria:
 
 ### A07. Add process-tracking helpers for Codex, Chrome, utmctl, guest bridge, and helper scripts
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -116,7 +116,7 @@ Acceptance criteria:
 
 ### A08. Add window/leak cleanup assertions
 
-Status: Pending
+Status: Done
 Depends on: A07
 Acceptance criteria:
 
@@ -126,7 +126,7 @@ Acceptance criteria:
 
 ### A09. Add temp-path, socket, mount, and symlink cleanup assertions
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -136,7 +136,7 @@ Acceptance criteria:
 
 ### A10. Add artifact capture helpers for failure triage
 
-Status: Pending
+Status: Done
 Depends on: A02
 Acceptance criteria:
 
@@ -208,7 +208,7 @@ Acceptance criteria:
 
 ### B03. Add hermetic host relogin happy-path coverage
 
-Status: Pending
+Status: Done
 Depends on: A03, A05, A08
 Acceptance criteria:
 
@@ -218,7 +218,7 @@ Acceptance criteria:
 
 ### B04. Add hermetic watch-triggered host rotation happy-path coverage
 
-Status: Pending
+Status: Done
 Depends on: A03, A04, A06, A08
 Acceptance criteria:
 
@@ -228,7 +228,7 @@ Acceptance criteria:
 
 ### B05. Add hermetic same-account reopen coverage
 
-Status: Pending
+Status: Done
 Depends on: A03, A04
 Acceptance criteria:
 
@@ -238,7 +238,7 @@ Acceptance criteria:
 
 ### B06. Add hermetic first-run host migration coverage
 
-Status: Pending
+Status: Done
 Depends on: A02, A03
 Acceptance criteria:
 
@@ -248,7 +248,7 @@ Acceptance criteria:
 
 ### B07. Add hermetic pre-migration compatibility coverage
 
-Status: Pending
+Status: Done
 Depends on: A02, A03
 Acceptance criteria:
 
@@ -258,7 +258,7 @@ Acceptance criteria:
 
 ### B08. Add hermetic active-thread handoff coverage
 
-Status: Pending
+Status: Done
 Depends on: A03, A04
 Acceptance criteria:
 
@@ -268,7 +268,7 @@ Acceptance criteria:
 
 ### B09. Add hermetic recoverable-thread handoff coverage
 
-Status: Pending
+Status: Done
 Depends on: A03, A04
 Acceptance criteria:
 

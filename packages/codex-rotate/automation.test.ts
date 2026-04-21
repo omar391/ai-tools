@@ -15,6 +15,7 @@ import { chromium } from "playwright";
 import {
   applyAccountPasswordFieldPath,
   applyLocatorFieldPathToSecretRef,
+  buildCodexBrowserPersonaInputs,
   buildFastBrowserSecretRefResolveSelector,
   buildFastBrowserWorkflowError,
   collectVerificationArtifactsForCleanup,
@@ -23,6 +24,7 @@ import {
   isFastBrowserRunResultFailure,
   isSuppressedFastBrowserEventLine,
   isUnavailableOptionalSecretLocatorError,
+  generateDeterministicFingerprint,
   resolveFastBrowserSkillPath,
   shouldResetFastBrowserBridgeInactivityTimer,
   shouldPromptForCodexRotateSecretUnlock,
@@ -725,6 +727,59 @@ describe("codex login managed-browser wrapper", () => {
     expect(result.stderr).toContain(
       "Managed Codex browser opener refused a non-URL browser launch request.",
     );
+  });
+});
+
+describe("browser persona inputs", () => {
+  test("buildCodexBrowserPersonaInputs maps persona data into coherent browser fields", () => {
+    const personaProfile = {
+      id: "persona-123",
+      osFamily: "macos" as const,
+      userAgent: "Custom User Agent 1.0",
+      acceptLanguage: "en-US",
+      timezone: "America/Los_Angeles",
+      screenWidth: 1512,
+      screenHeight: 982,
+      deviceScaleFactor: 2,
+    };
+
+    const expectedFingerprint = generateDeterministicFingerprint(
+      personaProfile.id,
+      {
+        userAgent: personaProfile.userAgent,
+        screenWidth: personaProfile.screenWidth,
+        screenHeight: personaProfile.screenHeight,
+        osFamily: personaProfile.osFamily,
+      },
+    );
+
+    const { fingerprint, browserInputs } = buildCodexBrowserPersonaInputs(
+      "workflow.sys.web.auth-openai-com.create-account",
+      personaProfile,
+    );
+
+    expect(fingerprint).toMatchObject({
+      userAgent: expectedFingerprint.userAgent,
+      screen: {
+        width: expectedFingerprint.screen.width,
+        height: expectedFingerprint.screen.height,
+      },
+    });
+    expect(browserInputs).toEqual({
+      browser_user_agent: expectedFingerprint.userAgent,
+      browser_accept_language: personaProfile.acceptLanguage,
+      browser_timezone: personaProfile.timezone,
+      browser_screen_width: String(expectedFingerprint.screen.width),
+      browser_screen_height: String(expectedFingerprint.screen.height),
+      browser_device_scale_factor: String(personaProfile.deviceScaleFactor),
+    });
+
+    const googleInputs = buildCodexBrowserPersonaInputs(
+      "workflow.sys.web.mail.google.com.collect-verification-artifact",
+      personaProfile,
+    );
+    expect(googleInputs.fingerprint).toBeNull();
+    expect(googleInputs.browserInputs).toBeNull();
   });
 });
 

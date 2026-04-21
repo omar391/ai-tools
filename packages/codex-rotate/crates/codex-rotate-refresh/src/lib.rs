@@ -1,5 +1,7 @@
 mod build;
+pub mod filesystem_tracking;
 mod process;
+pub mod process_tracking;
 mod targets;
 mod tray_service;
 
@@ -11,6 +13,12 @@ pub use build::{
 pub use process::{
     spawn_detached_process, stop_other_local_daemons, stop_running_daemons, stop_running_trays,
     INSTANCE_HOME_ARG,
+};
+pub use process_tracking::{
+    ProcessLeakGuard, ProcessRecord, ProcessSnapshot, ProcessTracker, TrackedProcessRecord,
+};
+pub use filesystem_tracking::{
+    FilesystemLeakGuard, FilesystemTracker, TrackedPathKind, TrackedPathRecord,
 };
 pub use targets::{
     current_process_local_build, detect_local_build, BuildProfile, LocalBinaryBuild, TargetKind,

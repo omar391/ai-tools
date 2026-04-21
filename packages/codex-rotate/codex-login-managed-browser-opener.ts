@@ -50,7 +50,8 @@ async function appendLog(
   message: string,
   details: unknown = null,
 ): Promise<void> {
-  const line = `[${new Date().toISOString()}] ${message}${details ? ` ${JSON.stringify(details)}` : ""}\n`;
+  const detailsText = details ? ` ${JSON.stringify(details)}` : "";
+  const line = `[${new Date().toISOString()}] ${message}${detailsText}\n`;
   await fs.appendFile(LOG_PATH, line, "utf8").catch(() => {});
 }
 
@@ -126,7 +127,9 @@ async function main(): Promise<void> {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-main().catch(async (error) => {
+try {
+  await main();
+} catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   await appendLog("browser_shim_failed", {
     message,
@@ -134,4 +137,4 @@ main().catch(async (error) => {
   });
   process.stderr.write(`${message}\n`);
   process.exit(1);
-});
+}

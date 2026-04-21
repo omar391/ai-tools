@@ -25,6 +25,8 @@ codex-rotate daemon run         # Start the background daemon used by the tray s
 
 `create` and automated `relogin` use the shared fast-browser managed Chrome profiles plus the auth URL emitted by `BROWSER=/usr/bin/false codex login`, so the regular system browser does not need to take over the OAuth handoff. Account inventory and credential metadata now live in `~/.codex-rotate/accounts.json`; the daemon-owned runtime state is `~/.codex-rotate/watch-state.json`, `~/.codex-rotate/profile/`, and `~/.codex-rotate/daemon.sock`. Managed login wrapper scripts are generated per checkout under `<repo-root>/.codex-rotate/bin/` instead of `~/.codex-rotate/bin/`.
 
+The confidence policy, suite matrix, and operator runbooks live in [docs/live-confidence.md](docs/live-confidence.md).
+
 The tray is only a UI shell over the daemon. The CLI owns the watch loop, managed Codex launch, live account sync, and create/relogin orchestration.
 
 #### VM Operations
@@ -49,6 +51,8 @@ The tray is only a UI shell over the daemon. The CLI owns the watch loop, manage
 4. **Configure Host**: Set `basePackagePath` and `personaRoot` in `~/.codex-rotate/accounts.json`.
 
 **APFS Requirement**: The VM backend assumes the `personaRoot` is on an APFS volume. This allows `cp -R` to use "Clone" (Copy-on-Write) semantics, ensuring that each new persona VM takes zero additional disk space until modified.
+
+See [docs/live-confidence.md](docs/live-confidence.md) for the live-suite preflight checks, artifact rules, and operator runbooks.
 
 #### Setup
 

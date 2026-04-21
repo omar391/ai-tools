@@ -20,3 +20,5 @@ url = "2.5.7"
 
 [dev-dependencies]
 codex-rotate-test-support = { path = "../codex-rotate-test-support" }
+rusqlite.workspace = true
+tempfile.workspace = true

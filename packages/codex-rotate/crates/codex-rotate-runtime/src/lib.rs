@@ -1,6 +1,7 @@
 pub mod cdp;
 pub mod daemon;
 pub mod hook;
+pub mod live_checks;
 pub mod ipc;
 pub mod launcher;
 pub mod log_isolation;

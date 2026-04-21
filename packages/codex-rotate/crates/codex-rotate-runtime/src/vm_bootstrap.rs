@@ -271,6 +271,7 @@ fn render_guest_bridge_launch_agent(node_path: &Path, bridge_root: &Path) -> Str
 mod tests {
     use super::*;
     use crate::test_support::env_mutex;
+    use codex_rotate_refresh::FilesystemTracker;
     use tempfile::tempdir;
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
@@ -299,6 +300,9 @@ mod tests {
         let repo_root = temp.path().join("repo");
         let guest_root = temp.path().join("guest");
         let fake_utmctl = temp.path().join("fake-utmctl");
+        let path_guard = FilesystemTracker::new()
+            .expect("create filesystem tracker")
+            .leak_guard("vm bootstrap filesystem cleanup");
 
         fs::create_dir_all(repo_root.join("packages").join("codex-rotate")).expect("repo assets");
         fs::write(
@@ -367,6 +371,16 @@ mod tests {
         let seal_contents = fs::read_to_string(&seal_stamp).expect("read seal stamp");
         assert!(seal_contents.contains("sealed_at="));
         assert!(seal_contents.contains("bridge_root="));
+
+        path_guard.record_temp_path(&guest_root, "guest root", false);
+        path_guard.record_temp_path(&bridge_root, "bridge root", false);
+        path_guard.record_temp_path(&launch_agent, "launch agent", false);
+        path_guard.record_temp_path(&seal_stamp, "seal stamp", false);
+
+        drop(temp);
+        path_guard
+            .assert_clean()
+            .expect("vm bootstrap artifacts should be removed");
 
         restore_env("CODEX_ROTATE_REPO_ROOT", previous_repo_root);
         restore_env(UTMCTL_BIN_ENV, previous_utmctl_bin);

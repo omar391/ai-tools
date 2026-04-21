@@ -27,6 +27,7 @@ use codex_rotate_refresh::{
     sources_newer_than_binary, stop_running_daemons, tray_service_pid, TargetKind,
 };
 use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
+use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
     ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
@@ -328,7 +329,9 @@ fn run_internal_command(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("managed-login") => run_managed_login(&args[1..]),
         Some("managed-browser-wrapper") => run_managed_browser_wrapper(&args[1..]),
+        Some("launch-managed") => run_internal_launch_managed_command(&args[1..]),
         Some("guest-bridge") => run_guest_bridge_command(&args[1..]),
+        Some("live-check") => run_internal_live_check_command(&args[1..]),
         Some("vm-bootstrap") => run_internal_vm_bootstrap_command(&args[1..]),
         Some("create") => {
             let output = cmd_create_with_progress(
@@ -349,6 +352,43 @@ fn run_internal_command(args: &[String]) -> Result<()> {
     }
 }
 
+fn run_internal_launch_managed_command(args: &[String]) -> Result<()> {
+    let mut port = None::<u16>;
+    let mut profile_dir = None::<PathBuf>;
+    let mut duration_secs = 5u64;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--port" {
+            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing port"))?;
+            port = Some(value.parse()?);
+            index += 2;
+        } else if arg == "--profile-dir" {
+            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing profile-dir"))?;
+            profile_dir = Some(PathBuf::from(value));
+            index += 2;
+        } else if arg == "--duration" {
+            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing duration"))?;
+            duration_secs = value.parse()?;
+            index += 2;
+        } else {
+            return Err(anyhow!("Unknown launch-managed arg: {arg}"));
+        }
+    }
+
+    codex_rotate_runtime::launcher::ensure_debug_codex_instance(
+        None,
+        port,
+        profile_dir.as_deref(),
+        None,
+    )?;
+
+    println!("Managed Codex launched. Waiting {} seconds...", duration_secs);
+    thread::sleep(Duration::from_secs(duration_secs));
+    Ok(())
+}
+
 fn run_guest_bridge_command(args: &[String]) -> Result<()> {
     let bind = parse_guest_bridge_bind(args)?;
     run_guest_bridge_server(bind.as_deref())
@@ -359,6 +399,25 @@ fn run_internal_vm_bootstrap_command(args: &[String]) -> Result<()> {
     let output = bootstrap_vm_base(&guest_root, bridge_root.as_deref())?;
     println!("{output}");
     Ok(())
+}
+
+fn run_internal_live_check_command(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("host") => {
+            let report = host_live_capability_report()?;
+            report.ensure_ready()?;
+            println!("{}", report.format());
+            Ok(())
+        }
+        Some("vm") => {
+            let report = vm_live_capability_report()?;
+            report.ensure_ready()?;
+            println!("{}", report.format());
+            Ok(())
+        }
+        Some(other) => Err(anyhow!("Unknown live-check target: \"{other}\". Usage: codex-rotate internal live-check <host|vm>")),
+        None => Err(anyhow!("Usage: codex-rotate internal live-check <host|vm>")),
+    }
 }
 
 fn parse_internal_vm_bootstrap_options(args: &[String]) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -1183,6 +1242,7 @@ fn help_text() -> String {
   {CYAN}remove{RESET} <selector>  Remove that account from the pool
   {CYAN}daemon{RESET}           Start the background runtime daemon
   {CYAN}guest-bridge{RESET} [--bind <host:port>] Run the VM guest bridge server
+    {CYAN}internal live-check{RESET} <host|vm> Verify live-suite prerequisites
   {CYAN}tray{RESET} [subcommand] Manage the Codex Rotate tray app
   {CYAN}help{RESET}             Show this help message
 "#

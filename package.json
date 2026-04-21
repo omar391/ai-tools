@@ -4,6 +4,12 @@
   "workspaces": [
     "packages/*"
   ],
+  "scripts": {
+    "hermetic:host": "cargo test -p codex-rotate-runtime --lib -- --nocapture && cargo test -p codex-rotate-cli --tests -- --nocapture",
+    "hermetic:vm": "cargo test -p codex-rotate-runtime --lib -- --nocapture && cargo test -p codex-rotate-cli --tests -- --nocapture",
+    "live:host": "cargo run -p codex-rotate-cli -- internal live-check host",
+    "live:vm": "cargo run -p codex-rotate-cli -- internal live-check vm"
+  },
   "devDependencies": {
     "playwright": "^1.58.2"
   }

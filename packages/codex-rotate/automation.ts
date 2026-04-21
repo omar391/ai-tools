@@ -1425,6 +1425,21 @@ function requireWorkflowInputInteger(
 
 const FINGERPRINT_GENERATOR = new FingerprintGenerator();
 export type BrowserOsFamily = "macos" | "windows" | "linux";
+export type CodexBrowserPersonaProfile = {
+  id: string;
+  osFamily: BrowserOsFamily;
+  userAgent: string;
+  acceptLanguage: string;
+  timezone: string;
+  screenWidth: number;
+  screenHeight: number;
+  deviceScaleFactor: number;
+};
+
+export type CodexBrowserPersonaInputs = {
+  fingerprint: Record<string, unknown> | null;
+  browserInputs: Record<string, string> | null;
+};
 
 /**
  * Generates a realistic but deterministic browser fingerprint for a persona.
@@ -1493,6 +1508,38 @@ function isGoogleWorkflow(workflowRef: string): boolean {
   );
 }
 
+export function buildCodexBrowserPersonaInputs(
+  workflowRef: string,
+  personaProfile?: CodexBrowserPersonaProfile | null,
+): CodexBrowserPersonaInputs {
+  const applyPersona = Boolean(personaProfile) && !isGoogleWorkflow(workflowRef);
+  if (!applyPersona || !personaProfile) {
+    return {
+      fingerprint: null,
+      browserInputs: null,
+    };
+  }
+
+  const fingerprint = generateDeterministicFingerprint(personaProfile.id, {
+    userAgent: personaProfile.userAgent,
+    screenWidth: personaProfile.screenWidth,
+    screenHeight: personaProfile.screenHeight,
+    osFamily: personaProfile.osFamily,
+  });
+
+  return {
+    fingerprint,
+    browserInputs: {
+      browser_user_agent: fingerprint.userAgent,
+      browser_accept_language: personaProfile.acceptLanguage,
+      browser_timezone: personaProfile.timezone,
+      browser_screen_width: String(fingerprint.screen.width),
+      browser_screen_height: String(fingerprint.screen.height),
+      browser_device_scale_factor: String(personaProfile.deviceScaleFactor),
+    },
+  };
+}
+
 async function runCodexBrowserLoginWorkflow(
   profileName: string,
   email: string,
@@ -1512,16 +1559,7 @@ async function runCodexBrowserLoginWorkflow(
     birthDay?: number;
     birthYear?: number;
     profileDir?: string;
-    personaProfile?: {
-      id: string;
-      osFamily: BrowserOsFamily;
-      userAgent: string;
-      acceptLanguage: string;
-      timezone: string;
-      screenWidth: number;
-      screenHeight: number;
-      deviceScaleFactor: number;
-    } | null;
+    personaProfile?: CodexBrowserPersonaProfile | null;
   },
 ): Promise<{
   result: FastBrowserRunResult;
@@ -1533,17 +1571,10 @@ async function runCodexBrowserLoginWorkflow(
     "workflowRef",
   );
 
-  const applyPersona =
-    options?.personaProfile && !isGoogleWorkflow(workflowRef);
-  const fingerprint =
-    applyPersona && options.personaProfile
-      ? generateDeterministicFingerprint(options.personaProfile.id, {
-          userAgent: options.personaProfile.userAgent,
-          screenWidth: options.personaProfile.screenWidth,
-          screenHeight: options.personaProfile.screenHeight,
-          osFamily: options.personaProfile.osFamily,
-        })
-      : null;
+  const { fingerprint, browserInputs } = buildCodexBrowserPersonaInputs(
+    workflowRef,
+    options?.personaProfile,
+  );
 
   const fullName = requireWorkflowInputString(options?.fullName, "fullName");
   const birthMonth = requireWorkflowInputInteger(
@@ -1612,18 +1643,7 @@ async function runCodexBrowserLoginWorkflow(
       birth_month: String(birthMonth),
       birth_day: String(birthDay),
       birth_year: String(birthYear),
-      ...(fingerprint && options?.personaProfile
-        ? {
-            browser_user_agent: fingerprint.userAgent,
-            browser_accept_language: options.personaProfile.acceptLanguage,
-            browser_timezone: options.personaProfile.timezone,
-            browser_screen_width: String(fingerprint.screen.width),
-            browser_screen_height: String(fingerprint.screen.height),
-            browser_device_scale_factor: String(
-              options.personaProfile.deviceScaleFactor,
-            ),
-          }
-        : {}),
+      ...(browserInputs ?? {}),
     },
     profileName,
     {
@@ -1657,16 +1677,7 @@ export async function completeCodexLoginViaWorkflowAttempt(
     skipLocatorPreflight?: boolean;
     codexSession?: CodexRotateAuthFlowSession | null;
     profileDir?: string;
-    personaProfile?: {
-      id: string;
-      osFamily: "macos" | "windows" | "linux";
-      userAgent: string;
-      acceptLanguage: string;
-      timezone: string;
-      screenWidth: number;
-      screenHeight: number;
-      deviceScaleFactor: number;
-    } | null;
+    personaProfile?: CodexBrowserPersonaProfile | null;
   },
 ): Promise<CodexRotateLoginWorkflowAttemptResult> {
   const workflowAccountLoginLocator =

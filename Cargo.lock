@@ -343,8 +343,10 @@ dependencies = [
  "codex-rotate-refresh",
  "codex-rotate-runtime",
  "codex-rotate-test-support",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "url",
 ]
 
@@ -398,6 +400,12 @@ name = "codex-rotate-test-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "codex-rotate-core",
+ "codex-rotate-refresh",
+ "codex-rotate-runtime",
+ "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

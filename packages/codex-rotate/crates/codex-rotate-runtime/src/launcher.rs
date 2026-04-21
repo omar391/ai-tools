@@ -139,7 +139,7 @@ fn path_looks_like_rust_test_binary(path: &Path) -> bool {
 }
 
 fn should_track_test_managed_launches() -> bool {
-    running_under_test_harness() && managed_launch_allowed_in_tests()
+    managed_launch_allowed_in_tests()
 }
 
 fn track_test_managed_launch(profile_dir: &Path) {

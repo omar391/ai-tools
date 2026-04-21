@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use codex_rotate_core::paths::resolve_main_worktree_root;
+use codex_rotate_refresh::{
+    FilesystemLeakGuard, FilesystemTracker, ProcessLeakGuard, ProcessTracker,
+};
 use codex_rotate_runtime::ipc::{
     daemon_socket_path, invoke, subscribe, InvokeAction, RuntimeCapabilities,
 };
@@ -213,6 +216,8 @@ struct DaemonCreateHarness {
     create: Child,
     bridge_child_pid: u32,
     _fixture: IsolatedHomeFixture,
+    _process_guard: ProcessLeakGuard,
+    _path_guard: FilesystemLeakGuard,
 }
 
 impl DaemonCreateHarness {
@@ -221,6 +226,9 @@ impl DaemonCreateHarness {
         let sandbox = fixture.sandbox_root().to_path_buf();
         let rotate_home = fixture.rotate_home().to_path_buf();
         let codex_home = fixture.codex_home().to_path_buf();
+        let process_guard = ProcessTracker::new()?.leak_guard("daemon create cleanup");
+        let path_guard = FilesystemTracker::new()?.leak_guard("daemon create filesystem cleanup");
+        path_guard.record_temp_path(&sandbox, "sandbox root", false);
 
         let fast_browser_runtime = sandbox.join("fast-browser-runtime.sh");
         write_executable(
@@ -309,11 +317,22 @@ else:
         ]);
 
         let mut daemon = spawn_daemon(&rotate_home, &codex_home, debug_port)?;
+        process_guard.record_test_owned_process(
+            daemon.id(),
+            "daemon",
+            format!("{} daemon", cli_binary()),
+        );
+        let daemon_socket = daemon_socket_path()?;
+        path_guard.record_socket_path(&daemon_socket, "daemon socket", false);
         if let Err(error) = wait_for_socket(&mut daemon, Duration::from_secs(10)) {
             let _ = terminate_child(&mut daemon);
             return Err(error);
         }
 
+        let create_command = format!(
+            "{} create --force --profile dev-1 --template dev.{{n}}@astronlab.com",
+            cli_binary()
+        );
         let mut create = match configured_command(&rotate_home, &codex_home, debug_port)
             .arg("create")
             .arg("--force")
@@ -333,6 +352,8 @@ else:
                     .with_context(|| format!("spawn {} create --force", cli_binary()));
             }
         };
+        process_guard.record_test_owned_process(create.id(), "create", create_command);
+        path_guard.record_temp_path(&child_pid_file, "bridge child pid file", false);
 
         let bridge_child_pid = match wait_for_pid_file_from_child(
             &child_pid_file,
@@ -346,6 +367,14 @@ else:
                 return Err(error);
             }
         };
+        process_guard.record_test_owned_process(
+            bridge_child_pid,
+            "bridge-child",
+            format!(
+                "sh -lc \"trap 'exit 0' TERM INT; echo $$ > {}; while true; do sleep 1; done\"",
+                child_pid_file.display()
+            ),
+        );
         anyhow::ensure!(
             process_is_running(bridge_child_pid),
             "expected bridge child {} to be running",
@@ -364,6 +393,8 @@ else:
             create,
             bridge_child_pid,
             _fixture: fixture,
+            _process_guard: process_guard,
+            _path_guard: path_guard,
         })
     }
 
@@ -515,8 +546,8 @@ fn terminate_child(child: &mut Child) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            child.kill().ok();
-            child.wait().ok();
+                child.kill().context("terminate child process")?;
+                child.wait().context("wait for child process termination")?;
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));

@@ -601,7 +601,7 @@ fn read_auth_if_exists(path: &Path) -> Result<Option<CodexAuth>> {
     load_codex_auth(path).map(Some)
 }
 
-pub(crate) fn managed_codex_is_running(profile_dir: &Path) -> Result<bool> {
+pub fn managed_codex_is_running(profile_dir: &Path) -> Result<bool> {
     Ok(!managed_codex_root_pids(profile_dir)?.is_empty())
 }
 
@@ -619,7 +619,7 @@ fn managed_codex_root_pids(profile_dir: &Path) -> Result<Vec<u32>> {
         .collect())
 }
 
-pub(crate) fn stop_managed_codex_instance(port: u16, profile_dir: &Path) -> Result<()> {
+pub fn stop_managed_codex_instance(port: u16, profile_dir: &Path) -> Result<()> {
     invalidate_local_codex_connection(port, true);
     let root_pids = managed_codex_root_pids(profile_dir)?;
     if root_pids.is_empty() {
