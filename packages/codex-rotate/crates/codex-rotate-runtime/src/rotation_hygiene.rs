@@ -2564,7 +2564,7 @@ fn is_empty_directory(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env_mutex;
+    use crate::test_support::{env_mutex, RecordingUtmctl};
     use codex_rotate_core::pool::{AccountEntry, PersonaEntry};
     use codex_rotate_refresh::FilesystemTracker;
     use codex_rotate_refresh::ProcessTracker;
@@ -4931,42 +4931,12 @@ insert into threads (id, rollout_path, updated_at, archived) values
             std::env::set_var("CODEX_HOME", paths.codex_home.clone());
         }
 
-        let utm_log = temp.path().join("utmctl.log");
-        let fake_utmctl = temp.path().join("bin").join("utmctl");
-        write_executable(
-            &fake_utmctl,
-            &format!(
-                r#"#!/bin/sh
-set -eu
-log_file='{log_file}'
-cmd="${{1-}}"
-shift || true
-printf '%s %s\n' "$cmd" "$*" >> "$log_file"
-case "$cmd" in
-  start)
-    exit 0
-    ;;
-  status)
-    printf '%s\n' started
-    exit 0
-    ;;
-  list)
-    exit 0
-    ;;
-  stop)
-    exit 0
-    ;;
-  *)
-    printf 'unsupported utmctl command: %s\n' "$cmd" >&2
-    exit 1
-    ;;
-esac
-"#,
-                log_file = utm_log.display()
-            ),
-        );
+        let recording_utmctl = RecordingUtmctl::install(temp.path()).expect("install utmctl");
+        recording_utmctl
+            .seed_active_vms(["persona-source"])
+            .expect("seed active vm");
         unsafe {
-            std::env::set_var("CODEX_ROTATE_UTMCTL_BIN", &fake_utmctl);
+            std::env::set_var("CODEX_ROTATE_UTMCTL_BIN", recording_utmctl.binary_path());
             std::env::set_var(
                 "CODEX_ROTATE_GUEST_BRIDGE_URL",
                 "http://127.0.0.1:9/request",
@@ -4984,7 +4954,9 @@ esac
         let result = backend.relogin(9333, "acct-target", ReloginOptions::default(), None);
         assert!(result.is_err());
 
-        let utm_calls = fs::read_to_string(&utm_log).expect("read utmctl log");
+        let utm_calls = recording_utmctl
+            .command_log_contents()
+            .expect("read utmctl log");
         let target_start = utm_calls.find("persona-target.utm");
         let source_start = utm_calls.rfind("persona-source.utm");
         assert!(
@@ -4999,11 +4971,39 @@ esac
             source_start.unwrap_or_default() > target_start.unwrap_or_default(),
             "active vm should be restored after target relogin attempt; calls:\n{utm_calls}"
         );
+        recording_utmctl
+            .assert_one_active_vm()
+            .expect("one-active-VM invariant");
+        let active_vms = recording_utmctl.active_vms().expect("read active vms");
+        let expected_active_vms = [String::from("persona-source")].into_iter().collect();
+        assert_eq!(active_vms, expected_active_vms);
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
         restore_env("CODEX_ROTATE_UTMCTL_BIN", previous_utmctl);
         restore_env("CODEX_ROTATE_GUEST_BRIDGE_URL", previous_bridge_url);
+    }
+
+    #[test]
+    fn recording_utmctl_detects_simultaneous_active_regression() {
+        let temp = tempdir().expect("tempdir");
+        let recording_utmctl = RecordingUtmctl::install(temp.path()).expect("install utmctl");
+        recording_utmctl
+            .seed_active_vms(["persona-source"])
+            .expect("seed active vm");
+
+        let target_package = temp.path().join("persona-target.utm");
+        let status = Command::new(recording_utmctl.binary_path())
+            .arg("start")
+            .arg(&target_package)
+            .status()
+            .expect("run fake utmctl start");
+        assert!(status.success());
+
+        let error = recording_utmctl
+            .assert_one_active_vm()
+            .expect_err("overlap should be rejected");
+        assert!(error.to_string().contains("simultaneous-active"));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'codex' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+            "timeout": 30,
+            "statusMessage": "loopo: evaluating continuation"
+          }
+        ]
+      }
+    ]
+  }
+}

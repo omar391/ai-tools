@@ -46,3 +46,7 @@ packages/codex-rotate/benchmarks/results/
 !.trunk/configs/**
 .worktree-target/
 worktrees/
+.loopo/bin/loopo
+.loopo/hook-events.jsonl
+.loopo/hook-state.json
+.loopo/state.json

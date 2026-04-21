@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'copilot' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+        "timeoutSec": 30
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "bash": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'copilot' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+        "timeoutSec": 30
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'copilot' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+        "timeoutSec": 30
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'copilot' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}

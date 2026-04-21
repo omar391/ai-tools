@@ -1,0 +1,20 @@
+{
+  "hooksConfig": {
+    "enabled": true
+  },
+  "hooks": {
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "name": "loopo-after-agent",
+            "type": "command",
+            "command": "'/Users/omar/.local/bin/loopo' 'hook' '--runtime' 'gemini' '--cwd' '/Volumes/Projects/business/AstronLab/omar391/ai-tools/worktrees/shared-persona-rotation'",
+            "timeout": 10000,
+            "description": "Continue loopo when work remains"
+          }
+        ]
+      }
+    ]
+  }
+}
