@@ -749,6 +749,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
     let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
+    let listed_at = Utc::now();
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
     dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
@@ -761,7 +762,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         }
         return Ok(());
     }
-    let refresh_order = build_list_quota_refresh_order(&pool, Utc::now());
+    let refresh_order = build_list_quota_refresh_order(&pool, listed_at);
     let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
     let display_order = build_list_account_display_order(&pool);
 
@@ -794,7 +795,9 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         let account_header_line = build_list_account_header_line(&pool.accounts[index], is_active);
         output.push_line(account_header_line.clone())?;
 
-        if refresh_indices.contains(&index) {
+        if refresh_indices.contains(&index)
+            && account_quota_refresh_due_for_list(&pool.accounts[index], listed_at)
+        {
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
             dirty |= inspection.updated;
@@ -992,6 +995,10 @@ fn cached_quota_state_is_stale(entry: &AccountEntry, now: DateTime<Utc>) -> bool
         return true;
     };
     now >= next_refresh_at
+}
+
+fn account_quota_refresh_due_for_list(entry: &AccountEntry, now: DateTime<Utc>) -> bool {
+    entry.last_quota_checked_at.is_none() || cached_quota_state_is_stale(entry, now)
 }
 
 fn cached_quota_checked_at(entry: &AccountEntry) -> Option<DateTime<Utc>> {
@@ -2904,6 +2911,26 @@ mod tests {
         );
         assert!(!cached_quota_state_is_stale(&exhausted, before_reset));
         assert!(cached_quota_state_is_stale(&exhausted, after_reset));
+    }
+
+    #[test]
+    fn list_account_refresh_due_only_when_refresh_time_elapsed_or_missing() {
+        let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+
+        let mut fresh = stored_entry(Some(true), Some("2026-04-08T12:04:30.000Z"));
+        fresh.last_quota_primary_left_percent = Some(40);
+        fresh.last_quota_next_refresh_at = Some("2026-04-08T12:10:00.000Z".to_string());
+        assert!(!account_quota_refresh_due_for_list(&fresh, now));
+
+        let mut stale = stored_entry(Some(true), Some("2026-04-08T12:03:30.000Z"));
+        stale.last_quota_primary_left_percent = Some(40);
+        stale.last_quota_next_refresh_at = Some("2026-04-08T12:04:59.000Z".to_string());
+        assert!(account_quota_refresh_due_for_list(&stale, now));
+
+        let unknown = stored_entry(None, None);
+        assert!(account_quota_refresh_due_for_list(&unknown, now));
     }
 
     #[test]
