@@ -3336,6 +3336,78 @@ mod tests {
     }
 
     #[test]
+    fn cmd_list_prunes_reused_refresh_token_accounts() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let mut reused = stored_entry(Some(false), Some("2099-01-01T00:00:00.000Z"));
+            reused.label = "devbench.10@astronlab.com_free".to_string();
+            reused.email = "devbench.10@astronlab.com".to_string();
+            reused.account_id = "acct-reused".to_string();
+            reused.auth = make_auth("devbench.10@astronlab.com", "acct-reused", "free");
+            reused.auth.tokens.account_id = "acct-reused".to_string();
+            reused.last_quota_blocker = Some(
+                "Token refresh failed (401): refresh_token_reused: previous refresh token already rotated."
+                    .to_string(),
+            );
+
+            write_rotate_state_json(&json!({
+                "families": {
+                    "dev-1::devbench.{n}@astronlab.com": {
+                        "profile_name": "dev-1",
+                        "template": "devbench.{n}@astronlab.com",
+                        "next_suffix": 11,
+                        "max_skipped_slots": 0,
+                        "created_at": "2026-04-13T05:00:00.000Z",
+                        "updated_at": "2026-04-21T00:00:00.000Z",
+                        "last_created_email": "devbench.10@astronlab.com",
+                        "deleted": []
+                    }
+                }
+            }))?;
+            save_pool(&Pool {
+                active_index: 0,
+                accounts: vec![reused],
+            })?;
+
+            let output = strip_ansi(&cmd_list()?);
+            assert!(!output.contains("devbench.10@astronlab.com_free"));
+
+            let state = load_rotate_state_json()?;
+            assert_eq!(
+                state["accounts"].as_array().map(|entries| entries.len()),
+                Some(0)
+            );
+            assert_eq!(
+                state["domain"]["astronlab.com"]["rotation_enabled"],
+                Value::Bool(false)
+            );
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]["deleted"]
+                    .as_array()
+                    .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+                Some(vec!["devbench.10@astronlab.com"])
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("list should prune reused refresh-token accounts");
+    }
+
+    #[test]
     fn cmd_list_sorts_total_accounts_by_quota_refresh_eta() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
