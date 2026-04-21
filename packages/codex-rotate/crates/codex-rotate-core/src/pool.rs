@@ -34,7 +34,6 @@ const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
-const LIST_STALE_QUOTA_REFRESH_LIMIT: usize = 2;
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -762,8 +761,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         }
         return Ok(());
     }
-    let refresh_order =
-        build_list_quota_refresh_order(&pool, Utc::now(), LIST_STALE_QUOTA_REFRESH_LIMIT);
+    let refresh_order = build_list_quota_refresh_order(&pool, Utc::now());
     let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
     let display_order = build_list_account_display_order(&pool);
 
@@ -943,11 +941,7 @@ fn build_list_account_display_order(pool: &Pool) -> Vec<usize> {
     indices
 }
 
-fn build_list_quota_refresh_order(
-    pool: &Pool,
-    now: DateTime<Utc>,
-    max_refreshes: usize,
-) -> Vec<usize> {
+fn build_list_quota_refresh_order(pool: &Pool, now: DateTime<Utc>) -> Vec<usize> {
     let mut refreshes = pool
         .accounts
         .iter()
@@ -962,10 +956,6 @@ fn build_list_quota_refresh_order(
             .cmp(&right_priority)
             .then_with(|| left.cmp(right))
     });
-
-    if max_refreshes == 0 {
-        return refreshes;
-    }
 
     let mut candidates = pool
         .accounts
@@ -992,12 +982,7 @@ fn build_list_quota_refresh_order(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    refreshes.extend(
-        candidates
-            .into_iter()
-            .take(max_refreshes)
-            .map(|(index, _, _)| index),
-    );
+    refreshes.extend(candidates.into_iter().map(|(index, _, _)| index));
 
     refreshes
 }
@@ -2949,11 +2934,11 @@ mod tests {
             ],
         };
 
-        assert_eq!(build_list_quota_refresh_order(&pool, now, 2), vec![0, 3]);
+        assert_eq!(build_list_quota_refresh_order(&pool, now), vec![0, 3]);
     }
 
     #[test]
-    fn list_quota_refresh_order_includes_unknown_entries_outside_stale_refresh_cap() {
+    fn list_quota_refresh_order_includes_unknown_and_all_stale_entries() {
         let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
             .expect("parse now")
             .with_timezone(&Utc);
@@ -2974,7 +2959,7 @@ mod tests {
             accounts: vec![stale_active, unknown, stale_usable],
         };
 
-        assert_eq!(build_list_quota_refresh_order(&pool, now, 1), vec![1, 0]);
+        assert_eq!(build_list_quota_refresh_order(&pool, now), vec![1, 0, 2]);
     }
 
     #[test]
