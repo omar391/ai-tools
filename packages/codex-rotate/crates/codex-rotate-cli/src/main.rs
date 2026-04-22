@@ -115,6 +115,10 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 &run_shared_relogin(None, &selector, options, cli_progress_callback())?,
             )?
         }
+        Some("report-duplicates") => write_output(
+            writer,
+            &codex_rotate_runtime::rotation_hygiene::report_duplicates()?,
+        )?,
         Some("remove") => write_output(writer, &cmd_remove(parse_remove_selector(&args[1..])?)?)?,
         Some(other) => {
             return Err(anyhow!(
@@ -1349,6 +1353,7 @@ fn help_text() -> String {
   {CYAN}list{RESET}             Show all accounts with cached quota info
   {CYAN}status{RESET}           Show the current active account info and quota
   {CYAN}relogin{RESET} <selector> Repair that account in one step
+  {CYAN}report-duplicates{RESET}   Show potential historical duplicates in the current persona
   {CYAN}remove{RESET} <selector>  Remove that account from the pool
   {CYAN}daemon{RESET}           Start the background runtime daemon
   {CYAN}guest-bridge{RESET} [--bind <host:port>] Run the VM guest bridge server

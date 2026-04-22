@@ -1329,6 +1329,10 @@ fn first_line(output: &str) -> String {
 fn migrate_runtime_state() -> Result<()> {
     let _ = migrate_legacy_credential_store_if_needed()?;
     migrate_legacy_tray_home_if_needed()?;
+
+    let paths = resolve_paths()?;
+    let _ = crate::rotation_hygiene::ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+
     Ok(())
 }
 
