@@ -60,6 +60,7 @@ const LOCAL_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_TAKEOVER_ARG: &str = "--takeover";
+const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DaemonRunOptions {
@@ -995,7 +996,20 @@ fn run_manual_next(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = run_shared_next(Some(managed_codex_port()), progress.clone())?;
+    let result = match run_shared_next(Some(managed_codex_port()), progress.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            refresh_static_snapshot(state);
+            refresh_quota_state(state, false);
+            state.snapshot.last_rotation_reason = Some("manual rotation failed".to_string());
+            set_snapshot_message(
+                &mut state.snapshot,
+                SnapshotMessageKind::Error,
+                manual_rotation_error_message(&error),
+            );
+            return Err(error);
+        }
+    };
     refresh_static_snapshot(state);
     if let Some(summary) = next_result_summary(&result) {
         state.snapshot.last_rotation_from_email = previous_displayed_email;
@@ -1020,6 +1034,14 @@ fn run_manual_next(
         first_line(&output),
     );
     Ok(output)
+}
+
+fn manual_rotation_error_message(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}");
+    if detail.contains(DISABLED_TARGET_ERROR_SNIPPET) {
+        return "rotation blocked: a target account domain is disabled; re-enable it in ~/.codex-rotate/accounts.json or use rotate prev".to_string();
+    }
+    format!("rotation failed: {}", first_line(&detail))
 }
 
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {

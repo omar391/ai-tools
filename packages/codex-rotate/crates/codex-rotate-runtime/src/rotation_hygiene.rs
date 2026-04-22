@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +32,7 @@ use crate::log_isolation::{
 };
 use crate::paths::{resolve_paths, RuntimePaths};
 use crate::thread_recovery::{read_active_thread_ids, send_codex_app_request};
-use crate::watch::read_watch_state;
+use crate::watch::{read_watch_state, write_watch_state};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +89,39 @@ const DEFAULT_PORT: u16 = 9333;
 const MAX_HANDOFF_ITEMS: usize = 48;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
 const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", "skills"];
+const CONVERSATION_DIR_NAMES: &[&str] = &["sessions", "archived_sessions"];
+const APP_SUPPORT_SYNC_DIR_NAMES: &[&str] = &["Local Storage"];
+const SESSION_INDEX_FILE_NAME: &str = "session_index.jsonl";
+const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
+const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
+const STAGE1_OUTPUTS_CONFLICT_COLUMNS: &[&str] = &["thread_id"];
+const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
+
+#[derive(Clone, Debug)]
+struct SessionIndexEntry {
+    updated_at: Option<String>,
+    raw: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConversationHistoryStats {
+    threads: usize,
+    session_index_entries: usize,
+    sessions_files: usize,
+    archived_sessions_files: usize,
+}
+
+impl ConversationHistoryStats {
+    fn format_compact(&self) -> String {
+        format!(
+            "threads={}, session_index={}, sessions_files={}, archived_sessions_files={}",
+            self.threads,
+            self.session_index_entries,
+            self.sessions_files,
+            self.archived_sessions_files
+        )
+    }
+}
 
 fn utmctl_binary() -> String {
     std::env::var("CODEX_ROTATE_UTMCTL_BIN")
@@ -182,6 +215,112 @@ pub fn relogin(
 ) -> Result<String> {
     let _lock = RotationLock::acquire()?;
     select_rotation_backend()?.relogin(port.unwrap_or(DEFAULT_PORT), selector, options, progress)
+}
+
+pub fn repair_host_history(
+    source_selector: &str,
+    target_selectors: &[String],
+    all_targets: bool,
+    apply: bool,
+) -> Result<String> {
+    let _lock = RotationLock::acquire()?;
+    if current_environment()? != RotationEnvironment::Host {
+        return Err(anyhow!(
+            "repair-host-history is only supported for host personas."
+        ));
+    }
+
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let _ = ensure_host_personas_ready(&paths, &mut pool)?;
+
+    let source_entry = resolve_pool_account(source_selector)?
+        .ok_or_else(|| anyhow!("Unknown source selector \"{source_selector}\"."))?;
+    let source_persona = source_entry
+        .persona
+        .as_ref()
+        .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?;
+    let source_paths = host_persona_paths(&paths, source_persona)?;
+
+    let mut targets = Vec::<AccountEntry>::new();
+    let mut seen_target_ids = BTreeSet::<String>::new();
+    if all_targets || target_selectors.is_empty() {
+        for entry in &pool.accounts {
+            if entry.account_id == source_entry.account_id {
+                continue;
+            }
+            if seen_target_ids.insert(entry.account_id.clone()) {
+                targets.push(entry.clone());
+            }
+        }
+    } else {
+        for selector in target_selectors {
+            let target_entry = resolve_pool_account(selector)?
+                .ok_or_else(|| anyhow!("Unknown target selector \"{selector}\"."))?;
+            if target_entry.account_id == source_entry.account_id {
+                continue;
+            }
+            if seen_target_ids.insert(target_entry.account_id.clone()) {
+                targets.push(target_entry);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "No repair targets resolved. Provide --target selectors or choose --all."
+        ));
+    }
+
+    let source_stats = collect_conversation_history_stats(&source_paths.codex_home)?;
+    let mut output = Vec::<String>::new();
+    output.push(format!(
+        "Repair mode: {}",
+        if apply { "apply" } else { "dry-run" }
+    ));
+    output.push(format!(
+        "Source: {} ({}) [{}]",
+        source_entry.label,
+        source_entry.account_id,
+        source_stats.format_compact()
+    ));
+
+    for target in targets {
+        let target_persona = target
+            .persona
+            .as_ref()
+            .ok_or_else(|| anyhow!("Target account is missing persona metadata."))?;
+        let target_paths = host_persona_paths(&paths, target_persona)?;
+        let before_stats = collect_conversation_history_stats(&target_paths.codex_home)?;
+        if apply {
+            provision_host_persona(&paths, &target, Some(&source_entry))?;
+            sync_host_persona_conversation_history_one_way(
+                &source_paths.codex_home,
+                &target_paths.codex_home,
+            )?;
+            sync_host_persona_app_support_state_one_way(
+                &source_paths.codex_app_support_dir,
+                &target_paths.codex_app_support_dir,
+            )?;
+        }
+        let after_stats = if apply {
+            collect_conversation_history_stats(&target_paths.codex_home)?
+        } else {
+            before_stats.clone()
+        };
+        output.push(format!(
+            "Target: {} ({}) before [{}]{}",
+            target.label,
+            target.account_id,
+            before_stats.format_compact(),
+            if apply {
+                format!(" -> after [{}]", after_stats.format_compact())
+            } else {
+                format!(" | source [{}]", source_stats.format_compact())
+            }
+        ));
+    }
+
+    Ok(output.join("\n"))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1236,33 +1375,29 @@ fn finalize_rotation_after_import(
     Ok(())
 }
 
-fn rotate_next_impl(
+fn maybe_complete_non_switch_next_result(
     backend: &dyn RotationBackend,
+    prepared: &PreparedRotation,
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
-) -> Result<NextResult> {
-    recover_incomplete_rotation_state_without_lock()?;
-    let mut prepared = prepare_next_rotation_with_progress(progress.clone())?;
-    let paths = resolve_paths()?;
-    let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
-
+) -> Result<Option<NextResult>> {
     match prepared.action {
         PreparedRotationAction::Stay => {
             if prepared.persist_pool {
-                ensure_no_rotation_drift(&prepared)?;
-                persist_prepared_rotation_pool(&prepared)?;
+                ensure_no_rotation_drift(prepared)?;
+                persist_prepared_rotation_pool(prepared)?;
             }
             let summary = summarize_codex_auth(&prepared.target.auth);
-            return Ok(NextResult::Stayed {
-                message: prepared.message,
+            Ok(Some(NextResult::Stayed {
+                message: prepared.message.clone(),
                 summary,
-            });
+            }))
         }
         PreparedRotationAction::CreateRequired if allow_create => {
             if prepared.persist_pool {
-                ensure_no_rotation_drift(&prepared)?;
-                persist_prepared_rotation_pool(&prepared)?;
+                ensure_no_rotation_drift(prepared)?;
+                persist_prepared_rotation_pool(prepared)?;
             }
             let create_output = cmd_create_with_progress(
                 CreateCommandOptions {
@@ -1291,20 +1426,68 @@ fn rotate_next_impl(
                     format!("{}\n{}", create_output.trim_end(), message)
                 }
             };
-            return Ok(NextResult::Created {
+            Ok(Some(NextResult::Created {
                 output: combined,
                 summary,
-            });
+            }))
         }
-        PreparedRotationAction::CreateRequired => {
-            return Err(anyhow!(
-                "Auto rotation requires creating a replacement account, but the retry budget is exhausted."
-            ));
-        }
-        PreparedRotationAction::Switch => {}
+        PreparedRotationAction::CreateRequired => Err(anyhow!(
+            "Auto rotation requires creating a replacement account, but the retry budget is exhausted."
+        )),
+        PreparedRotationAction::Switch => Ok(None),
+    }
+}
+
+fn is_disabled_target_validation_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(DISABLED_TARGET_ERROR_SNIPPET))
+}
+
+fn rotate_next_impl(
+    backend: &dyn RotationBackend,
+    port: u16,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    allow_create: bool,
+) -> Result<NextResult> {
+    recover_incomplete_rotation_state_without_lock()?;
+    let mut prepared = prepare_next_rotation_with_progress(progress.clone())?;
+    let paths = resolve_paths()?;
+    let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
+
+    if let Some(result) = maybe_complete_non_switch_next_result(
+        backend,
+        &prepared,
+        port,
+        progress.clone(),
+        allow_create,
+    )? {
+        return Ok(result);
     }
 
-    ensure_target_account_still_valid(&prepared)?;
+    if let Err(error) = ensure_target_account_still_valid(&prepared) {
+        if !is_disabled_target_validation_error(&error) {
+            return Err(error);
+        }
+        if let Some(progress) = progress.as_ref() {
+            progress(
+                "Rotation target became disabled mid-flow; re-evaluating eligible target."
+                    .to_string(),
+            );
+        }
+        prepared = prepare_next_rotation_with_progress(progress.clone())?;
+        let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
+        if let Some(result) = maybe_complete_non_switch_next_result(
+            backend,
+            &prepared,
+            port,
+            progress.clone(),
+            allow_create,
+        )? {
+            return Ok(result);
+        }
+        ensure_target_account_still_valid(&prepared)?;
+    }
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend
@@ -1488,15 +1671,12 @@ fn activate_host_rotation(
     progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<HostRotationActivation> {
     let managed_running_before = managed_codex_is_running(&paths.debug_profile_dir)?;
-    let handoffs = if managed_running_before {
+    if managed_running_before {
         if let Some(progress) = progress {
             progress("Waiting for active Codex work to become handoff-safe.".to_string());
         }
         wait_for_all_threads_idle(port, progress)?;
-        export_thread_handoffs(port, &prepared.previous.account_id)?
-    } else {
-        Vec::new()
-    };
+    }
 
     if managed_running_before {
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
@@ -1524,7 +1704,11 @@ fn activate_host_rotation(
                     )
                 })?;
             }
-            Ok(HostRotationActivation { items: handoffs })
+            transfer_thread_recovery_state_between_accounts(
+                &prepared.previous.account_id,
+                &prepared.target.account_id,
+            )?;
+            Ok(HostRotationActivation { items: Vec::new() })
         }
         Err(error) => {
             let rollback_error = rollback_after_failed_host_activation(
@@ -1582,6 +1766,35 @@ fn rollback_vm_relogin_auth_sync_failure(
         write_selected_account_auth(active_entry)?;
     }
     Ok(())
+}
+
+fn transfer_thread_recovery_state_between_accounts(
+    source_account_id: &str,
+    target_account_id: &str,
+) -> Result<()> {
+    if source_account_id.trim().is_empty()
+        || target_account_id.trim().is_empty()
+        || source_account_id == target_account_id
+    {
+        return Ok(());
+    }
+    let mut watch_state = read_watch_state()?;
+    let mut source_state = watch_state.account_state(source_account_id);
+    let mut target_state = watch_state.account_state(target_account_id);
+
+    target_state.last_thread_recovery_log_id = source_state.last_thread_recovery_log_id;
+    target_state.thread_recovery_pending = source_state.thread_recovery_pending;
+    target_state.thread_recovery_pending_events =
+        source_state.thread_recovery_pending_events.clone();
+    target_state.thread_recovery_backfill_complete = source_state.thread_recovery_backfill_complete;
+
+    source_state.last_thread_recovery_log_id = None;
+    source_state.thread_recovery_pending = false;
+    source_state.thread_recovery_pending_events.clear();
+
+    watch_state.set_account_state(source_account_id.to_string(), source_state);
+    watch_state.set_account_state(target_account_id.to_string(), target_state);
+    write_watch_state(&watch_state)
 }
 
 fn ensure_host_personas_ready(
@@ -1688,6 +1901,13 @@ fn switch_host_persona(
     allow_seed: bool,
 ) -> Result<()> {
     provision_host_persona(paths, target_entry, allow_seed.then_some(source_entry))?;
+    let source = host_persona_paths(
+        paths,
+        source_entry
+            .persona
+            .as_ref()
+            .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
+    )?;
     let target = host_persona_paths(
         paths,
         target_entry
@@ -1695,9 +1915,668 @@ fn switch_host_persona(
             .as_ref()
             .ok_or_else(|| anyhow!("Target account is missing persona metadata."))?,
     )?;
+    // Keep full conversation history mirrored across host personas.
+    sync_host_persona_conversation_history(&source.codex_home, &target.codex_home)?;
+    // Keep project/sidebar local-storage state mirrored so project-scoped chats stay visible.
+    sync_host_persona_app_support_state(
+        &source.codex_app_support_dir,
+        &target.codex_app_support_dir,
+    )?;
     ensure_symlink_dir(&paths.codex_home, &target.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &target.codex_app_support_dir)?;
     Ok(())
+}
+
+fn sync_host_persona_conversation_history(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+    sync_host_persona_conversation_history_one_way(source_codex_home, target_codex_home)?;
+    sync_host_persona_conversation_history_one_way(target_codex_home, source_codex_home)?;
+    Ok(())
+}
+
+fn sync_host_persona_app_support_state(
+    source_app_support: &Path,
+    target_app_support: &Path,
+) -> Result<()> {
+    if source_app_support == target_app_support {
+        return Ok(());
+    }
+    sync_host_persona_app_support_state_one_way(source_app_support, target_app_support)?;
+    sync_host_persona_app_support_state_one_way(target_app_support, source_app_support)?;
+    Ok(())
+}
+
+fn sync_host_persona_app_support_state_one_way(
+    source_app_support: &Path,
+    target_app_support: &Path,
+) -> Result<()> {
+    if !source_app_support.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_app_support)
+        .with_context(|| format!("Failed to create {}.", target_app_support.display()))?;
+    for dir_name in APP_SUPPORT_SYNC_DIR_NAMES {
+        sync_directory_tree_one_way(
+            &source_app_support.join(dir_name),
+            &target_app_support.join(dir_name),
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_host_persona_conversation_history_one_way(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if !source_codex_home.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_codex_home)
+        .with_context(|| format!("Failed to create {}.", target_codex_home.display()))?;
+    for dir_name in CONVERSATION_DIR_NAMES {
+        sync_directory_tree_one_way(
+            &source_codex_home.join(dir_name),
+            &target_codex_home.join(dir_name),
+        )?;
+    }
+    merge_session_index_one_way(
+        &source_codex_home.join(SESSION_INDEX_FILE_NAME),
+        &target_codex_home.join(SESSION_INDEX_FILE_NAME),
+    )?;
+    merge_state_threads_one_way(source_codex_home, target_codex_home)?;
+    Ok(())
+}
+
+fn sync_directory_tree_one_way(source_root: &Path, target_root: &Path) -> Result<()> {
+    if !source_root.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(source_root)
+        .with_context(|| format!("Failed to inspect {}.", source_root.display()))?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_root)
+        .with_context(|| format!("Failed to create {}.", target_root.display()))?;
+    for entry in fs::read_dir(source_root)
+        .with_context(|| format!("Failed to read {}.", source_root.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target_root.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect {}.", source_path.display()))?;
+        if file_type.is_dir() {
+            sync_directory_tree_one_way(&source_path, &target_path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            copy_file_if_newer(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_file_if_newer(source: &Path, target: &Path) -> Result<()> {
+    let source_meta =
+        fs::metadata(source).with_context(|| format!("Failed to inspect {}.", source.display()))?;
+    let should_copy = if !target.exists() {
+        true
+    } else {
+        let target_meta = fs::metadata(target)
+            .with_context(|| format!("Failed to inspect {}.", target.display()))?;
+        if !target_meta.is_file() {
+            true
+        } else {
+            let source_newer = source_meta
+                .modified()
+                .ok()
+                .zip(target_meta.modified().ok())
+                .map(|(source_modified, target_modified)| source_modified > target_modified)
+                .unwrap_or(false);
+            source_meta.len() != target_meta.len() || source_newer
+        }
+    };
+    if !should_copy {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "Failed to copy conversation file {} -> {}.",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn merge_session_index_one_way(source_index: &Path, target_index: &Path) -> Result<()> {
+    if !source_index.exists() {
+        return Ok(());
+    }
+    let source_entries = read_session_index_entries(source_index)?;
+    if source_entries.is_empty() {
+        return Ok(());
+    }
+    let mut merged = read_session_index_entries(target_index)?;
+    for (id, source_entry) in source_entries {
+        let should_replace = match merged.get(&id) {
+            Some(existing_entry) => session_index_entry_is_newer(&source_entry, existing_entry),
+            None => true,
+        };
+        if should_replace {
+            merged.insert(id, source_entry);
+        }
+    }
+    write_session_index_entries(target_index, &merged)?;
+    Ok(())
+}
+
+fn read_session_index_entries(path: &Path) -> Result<BTreeMap<String, SessionIndexEntry>> {
+    let mut entries = BTreeMap::new();
+    if !path.exists() {
+        return Ok(entries);
+    }
+    let file =
+        fs::File::open(path).with_context(|| format!("Failed to read {}.", path.display()))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("Failed to read {}.", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let entry = SessionIndexEntry {
+            updated_at: parsed
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            raw: trimmed.to_string(),
+        };
+        match entries.get(id) {
+            Some(existing) if !session_index_entry_is_newer(&entry, existing) => {}
+            _ => {
+                entries.insert(id.to_string(), entry);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn session_index_entry_is_newer(
+    candidate: &SessionIndexEntry,
+    current: &SessionIndexEntry,
+) -> bool {
+    match (
+        candidate.updated_at.as_deref(),
+        current.updated_at.as_deref(),
+    ) {
+        (Some(candidate_updated_at), Some(current_updated_at)) => {
+            candidate_updated_at > current_updated_at
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate.raw.len() > current.raw.len(),
+    }
+}
+
+fn write_session_index_entries(
+    path: &Path,
+    entries: &BTreeMap<String, SessionIndexEntry>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    let mut ordered = entries
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.clone()))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(id_a, entry_a), (id_b, entry_b)| {
+        match (entry_a.updated_at.as_deref(), entry_b.updated_at.as_deref()) {
+            (Some(updated_a), Some(updated_b)) => {
+                updated_b.cmp(updated_a).then_with(|| id_a.cmp(id_b))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => id_a.cmp(id_b),
+        }
+    });
+
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session_index.jsonl".to_string());
+    let temp_path = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    let mut file = fs::File::create(&temp_path)
+        .with_context(|| format!("Failed to create {}.", temp_path.display()))?;
+    for (_, entry) in ordered {
+        writeln!(file, "{}", entry.raw)
+            .with_context(|| format!("Failed to write {}.", temp_path.display()))?;
+    }
+    file.flush()
+        .with_context(|| format!("Failed to flush {}.", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "Failed to replace {} with merged session index {}.",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn merge_state_threads_one_way(source_codex_home: &Path, target_codex_home: &Path) -> Result<()> {
+    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
+        return Ok(());
+    };
+    if !source_state_db.exists() {
+        return Ok(());
+    }
+    let target_state_db =
+        resolve_state_db_file_in_codex_home(target_codex_home).unwrap_or_else(|| {
+            let file_name = source_state_db
+                .file_name()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| std::ffi::OsString::from("state_5.sqlite"));
+            target_codex_home.join(file_name)
+        });
+    if !target_state_db.exists() {
+        if let Some(parent) = target_state_db.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}.", parent.display()))?;
+        }
+        fs::copy(&source_state_db, &target_state_db).with_context(|| {
+            format!(
+                "Failed to seed {} from {}.",
+                target_state_db.display(),
+                source_state_db.display()
+            )
+        })?;
+        return Ok(());
+    }
+    merge_threads_table_with_upsert(&source_state_db, &target_state_db)?;
+    merge_table_with_upsert(
+        &source_state_db,
+        &target_state_db,
+        "thread_dynamic_tools",
+        THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS,
+    )?;
+    merge_table_with_upsert(
+        &source_state_db,
+        &target_state_db,
+        "thread_spawn_edges",
+        THREAD_SPAWN_EDGES_CONFLICT_COLUMNS,
+    )?;
+    merge_table_with_upsert(
+        &source_state_db,
+        &target_state_db,
+        "stage1_outputs",
+        STAGE1_OUTPUTS_CONFLICT_COLUMNS,
+    )?;
+    Ok(())
+}
+
+fn resolve_state_db_file_in_codex_home(codex_home: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(codex_home).ok()?;
+    let mut best_versioned = None::<(u32, PathBuf)>;
+    let mut fallback_unversioned = None::<PathBuf>;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(version) = parse_versioned_state_db_name(&name) {
+            let should_replace = match best_versioned.as_ref() {
+                Some((current_version, _)) => version > *current_version,
+                None => true,
+            };
+            if should_replace {
+                best_versioned = Some((version, path));
+            }
+            continue;
+        }
+        if name == "state.sqlite" {
+            fallback_unversioned = Some(path);
+        }
+    }
+    best_versioned
+        .map(|(_, path)| path)
+        .or(fallback_unversioned)
+}
+
+fn parse_versioned_state_db_name(name: &str) -> Option<u32> {
+    if !name.starts_with("state_") || !name.ends_with(".sqlite") {
+        return None;
+    }
+    let version = &name["state_".len()..name.len() - ".sqlite".len()];
+    version.parse::<u32>().ok()
+}
+
+fn merge_threads_table_with_upsert(source_state_db: &Path, target_state_db: &Path) -> Result<()> {
+    let connection = rusqlite::Connection::open(target_state_db)
+        .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(());
+    }
+
+    let source_path_escaped = source_state_db.to_string_lossy().replace('\'', "''");
+    connection
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{source_path_escaped}' AS source_db;"
+        ))
+        .with_context(|| format!("Failed to attach {}.", source_state_db.display()))?;
+    let merge_result = (|| -> Result<()> {
+        if !sqlite_table_exists_in_schema(&connection, "source_db", "threads")? {
+            return Ok(());
+        }
+        let target_columns = sqlite_table_columns(&connection, "main", "threads")?;
+        let source_columns = sqlite_table_columns(&connection, "source_db", "threads")?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let shared_columns = target_columns
+            .into_iter()
+            .filter(|column| source_columns.contains(column))
+            .collect::<Vec<_>>();
+        let id_column = String::from("id");
+        if !shared_columns.contains(&id_column) {
+            return Ok(());
+        }
+        let insert_columns = shared_columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_columns = shared_columns
+            .iter()
+            .filter(|column| column.as_str() != "id")
+            .cloned()
+            .collect::<Vec<_>>();
+        if update_columns.is_empty() {
+            return Ok(());
+        }
+        let update_assignments = update_columns
+            .iter()
+            .map(|column| {
+                let escaped = quote_sql_identifier(column);
+                format!("{escaped}=excluded.{escaped}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let has_updated_at_ms = shared_columns
+            .iter()
+            .any(|column| column.as_str() == "updated_at_ms");
+        let has_updated_at = shared_columns
+            .iter()
+            .any(|column| column.as_str() == "updated_at");
+        let threads_table = quote_sql_identifier("threads");
+        let updated_at_ms_column = quote_sql_identifier("updated_at_ms");
+        let updated_at_column = quote_sql_identifier("updated_at");
+        let where_clause = if has_updated_at_ms && has_updated_at {
+            format!(
+                " WHERE coalesce(excluded.{updated_at_ms_column}, excluded.{updated_at_column} * 1000, 0) >= \
+                 coalesce({threads_table}.{updated_at_ms_column}, {threads_table}.{updated_at_column} * 1000, 0)"
+            )
+        } else if has_updated_at_ms {
+            format!(
+                " WHERE coalesce(excluded.{updated_at_ms_column}, 0) >= \
+                 coalesce({threads_table}.{updated_at_ms_column}, 0)"
+            )
+        } else if has_updated_at {
+            format!(
+                " WHERE coalesce(excluded.{updated_at_column}, 0) >= \
+                 coalesce({threads_table}.{updated_at_column}, 0)"
+            )
+        } else {
+            String::new()
+        };
+        let source_threads_table = format!(
+            "{}.{}",
+            quote_sql_identifier("source_db"),
+            quote_sql_identifier("threads")
+        );
+        let sql = format!(
+            "INSERT INTO {threads_table} ({insert_columns}) \
+             SELECT {insert_columns} FROM {source_threads_table} WHERE 1 \
+             ON CONFLICT({id_column}) DO UPDATE SET {update_assignments}{where_clause};",
+            id_column = quote_sql_identifier("id")
+        );
+        connection
+            .execute_batch(&sql)
+            .context("Failed to merge threads table between personas.")?;
+        Ok(())
+    })();
+    let detach_result = connection.execute_batch("DETACH DATABASE source_db;");
+    if let Err(error) = merge_result {
+        let _ = detach_result;
+        return Err(error);
+    }
+    detach_result.context("Failed to detach source DB after thread merge.")?;
+    Ok(())
+}
+
+fn merge_table_with_upsert(
+    source_state_db: &Path,
+    target_state_db: &Path,
+    table_name: &str,
+    conflict_columns: &[&str],
+) -> Result<()> {
+    if conflict_columns.is_empty() {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open(target_state_db)
+        .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
+    if !sqlite_table_exists(&connection, table_name)? {
+        return Ok(());
+    }
+
+    let source_path_escaped = source_state_db.to_string_lossy().replace('\'', "''");
+    connection
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{source_path_escaped}' AS source_db;"
+        ))
+        .with_context(|| format!("Failed to attach {}.", source_state_db.display()))?;
+    let merge_result = (|| -> Result<()> {
+        if !sqlite_table_exists_in_schema(&connection, "source_db", table_name)? {
+            return Ok(());
+        }
+        let target_columns = sqlite_table_columns(&connection, "main", table_name)?;
+        let source_columns = sqlite_table_columns(&connection, "source_db", table_name)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let shared_columns = target_columns
+            .into_iter()
+            .filter(|column| source_columns.contains(column))
+            .collect::<Vec<_>>();
+        if shared_columns.is_empty() {
+            return Ok(());
+        }
+        let shared_column_set = shared_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if !conflict_columns
+            .iter()
+            .all(|column| shared_column_set.contains(column))
+        {
+            return Ok(());
+        }
+
+        let insert_columns = shared_columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_columns = shared_columns
+            .iter()
+            .filter(|column| !conflict_columns.contains(&column.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let conflict_clause = conflict_columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target_table = quote_sql_identifier(table_name);
+        let source_table = format!(
+            "{}.{}",
+            quote_sql_identifier("source_db"),
+            quote_sql_identifier(table_name)
+        );
+        let sql = if update_columns.is_empty() {
+            format!(
+                "INSERT INTO {target_table} ({insert_columns}) \
+                 SELECT {insert_columns} FROM {source_table} WHERE 1 \
+                 ON CONFLICT({conflict_clause}) DO NOTHING;"
+            )
+        } else {
+            let update_assignments = update_columns
+                .iter()
+                .map(|column| {
+                    let escaped = quote_sql_identifier(column);
+                    format!("{escaped}=excluded.{escaped}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT INTO {target_table} ({insert_columns}) \
+                 SELECT {insert_columns} FROM {source_table} WHERE 1 \
+                 ON CONFLICT({conflict_clause}) DO UPDATE SET {update_assignments};"
+            )
+        };
+        connection
+            .execute_batch(&sql)
+            .with_context(|| format!("Failed to merge {table_name} table between personas."))?;
+        Ok(())
+    })();
+    let detach_result = connection.execute_batch("DETACH DATABASE source_db;");
+    if let Err(error) = merge_result {
+        let _ = detach_result;
+        return Err(error);
+    }
+    detach_result.context("Failed to detach source DB after table merge.")?;
+    Ok(())
+}
+
+fn collect_conversation_history_stats(codex_home: &Path) -> Result<ConversationHistoryStats> {
+    let session_index_entries =
+        read_session_index_entries(&codex_home.join(SESSION_INDEX_FILE_NAME))?.len();
+    let sessions_files = count_files_recursively(&codex_home.join("sessions"))?;
+    let archived_sessions_files = count_files_recursively(&codex_home.join("archived_sessions"))?;
+    let threads = count_threads_in_state_db(codex_home)?;
+    Ok(ConversationHistoryStats {
+        threads,
+        session_index_entries,
+        sessions_files,
+        archived_sessions_files,
+    })
+}
+
+fn count_files_recursively(root: &Path) -> Result<usize> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}.", dir.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("Failed to inspect {}.", entry.path().display()))?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn count_threads_in_state_db(codex_home: &Path) -> Result<usize> {
+    let Some(state_db) = resolve_state_db_file_in_codex_home(codex_home) else {
+        return Ok(0);
+    };
+    if !state_db.exists() {
+        return Ok(0);
+    }
+    let connection = rusqlite::Connection::open(&state_db)
+        .with_context(|| format!("Failed to open {}.", state_db.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(0);
+    }
+    let count = connection
+        .query_row("select count(*) from threads", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .with_context(|| format!("Failed to count threads in {}.", state_db.display()))?;
+    Ok(count.max(0) as usize)
+}
+
+fn sqlite_table_exists(connection: &rusqlite::Connection, table_name: &str) -> Result<bool> {
+    sqlite_table_exists_in_schema(connection, "main", table_name)
+}
+
+fn sqlite_table_exists_in_schema(
+    connection: &rusqlite::Connection,
+    schema: &str,
+    table_name: &str,
+) -> Result<bool> {
+    let sql = format!(
+        "select 1 from {}.sqlite_master where type = 'table' and name = ?1 limit 1",
+        quote_sql_identifier(schema)
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query([table_name])?;
+    Ok(rows.next()?.is_some())
+}
+
+fn sqlite_table_columns(
+    connection: &rusqlite::Connection,
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<String>> {
+    let sql = format!(
+        "PRAGMA {}.table_info({})",
+        quote_sql_identifier(schema),
+        quote_sql_identifier(table_name)
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn quote_sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHandoff>> {
@@ -3473,6 +4352,427 @@ exit 91
 
         assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).expect("target symlink"));
         assert!(source_paths.codex_home.join("history.jsonl").exists());
+    }
+
+    #[test]
+    fn switch_host_persona_merges_full_conversation_history_bidirectionally() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[(
+                "thread-source",
+                "/Users/test/.codex/sessions/2026/01/01/rollout-source.jsonl",
+                100,
+            )],
+        );
+        seed_thread_scoped_tables(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-source",
+        );
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[(
+                "thread-target",
+                "/Users/test/.codex/sessions/2026/01/01/rollout-target.jsonl",
+                200,
+            )],
+        );
+        seed_thread_scoped_tables(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-target",
+        );
+
+        let source_rollout = source_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl");
+        let target_rollout = target_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-target.jsonl");
+        fs::create_dir_all(source_rollout.parent().unwrap()).expect("create source rollout parent");
+        fs::create_dir_all(target_rollout.parent().unwrap()).expect("create target rollout parent");
+        fs::write(&source_rollout, "{\"thread\":\"source\"}\n").expect("write source rollout");
+        fs::write(&target_rollout, "{\"thread\":\"target\"}\n").expect("write target rollout");
+
+        fs::write(
+            source_paths.codex_home.join("session_index.jsonl"),
+            "{\"id\":\"thread-source\",\"thread_name\":\"source\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+        )
+        .expect("write source index");
+        fs::write(
+            target_paths.codex_home.join("session_index.jsonl"),
+            "{\"id\":\"thread-target\",\"thread_name\":\"target\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n",
+        )
+        .expect("write target index");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        let source_thread_ids = read_thread_ids(&source_paths.codex_home.join("state_5.sqlite"));
+        let target_thread_ids = read_thread_ids(&target_paths.codex_home.join("state_5.sqlite"));
+        assert!(
+            source_thread_ids.contains(&"thread-source".to_string())
+                && source_thread_ids.contains(&"thread-target".to_string())
+        );
+        assert!(
+            target_thread_ids.contains(&"thread-source".to_string())
+                && target_thread_ids.contains(&"thread-target".to_string())
+        );
+
+        assert!(source_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl")
+            .exists());
+        assert!(source_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-target.jsonl")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-target.jsonl")
+            .exists());
+
+        let source_index =
+            fs::read_to_string(source_paths.codex_home.join("session_index.jsonl")).unwrap();
+        let target_index =
+            fs::read_to_string(target_paths.codex_home.join("session_index.jsonl")).unwrap();
+        assert!(source_index.contains("\"thread-source\""));
+        assert!(source_index.contains("\"thread-target\""));
+        assert!(target_index.contains("\"thread-source\""));
+        assert!(target_index.contains("\"thread-target\""));
+
+        let source_dynamic_tool_threads = read_single_text_column(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "select distinct thread_id from thread_dynamic_tools order by thread_id",
+        );
+        let target_dynamic_tool_threads = read_single_text_column(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "select distinct thread_id from thread_dynamic_tools order by thread_id",
+        );
+        assert_eq!(
+            source_dynamic_tool_threads,
+            vec!["thread-source".to_string(), "thread-target".to_string()]
+        );
+        assert_eq!(
+            target_dynamic_tool_threads,
+            vec!["thread-source".to_string(), "thread-target".to_string()]
+        );
+
+        let source_stage1_threads = read_single_text_column(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "select thread_id from stage1_outputs order by thread_id",
+        );
+        let target_stage1_threads = read_single_text_column(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "select thread_id from stage1_outputs order by thread_id",
+        );
+        assert_eq!(
+            source_stage1_threads,
+            vec!["thread-source".to_string(), "thread-target".to_string()]
+        );
+        assert_eq!(
+            target_stage1_threads,
+            vec!["thread-source".to_string(), "thread-target".to_string()]
+        );
+
+        let source_spawn_edges = read_single_text_column(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "select child_thread_id from thread_spawn_edges order by child_thread_id",
+        );
+        let target_spawn_edges = read_single_text_column(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "select child_thread_id from thread_spawn_edges order by child_thread_id",
+        );
+        assert_eq!(
+            source_spawn_edges,
+            vec![
+                "thread-source-child".to_string(),
+                "thread-target-child".to_string()
+            ]
+        );
+        assert_eq!(
+            target_spawn_edges,
+            vec![
+                "thread-source-child".to_string(),
+                "thread-target-child".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn switch_host_persona_merges_app_support_local_storage_bidirectionally() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        let source_leveldb = source_paths
+            .codex_app_support_dir
+            .join("Local Storage")
+            .join("leveldb");
+        let target_leveldb = target_paths
+            .codex_app_support_dir
+            .join("Local Storage")
+            .join("leveldb");
+        fs::create_dir_all(&source_leveldb).expect("create source local storage leveldb");
+        fs::create_dir_all(&target_leveldb).expect("create target local storage leveldb");
+        fs::write(
+            source_leveldb.join("source-project.marker"),
+            "source-local-storage",
+        )
+        .expect("write source marker");
+        fs::write(
+            target_leveldb.join("target-project.marker"),
+            "target-local-storage",
+        )
+        .expect("write target marker");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        assert_eq!(
+            fs::read_to_string(source_leveldb.join("source-project.marker")).unwrap(),
+            "source-local-storage"
+        );
+        assert_eq!(
+            fs::read_to_string(source_leveldb.join("target-project.marker")).unwrap(),
+            "target-local-storage"
+        );
+        assert_eq!(
+            fs::read_to_string(target_leveldb.join("source-project.marker")).unwrap(),
+            "source-local-storage"
+        );
+        assert_eq!(
+            fs::read_to_string(target_leveldb.join("target-project.marker")).unwrap(),
+            "target-local-storage"
+        );
+    }
+
+    #[test]
+    fn transfer_thread_recovery_state_between_accounts_moves_pending_events() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+        }
+
+        let mut watch_state = crate::watch::WatchState::default();
+        let source_event = crate::thread_recovery::ThreadRecoveryEvent {
+            source_log_id: 42,
+            source_ts: 1_717_171_717,
+            thread_id: "thread-source".to_string(),
+            kind: crate::thread_recovery::ThreadRecoveryKind::QuotaExhausted,
+            exhausted_turn_id: Some("turn-1".to_string()),
+            exhausted_email: Some("source@example.com".to_string()),
+            exhausted_account_id: Some("acct-source".to_string()),
+            message: "quota exhausted".to_string(),
+        };
+        watch_state.set_account_state(
+            "acct-source".to_string(),
+            crate::watch::AccountWatchState {
+                last_thread_recovery_log_id: Some(99),
+                thread_recovery_pending: true,
+                thread_recovery_pending_events: vec![source_event.clone()],
+                thread_recovery_backfill_complete: true,
+                ..crate::watch::AccountWatchState::default()
+            },
+        );
+        write_watch_state(&watch_state).expect("write source watch state");
+
+        transfer_thread_recovery_state_between_accounts("acct-source", "acct-target")
+            .expect("transfer recovery state");
+
+        let updated = read_watch_state().expect("read updated watch state");
+        let source_state = updated.account_state("acct-source");
+        let target_state = updated.account_state("acct-target");
+
+        assert_eq!(source_state.last_thread_recovery_log_id, None);
+        assert!(!source_state.thread_recovery_pending);
+        assert!(source_state.thread_recovery_pending_events.is_empty());
+        assert_eq!(target_state.last_thread_recovery_log_id, Some(99));
+        assert!(target_state.thread_recovery_pending);
+        assert_eq!(
+            target_state.thread_recovery_pending_events,
+            vec![source_event]
+        );
+        assert!(target_state.thread_recovery_backfill_complete);
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    fn seed_threads_table(state_db_path: &Path, rows: &[(&str, &str, i64)]) {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table if not exists threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    source text not null,
+    model_provider text not null,
+    cwd text not null,
+    title text not null,
+    sandbox_policy text not null,
+    approval_mode text not null,
+    tokens_used integer not null default 0,
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        for (thread_id, rollout_path, updated_at) in rows {
+            connection
+                .execute(
+                    r#"
+insert into threads (
+    id,
+    rollout_path,
+    created_at,
+    updated_at,
+    source,
+    model_provider,
+    cwd,
+    title,
+    sandbox_policy,
+    approval_mode,
+    tokens_used,
+    has_user_event,
+    archived
+) values (?1, ?2, ?3, ?3, 'local', 'openai', '/', ?1, 'workspace-write', 'never', 0, 1, 0)
+on conflict(id) do update set
+    rollout_path=excluded.rollout_path,
+    updated_at=excluded.updated_at
+"#,
+                    rusqlite::params![thread_id, rollout_path, updated_at],
+                )
+                .expect("insert thread");
+        }
+    }
+
+    fn read_thread_ids(state_db_path: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        let mut statement = connection
+            .prepare("select id from threads order by id")
+            .expect("prepare threads query");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query thread ids");
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.expect("thread id"));
+        }
+        ids
+    }
+
+    fn seed_thread_scoped_tables(state_db_path: &Path, thread_id: &str) {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table if not exists thread_dynamic_tools (
+    thread_id text not null,
+    position integer not null,
+    name text not null,
+    description text not null,
+    input_schema text not null,
+    defer_loading integer not null default 0,
+    primary key(thread_id, position)
+);
+create table if not exists thread_spawn_edges (
+    parent_thread_id text not null,
+    child_thread_id text not null primary key,
+    status text not null
+);
+create table if not exists stage1_outputs (
+    thread_id text primary key,
+    source_updated_at integer not null,
+    raw_memory text not null,
+    rollout_summary text not null,
+    generated_at integer not null
+);
+"#,
+            )
+            .expect("create thread scoped tables");
+        connection
+            .execute(
+                r#"
+insert into thread_dynamic_tools (thread_id, position, name, description, input_schema, defer_loading)
+values (?1, 0, 'tool-name', 'tool-description', '{}', 0)
+on conflict(thread_id, position) do update set
+    name=excluded.name,
+    description=excluded.description,
+    input_schema=excluded.input_schema
+"#,
+                rusqlite::params![thread_id],
+            )
+            .expect("insert thread dynamic tool");
+        connection
+            .execute(
+                r#"
+insert into thread_spawn_edges (parent_thread_id, child_thread_id, status)
+values (?1, ?2, 'ready')
+on conflict(child_thread_id) do update set
+    parent_thread_id=excluded.parent_thread_id,
+    status=excluded.status
+"#,
+                rusqlite::params![thread_id, format!("{thread_id}-child")],
+            )
+            .expect("insert spawn edge");
+        connection
+            .execute(
+                r#"
+insert into stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at)
+values (?1, 1, 'memory', 'summary', 1)
+on conflict(thread_id) do update set
+    source_updated_at=excluded.source_updated_at,
+    raw_memory=excluded.raw_memory,
+    rollout_summary=excluded.rollout_summary,
+    generated_at=excluded.generated_at
+"#,
+                rusqlite::params![thread_id],
+            )
+            .expect("insert stage1 output");
+    }
+
+    fn read_single_text_column(state_db_path: &Path, sql: &str) -> Vec<String> {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        let mut statement = connection.prepare(sql).expect("prepare query");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query rows");
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row.expect("value"));
+        }
+        values
     }
 
     #[test]
@@ -5353,6 +6653,59 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+    }
+
+    #[test]
+    fn repair_host_history_dry_run_does_not_provision_target_persona() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "host");
+            std::env::set_var("CODEX_ROTATE_HOME", &paths.rotate_home);
+            std::env::set_var("CODEX_HOME", &paths.codex_home);
+            std::env::set_var("FAST_BROWSER_HOME", &paths.fast_browser_home);
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                &paths.codex_app_support_dir,
+            );
+        }
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
+        codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+            .expect("write source auth");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        assert!(!target_paths.codex_home.exists());
+
+        let output = repair_host_history("acct-source", &["acct-target".to_string()], false, false)
+            .expect("dry-run repair");
+        assert!(output.contains("Repair mode: dry-run"));
+        assert!(!target_paths.codex_home.exists());
+
+        restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
     }
 
     #[test]

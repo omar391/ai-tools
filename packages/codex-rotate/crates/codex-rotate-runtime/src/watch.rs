@@ -354,11 +354,23 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
     let account_changed = current_summary.account_id != previous_account_id;
-    let should_record_rotation_metadata = should_record_rotation_metadata(rotated, account_changed);
-    let current_account_previous_state = if account_changed {
-        previous_state.account_state(&current_summary.account_id)
+    let persisted_state_after_rotation = if rotated && account_changed {
+        read_watch_state().ok()
     } else {
-        previous_account_state.clone()
+        None
+    };
+    let should_record_rotation_metadata = should_record_rotation_metadata(rotated, account_changed);
+    let source_account_previous_state = persisted_state_after_rotation
+        .as_ref()
+        .map(|state| state.account_state(&previous_account_id))
+        .unwrap_or_else(|| previous_account_state.clone());
+    let current_account_previous_state = if account_changed {
+        persisted_state_after_rotation
+            .as_ref()
+            .map(|state| state.account_state(&current_summary.account_id))
+            .unwrap_or_else(|| previous_state.account_state(&current_summary.account_id))
+    } else {
+        source_account_previous_state.clone()
     };
     let latest_recoverable_turn_failure_log_id = read_latest_recoverable_turn_failure_log_id()?;
     let (mut thread_recovery_log_id, recoverable_turn_failure_log_reset) = normalize_log_cursor(
@@ -401,7 +413,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     next_state.auto_create_enabled = previous_state.auto_create_enabled;
     next_state.tray_enabled = previous_state.tray_enabled;
 
-    let mut source_account_state = previous_account_state.clone();
+    let mut source_account_state = source_account_previous_state.clone();
     source_account_state.last_signal_id = decision.last_signal_id;
     source_account_state.last_checked_at = Some(now.clone());
     source_account_state.last_live_email = source_live

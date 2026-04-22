@@ -27,14 +27,14 @@ use codex_rotate_refresh::{
     sources_newer_than_binary, stop_running_daemons, tray_service_pid, TargetKind,
 };
 use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
-use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
     ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
 };
+use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::rotation_hygiene::{
-    relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
-    run_guest_bridge_server,
+    relogin as run_shared_relogin, repair_host_history, rotate_next as run_shared_next,
+    rotate_prev as run_shared_prev, run_guest_bridge_server,
 };
 use codex_rotate_runtime::vm_bootstrap::bootstrap_vm_base;
 use codex_rotate_runtime::watch::set_tray_enabled;
@@ -82,6 +82,18 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 cli_progress_callback(),
             )?,
         )?,
+        Some("repair-host-history") => {
+            let options = parse_repair_host_history_options(&args[1..])?;
+            write_output(
+                writer,
+                &repair_host_history(
+                    &options.source_selector,
+                    &options.target_selectors,
+                    options.all_targets,
+                    options.apply,
+                )?,
+            )?
+        }
         Some("next") => {
             let result = run_shared_next(None, cli_progress_callback())?;
             let output = match result {
@@ -365,11 +377,15 @@ fn run_internal_launch_managed_command(args: &[String]) -> Result<()> {
             port = Some(value.parse()?);
             index += 2;
         } else if arg == "--profile-dir" {
-            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing profile-dir"))?;
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("missing profile-dir"))?;
             profile_dir = Some(PathBuf::from(value));
             index += 2;
         } else if arg == "--duration" {
-            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing duration"))?;
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("missing duration"))?;
             duration_secs = value.parse()?;
             index += 2;
         } else {
@@ -384,7 +400,10 @@ fn run_internal_launch_managed_command(args: &[String]) -> Result<()> {
         None,
     )?;
 
-    println!("Managed Codex launched. Waiting {} seconds...", duration_secs);
+    println!(
+        "Managed Codex launched. Waiting {} seconds...",
+        duration_secs
+    );
     thread::sleep(Duration::from_secs(duration_secs));
     Ok(())
 }
@@ -1049,6 +1068,96 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairHostHistoryOptions {
+    source_selector: String,
+    target_selectors: Vec<String>,
+    all_targets: bool,
+    apply: bool,
+}
+
+fn parse_repair_host_history_options(args: &[String]) -> Result<RepairHostHistoryOptions> {
+    let usage = "Usage: codex-rotate repair-host-history --source <selector> [--target <selector> ...|--all] [--apply]";
+    let mut source_selector = None::<String>;
+    let mut target_selectors = Vec::<String>::new();
+    let mut all_targets = false;
+    let mut apply = false;
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == "--source" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!(usage));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(usage));
+            }
+            source_selector = Some(value.to_string());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--source=") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(usage));
+            }
+            source_selector = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if arg == "--target" {
+            let Some(value) = args.get(index + 1).map(String::as_str) else {
+                return Err(anyhow!(usage));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(usage));
+            }
+            target_selectors.push(value.to_string());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--target=") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(usage));
+            }
+            target_selectors.push(value.to_string());
+            index += 1;
+            continue;
+        }
+        if arg == "--all" {
+            all_targets = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--apply" {
+            apply = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--dry-run" {
+            apply = false;
+            index += 1;
+            continue;
+        }
+        return Err(anyhow!("Unknown repair-host-history option: \"{arg}\""));
+    }
+
+    let Some(source_selector) = source_selector else {
+        return Err(anyhow!(usage));
+    };
+    if target_selectors.is_empty() {
+        all_targets = true;
+    }
+    Ok(RepairHostHistoryOptions {
+        source_selector,
+        target_selectors,
+        all_targets,
+        apply,
+    })
+}
+
 fn parse_create_options(
     args: &[String],
     allow_internal_flags: bool,
@@ -1234,6 +1343,7 @@ fn help_text() -> String {
 {BOLD}COMMANDS{RESET}
   {CYAN}add{RESET} [alias]      Snapshot current ~/.codex/auth.json into the pool
   {CYAN}create{RESET} [alias]   Reuse a healthy account, or create a new one when needed
+  {CYAN}repair-host-history{RESET} --source <selector> [--target <selector> ...|--all] [--apply]
   {CYAN}next{RESET}             Swap to the next account with usable quota
   {CYAN}prev{RESET}             Swap to the previous account
   {CYAN}list{RESET}             Show all accounts with cached quota info
@@ -1623,6 +1733,48 @@ mod tests {
             parse_public_relogin_options(&["acct-123".to_string(), "--manual-login".to_string()])
                 .expect_err("public relogin should reject internal flags");
         assert!(error.to_string().contains("Unknown relogin option"));
+    }
+
+    #[test]
+    fn repair_host_history_parser_accepts_source_targets_and_apply() {
+        let options = parse_repair_host_history_options(&[
+            "--source".to_string(),
+            "acct-source".to_string(),
+            "--target=acct-target-1".to_string(),
+            "--target".to_string(),
+            "acct-target-2".to_string(),
+            "--apply".to_string(),
+        ])
+        .expect("repair options");
+        assert_eq!(options.source_selector, "acct-source");
+        assert_eq!(
+            options.target_selectors,
+            vec!["acct-target-1".to_string(), "acct-target-2".to_string()]
+        );
+        assert!(!options.all_targets);
+        assert!(options.apply);
+    }
+
+    #[test]
+    fn repair_host_history_parser_defaults_to_all_targets() {
+        let options = parse_repair_host_history_options(&[
+            "--source=acct-source".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("repair options");
+        assert_eq!(options.source_selector, "acct-source");
+        assert!(options.target_selectors.is_empty());
+        assert!(options.all_targets);
+        assert!(!options.apply);
+    }
+
+    #[test]
+    fn repair_host_history_parser_requires_source() {
+        let error = parse_repair_host_history_options(&["--all".to_string()])
+            .expect_err("repair should require source");
+        assert!(error
+            .to_string()
+            .contains("repair-host-history --source <selector>"));
     }
 
     #[test]

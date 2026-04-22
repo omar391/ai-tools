@@ -50,3 +50,5 @@ worktrees/
 .loopo/hook-events.jsonl
 .loopo/hook-state.json
 .loopo/state.json
+.codex-rotate/
+package-lock.json

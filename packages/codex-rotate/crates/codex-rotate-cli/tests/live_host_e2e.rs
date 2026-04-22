@@ -2,8 +2,10 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
-use codex_rotate_core::pool::{load_pool, NextResult};
+use codex_rotate_core::pool::{load_pool, restore_codex_auth_from_active_pool, NextResult};
 use codex_rotate_core::workflow::{cmd_relogin_with_progress, ReloginOptions};
+use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
+use codex_rotate_refresh::process_tracking::ProcessTracker;
 use codex_rotate_runtime::cdp::is_cdp_page_ready;
 use codex_rotate_runtime::cdp::with_local_codex_connection;
 use codex_rotate_runtime::launcher::ensure_debug_codex_instance;
@@ -19,11 +21,10 @@ use codex_rotate_runtime::thread_recovery::{
     read_active_thread_ids, ThreadRecoveryEvent, ThreadRecoveryKind,
 };
 use codex_rotate_runtime::watch::{
-    read_watch_state, write_watch_state, RotationCommand, WatchIterationOptions,
+    read_watch_state, run_watch_iteration, write_watch_state, RotationCommand,
+    WatchIterationOptions,
 };
-use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
-use codex_rotate_refresh::process_tracking::ProcessTracker;
-use codex_rotate_test_support::{FailureArtifactBundle, FailureArtifactCapture, WatchTriggerHarness};
+use codex_rotate_test_support::{FailureArtifactBundle, FailureArtifactCapture};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -48,7 +49,8 @@ struct LiveHostFailureArtifacts {
 impl LiveHostFailureArtifacts {
     fn new(scenario: impl AsRef<str>, paths: &RuntimePaths) -> Result<Self> {
         let scenario = scenario.as_ref().to_string();
-        let capture = FailureArtifactCapture::new("codex-rotate-live-host")?.with_scenario(&scenario);
+        let capture =
+            FailureArtifactCapture::new("codex-rotate-live-host")?.with_scenario(&scenario);
         let bundle = capture.start_bundle()?;
         let process_tracker = ProcessTracker::new()?;
         let filesystem_tracker = FilesystemTracker::new()?;
@@ -106,11 +108,8 @@ impl LiveHostFailureArtifacts {
             &paths.codex_state_db_file,
             "codex state db file",
         );
-        self.filesystem_tracker.record_socket_path(
-            &paths.daemon_socket,
-            "daemon socket",
-            false,
-        );
+        self.filesystem_tracker
+            .record_socket_path(&paths.daemon_socket, "daemon socket", false);
         self.copy_targets.push((
             paths.codex_logs_db_file.clone(),
             PathBuf::from("logs/codex-logs.db"),
@@ -280,10 +279,8 @@ fn live_host_same_account_reopen_acceptance() -> Result<()> {
     let target_email = &staging_accounts[0].email;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_same_account_reopen_acceptance",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_same_account_reopen_acceptance", &paths)?;
     let port = 9333;
 
     // Ensure clean state.
@@ -334,10 +331,8 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
     );
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_active_thread_continuity_acceptance",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_active_thread_continuity_acceptance", &paths)?;
     let port = 9333;
     let source_cwd = paths.rotate_home.display().to_string();
     let marker = format!(
@@ -353,14 +348,7 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
     }
 
     let outcome = (|| -> Result<()> {
-        let options = ReloginOptions {
-            manual_login: false,
-            logout_first: true,
-            allow_email_change: false,
-        };
-
-        let _ = cmd_relogin_with_progress(&staging_accounts[0].email, options, None)
-            .with_context(|| format!("failed to relogin {}", staging_accounts[0].email))?;
+        let _ = prime_source_account_for_live_rotation(&staging_accounts[0].email)?;
 
         ensure_debug_codex_instance(None, Some(port), None, None)?;
 
@@ -421,13 +409,23 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
                 .any(|thread_id| thread_id == &source_thread_id),
             "source active thread {source_thread_id} was not visible before rotation"
         );
+        let pool_before =
+            load_pool().context("failed to load pool before active continuity next")?;
+        ensure!(
+            pool_before.accounts.len() >= 2,
+            "expected at least two pool accounts before active continuity next"
+        );
+        let expected_target_email = pool_before.accounts
+            [(pool_before.active_index + 1) % pool_before.accounts.len()]
+        .email
+        .clone();
 
         match run_shared_next(Some(port), None)? {
             NextResult::Rotated { summary, .. } => {
                 ensure!(
-                    summary.email == staging_accounts[1].email,
+                    summary.email == expected_target_email,
                     "expected rotation to target {}, got {}",
-                    staging_accounts[1].email,
+                    expected_target_email,
                     summary.email
                 );
             }
@@ -438,10 +436,24 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
 
         ensure_debug_codex_instance(None, Some(port), None, None)?;
 
-        let (target_thread_id, target_thread) = wait_for_imported_thread(port, &marker)?;
+        let target_threads = wait_for_active_threads_with_marker(port, &marker)?;
+        let target_thread_ids = target_threads
+            .iter()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .collect::<Vec<_>>();
+        ensure!(
+            target_threads.len() == 1,
+            "expected exactly one marker thread after first forward rotation, found {} ({})",
+            target_threads.len(),
+            target_thread_ids.join(", ")
+        );
+        let (target_thread_id, target_thread) = target_threads
+            .into_iter()
+            .next()
+            .context("missing marker thread after first forward rotation")?;
         ensure!(
             target_thread_id != source_thread_id,
-            "expected imported target thread to use a new thread id, but both were {source_thread_id}"
+            "expected target persona to materialize a different local thread id than source id {source_thread_id}"
         );
         ensure!(
             target_thread
@@ -454,6 +466,49 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
                 .get("cwd")
                 .and_then(Value::as_str)
                 .unwrap_or("<missing>")
+        );
+
+        match run_shared_prev(Some(port), None)? {
+            output => ensure!(
+                !output.trim().is_empty(),
+                "expected prev rotation output to be non-empty"
+            ),
+        }
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        match run_shared_next(Some(port), None)? {
+            NextResult::Rotated { summary, .. } => {
+                ensure!(
+                    summary.email == expected_target_email,
+                    "expected second forward rotation to target {}, got {}",
+                    expected_target_email,
+                    summary.email
+                );
+            }
+            other => {
+                bail!("expected second host rotation to move to the next account, got {other:?}");
+            }
+        }
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        let repeated_target_threads = wait_for_active_threads_with_marker(port, &marker)?;
+        let repeated_target_thread_ids = repeated_target_threads
+            .iter()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .collect::<Vec<_>>();
+        ensure!(
+            repeated_target_threads.len() == 1,
+            "expected deduplicated marker thread after repeat rotation, found {} ({})",
+            repeated_target_threads.len(),
+            repeated_target_thread_ids.join(", ")
+        );
+        let repeated_target_thread_id = repeated_target_threads
+            .first()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .context("missing marker thread after repeat rotation")?;
+        ensure!(
+            repeated_target_thread_id != source_thread_id,
+            "expected target persona to keep a distinct local id after repeat rotation; source id was {source_thread_id}"
         );
 
         Ok(())
@@ -503,22 +558,15 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
     let previous_watch_state = read_watch_state()?;
 
     let outcome = (|| -> Result<()> {
-        let options = ReloginOptions {
-            manual_login: false,
-            logout_first: true,
-            allow_email_change: false,
-        };
-
-        let _ = cmd_relogin_with_progress(&staging_accounts[0].email, options, None)
-            .with_context(|| format!("failed to relogin {}", staging_accounts[0].email))?;
+        let source_email = prime_source_account_for_live_rotation(&staging_accounts[0].email)?;
 
         let source_auth = load_codex_auth(&paths.codex_auth_file)
             .context("failed to read current Codex auth after relogin")?;
         let source_summary = summarize_codex_auth(&source_auth);
         ensure!(
-            source_summary.email == staging_accounts[0].email,
+            source_summary.email == source_email,
             "expected source auth to match {}, got {}",
-            staging_accounts[0].email,
+            source_email,
             source_summary.email
         );
 
@@ -613,13 +661,23 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
                 .any(|thread_id| thread_id == &source_thread_id),
             "recoverable source thread {source_thread_id} should not remain active before rotation"
         );
+        let pool_before =
+            load_pool().context("failed to load pool before recoverable continuity next")?;
+        ensure!(
+            pool_before.accounts.len() >= 2,
+            "expected at least two pool accounts before recoverable continuity next"
+        );
+        let expected_target_email = pool_before.accounts
+            [(pool_before.active_index + 1) % pool_before.accounts.len()]
+        .email
+        .clone();
 
         match run_shared_next(Some(port), None)? {
             NextResult::Rotated { summary, .. } => {
                 ensure!(
-                    summary.email == staging_accounts[1].email,
+                    summary.email == expected_target_email,
                     "expected rotation to target {}, got {}",
-                    staging_accounts[1].email,
+                    expected_target_email,
                     summary.email
                 );
             }
@@ -630,10 +688,24 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
 
         ensure_debug_codex_instance(None, Some(port), None, None)?;
 
-        let (target_thread_id, target_thread) = wait_for_imported_thread(port, &marker)?;
+        let target_threads = wait_for_active_threads_with_marker(port, &marker)?;
+        let target_thread_ids = target_threads
+            .iter()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .collect::<Vec<_>>();
+        ensure!(
+            target_threads.len() == 1,
+            "expected exactly one recoverable marker thread after rotation, found {} ({})",
+            target_threads.len(),
+            target_thread_ids.join(", ")
+        );
+        let (target_thread_id, target_thread) = target_threads
+            .into_iter()
+            .next()
+            .context("missing recoverable marker thread after rotation")?;
         ensure!(
             target_thread_id != source_thread_id,
-            "expected imported target thread to use a new thread id, but both were {source_thread_id}"
+            "expected target persona to materialize a different local thread id than source id {source_thread_id}"
         );
         ensure!(
             target_thread
@@ -651,6 +723,39 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
             value_contains_text(&target_thread, &marker),
             "imported recoverable target thread did not preserve marker {marker}"
         );
+        let target_auth = load_codex_auth(&paths.codex_auth_file)
+            .context("failed to read current Codex auth after recoverable rotation")?;
+        let target_summary = summarize_codex_auth(&target_auth);
+        ensure!(
+            target_summary.email == expected_target_email,
+            "expected target auth to match {}, got {}",
+            expected_target_email,
+            target_summary.email
+        );
+        let watch_state = read_watch_state()?;
+        let source_watch_state_after = watch_state.account_state(&source_summary.account_id);
+        ensure!(
+            !source_watch_state_after.thread_recovery_pending,
+            "expected source account {} to clear pending recovery state after rotation",
+            source_summary.account_id
+        );
+        ensure!(
+            source_watch_state_after
+                .thread_recovery_pending_events
+                .is_empty(),
+            "expected source account {} to clear pending recovery events after rotation",
+            source_summary.account_id
+        );
+        let target_watch_state_after = watch_state.account_state(&target_summary.account_id);
+        ensure!(
+            target_watch_state_after.thread_recovery_pending,
+            "expected target account {} to retain pending recovery state after rotation",
+            target_summary.account_id
+        );
+        ensure_one_pending_recoverable_thread(
+            &target_watch_state_after.thread_recovery_pending_events,
+            &target_thread_id,
+        )?;
 
         Ok(())
     })();
@@ -967,8 +1072,7 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
         "expected at least two staging accounts"
     );
 
-    let source_email = staging_accounts[0].email.clone();
-    let target_email = staging_accounts[1].email.clone();
+    let preferred_source_email = staging_accounts[0].email.clone();
     let paths = resolve_paths()?;
     let artifacts = LiveHostFailureArtifacts::new(
         "live_host_watch_triggered_next_acceptance_across_two_staging_accounts",
@@ -984,13 +1088,7 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
     }
 
     let outcome = (|| -> Result<()> {
-        let relogin_options = ReloginOptions {
-            manual_login: false,
-            logout_first: true,
-            allow_email_change: false,
-        };
-        cmd_relogin_with_progress(&source_email, relogin_options, None)
-            .with_context(|| format!("failed to relogin {source_email}"))?;
+        let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
 
         ensure_debug_codex_instance(None, Some(port), None, None)
             .context("failed to launch managed Codex for watch-trigger setup")?;
@@ -1017,6 +1115,11 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
             source_account.email,
             source_summary.email
         );
+        let expected_target_email = source_pool
+            .accounts
+            .get((source_index + 1) % source_pool.accounts.len())
+            .map(|entry| entry.email.clone())
+            .context("failed to resolve expected watch-trigger target account email")?;
 
         let source_account_id = source_summary.account_id.clone();
         let source_account_email = source_summary.email.clone();
@@ -1049,9 +1152,6 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
             std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
         }
 
-        let harness = WatchTriggerHarness::new();
-        harness.clear_signals()?;
-
         let mut watch_state = read_watch_state()?;
         let mut source_watch_state = watch_state.account_state(&source_account_id);
         source_watch_state.last_signal_id = Some(0);
@@ -1061,17 +1161,18 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
         watch_state.set_account_state(source_account_id.clone(), source_watch_state);
         write_watch_state(&watch_state)?;
 
-        harness.insert_usage_limit_signal(1, 1_000)?;
-
-        let result = harness.run_iteration(WatchIterationOptions {
+        let result = run_watch_iteration(WatchIterationOptions {
             port: Some(port),
-            after_signal_id: Some(0),
+            after_signal_id: None,
             cooldown_ms: Some(0),
             force_quota_refresh: true,
             progress: None,
         })?;
 
-        ensure!(result.rotated, "watch trigger should have rotated the account");
+        ensure!(
+            result.rotated,
+            "watch trigger should have rotated the account"
+        );
         ensure!(
             result.decision.should_rotate,
             "watch decision should have requested rotation"
@@ -1082,15 +1183,15 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
             result.decision.rotation_command
         );
         ensure!(
-            result.current_account_id == target_email,
+            result.current_account_id == expected_target_email,
             "expected watch-triggered rotation to land on {}, got {}",
-            target_email,
+            expected_target_email,
             result.current_account_id
         );
         ensure!(
-            result.state.last_rotated_email.as_deref() == Some(target_email.as_str()),
+            result.state.last_rotated_email.as_deref() == Some(expected_target_email.as_str()),
             "expected watch state to record the rotated account {}",
-            target_email
+            expected_target_email
         );
 
         let rotated_pool = load_pool().context("failed to load pool after watch rotation")?;
@@ -1111,9 +1212,9 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
         );
         let rotated_summary = summarize_codex_auth(&rotated_auth);
         ensure!(
-            rotated_summary.email == target_email,
+            rotated_summary.email == expected_target_email,
             "expected rotated summary email {}, got {}",
-            target_email,
+            expected_target_email,
             rotated_summary.email
         );
 
@@ -1180,6 +1281,320 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
 
 #[test]
 #[ignore]
+fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> Result<()> {
+    require_host_live_capabilities()?;
+
+    let staging_accounts: Vec<LiveStagingAccount> = load_live_staging_accounts(2)?;
+    ensure!(
+        staging_accounts.len() >= 2,
+        "expected at least two staging accounts"
+    );
+
+    let preferred_source_email = staging_accounts[0].email.clone();
+    let paths = resolve_paths()?;
+    let artifacts = LiveHostFailureArtifacts::new(
+        "live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance",
+        &paths,
+    )?;
+    let port = 9333;
+    let previous_watch_state = read_watch_state()?;
+    let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+    let mut stop_server = None;
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    let outcome = (|| -> Result<()> {
+        let source_cwd = paths.rotate_home.display().to_string();
+        let active_marker = format!(
+            "T047 full-flow active marker {}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock before UNIX_EPOCH")?
+                .as_millis()
+        );
+        let recoverable_marker = format!(
+            "T047 full-flow recoverable marker {}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock before UNIX_EPOCH")?
+                .as_millis()
+        );
+
+        let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+
+        ensure_debug_codex_instance(None, Some(port), None, None)
+            .context("failed to launch managed Codex for full-flow setup")?;
+
+        let source_auth = load_codex_auth(&paths.codex_auth_file)
+            .context("failed to read source auth during full-flow setup")?;
+        let source_summary = summarize_codex_auth(&source_auth);
+        ensure!(
+            source_summary.email == source_email,
+            "expected source auth to match {}, got {}",
+            source_email,
+            source_summary.email
+        );
+        let source_pool = load_pool().context("failed to load pool before full-flow rotation")?;
+        let source_index = source_pool.active_index;
+        ensure!(
+            source_pool.accounts.len() >= 2,
+            "expected at least two pool accounts before full-flow rotation"
+        );
+        let expected_target_email = source_pool
+            .accounts
+            .get((source_index + 1) % source_pool.accounts.len())
+            .map(|entry| entry.email.clone())
+            .context("failed to resolve expected full-flow target account email")?;
+
+        let source_active_thread_id = start_thread_with_marker(port, &source_cwd, &active_marker)?;
+        let source_recoverable_thread_id =
+            start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+        archive_thread_in_state_db(&paths.codex_state_db_file, &source_recoverable_thread_id)?;
+
+        let mut watch_state = read_watch_state()?;
+        let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+        source_watch_state.last_signal_id = Some(0);
+        source_watch_state.thread_recovery_pending = true;
+        source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+            source_log_id: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock before UNIX_EPOCH")?
+                .as_millis() as i64,
+            source_ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock before UNIX_EPOCH")?
+                .as_secs() as i64,
+            thread_id: source_recoverable_thread_id.clone(),
+            kind: ThreadRecoveryKind::QuotaExhausted,
+            exhausted_turn_id: None,
+            exhausted_email: Some(source_summary.email.clone()),
+            exhausted_account_id: Some(source_summary.account_id.clone()),
+            message: "You've hit your usage limit.".to_string(),
+        }];
+        source_watch_state.thread_recovery_backfill_complete = true;
+        watch_state.set_account_state(source_summary.account_id.clone(), source_watch_state);
+        write_watch_state(&watch_state)?;
+
+        let quota_body = serde_json::json!({
+            "user_id": source_summary.account_id,
+            "account_id": source_summary.account_id,
+            "email": source_summary.email,
+            "plan_type": source_summary.plan_type,
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "limit_window_seconds": 18_000,
+                    "reset_after_seconds": 3_600,
+                    "reset_at": 1_775_185_200,
+                },
+                "secondary_window": null
+            },
+            "code_review_rate_limit": null,
+            "additional_rate_limits": null,
+            "credits": null,
+            "promo": null
+        })
+        .to_string();
+        let (quota_url, _, server_stop) = spawn_quota_server(quota_body);
+        stop_server = Some(server_stop);
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
+        }
+
+        let first_iteration = run_watch_iteration(WatchIterationOptions {
+            port: Some(port),
+            after_signal_id: None,
+            cooldown_ms: Some(0),
+            force_quota_refresh: true,
+            progress: None,
+        })?;
+        ensure!(
+            first_iteration.rotated,
+            "watch trigger should have rotated during full-flow acceptance"
+        );
+        ensure!(
+            first_iteration.decision.should_rotate,
+            "watch decision should have requested rotation during full-flow acceptance"
+        );
+        ensure!(
+            first_iteration.decision.rotation_command == Some(RotationCommand::Next),
+            "expected watch-triggered full-flow rotation command to be Next, got {:?}",
+            first_iteration.decision.rotation_command
+        );
+
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+        ensure!(
+            managed_codex_is_running(&paths.debug_profile_dir)?,
+            "expected managed Codex to be running after watch-triggered rotation"
+        );
+
+        let target_auth = load_codex_auth(&paths.codex_auth_file)
+            .context("failed to read target auth after watch-triggered rotation")?;
+        let target_summary = summarize_codex_auth(&target_auth);
+        ensure!(
+            target_summary.email == expected_target_email,
+            "expected rotated auth email {}, got {}",
+            expected_target_email,
+            target_summary.email
+        );
+
+        let target_active_threads = wait_for_active_threads_with_marker(port, &active_marker)?;
+        let target_active_thread_ids = target_active_threads
+            .iter()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .collect::<Vec<_>>();
+        ensure!(
+            target_active_threads.len() == 1,
+            "expected exactly one synced active marker thread, found {} ({})",
+            target_active_threads.len(),
+            target_active_thread_ids.join(", ")
+        );
+        let target_active_thread_id = target_active_threads
+            .first()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .context("missing synced active marker thread")?;
+        ensure!(
+            target_active_thread_id != source_active_thread_id,
+            "expected synced active conversation to use a target-local thread id, but matched source id {}",
+            source_active_thread_id
+        );
+
+        let watch_state_after_rotation = read_watch_state()?;
+        let source_after_rotation =
+            watch_state_after_rotation.account_state(&source_summary.account_id);
+        ensure!(
+            !source_after_rotation.thread_recovery_pending,
+            "expected source account {} to clear pending recovery state after watch rotation",
+            source_summary.account_id
+        );
+        ensure!(
+            source_after_rotation
+                .thread_recovery_pending_events
+                .is_empty(),
+            "expected source account {} to clear pending recovery events after watch rotation",
+            source_summary.account_id
+        );
+
+        let target_after_rotation =
+            watch_state_after_rotation.account_state(&target_summary.account_id);
+        ensure!(
+            target_after_rotation.thread_recovery_pending,
+            "expected target account {} to have pending interrupted-thread state after watch rotation",
+            target_summary.account_id
+        );
+        ensure!(
+            target_after_rotation.thread_recovery_pending_events.len() == 1,
+            "expected exactly one pending interrupted thread on target, got {}",
+            target_after_rotation.thread_recovery_pending_events.len()
+        );
+        let pending_target_thread_id = target_after_rotation.thread_recovery_pending_events[0]
+            .thread_id
+            .clone();
+        ensure!(
+            pending_target_thread_id != source_recoverable_thread_id,
+            "expected recoverable conversation to map to a target-local thread id distinct from source {}",
+            source_recoverable_thread_id
+        );
+        let pending_thread = read_thread_with_turns(port, &pending_target_thread_id)?
+            .with_context(|| {
+                format!("failed to read pending target thread {pending_target_thread_id}")
+            })?;
+        ensure!(
+            value_contains_text(&pending_thread, &recoverable_marker),
+            "expected pending target thread {} to preserve recoverable marker {}",
+            pending_target_thread_id,
+            recoverable_marker
+        );
+
+        if managed_codex_is_running(&paths.debug_profile_dir)? {
+            stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+        }
+        ensure!(
+            !managed_codex_is_running(&paths.debug_profile_dir)?,
+            "expected managed Codex to be stopped before restart validation"
+        );
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        let mut recovered = false;
+        for _ in 0..6 {
+            let _ = run_watch_iteration(WatchIterationOptions {
+                port: Some(port),
+                after_signal_id: target_after_rotation.last_signal_id,
+                cooldown_ms: Some(0),
+                force_quota_refresh: false,
+                progress: None,
+            })?;
+            let state_after_recovery_attempt = read_watch_state()?;
+            let target_after_recovery =
+                state_after_recovery_attempt.account_state(&target_summary.account_id);
+            if !target_after_recovery.thread_recovery_pending
+                && target_after_recovery
+                    .thread_recovery_pending_events
+                    .is_empty()
+            {
+                recovered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        ensure!(
+            recovered,
+            "expected interrupted-thread recovery to auto-complete after restart for account {}",
+            target_summary.account_id
+        );
+
+        let _ = wait_for_thread_marker(
+            port,
+            &pending_target_thread_id,
+            "continue with skipped msgs",
+        )
+        .with_context(|| {
+            format!(
+                "expected interrupted thread {} to receive automatic resume input after restart",
+                pending_target_thread_id
+            )
+        })?;
+
+        Ok(())
+    })();
+
+    if let Some(stop_server) = stop_server {
+        stop_server.store(true, Ordering::Relaxed);
+    }
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    if let Err(error) = write_watch_state(&previous_watch_state) {
+        if outcome.is_ok() {
+            return Err(error);
+        }
+        eprintln!("failed to restore watch state after full-flow acceptance test: {error:#}");
+    }
+
+    match previous_usage_url {
+        Some(value) => unsafe {
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value);
+        },
+        None => unsafe {
+            std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+        },
+    }
+
+    if outcome.is_ok() {
+        artifacts.complete()?;
+    }
+
+    outcome
+}
+
+#[test]
+#[ignore]
 fn live_host_managed_relogin_smoke_coverage() -> Result<()> {
     // A12: Missing prerequisites fail loudly.
     require_host_live_capabilities()?;
@@ -1189,10 +1604,8 @@ fn live_host_managed_relogin_smoke_coverage() -> Result<()> {
     let target_email = &staging_accounts[0].email;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_managed_relogin_smoke_coverage",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_managed_relogin_smoke_coverage", &paths)?;
     let port = 9333;
 
     // Ensure clean state.
@@ -1302,10 +1715,8 @@ fn live_host_codex_desktop_smoke_coverage() -> Result<()> {
 
     let paths = resolve_paths()?;
     let process_tracker = ProcessTracker::new()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_codex_desktop_smoke_coverage",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_codex_desktop_smoke_coverage", &paths)?;
     let port = 9333;
 
     // Ensure we start from a clean state for the isolated profile.
@@ -1414,10 +1825,8 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
     let filesystem_tracker = FilesystemTracker::new()?;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_codex_desktop_auto_close_on_exit",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_codex_desktop_auto_close_on_exit", &paths)?;
 
     {
         // Use a separate temp profile for this test.
@@ -1453,7 +1862,11 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
             .env("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "0")
             .spawn()
             .context("spawn codex-rotate launch-managed")?;
-        process_tracker.record_test_owned_process(child.id(), "launch-managed child", child_command);
+        process_tracker.record_test_owned_process(
+            child.id(),
+            "launch-managed child",
+            child_command,
+        );
 
         // Wait for it to launch.
         let mut launched = false;
@@ -1555,15 +1968,111 @@ await window.electronBridge.sendMessageFromView(request);
 }
 
 fn read_thread_with_turns(port: u16, thread_id: &str) -> Result<Option<Value>> {
-    let response = send_local_mcp_request(
+    let response = match send_local_mcp_request(
         port,
         "thread/read",
         json!({
             "threadId": thread_id,
             "includeTurns": true,
         }),
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("{:#}", error);
+            if message.contains("includeTurns is unavailable before first user message")
+                || message.contains("is not materialized yet")
+            {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
     Ok(response.get("thread").cloned())
+}
+
+fn is_live_unattended_relogin_error(error: &anyhow::Error) -> bool {
+    let message = format!("{:#}", error).to_ascii_lowercase();
+    message.contains("secrets.session request did not match")
+        || message.contains("no stored credentials were found")
+        || message.contains("automation bridge command complete-codex-login-attempt failed")
+}
+
+fn prime_source_account_for_live_rotation(preferred_email: &str) -> Result<String> {
+    let options = ReloginOptions {
+        manual_login: false,
+        logout_first: true,
+        allow_email_change: false,
+    };
+    match cmd_relogin_with_progress(preferred_email, options, None) {
+        Ok(_) => Ok(preferred_email.to_string()),
+        Err(error) if is_live_unattended_relogin_error(&error) => {
+            let _ = restore_codex_auth_from_active_pool()
+                .context("failed to restore active pool auth during live relogin fallback")?;
+            let paths = resolve_paths()?;
+            let auth = load_codex_auth(&paths.codex_auth_file).context(
+                "failed to read Codex auth after restoring active pool auth during relogin fallback",
+            )?;
+            let summary = summarize_codex_auth(&auth);
+            eprintln!(
+                "codex-rotate: relogin fallback using existing active account {} after relogin error: {:#}",
+                summary.email, error
+            );
+            Ok(summary.email)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn start_thread_with_marker(port: u16, cwd: &str, marker: &str) -> Result<String> {
+    let thread = send_local_mcp_request(
+        port,
+        "thread/start",
+        json!({
+            "cwd": cwd,
+            "model": Value::Null,
+            "modelProvider": Value::Null,
+            "serviceTier": Value::Null,
+            "approvalPolicy": Value::Null,
+            "approvalsReviewer": "user",
+            "sandbox": Value::Null,
+            "personality": "pragmatic",
+        }),
+    )?;
+    let thread_id = thread
+        .get("thread")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .context("thread/start did not return a thread id")?
+        .to_string();
+
+    send_local_mcp_request(
+        port,
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": marker,
+                    "text_elements": [],
+                }
+            ],
+            "cwd": cwd,
+            "approvalPolicy": Value::Null,
+            "approvalsReviewer": "user",
+            "sandboxPolicy": Value::Null,
+            "model": Value::Null,
+            "serviceTier": Value::Null,
+            "effort": Value::Null,
+            "summary": "none",
+            "personality": Value::Null,
+            "outputSchema": Value::Null,
+            "collaborationMode": Value::Null,
+            "attachments": [],
+        }),
+    )?;
+    wait_for_thread_marker(port, &thread_id, marker)?;
+    Ok(thread_id)
 }
 
 fn wait_for_thread_marker(port: u16, thread_id: &str, marker: &str) -> Result<Value> {
@@ -1581,19 +2090,30 @@ fn wait_for_thread_marker(port: u16, thread_id: &str, marker: &str) -> Result<Va
     }
 }
 
-fn wait_for_imported_thread(port: u16, marker: &str) -> Result<(String, Value)> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let thread_ids = read_active_thread_ids(Some(port))?;
-        for thread_id in thread_ids {
-            if let Some(thread) = read_thread_with_turns(port, &thread_id)? {
-                if value_contains_text(&thread, marker) {
-                    return Ok((thread_id, thread));
-                }
+fn active_threads_with_marker(port: u16, marker: &str) -> Result<Vec<(String, Value)>> {
+    let mut matches = Vec::new();
+    let thread_ids = read_active_thread_ids(Some(port))?;
+    for thread_id in thread_ids {
+        if let Some(thread) = read_thread_with_turns(port, &thread_id)? {
+            if value_contains_text(&thread, marker) {
+                matches.push((thread_id, thread));
             }
         }
+    }
+    Ok(matches)
+}
+
+fn wait_for_active_threads_with_marker(port: u16, marker: &str) -> Result<Vec<(String, Value)>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let matches = active_threads_with_marker(port, marker)?;
+        if !matches.is_empty() {
+            return Ok(matches);
+        }
         if Instant::now() >= deadline {
-            bail!("Timed out waiting for target persona to import an active thread containing marker {marker}");
+            bail!(
+                "Timed out waiting for target persona to materialize an active thread containing marker {marker}"
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     }
