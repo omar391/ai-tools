@@ -137,6 +137,20 @@ fn shared_cdp_session() -> &'static Mutex<SharedCdpSession> {
 }
 
 impl CdpConnection {
+    pub fn add_script_to_evaluate_on_new_document(&mut self, source: &str) -> Result<String> {
+        let result: Value = self.send_command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({
+                "source": source,
+            }),
+        )?;
+        result
+            .get("identifier")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .context("Failed to add CDP new-document script.")
+    }
+
     pub fn evaluate<T: DeserializeOwned>(&mut self, expression: &str) -> Result<T> {
         let result: Value = self.send_command(
             "Runtime.evaluate",

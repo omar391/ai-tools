@@ -4658,6 +4658,7 @@ mod tests {
                 last_quota_checked_at: Some("2026-04-18T02:01:57.804Z".to_string()),
                 last_quota_primary_left_percent: Some(100),
                 last_quota_next_refresh_at: Some("2026-04-18T02:02:57.804Z".to_string()),
+                persona: None,
             }],
         };
 

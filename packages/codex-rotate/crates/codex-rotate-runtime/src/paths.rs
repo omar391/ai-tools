@@ -17,6 +17,7 @@ pub struct RuntimePaths {
     pub watch_state_file: PathBuf,
     pub debug_profile_dir: PathBuf,
     pub daemon_socket: PathBuf,
+    pub conversation_sync_db_file: PathBuf,
 }
 
 pub fn resolve_paths() -> Result<RuntimePaths> {
@@ -30,10 +31,11 @@ pub fn resolve_paths() -> Result<RuntimePaths> {
         codex_home: core.codex_home,
         fast_browser_home: core.fast_browser_home,
         codex_app_support_dir: core.codex_app_support_dir,
-        rotate_home: core.rotate_home,
+        rotate_home: core.rotate_home.clone(),
         watch_state_file: core.watch_state_file,
         debug_profile_dir: core.profile_dir,
         daemon_socket: core.daemon_socket,
+        conversation_sync_db_file: core.rotate_home.join("conversation_sync.sqlite"),
     })
 }
 

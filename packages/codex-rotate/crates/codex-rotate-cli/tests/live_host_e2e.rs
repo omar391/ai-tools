@@ -8,6 +8,7 @@ use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKi
 use codex_rotate_refresh::process_tracking::ProcessTracker;
 use codex_rotate_runtime::cdp::is_cdp_page_ready;
 use codex_rotate_runtime::cdp::with_local_codex_connection;
+use codex_rotate_runtime::hook::switch_live_account_to_current_auth;
 use codex_rotate_runtime::launcher::ensure_debug_codex_instance;
 use codex_rotate_runtime::live_checks::{
     load_live_staging_accounts, require_host_live_capabilities, LiveStagingAccount,
@@ -1499,6 +1500,226 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore]
+fn live_host_full_lineage_sync_acceptance() -> Result<()> {
+    require_host_live_capabilities()?;
+
+    let staging_accounts: Vec<LiveStagingAccount> = load_live_staging_accounts(2)?;
+    ensure!(
+        staging_accounts.len() >= 2,
+        "expected at least two staging accounts"
+    );
+
+    let paths = resolve_paths()?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_full_lineage_sync_acceptance", &paths)?;
+    let port = 9333;
+    let source_cwd = paths.rotate_home.display().to_string();
+    let marker = format!(
+        "T122-marker-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+    );
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    let outcome = (|| -> Result<()> {
+        let options = ReloginOptions {
+            manual_login: false,
+            logout_first: true,
+            allow_email_change: false,
+        };
+        cmd_relogin_with_progress(&staging_accounts[0].email, options.clone(), None)?;
+
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        // 1. Create a thread in source persona
+        let source_thread = send_local_mcp_request(
+            port,
+            "thread/start",
+            json!({
+                "cwd": source_cwd,
+                "personality": "pragmatic",
+                "approvalsReviewer": "user",
+            }),
+        )?;
+        let source_thread_id = source_thread
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .context("thread/start did not return a thread id")?
+            .to_string();
+
+        send_local_mcp_request(
+            port,
+            "turn/start",
+            json!({
+                "threadId": source_thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": marker,
+                        "text_elements": [],
+                    }
+                ],
+                "cwd": source_cwd,
+                "approvalPolicy": Value::Null,
+                "approvalsReviewer": "user",
+                "summary": "none",
+                "personality": "pragmatic",
+                "attachments": [],
+            }),
+        )?;
+
+        wait_for_thread_marker(port, &source_thread_id, &marker)?;
+
+        // 2. Rotate to target persona
+        match run_shared_next(Some(port), None)? {
+            NextResult::Rotated { summary, .. } => {
+                ensure!(
+                    summary.email == staging_accounts[1].email,
+                    "expected rotation to target {}, got {}",
+                    staging_accounts[1].email,
+                    summary.email
+                );
+            }
+            other => bail!("expected rotation, got {:?}", other),
+        }
+
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        // 3. Verify thread imported with NEW ID
+        let (target_thread_id, _target_thread) = wait_for_imported_thread(port, &marker)?;
+        ensure!(
+            target_thread_id != source_thread_id,
+            "expected imported target thread to use a new thread id, but both were {source_thread_id}"
+        );
+
+        // 4. Re-rotate back to source and back to target (Repeated Sync)
+        run_shared_next(Some(port), None)?; // Back to [0]
+        run_shared_next(Some(port), None)?; // Back to [1]
+
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+        // 5. Verify NO DUPLICATE thread in target
+        let thread_ids = read_active_thread_ids(Some(port))?;
+        let mut matching_threads = 0;
+        for tid in thread_ids {
+            if let Some(t) = read_thread_with_turns(port, &tid)? {
+                if value_contains_text(&t, &marker) {
+                    matching_threads += 1;
+                    ensure!(
+                        tid == target_thread_id,
+                        "Idempotency failure: found new thread ID {} instead of bound {}",
+                        tid,
+                        target_thread_id
+                    );
+                }
+            }
+        }
+        ensure!(
+            matching_threads == 1,
+            "Expected exactly 1 matching thread, found {}",
+            matching_threads
+        );
+
+        Ok(())
+    })();
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    if outcome.is_ok() {
+        artifacts.complete()?;
+    }
+
+    outcome
+}
+
+#[test]
+#[ignore]
+fn live_host_project_visibility_probe() -> Result<()> {
+    require_host_live_capabilities()?;
+
+    let paths = resolve_paths()?;
+    let artifacts = LiveHostFailureArtifacts::new("live_host_project_visibility_probe", &paths)?;
+    let port = std::env::var("LIVE_HOST_PROJECT_VISIBILITY_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(9333);
+    let restart_after_login = std::env::var("LIVE_HOST_PROJECT_VISIBILITY_RESTART")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let capture_startup_requests = std::env::var("LIVE_HOST_PROJECT_VISIBILITY_CAPTURE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    let outcome = (|| -> Result<()> {
+        ensure_debug_codex_instance(None, Some(port), None, None)?;
+        switch_live_account_to_current_auth(Some(port), true, 30_000)?;
+        if restart_after_login {
+            stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            switch_live_account_to_current_auth(Some(port), true, 30_000)?;
+        }
+
+        if capture_startup_requests {
+            let startup_requests = capture_codex_startup_requests(port)?;
+            println!(
+                "PROJECT VISIBILITY STARTUP REQUESTS:\n{}",
+                serde_json::to_string_pretty(&startup_requests)?
+            );
+        }
+
+        let snapshot = inspect_codex_page_state(port)?;
+        println!(
+            "PROJECT VISIBILITY SNAPSHOT:\n{}",
+            serde_json::to_string_pretty(&snapshot)?
+        );
+
+        if let Some(body_text) = snapshot.get("bodyText").and_then(Value::as_str) {
+            println!(
+                "PROJECT VISIBILITY MATCHES: ai-tools={}, projects={}, threads={}, add-project={}",
+                body_text.contains("ai-tools"),
+                body_text.contains("Projects"),
+                body_text.contains("Threads"),
+                body_text.contains("Add project"),
+            );
+        }
+
+        Ok(())
+    })();
+
+    if managed_codex_is_running(&paths.debug_profile_dir)? {
+        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+    }
+
+    if outcome.is_ok() {
+        artifacts.complete()?;
+    }
+
+    outcome
+}
+
 fn send_local_mcp_request(port: u16, method: &str, params: Value) -> Result<Value> {
     let request_id = format!(
         "live-host-{method}-{}",
@@ -1549,6 +1770,120 @@ await window.electronBridge.sendMessageFromView(request);
         bail!("Codex {method} request failed: {error}");
     }
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn inspect_codex_page_state(port: u16) -> Result<Value> {
+    with_local_codex_connection(port, |connection| {
+        connection.evaluate(
+            r#"(() => {
+const sessionStorageDump = {};
+for (let index = 0; index < sessionStorage.length; index += 1) {
+  const key = sessionStorage.key(index);
+  if (key !== null) {
+    sessionStorageDump[key] = sessionStorage.getItem(key);
+  }
+}
+const controls = Array.from(document.querySelectorAll('button, [role="button"], a'))
+  .map((element) => ({
+    tag: element.tagName,
+    text: (element.textContent || '').trim(),
+    ariaLabel: element.getAttribute('aria-label'),
+    dataTestid: element.getAttribute('data-testid'),
+  }))
+  .filter((control) => control.text || control.ariaLabel || control.dataTestid);
+const localStorageKeys = [];
+const relevantLocalStorage = {};
+for (let index = 0; index < localStorage.length; index += 1) {
+  const key = localStorage.key(index);
+  if (key !== null) {
+    localStorageKeys.push(key);
+    const value = localStorage.getItem(key);
+    if (/(project|thread|workspace|sidebar|codex|chat)/i.test(key) || /ai-tools/i.test(value || "")) {
+      relevantLocalStorage[key] = value;
+    }
+  }
+}
+const databasesPromise =
+  typeof indexedDB !== "undefined" && indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
+return databasesPromise.then((indexedDbDatabases) => ({
+  url: location.href,
+  title: document.title,
+  bodyText: document.body ? document.body.innerText.slice(0, 12000) : null,
+  controls,
+  localStorageKeyCount: localStorageKeys.length,
+  localStorageKeys: localStorageKeys.sort(),
+  relevantLocalStorage,
+  sessionStorage: sessionStorageDump,
+  indexedDbDatabases,
+  windowKeys: Object.keys(window)
+    .filter((key) => /store|project|sidebar|thread|workspace/i.test(key))
+    .sort()
+    .slice(0, 200),
+}));
+})()"#,
+        )
+    })
+}
+
+fn capture_codex_startup_requests(port: u16) -> Result<Value> {
+    with_local_codex_connection(port, |connection| {
+        connection.add_script_to_evaluate_on_new_document(
+            r#"(() => {
+const requestLog = [];
+let bridgeValue = window.electronBridge ?? null;
+const record = (kind, detail) => {
+  try {
+    requestLog.push({ kind, ...detail, timestamp: Date.now() });
+  } catch (_) {}
+};
+const wrapBridge = (bridge) => {
+  if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+    return bridge;
+  }
+  const original = bridge.sendMessageFromView.bind(bridge);
+  bridge.sendMessageFromView = async (request) => {
+    record("mcp", {
+      hostId: request && typeof request === "object" ? request.hostId ?? null : null,
+      method:
+        request && typeof request === "object"
+          ? request.request?.method ?? request.method ?? null
+          : null,
+    });
+    return original(request);
+  };
+  return bridge;
+};
+Object.defineProperty(window, "__codexRequestLog", {
+  configurable: true,
+  enumerable: false,
+  get: () => requestLog,
+});
+Object.defineProperty(window, "electronBridge", {
+  configurable: true,
+  enumerable: true,
+  get: () => bridgeValue,
+  set: (next) => {
+    bridgeValue = wrapBridge(next);
+  },
+});
+bridgeValue = wrapBridge(bridgeValue);
+const originalFetch = window.fetch?.bind(window) ?? null;
+if (originalFetch) {
+  window.fetch = async (...args) => {
+    record("fetch", {
+      url: String(args[0]),
+    });
+    return originalFetch(...args);
+  };
+}
+})()"#,
+        )?;
+        connection.reload_page(true)?;
+        std::thread::sleep(Duration::from_secs(5));
+        connection.evaluate(
+            r#"(() => window.__codexRequestLog ? window.__codexRequestLog.slice() : [])()"#,
+        )
+    })
 }
 
 fn read_thread_with_turns(port: u16, thread_id: &str) -> Result<Option<Value>> {

@@ -88,6 +88,24 @@ pub fn switch_live_account_to_current_auth(
             .unwrap_or(false)
         {
             let current_account = current.account.clone();
+            with_live_codex_connection(port, ensure_launched, |connection| {
+                connection.reload_page(true)?;
+                Ok(())
+            })?;
+            thread::sleep(Duration::from_millis(500));
+            let render_deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            while Instant::now() < render_deadline {
+                let body_text_len = with_local_codex_connection(port, |connection| {
+                    connection.evaluate::<usize>(
+                        "(() => document.body ? document.body.innerText.trim().length : 0)()",
+                    )
+                })
+                .unwrap_or_default();
+                if body_text_len > 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
             return Ok(LiveSwitchResult {
                 email: current_account
                     .as_ref()
