@@ -546,8 +546,8 @@ fn terminate_child(child: &mut Child) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-                child.kill().context("terminate child process")?;
-                child.wait().context("wait for child process termination")?;
+            child.kill().context("terminate child process")?;
+            child.wait().context("wait for child process termination")?;
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));

@@ -28,7 +28,9 @@ fn spawn_usage_server(
     target_body: String,
 ) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind usage server");
-    listener.set_nonblocking(true).expect("set usage server nonblocking");
+    listener
+        .set_nonblocking(true)
+        .expect("set usage server nonblocking");
     let address = listener.local_addr().expect("usage server address");
     let handle = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -194,7 +196,11 @@ if (requestFileIndex !== -1) {
     )?;
 
     // Create a dummy workflow file
-    let workflow_dir = sandbox.join(".fast-browser").join("workflows").join("web").join("auth.openai.com");
+    let workflow_dir = sandbox
+        .join(".fast-browser")
+        .join("workflows")
+        .join("web")
+        .join("auth.openai.com");
     fs::create_dir_all(&workflow_dir)?;
     let workflow_file = workflow_dir.join("codex-rotate-account-flow-main.yaml");
     fs::copy(
@@ -205,52 +211,52 @@ if (requestFileIndex !== -1) {
     // We must provide the correct environment to the WatchTriggerHarness.
     // The harness uses the current process environment variables inside resolve_paths().
     // We set them for the current test.
-    let _env_guard = env_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
 
     let source_usage_body = serde_json::json!({
-            "user_id": source_account.account_id.clone(),
-            "account_id": source_account.account_id.clone(),
-            "email": source_account.email.clone(),
-            "plan_type": source_account.plan_type.clone(),
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": true,
-                "primary_window": {
-                    "used_percent": 100.0,
-                    "limit_window_seconds": 10800,
-                    "reset_after_seconds": 3600,
-                    "reset_at": 1729600000
-                },
-                "secondary_window": null
+        "user_id": source_account.account_id.clone(),
+        "account_id": source_account.account_id.clone(),
+        "email": source_account.email.clone(),
+        "plan_type": source_account.plan_type.clone(),
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": true,
+            "primary_window": {
+                "used_percent": 100.0,
+                "limit_window_seconds": 10800,
+                "reset_after_seconds": 3600,
+                "reset_at": 1729600000
             },
-            "code_review_rate_limit": null,
-            "additional_rate_limits": null,
-            "credits": null,
-            "promo": null
-        }).to_string();
+            "secondary_window": null
+        },
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": null,
+        "promo": null
+    })
+    .to_string();
     let target_usage_body = serde_json::json!({
-            "user_id": target_account.account_id.clone(),
-            "account_id": target_account.account_id.clone(),
-            "email": target_account.email.clone(),
-            "plan_type": target_account.plan_type.clone(),
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": false,
-                "primary_window": {
-                    "used_percent": 25.0,
-                    "limit_window_seconds": 10800,
-                    "reset_after_seconds": 3600,
-                    "reset_at": 1729600000
-                },
-                "secondary_window": null
+        "user_id": target_account.account_id.clone(),
+        "account_id": target_account.account_id.clone(),
+        "email": target_account.email.clone(),
+        "plan_type": target_account.plan_type.clone(),
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 25.0,
+                "limit_window_seconds": 10800,
+                "reset_after_seconds": 3600,
+                "reset_at": 1729600000
             },
-            "code_review_rate_limit": null,
-            "additional_rate_limits": null,
-            "credits": null,
-            "promo": null
-        }).to_string();
+            "secondary_window": null
+        },
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": null,
+        "promo": null
+    })
+    .to_string();
 
     let (usage_url, _usage_handle) = spawn_usage_server(
         source_account.account_id.clone(),
@@ -297,19 +303,24 @@ if (requestFileIndex !== -1) {
     let result = harness.trigger_now()?;
     println!("finished watch trigger iteration");
     println!("Watch iteration result: {:#?}", result);
-    
+
     // Assert rotation happened successfully
-    assert!(result.rotated, "Watch trigger should have performed a rotation.");
+    assert!(
+        result.rotated,
+        "Watch trigger should have performed a rotation."
+    );
     assert_eq!(result.current_account_id, target_account.account_id);
-    
+
     // Verify pool active index updated
     let pool = load_pool()?;
     assert_eq!(pool.active_index, 1);
-    
+
     // Verify symlink updated to target persona
     let current_home_link = fs::read_link(&codex_home).context("read codex_home symlink")?;
     let target_persona = target_account.persona.as_ref().unwrap();
-    let expected_home = rotate_home.join(target_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
+    let expected_home = rotate_home
+        .join(target_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
     assert_eq!(current_home_link, expected_home);
 
     // Verify auth was saved for the target persona
@@ -458,7 +469,11 @@ if (requestFileIndex !== -1) {
     )?;
 
     // Create a dummy workflow file
-    let workflow_dir = sandbox.join(".fast-browser").join("workflows").join("web").join("auth.openai.com");
+    let workflow_dir = sandbox
+        .join(".fast-browser")
+        .join("workflows")
+        .join("web")
+        .join("auth.openai.com");
     fs::create_dir_all(&workflow_dir)?;
     let workflow_file = workflow_dir.join("codex-rotate-account-flow-main.yaml");
     fs::copy(
@@ -469,52 +484,52 @@ if (requestFileIndex !== -1) {
     // We must provide the correct environment to the WatchTriggerHarness.
     // The harness uses the current process environment variables inside resolve_paths().
     // We set them for the current test.
-    let _env_guard = env_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
 
     let source_usage_body = serde_json::json!({
-            "user_id": source_account.account_id.clone(),
-            "account_id": source_account.account_id.clone(),
-            "email": source_account.email.clone(),
-            "plan_type": source_account.plan_type.clone(),
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": true,
-                "primary_window": {
-                    "used_percent": 100.0,
-                    "limit_window_seconds": 10800,
-                    "reset_after_seconds": 3600,
-                    "reset_at": 1729600000
-                },
-                "secondary_window": null
+        "user_id": source_account.account_id.clone(),
+        "account_id": source_account.account_id.clone(),
+        "email": source_account.email.clone(),
+        "plan_type": source_account.plan_type.clone(),
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": true,
+            "primary_window": {
+                "used_percent": 100.0,
+                "limit_window_seconds": 10800,
+                "reset_after_seconds": 3600,
+                "reset_at": 1729600000
             },
-            "code_review_rate_limit": null,
-            "additional_rate_limits": null,
-            "credits": null,
-            "promo": null
-        }).to_string();
+            "secondary_window": null
+        },
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": null,
+        "promo": null
+    })
+    .to_string();
     let target_usage_body = serde_json::json!({
-            "user_id": target_account.account_id.clone(),
-            "account_id": target_account.account_id.clone(),
-            "email": target_account.email.clone(),
-            "plan_type": target_account.plan_type.clone(),
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": false,
-                "primary_window": {
-                    "used_percent": 25.0,
-                    "limit_window_seconds": 10800,
-                    "reset_after_seconds": 3600,
-                    "reset_at": 1729600000
-                },
-                "secondary_window": null
+        "user_id": target_account.account_id.clone(),
+        "account_id": target_account.account_id.clone(),
+        "email": target_account.email.clone(),
+        "plan_type": target_account.plan_type.clone(),
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 25.0,
+                "limit_window_seconds": 10800,
+                "reset_after_seconds": 3600,
+                "reset_at": 1729600000
             },
-            "code_review_rate_limit": null,
-            "additional_rate_limits": null,
-            "credits": null,
-            "promo": null
-        }).to_string();
+            "secondary_window": null
+        },
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": null,
+        "promo": null
+    })
+    .to_string();
 
     let (usage_url, _usage_handle) = spawn_usage_server(
         source_account.account_id.clone(),
@@ -557,33 +572,42 @@ if (requestFileIndex !== -1) {
     eprintln!("watch_trigger_e2e: inserting usage signal");
     harness.insert_usage_limit_signal(1, 1000)?;
 
-
     // INJECT FAILURE: Make target codex-home read-only so activation fails
     let target_persona = target_account.persona.as_ref().unwrap();
-    let expected_home = rotate_home.join(target_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
+    let expected_home = rotate_home
+        .join(target_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
     fs::create_dir_all(&expected_home)?;
     let mut perms = fs::metadata(&expected_home)?.permissions();
     perms.set_readonly(true);
     fs::set_permissions(&expected_home, perms)?;
 
     let result = harness.trigger_now();
-    assert!(result.is_err(), "Watch trigger should have failed during activation.");
+    assert!(
+        result.is_err(),
+        "Watch trigger should have failed during activation."
+    );
     let err_msg = format!("{:#}", result.unwrap_err());
-    assert!(err_msg.contains("Permission denied") || err_msg.contains("Read-only file system"), "Unexpected error: {}", err_msg);
+    assert!(
+        err_msg.contains("Permission denied") || err_msg.contains("Read-only file system"),
+        "Unexpected error: {}",
+        err_msg
+    );
 
     // Verify rollback semantics
     let pool = load_pool()?;
     assert_eq!(pool.active_index, 0);
     let current_home_link = fs::read_link(&codex_home).context("read codex_home symlink")?;
     let source_persona = source_account.persona.as_ref().unwrap();
-    let source_home = rotate_home.join(source_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
+    let source_home = rotate_home
+        .join(source_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
     assert_eq!(current_home_link, source_home);
 
     // Restore permissions so cleanup can succeed
     let mut perms = fs::metadata(&expected_home)?.permissions();
     perms.set_readonly(false);
     fs::set_permissions(&expected_home, perms)?;
-
 
     // Clean up environment
     unsafe {

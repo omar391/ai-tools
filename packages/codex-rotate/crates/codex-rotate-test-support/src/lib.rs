@@ -5,25 +5,25 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 mod account_state;
+mod app_server;
 mod artifact_capture;
 mod managed_browser_opener;
 mod watch_trigger;
-mod app_server;
 
 pub use account_state::{
     stable_test_accounts, test_account, test_auth, test_persona, test_vm_environment,
     IsolatedAccountStateFixture, IsolatedAccountStateFixtureBuilder,
 };
-pub use managed_browser_opener::{
-    FakeManagedBrowserOpenerFixture, FakeManagedBrowserOpenerFixtureBuilder,
-    FakeManagedBrowserOpenerLaunchFailure, FakeManagedBrowserOpenerInstallGuard,
-};
-pub use watch_trigger::{WatchSignalRow, WatchTriggerHarness};
 pub use app_server::{
     FakeCodexAppServerFixture, FakeCodexAppServerFixtureBuilder, FakeCodexAppServerOutcome,
     FakeCodexAppServerRequest,
 };
 pub use artifact_capture::{FailureArtifactBundle, FailureArtifactCapture};
+pub use managed_browser_opener::{
+    FakeManagedBrowserOpenerFixture, FakeManagedBrowserOpenerFixtureBuilder,
+    FakeManagedBrowserOpenerInstallGuard, FakeManagedBrowserOpenerLaunchFailure,
+};
+pub use watch_trigger::{WatchSignalRow, WatchTriggerHarness};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IsolatedHomePaths {
@@ -235,8 +235,8 @@ mod tests {
     #[test]
     fn install_sets_and_restores_isolated_home_environment() -> Result<()> {
         let _guard = env_mutex()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let previous_home = std::env::var_os("HOME");
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");

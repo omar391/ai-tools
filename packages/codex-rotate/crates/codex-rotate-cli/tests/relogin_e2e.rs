@@ -89,25 +89,31 @@ process.stdout.write(JSON.stringify({ ok: true, profile: event.profile, browser:
     write_executable(&fake_open_bin.join("xdg-open"), &trap_script)?;
 
     let call_log = sandbox.join("relogin-calls.log");
-    
+
     // Update accounts.json (CredentialStore) to include families and domain state
     let mut state_json = fixture.read_state()?;
     if let serde_json::Value::Object(ref mut map) = state_json {
         map.insert("version".to_string(), serde_json::json!(9));
-        map.insert("families".to_string(), serde_json::json!({
-            "default:dev.{n}@astronlab.com": {
-                "profile_name": "default",
-                "template": "dev.{n}@astronlab.com",
-                "next_suffix": 3,
-                "created_at": "2026-04-07T00:00:00.000Z",
-                "updated_at": "2026-04-07T00:00:00.000Z"
-            }
-        }));
-        map.insert("domain".to_string(), serde_json::json!({
-            "astronlab.com": {
-                "rotation_enabled": true
-            }
-        }));
+        map.insert(
+            "families".to_string(),
+            serde_json::json!({
+                "default:dev.{n}@astronlab.com": {
+                    "profile_name": "default",
+                    "template": "dev.{n}@astronlab.com",
+                    "next_suffix": 3,
+                    "created_at": "2026-04-07T00:00:00.000Z",
+                    "updated_at": "2026-04-07T00:00:00.000Z"
+                }
+            }),
+        );
+        map.insert(
+            "domain".to_string(),
+            serde_json::json!({
+                "astronlab.com": {
+                    "rotation_enabled": true
+                }
+            }),
+        );
     }
     fs::write(fixture.state_path(), serde_json::to_string(&state_json)?)?;
 
@@ -171,7 +177,7 @@ if (process.argv.includes('app-server')) {
 "#,
     )?;
     write_executable(&fake_codex, &fs::read_to_string(&fake_codex)?)?;
-    
+
     // We need to mock automation-bridge for relogin if it uses it.
     let fake_bridge = sandbox.join("fake-bridge.mjs");
     fs::write(
@@ -212,7 +218,11 @@ if (requestFileIndex !== -1) {
     write_executable(&fake_bridge, &fs::read_to_string(&fake_bridge)?)?;
 
     // Create a dummy workflow file
-    let workflow_dir = sandbox.join(".fast-browser").join("workflows").join("web").join("auth.openai.com");
+    let workflow_dir = sandbox
+        .join(".fast-browser")
+        .join("workflows")
+        .join("web")
+        .join("auth.openai.com");
     fs::create_dir_all(&workflow_dir)?;
     let workflow_file = workflow_dir.join("codex-rotate-account-flow-main.yaml");
     fs::copy(
@@ -234,31 +244,49 @@ if (requestFileIndex !== -1) {
         .env("CODEX_ROTATE_CLI_BIN", cli_binary())
         .env("CODEX_ROTATE_AUTOMATION_BRIDGE", &fake_bridge)
         .env("CODEX_ROTATE_ACCOUNT_FLOW_FILE", &workflow_file)
+        .env("CODEX_ROTATE_BROWSER_SHIM_LOG", &browser_shim_log)
         .env(
-            "CODEX_ROTATE_BROWSER_SHIM_LOG",
-            &browser_shim_log,
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_open_bin.display(),
+                std::env::var_os("PATH")
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ),
         )
-        .env("PATH", format!(
-            "{}:{}",
-            fake_open_bin.display(),
-            std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
-        ))
         .output()?;
 
     if !result.status.success() {
-        eprintln!("relogin stdout: {}", String::from_utf8_lossy(&result.stdout));
-        eprintln!("relogin stderr: {}", String::from_utf8_lossy(&result.stderr));
+        eprintln!(
+            "relogin stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        eprintln!(
+            "relogin stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
-    assert!(result.status.success(), "relogin failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "relogin failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
     // Verify that the fake codex was called with the target persona's CODEX_HOME
     println!("Checking call log at {}", call_log.display());
     let calls = fs::read_to_string(&call_log).context("read call log")?;
     let target_persona = target_account.persona.as_ref().unwrap();
-    let expected_home = rotate_home.join(&target_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
-    
-    assert!(calls.contains(&expected_home.to_string_lossy().to_string()), 
-        "Expected call with {}, but got:\n{}", expected_home.display(), calls);
+    let expected_home = rotate_home
+        .join(&target_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
+
+    assert!(
+        calls.contains(&expected_home.to_string_lossy().to_string()),
+        "Expected call with {}, but got:\n{}",
+        expected_home.display(),
+        calls
+    );
 
     let browser_shim_log_contents =
         fs::read_to_string(&browser_shim_log).context("read browser shim log")?;
@@ -273,7 +301,9 @@ if (requestFileIndex !== -1) {
         browser_shim_log_contents
     );
     assert!(
-        browser_shim_log_contents.contains("http://localhost:1455/auth/callback?redirect_uri=http://localhost:1455/callback"),
+        browser_shim_log_contents.contains(
+            "http://localhost:1455/auth/callback?redirect_uri=http://localhost:1455/callback"
+        ),
         "expected opener URL to be routed through the managed browser shim, log was:\n{}",
         browser_shim_log_contents
     );
@@ -288,12 +318,14 @@ if (requestFileIndex !== -1) {
     // Verify that after relogin, the active persona is restored to the original one (index 0)
     let state = fixture.read_state()?;
     assert_eq!(state["active_index"], 0);
-    
+
     // Check live symlink
     println!("Checking symlink at {}", codex_home.display());
     let current_home_link = fs::read_link(&codex_home).context("read codex_home symlink")?;
     let original_persona = accounts[0].persona.as_ref().unwrap();
-    let original_expected_home = rotate_home.join(original_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
+    let original_expected_home = rotate_home
+        .join(original_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
     assert_eq!(current_home_link, original_expected_home);
 
     Ok(())

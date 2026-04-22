@@ -759,6 +759,32 @@ fn decide_rotation(
     let paths = resolve_paths()?;
     let signals = read_codex_signals(&paths.codex_logs_db_file, after_signal_id, 50)?;
     let last_signal_id = signals.last().map(|signal| signal.id).or(after_signal_id);
+
+    let disabled_domains = codex_rotate_core::workflow::load_disabled_rotation_domains()?;
+    if let Some(domain) = codex_rotate_core::workflow::extract_email_domain(&summary.email) {
+        if disabled_domains.contains(&domain) {
+            let blocker = format!("account domain {} is disabled", domain);
+            let assessment = DecisionQuotaAssessment {
+                summary: blocker.clone(),
+                usable: false,
+                blocker: Some(blocker.clone()),
+                primary_quota_left_percent: None,
+            };
+            return Ok((
+                RotationDecision {
+                    last_signal_id,
+                    signals,
+                    assessment: Some(assessment),
+                    assessment_error: None,
+                    should_rotate: true,
+                    reason: Some(blocker),
+                    rotation_command: Some(RotationCommand::Next),
+                },
+                None,
+            ));
+        }
+    }
+
     let cache_invalidated = quota_cache_invalidated(previous_cache, &summary.account_id, &signals)?;
 
     let quota_cache = if force_quota_refresh || cache_invalidated {
