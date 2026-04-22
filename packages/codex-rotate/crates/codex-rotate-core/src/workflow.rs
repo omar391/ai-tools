@@ -5728,6 +5728,26 @@ pub fn record_deleted_account(email: &str) -> Result<bool> {
     Ok(dirty)
 }
 
+pub(crate) fn family_has_deleted_array_for_account(email: &str) -> Result<bool> {
+    let paths = resolve_paths()?;
+    let raw_state = serde_json::from_str::<Value>(
+        &fs::read_to_string(&paths.pool_file)
+            .with_context(|| format!("Failed to read {}.", paths.pool_file.display()))?,
+    )
+    .with_context(|| format!("Failed to parse {} as JSON.", paths.pool_file.display()))?;
+    let store = normalize_credential_store(raw_state.clone());
+    let Some(family_match) = select_family_for_account_email(&store, email) else {
+        return Ok(false);
+    };
+
+    Ok(raw_state
+        .get("families")
+        .and_then(Value::as_object)
+        .and_then(|families| families.get(&family_match.key))
+        .and_then(Value::as_object)
+        .is_some_and(|family| family.contains_key("deleted")))
+}
+
 pub fn extract_email_domain(email: &str) -> Option<String> {
     let normalized = normalize_email_key(email);
     let (_, domain) = normalized.split_once('@')?;

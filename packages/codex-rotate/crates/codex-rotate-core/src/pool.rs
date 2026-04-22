@@ -27,7 +27,7 @@ use crate::state::write_rotate_state_json;
 use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 use crate::workflow::{
     auto_disable_domain_for_account, cmd_create, cmd_create_with_progress,
-    create_next_fallback_options, extract_email_domain,
+    create_next_fallback_options, extract_email_domain, family_has_deleted_array_for_account,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
     reconcile_added_account_credential_state, record_deleted_account,
 };
@@ -118,8 +118,9 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     let Some(entry) = pool.accounts.get(index).cloned() else {
         return Ok(false);
     };
+    let should_disable_domain = family_has_deleted_array_for_account(&entry.email)?;
     let deleted = record_deleted_account(&entry.email)?;
-    if deleted {
+    if deleted && should_disable_domain {
         auto_disable_domain_for_account(&entry.email)?;
     }
     Ok(deleted)
@@ -3275,6 +3276,42 @@ mod tests {
         write_rotate_state_json(&state)
     }
 
+    fn terminal_cleanup_account(email: &str) -> AccountEntry {
+        let mut entry = stored_entry(Some(false), Some("2026-04-07T01:00:00.000Z"));
+        entry.email = email.to_string();
+        entry.account_id = "acct-terminal".to_string();
+        entry.last_quota_blocker = Some("refresh token has been invalidated".to_string());
+        entry
+    }
+
+    fn write_terminal_cleanup_state(family_field: &str) -> Result<()> {
+        let mut family = json!({
+            "profile_name": "dev-1",
+            "template": "dev.{n}@astronlab.com",
+            "next_suffix": 2,
+            "created_at": "2026-04-05T00:00:00.000Z",
+            "updated_at": "2026-04-05T00:00:00.000Z",
+            "last_created_email": "dev.1@astronlab.com",
+        });
+        family[family_field] = json!([]);
+        write_rotate_state_json(&json!({
+            "accounts": [terminal_cleanup_account("dev.1@astronlab.com")],
+            "active_index": 0,
+            "version": 7,
+            "default_create_template": "dev.{n}@astronlab.com",
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": family
+            },
+            "pending": {},
+            "skipped": [],
+            "domain": {
+                "astronlab.com": {
+                    "rotation_enabled": true
+                }
+            }
+        }))
+    }
+
     #[test]
     fn save_pool_preserves_credential_store_sections() {
         let _guard = RotateHomeGuard::enter("codex-rotate-save-pool-preserve");
@@ -3340,6 +3377,48 @@ mod tests {
         );
         assert_eq!(state["active_index"], json!(1));
         assert_eq!(state["accounts"][1]["email"], json!("dev.2@astronlab.com"));
+    }
+
+    #[test]
+    fn prune_terminal_accounts_does_not_disable_domain_for_relogin_only_families() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-relogin-only");
+        write_terminal_cleanup_state("relogin").expect("write relogin-only state");
+
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![terminal_cleanup_account("dev.1@astronlab.com")],
+        };
+
+        let changed =
+            prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
+        assert!(changed);
+
+        let state = load_rotate_state_json().expect("load rotate state");
+        assert_eq!(
+            state["domain"]["astronlab.com"]["rotation_enabled"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn prune_terminal_accounts_disables_domain_for_legacy_deleted_families() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-deleted");
+        write_terminal_cleanup_state("deleted").expect("write deleted state");
+
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![terminal_cleanup_account("dev.1@astronlab.com")],
+        };
+
+        let changed =
+            prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
+        assert!(changed);
+
+        let state = load_rotate_state_json().expect("load rotate state");
+        assert_eq!(
+            state["domain"]["astronlab.com"]["rotation_enabled"],
+            json!(false)
+        );
     }
 
     #[test]
