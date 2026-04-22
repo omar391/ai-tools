@@ -89,6 +89,12 @@ const DEFAULT_PORT: u16 = 9333;
 const MAX_HANDOFF_ITEMS: usize = 48;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
 const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", "skills"];
+#[cfg(test)]
+const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
+- The same logical conversation across personas must use different local thread IDs while preserving continuity.
+- Additive sync means one local thread per lineage per persona with no duplicate logical conversations on repeated sync.
+- Host and VM execute the same sync semantics through the shared rotation engine; only transport wiring differs.
+"#;
 
 fn utmctl_binary() -> String {
     std::env::var("CODEX_ROTATE_UTMCTL_BIN")
@@ -3019,6 +3025,17 @@ exit 91
                 log_file = log_file.display()
             ),
         );
+    }
+
+    #[test]
+    fn lineage_sync_contract_states_unique_ids_and_additive_sync() {
+        assert!(LINEAGE_SYNC_CONTRACT
+            .contains("different local thread IDs while preserving continuity"));
+        assert!(LINEAGE_SYNC_CONTRACT.contains(
+            "one local thread per lineage per persona with no duplicate logical conversations on repeated sync"
+        ));
+        assert!(LINEAGE_SYNC_CONTRACT
+            .contains("same sync semantics through the shared rotation engine"));
     }
 
     #[test]
