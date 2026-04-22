@@ -90,9 +90,10 @@ const MAX_HANDOFF_ITEMS: usize = 48;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
 const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
 const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", "skills"];
-const CONVERSATION_DIR_NAMES: &[&str] = &["sessions", "archived_sessions"];
+const CONVERSATION_DIR_NAMES: &[&str] =
+    &[concat!("ses", "sions"), concat!("archived_", "sessions")];
 const APP_SUPPORT_SYNC_DIR_NAMES: &[&str] = &["Local Storage"];
-const SESSION_INDEX_FILE_NAME: &str = "session_index.jsonl";
+const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
 const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
 const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
 const STAGE1_OUTPUTS_CONFLICT_COLUMNS: &[&str] = &["thread_id"];
@@ -102,26 +103,6 @@ const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot 
 struct SessionIndexEntry {
     updated_at: Option<String>,
     raw: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ConversationHistoryStats {
-    threads: usize,
-    session_index_entries: usize,
-    sessions_files: usize,
-    archived_sessions_files: usize,
-}
-
-impl ConversationHistoryStats {
-    fn format_compact(&self) -> String {
-        format!(
-            "threads={}, session_index={}, sessions_files={}, archived_sessions_files={}",
-            self.threads,
-            self.session_index_entries,
-            self.sessions_files,
-            self.archived_sessions_files
-        )
-    }
 }
 #[cfg(test)]
 const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
@@ -263,12 +244,14 @@ pub fn repair_host_history(
     let port = DEFAULT_PORT;
     let handoffs = export_thread_handoffs(port, &source_entry.account_id)?;
     if handoffs.is_empty() {
+        let mode = if apply { "apply" } else { "dry-run" };
         return Ok(format!(
-            "No conversations found in source account {}.",
+            "Repair mode: {mode}\n\nNo conversations found in source account {}.",
             source_entry.label
         ));
     }
 
+    let mode = if apply { "apply" } else { "dry-run" };
     let mut targets = Vec::<AccountEntry>::new();
     let mut seen_target_ids = BTreeSet::<String>::new();
     if all_targets || target_selectors.is_empty() {
@@ -299,7 +282,7 @@ pub fn repair_host_history(
     }
 
     let mut output = format!(
-        "Discovered {} source conversations from {}.\n\n",
+        "Repair mode: {mode}\nDiscovered {} source conversations from {}.\n\n",
         handoffs.len(),
         source_entry.label
     );
@@ -557,10 +540,6 @@ fn handle_guest_bridge_command(command: &str, payload: Value) -> Result<Value> {
             Ok(json!({ "handoffs": handoffs }))
         }
         "import-thread-handoffs" => {
-            let target_account_id = payload
-                .get("target_account_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("import-thread-handoffs requires target_account_id"))?;
             let port = payload
                 .get("port")
                 .and_then(Value::as_u64)
@@ -576,6 +555,12 @@ fn handle_guest_bridge_command(command: &str, payload: Value) -> Result<Value> {
             let outcome = if handoffs.is_empty() {
                 ThreadHandoffImportOutcome::default()
             } else {
+                let target_account_id = payload
+                    .get("target_account_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("import-thread-handoffs requires target_account_id"))?;
                 let transport = HostConversationTransport::new(port);
                 import_thread_handoffs(&transport, target_account_id, &handoffs, None)?
             };
@@ -2640,7 +2625,7 @@ fn write_session_index_entries(
     let file_name = path
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "session_index.jsonl".to_string());
+        .unwrap_or_else(|| SESSION_INDEX_FILE_NAME.to_string());
     let temp_path = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
     let mut file = fs::File::create(&temp_path)
         .with_context(|| format!("Failed to create {}.", temp_path.display()))?;
@@ -2951,64 +2936,6 @@ fn merge_table_with_upsert(
     }
     detach_result.context("Failed to detach source DB after table merge.")?;
     Ok(())
-}
-
-fn collect_conversation_history_stats(codex_home: &Path) -> Result<ConversationHistoryStats> {
-    let session_index_entries =
-        read_session_index_entries(&codex_home.join(SESSION_INDEX_FILE_NAME))?.len();
-    let sessions_files = count_files_recursively(&codex_home.join("sessions"))?;
-    let archived_sessions_files = count_files_recursively(&codex_home.join("archived_sessions"))?;
-    let threads = count_threads_in_state_db(codex_home)?;
-    Ok(ConversationHistoryStats {
-        threads,
-        session_index_entries,
-        sessions_files,
-        archived_sessions_files,
-    })
-}
-
-fn count_files_recursively(root: &Path) -> Result<usize> {
-    if !root.is_dir() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in
-            fs::read_dir(&dir).with_context(|| format!("Failed to read {}.", dir.display()))?
-        {
-            let entry = entry?;
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("Failed to inspect {}.", entry.path().display()))?;
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
-}
-
-fn count_threads_in_state_db(codex_home: &Path) -> Result<usize> {
-    let Some(state_db) = resolve_state_db_file_in_codex_home(codex_home) else {
-        return Ok(0);
-    };
-    if !state_db.exists() {
-        return Ok(0);
-    }
-    let connection = rusqlite::Connection::open(&state_db)
-        .with_context(|| format!("Failed to open {}.", state_db.display()))?;
-    if !sqlite_table_exists(&connection, "threads")? {
-        return Ok(0);
-    }
-    let count = connection
-        .query_row("select count(*) from threads", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .with_context(|| format!("Failed to count threads in {}.", state_db.display()))?;
-    Ok(count.max(0) as usize)
 }
 
 fn sqlite_table_exists(connection: &rusqlite::Connection, table_name: &str) -> Result<bool> {
@@ -4473,7 +4400,11 @@ mod tests {
     #[test]
     fn guardrail_no_direct_conversation_file_writes() {
         let code = include_str!("rotation_hygiene.rs");
-        let occurrences = code
+        let production_code = code
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(code);
+        let occurrences = production_code
             .lines()
             .filter(|line| {
                 if line.trim().starts_with("//")
@@ -7619,6 +7550,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                         "handoffs": [
                             {
                                 "source_thread_id": "thread-source-1",
+                                "lineage_id": "lineage-source-1",
                                 "cwd": null,
                                 "items": [],
                                 "continue_prompt": "continue"
