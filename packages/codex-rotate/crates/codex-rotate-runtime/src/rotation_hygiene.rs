@@ -4902,7 +4902,11 @@ insert into threads (id, rollout_path, updated_at, archived) values
             persist_pool: false,
         };
 
-        let error = activate_host_rotation(&paths, &prepared, 9333, None)
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let port = probe.local_addr().expect("probe local addr").port();
+        drop(probe);
+
+        let error = activate_host_rotation(&paths, &prepared, port, None)
             .expect_err("host activation should fail after commit");
         let message = format!("{:#}", error);
         assert!(!message.trim().is_empty());
