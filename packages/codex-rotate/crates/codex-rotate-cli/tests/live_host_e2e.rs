@@ -12,7 +12,9 @@ use codex_rotate_runtime::launcher::ensure_debug_codex_instance;
 use codex_rotate_runtime::live_checks::{
     load_live_staging_accounts, require_host_live_capabilities, LiveStagingAccount,
 };
-use codex_rotate_runtime::log_isolation::{managed_codex_is_running, stop_managed_codex_instance};
+use codex_rotate_runtime::log_isolation::{
+    managed_codex_is_running, managed_codex_root_pids, stop_managed_codex_instance,
+};
 use codex_rotate_runtime::paths::{resolve_paths, RuntimePaths};
 use codex_rotate_runtime::rotation_hygiene::{
     rotate_next as run_shared_next, rotate_prev as run_shared_prev,
@@ -1326,6 +1328,7 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
 
         ensure_debug_codex_instance(None, Some(port), None, None)
             .context("failed to launch managed Codex for full-flow setup")?;
+        let pre_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
 
         let source_auth = load_codex_auth(&paths.codex_auth_file)
             .context("failed to read source auth during full-flow setup")?;
@@ -1431,6 +1434,12 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
             managed_codex_is_running(&paths.debug_profile_dir)?,
             "expected managed Codex to be running after watch-triggered rotation"
         );
+        let post_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
+        ensure!(
+            post_rotation_root_pid != pre_rotation_root_pid,
+            "expected watch-triggered rotation to relaunch managed Codex with a new root pid, but pid stayed {}",
+            pre_rotation_root_pid
+        );
 
         let target_auth = load_codex_auth(&paths.codex_auth_file)
             .context("failed to read target auth after watch-triggered rotation")?;
@@ -1440,6 +1449,26 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
             "expected rotated auth email {}, got {}",
             expected_target_email,
             target_summary.email
+        );
+        let rotated_pool =
+            load_pool().context("failed to load pool after watch-triggered rotation")?;
+        let rotated_persona = rotated_pool
+            .accounts
+            .get(rotated_pool.active_index)
+            .and_then(|entry| entry.persona.as_ref())
+            .context("rotated account missing persona metadata after watch-triggered rotation")?;
+        let target_config_path = paths
+            .rotate_home
+            .join(rotated_persona.host_root_rel_path.as_ref().context(
+                "rotated persona missing host_root_rel_path after watch-triggered rotation",
+            )?)
+            .join("codex-home")
+            .join("config.toml");
+        ensure!(
+            config_contains_project(&target_config_path, &source_cwd)?,
+            "expected rotated target config {} to register synced project cwd {}",
+            target_config_path.display(),
+            source_cwd
         );
 
         let target_active_threads = wait_for_active_threads_with_marker(port, &active_marker)?;
@@ -2117,6 +2146,41 @@ fn wait_for_active_threads_with_marker(port: u16, marker: &str) -> Result<Vec<(S
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn managed_root_pid(profile_dir: &Path) -> Result<u32> {
+    let mut root_pids = managed_codex_root_pids(profile_dir)?;
+    root_pids.sort_unstable();
+    root_pids.into_iter().next().context(format!(
+        "expected a managed Codex root pid for profile {}",
+        profile_dir.display()
+    ))
+}
+
+fn config_contains_project(path: &Path, project_path: &str) -> Result<bool> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(contents.contains(&format!(
+        "[projects.\"{}\"]",
+        encode_toml_basic_string(project_path)
+    )))
+}
+
+fn encode_toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn archive_thread_in_state_db(state_db_path: &Path, thread_id: &str) -> Result<()> {

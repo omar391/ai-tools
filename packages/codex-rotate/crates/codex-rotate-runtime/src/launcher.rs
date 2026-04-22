@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 
 use crate::cdp::is_cdp_page_ready;
+use crate::log_isolation::managed_codex_root_pids;
 use crate::paths::resolve_paths;
+use crate::runtime_log::log_daemon_info;
 
 const DISABLE_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH";
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -24,7 +26,12 @@ pub fn ensure_debug_codex_instance(
     let port = port.unwrap_or(9333);
     let profile_dir = profile_dir.unwrap_or(&paths.debug_profile_dir);
 
-    if is_cdp_page_ready(port) {
+    if managed_codex_instance_ready(port, profile_dir)? {
+        log_daemon_info(format!(
+            "Managed Codex instance already ready for profile {} on port {}.",
+            profile_dir.display(),
+            port
+        ));
         return Ok(());
     }
 
@@ -36,6 +43,11 @@ pub fn ensure_debug_codex_instance(
         .with_context(|| format!("Failed to create {}.", paths.rotate_home.display()))?;
     std::fs::create_dir_all(profile_dir)
         .with_context(|| format!("Failed to create {}.", profile_dir.display()))?;
+    log_daemon_info(format!(
+        "Relaunching managed Codex for profile {} on port {}.",
+        profile_dir.display(),
+        port
+    ));
 
     #[cfg(target_os = "macos")]
     let output = Command::new("open")
@@ -68,16 +80,33 @@ pub fn ensure_debug_codex_instance(
 
     let deadline = Instant::now() + Duration::from_millis(wait_ms.unwrap_or(15_000));
     while Instant::now() < deadline {
-        if is_cdp_page_ready(port) {
+        if managed_codex_instance_ready(port, profile_dir)? {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(500));
     }
 
     Err(anyhow!(
-        "Codex did not expose a remote debugging target on port {}.",
-        port
+        "Codex did not expose a managed remote debugging target on port {} for profile {}.",
+        port,
+        profile_dir.display()
     ))
+}
+
+fn managed_codex_instance_ready(port: u16, profile_dir: &Path) -> Result<bool> {
+    let has_cdp_page = is_cdp_page_ready(port);
+    let has_matching_profile_process = !managed_codex_root_pids(profile_dir)?.is_empty();
+    Ok(managed_codex_instance_ready_state(
+        has_cdp_page,
+        has_matching_profile_process,
+    ))
+}
+
+fn managed_codex_instance_ready_state(
+    has_cdp_page: bool,
+    has_matching_profile_process: bool,
+) -> bool {
+    has_cdp_page && has_matching_profile_process
 }
 
 fn managed_launch_disabled_reason() -> Option<&'static str> {
@@ -189,7 +218,7 @@ fn cleanup_tracked_test_managed_launches() -> Result<()> {
         .clone();
 
     for profile_dir in profiles {
-        let root_pids = managed_codex_root_pids_for_profile(&profile_dir)?;
+        let root_pids = managed_codex_root_pids(&profile_dir)?;
         if root_pids.is_empty() {
             continue;
         }
@@ -201,21 +230,6 @@ fn cleanup_tracked_test_managed_launches() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn managed_codex_root_pids_for_profile(profile_dir: &Path) -> Result<Vec<u32>> {
-    let profile_marker = format!("--user-data-dir={}", profile_dir.display());
-    Ok(list_processes()?
-        .into_iter()
-        .filter(|process| {
-            process
-                .command
-                .contains("/Applications/Codex.app/Contents/MacOS/Codex")
-                && process.command.contains(&profile_marker)
-        })
-        .map(|process| process.pid)
-        .collect())
 }
 
 #[cfg(target_os = "macos")]
@@ -422,5 +436,13 @@ mod tests {
         assert!(!path_looks_like_rust_test_binary(Path::new(
             "/repo/target/debug/codex-rotate"
         )));
+    }
+
+    #[test]
+    fn managed_instance_ready_state_requires_cdp_and_profile_process() {
+        assert!(!managed_codex_instance_ready_state(false, false));
+        assert!(!managed_codex_instance_ready_state(true, false));
+        assert!(!managed_codex_instance_ready_state(false, true));
+        assert!(managed_codex_instance_ready_state(true, true));
     }
 }

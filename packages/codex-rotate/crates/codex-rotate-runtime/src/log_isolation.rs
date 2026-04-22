@@ -19,6 +19,7 @@ use crate::cdp::invalidate_local_codex_connection;
 use crate::launcher::ensure_debug_codex_instance;
 use crate::logs::invalidate_log_connection;
 use crate::paths::resolve_paths;
+use crate::runtime_log::log_daemon_info;
 use crate::thread_recovery::read_active_thread_ids;
 
 const DEFAULT_PORT: u16 = 9333;
@@ -605,7 +606,7 @@ pub fn managed_codex_is_running(profile_dir: &Path) -> Result<bool> {
     Ok(!managed_codex_root_pids(profile_dir)?.is_empty())
 }
 
-fn managed_codex_root_pids(profile_dir: &Path) -> Result<Vec<u32>> {
+pub fn managed_codex_root_pids(profile_dir: &Path) -> Result<Vec<u32>> {
     let profile_marker = format!("--user-data-dir={}", profile_dir.display());
     Ok(list_processes()?
         .into_iter()
@@ -625,6 +626,16 @@ pub fn stop_managed_codex_instance(port: u16, profile_dir: &Path) -> Result<()> 
     if root_pids.is_empty() {
         return Ok(());
     }
+    log_daemon_info(format!(
+        "Stopping managed Codex for profile {} on port {} (pids: {}).",
+        profile_dir.display(),
+        port,
+        root_pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
 
     signal_processes("TERM", &root_pids)?;
     if !wait_for_processes_to_exit(&root_pids, PROCESS_STOP_TIMEOUT)? {

@@ -1924,6 +1924,9 @@ fn switch_host_persona(
     )?;
     // Keep full conversation history mirrored across host personas.
     sync_host_persona_conversation_history(&source.codex_home, &target.codex_home)?;
+    // Keep the Codex project registry aligned with synced thread cwd values so
+    // project-scoped history stays visible in the desktop UI after rotation.
+    sync_host_persona_project_registry(&source.codex_home, &target.codex_home)?;
     // Keep project/sidebar local-storage state mirrored so project-scoped chats stay visible.
     sync_host_persona_app_support_state(
         &source.codex_app_support_dir,
@@ -1943,6 +1946,18 @@ fn sync_host_persona_conversation_history(
     }
     sync_host_persona_conversation_history_one_way(source_codex_home, target_codex_home)?;
     sync_host_persona_conversation_history_one_way(target_codex_home, source_codex_home)?;
+    Ok(())
+}
+
+fn sync_host_persona_project_registry(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+    sync_host_persona_project_registry_one_way(source_codex_home, target_codex_home)?;
+    sync_host_persona_project_registry_one_way(target_codex_home, source_codex_home)?;
     Ok(())
 }
 
@@ -1976,6 +1991,30 @@ fn sync_host_persona_app_support_state_one_way(
     Ok(())
 }
 
+fn sync_host_persona_project_registry_one_way(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    let source_config = source_codex_home.join("config.toml");
+    let target_config = target_codex_home.join("config.toml");
+
+    let source_projects = read_config_project_paths(&source_config)?;
+    let target_projects = read_config_project_paths(&target_config)?;
+    let mut known_projects = source_projects.clone();
+    known_projects.extend(target_projects.iter().cloned());
+
+    let mut candidates = known_projects.clone();
+    candidates.extend(read_thread_cwds_from_codex_home(source_codex_home)?);
+    candidates.extend(read_thread_cwds_from_codex_home(target_codex_home)?);
+
+    let missing_projects = candidates
+        .into_iter()
+        .filter(|path| !target_projects.contains(path))
+        .filter(|path| should_sync_project_path(path, &known_projects))
+        .collect::<Vec<_>>();
+    append_missing_projects_to_config(&target_config, &missing_projects)
+}
+
 fn sync_host_persona_conversation_history_one_way(
     source_codex_home: &Path,
     target_codex_home: &Path,
@@ -1997,6 +2036,171 @@ fn sync_host_persona_conversation_history_one_way(
     )?;
     merge_state_threads_one_way(source_codex_home, target_codex_home)?;
     Ok(())
+}
+
+fn read_config_project_paths(path: &Path) -> Result<BTreeSet<String>> {
+    let mut projects = BTreeSet::new();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(projects),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    for line in contents.lines() {
+        if let Some(project_path) = parse_project_table_heading(line) {
+            projects.insert(project_path);
+        }
+    }
+    Ok(projects)
+}
+
+fn parse_project_table_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let prefix = "[projects.\"";
+    let suffix = "\"]";
+    if !trimmed.starts_with(prefix) || !trimmed.ends_with(suffix) {
+        return None;
+    }
+    decode_toml_basic_string(&trimmed[prefix.len()..trimmed.len() - suffix.len()])
+}
+
+fn decode_toml_basic_string(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let escaped = chars.next()?;
+        match escaped {
+            'b' => decoded.push('\u{0008}'),
+            't' => decoded.push('\t'),
+            'n' => decoded.push('\n'),
+            'f' => decoded.push('\u{000C}'),
+            'r' => decoded.push('\r'),
+            '"' => decoded.push('"'),
+            '\\' => decoded.push('\\'),
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn read_thread_cwds_from_codex_home(codex_home: &Path) -> Result<BTreeSet<String>> {
+    let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) else {
+        return Ok(BTreeSet::new());
+    };
+    read_thread_cwds_from_state_db(&state_db_path)
+}
+
+fn read_thread_cwds_from_state_db(state_db_path: &Path) -> Result<BTreeSet<String>> {
+    let mut cwd_values = BTreeSet::new();
+    if !state_db_path.exists() {
+        return Ok(cwd_values);
+    }
+
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(cwd_values);
+    }
+    if !sqlite_table_columns(&connection, "main", "threads")?
+        .iter()
+        .any(|column| column == "cwd")
+    {
+        return Ok(cwd_values);
+    }
+
+    let mut statement = connection
+        .prepare(
+            "select distinct cwd from threads \
+             where cwd is not null and trim(cwd) != '' \
+             order by cwd",
+        )
+        .with_context(|| {
+            format!(
+                "Failed to query cwd values from {}.",
+                state_db_path.display()
+            )
+        })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .with_context(|| {
+            format!(
+                "Failed to read cwd values from {}.",
+                state_db_path.display()
+            )
+        })?;
+    for row in rows {
+        cwd_values.insert(
+            row.with_context(|| format!("Failed to decode cwd from {}.", state_db_path.display()))?,
+        );
+    }
+    Ok(cwd_values)
+}
+
+fn should_sync_project_path(path: &str, known_projects: &BTreeSet<String>) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if known_projects.contains(trimmed) {
+        return true;
+    }
+    let project_path = Path::new(trimmed);
+    project_path.exists() || fs::canonicalize(project_path).is_ok()
+}
+
+fn append_missing_projects_to_config(path: &Path, missing_projects: &[String]) -> Result<()> {
+    if missing_projects.is_empty() {
+        return Ok(());
+    }
+    let mut contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    for (index, project_path) in missing_projects.iter().enumerate() {
+        if index > 0 {
+            contents.push('\n');
+        }
+        contents.push_str("[projects.\"");
+        contents.push_str(&encode_toml_basic_string(project_path));
+        contents.push_str("\"]\n");
+        contents.push_str("trust_level = \"trusted\"\n");
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn encode_toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn sync_directory_tree_one_way(source_root: &Path, target_root: &Path) -> Result<()> {
@@ -4586,6 +4790,103 @@ exit 91
     }
 
     #[test]
+    fn switch_host_persona_reconciles_config_projects_from_thread_history_bidirectionally() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        let source_project = temp.path().join("projects/source-visible");
+        let target_project = temp.path().join("projects/target-visible");
+        let archived_backfill_project = temp.path().join("projects/archived-backfill");
+        let missing_project = temp.path().join("projects/missing-project");
+        fs::create_dir_all(&source_project).expect("create source project");
+        fs::create_dir_all(&target_project).expect("create target project");
+        fs::create_dir_all(&archived_backfill_project).expect("create archived project");
+
+        fs::write(
+            source_paths.codex_home.join("config.toml"),
+            format!(
+                "model = \"gpt-5.3-codex\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&source_project.display().to_string())
+            ),
+        )
+        .expect("write source config");
+        fs::write(
+            target_paths.codex_home.join("config.toml"),
+            format!(
+                "personality = \"pragmatic\"\n\n[plugins.\"computer-use@openai-bundled\"]\nenabled = true\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&target_project.display().to_string())
+            ),
+        )
+        .expect("write target config");
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[
+                ("thread-source", "/tmp/source.jsonl", 100),
+                ("thread-archived-backfill", "/tmp/backfill.jsonl", 101),
+                ("thread-missing", "/tmp/missing.jsonl", 102),
+            ],
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-source",
+            &source_project.display().to_string(),
+            false,
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-archived-backfill",
+            &archived_backfill_project.display().to_string(),
+            true,
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-missing",
+            &missing_project.display().to_string(),
+            false,
+        );
+
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-target", "/tmp/target.jsonl", 200)],
+        );
+        update_thread_metadata(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-target",
+            &target_project.display().to_string(),
+            false,
+        );
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        let source_config =
+            fs::read_to_string(source_paths.codex_home.join("config.toml")).expect("source config");
+        let target_config =
+            fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
+
+        assert!(source_config.contains("model = \"gpt-5.3-codex\""));
+        assert!(!source_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
+        assert!(!target_config.contains("model = \"gpt-5.3-codex\""));
+        assert!(target_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
+
+        for config in [&source_config, &target_config] {
+            assert!(config.contains(&project_table_heading(&source_project)));
+            assert!(config.contains(&project_table_heading(&target_project)));
+            assert!(config.contains(&project_table_heading(&archived_backfill_project)));
+            assert!(!config.contains(&project_table_heading(&missing_project)));
+        }
+    }
+
+    #[test]
     fn transfer_thread_recovery_state_between_accounts_moves_pending_events() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
@@ -4708,6 +5009,23 @@ on conflict(id) do update set
             ids.push(row.expect("thread id"));
         }
         ids
+    }
+
+    fn update_thread_metadata(state_db_path: &Path, thread_id: &str, cwd: &str, archived: bool) {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        connection
+            .execute(
+                "update threads set cwd = ?1, archived = ?2 where id = ?3",
+                rusqlite::params![cwd, archived as i64, thread_id],
+            )
+            .expect("update thread metadata");
+    }
+
+    fn project_table_heading(path: &Path) -> String {
+        format!(
+            "[projects.\"{}\"]",
+            encode_toml_basic_string(&path.display().to_string())
+        )
     }
 
     fn seed_thread_scoped_tables(state_db_path: &Path, thread_id: &str) {
