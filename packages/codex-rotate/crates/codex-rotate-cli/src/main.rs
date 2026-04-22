@@ -27,11 +27,11 @@ use codex_rotate_refresh::{
     sources_newer_than_binary, stop_running_daemons, tray_service_pid, TargetKind,
 };
 use codex_rotate_runtime::daemon::{run_daemon_forever, DaemonRunOptions, DAEMON_TAKEOVER_ARG};
-use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, invoke, subscribe, CreateInvocation, InvokeAction,
     ReloginInvocation, SnapshotMessageKind, StatusSnapshot,
 };
+use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::rotation_hygiene::{
     relogin as run_shared_relogin, rotate_next as run_shared_next, rotate_prev as run_shared_prev,
     run_guest_bridge_server,
@@ -365,11 +365,15 @@ fn run_internal_launch_managed_command(args: &[String]) -> Result<()> {
             port = Some(value.parse()?);
             index += 2;
         } else if arg == "--profile-dir" {
-            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing profile-dir"))?;
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("missing profile-dir"))?;
             profile_dir = Some(PathBuf::from(value));
             index += 2;
         } else if arg == "--duration" {
-            let value = args.get(index + 1).ok_or_else(|| anyhow!("missing duration"))?;
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("missing duration"))?;
             duration_secs = value.parse()?;
             index += 2;
         } else {
@@ -384,7 +388,10 @@ fn run_internal_launch_managed_command(args: &[String]) -> Result<()> {
         None,
     )?;
 
-    println!("Managed Codex launched. Waiting {} seconds...", duration_secs);
+    println!(
+        "Managed Codex launched. Waiting {} seconds...",
+        duration_secs
+    );
     thread::sleep(Duration::from_secs(duration_secs));
     Ok(())
 }

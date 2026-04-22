@@ -4,6 +4,8 @@ use anyhow::{bail, ensure, Context, Result};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::pool::{load_pool, NextResult};
 use codex_rotate_core::workflow::{cmd_relogin_with_progress, ReloginOptions};
+use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
+use codex_rotate_refresh::process_tracking::ProcessTracker;
 use codex_rotate_runtime::cdp::is_cdp_page_ready;
 use codex_rotate_runtime::cdp::with_local_codex_connection;
 use codex_rotate_runtime::launcher::ensure_debug_codex_instance;
@@ -21,9 +23,9 @@ use codex_rotate_runtime::thread_recovery::{
 use codex_rotate_runtime::watch::{
     read_watch_state, write_watch_state, RotationCommand, WatchIterationOptions,
 };
-use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
-use codex_rotate_refresh::process_tracking::ProcessTracker;
-use codex_rotate_test_support::{FailureArtifactBundle, FailureArtifactCapture, WatchTriggerHarness};
+use codex_rotate_test_support::{
+    FailureArtifactBundle, FailureArtifactCapture, WatchTriggerHarness,
+};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -48,7 +50,8 @@ struct LiveHostFailureArtifacts {
 impl LiveHostFailureArtifacts {
     fn new(scenario: impl AsRef<str>, paths: &RuntimePaths) -> Result<Self> {
         let scenario = scenario.as_ref().to_string();
-        let capture = FailureArtifactCapture::new("codex-rotate-live-host")?.with_scenario(&scenario);
+        let capture =
+            FailureArtifactCapture::new("codex-rotate-live-host")?.with_scenario(&scenario);
         let bundle = capture.start_bundle()?;
         let process_tracker = ProcessTracker::new()?;
         let filesystem_tracker = FilesystemTracker::new()?;
@@ -106,11 +109,8 @@ impl LiveHostFailureArtifacts {
             &paths.codex_state_db_file,
             "codex state db file",
         );
-        self.filesystem_tracker.record_socket_path(
-            &paths.daemon_socket,
-            "daemon socket",
-            false,
-        );
+        self.filesystem_tracker
+            .record_socket_path(&paths.daemon_socket, "daemon socket", false);
         self.copy_targets.push((
             paths.codex_logs_db_file.clone(),
             PathBuf::from("logs/codex-logs.db"),
@@ -280,10 +280,8 @@ fn live_host_same_account_reopen_acceptance() -> Result<()> {
     let target_email = &staging_accounts[0].email;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_same_account_reopen_acceptance",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_same_account_reopen_acceptance", &paths)?;
     let port = 9333;
 
     // Ensure clean state.
@@ -334,10 +332,8 @@ fn live_host_active_thread_continuity_acceptance() -> Result<()> {
     );
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_active_thread_continuity_acceptance",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_active_thread_continuity_acceptance", &paths)?;
     let port = 9333;
     let source_cwd = paths.rotate_home.display().to_string();
     let marker = format!(
@@ -1071,7 +1067,10 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
             progress: None,
         })?;
 
-        ensure!(result.rotated, "watch trigger should have rotated the account");
+        ensure!(
+            result.rotated,
+            "watch trigger should have rotated the account"
+        );
         ensure!(
             result.decision.should_rotate,
             "watch decision should have requested rotation"
@@ -1189,10 +1188,8 @@ fn live_host_managed_relogin_smoke_coverage() -> Result<()> {
     let target_email = &staging_accounts[0].email;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_managed_relogin_smoke_coverage",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_managed_relogin_smoke_coverage", &paths)?;
     let port = 9333;
 
     // Ensure clean state.
@@ -1302,10 +1299,8 @@ fn live_host_codex_desktop_smoke_coverage() -> Result<()> {
 
     let paths = resolve_paths()?;
     let process_tracker = ProcessTracker::new()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_codex_desktop_smoke_coverage",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_codex_desktop_smoke_coverage", &paths)?;
     let port = 9333;
 
     // Ensure we start from a clean state for the isolated profile.
@@ -1414,10 +1409,8 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
     let filesystem_tracker = FilesystemTracker::new()?;
 
     let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
-        "live_host_codex_desktop_auto_close_on_exit",
-        &paths,
-    )?;
+    let artifacts =
+        LiveHostFailureArtifacts::new("live_host_codex_desktop_auto_close_on_exit", &paths)?;
 
     {
         // Use a separate temp profile for this test.
@@ -1453,7 +1446,11 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
             .env("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "0")
             .spawn()
             .context("spawn codex-rotate launch-managed")?;
-        process_tracker.record_test_owned_process(child.id(), "launch-managed child", child_command);
+        process_tracker.record_test_owned_process(
+            child.id(),
+            "launch-managed child",
+            child_command,
+        );
 
         // Wait for it to launch.
         let mut launched = false;

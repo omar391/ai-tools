@@ -165,7 +165,7 @@ process.stdout.write(JSON.stringify({ ok: true, result: {} }) + '\n');
 
     let call_log = sandbox.join("relogin-calls.log");
     let sandbox_canonical = sandbox.canonicalize()?;
-    
+
     let run_cli = |cmd: &str| -> Result<()> {
         let result = Command::new(cli_binary())
             .arg(cmd)
@@ -180,10 +180,18 @@ process.stdout.write(JSON.stringify({ ok: true, result: {} }) + '\n');
             .env("CODEX_ROTATE_DISABLE_LOCAL_REFRESH", "1")
             .env("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1")
             .output()?;
-        
+
         if !result.status.success() {
-            eprintln!("{} stdout: {}", cmd, String::from_utf8_lossy(&result.stdout));
-            eprintln!("{} stderr: {}", cmd, String::from_utf8_lossy(&result.stderr));
+            eprintln!(
+                "{} stdout: {}",
+                cmd,
+                String::from_utf8_lossy(&result.stdout)
+            );
+            eprintln!(
+                "{} stderr: {}",
+                cmd,
+                String::from_utf8_lossy(&result.stderr)
+            );
             anyhow::bail!("{} failed", cmd);
         }
         Ok(())
@@ -191,21 +199,25 @@ process.stdout.write(JSON.stringify({ ok: true, result: {} }) + '\n');
 
     // Step 1: Rotate to the next account (index 1)
     run_cli("next")?;
-    
+
     // Verify pool active index updated to 1
-    unsafe { std::env::set_var("CODEX_ROTATE_HOME", &rotate_home); }
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+    }
     let pool = load_pool()?;
     assert_eq!(pool.active_index, 1);
 
     // Write a dummy file to account 0's persona to simulate native history
     let original_persona = accounts[0].persona.as_ref().unwrap();
-    let account_0_home = rotate_home.join(original_persona.host_root_rel_path.as_ref().unwrap()).join("codex-home");
+    let account_0_home = rotate_home
+        .join(original_persona.host_root_rel_path.as_ref().unwrap())
+        .join("codex-home");
     fs::create_dir_all(&account_0_home)?;
     fs::write(account_0_home.join("dummy-history.txt"), "history content")?;
 
     // Step 2: Rotate to the next account (index 0, assuming 2 accounts)
     run_cli("next")?;
-    
+
     let pool = load_pool()?;
     assert_eq!(pool.active_index, 0);
 
