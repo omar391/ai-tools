@@ -51,8 +51,9 @@ fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> 
 }
 
 fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
-    account_rotation_enabled(disabled_domains, &entry.email)
-        || entry.last_quota_usable != Some(true)
+    !account_requires_terminal_cleanup(entry)
+        && (account_rotation_enabled(disabled_domains, &entry.email)
+            || entry.last_quota_usable != Some(true))
 }
 
 fn normalize_cached_quota_usability(entry: &mut AccountEntry) -> bool {
@@ -113,23 +114,15 @@ fn account_requires_terminal_cleanup(entry: &AccountEntry) -> bool {
         .unwrap_or(false)
 }
 
-fn remove_account_from_pool(pool: &mut Pool, index: usize) {
-    pool.accounts.remove(index);
-    if pool.accounts.is_empty() || pool.active_index >= pool.accounts.len() {
-        pool.active_index = 0;
-    } else if index < pool.active_index && pool.active_index > 0 {
-        pool.active_index -= 1;
-    }
-}
-
 fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     let Some(entry) = pool.accounts.get(index).cloned() else {
         return Ok(false);
     };
-    auto_disable_domain_for_account(&entry.email)?;
-    let _ = record_deleted_account(&entry.email)?;
-    remove_account_from_pool(pool, index);
-    Ok(true)
+    let deleted = record_deleted_account(&entry.email)?;
+    if deleted {
+        auto_disable_domain_for_account(&entry.email)?;
+    }
+    Ok(deleted)
 }
 
 fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
@@ -4094,10 +4087,13 @@ mod tests {
             assert!(!output.contains("devbench.9@astronlab.com_free"));
 
             let state = load_rotate_state_json()?;
-            assert_eq!(
-                state["accounts"].as_array().map(|entries| entries.len()),
-                Some(0)
-            );
+            let accounts = state["accounts"].as_array().expect("accounts");
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0]["email"], "devbench.9@astronlab.com");
+            assert!(accounts[0]["auth"]["tokens"]["access_token"]
+                .as_str()
+                .is_some());
+            assert_eq!(accounts[0]["auth"]["tokens"]["refresh_token"], "refresh");
             assert_eq!(
                 state["domain"]["astronlab.com"]["rotation_enabled"],
                 Value::Bool(false)
@@ -4174,10 +4170,13 @@ mod tests {
             assert!(!output.contains("devbench.10@astronlab.com_free"));
 
             let state = load_rotate_state_json()?;
-            assert_eq!(
-                state["accounts"].as_array().map(|entries| entries.len()),
-                Some(0)
-            );
+            let accounts = state["accounts"].as_array().expect("accounts");
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0]["email"], "devbench.10@astronlab.com");
+            assert!(accounts[0]["auth"]["tokens"]["access_token"]
+                .as_str()
+                .is_some());
+            assert_eq!(accounts[0]["auth"]["tokens"]["refresh_token"], "refresh");
             assert_eq!(
                 state["domain"]["astronlab.com"]["rotation_enabled"],
                 Value::Bool(false)
@@ -4658,6 +4657,7 @@ mod tests {
                 last_quota_checked_at: Some("2026-04-18T02:01:57.804Z".to_string()),
                 last_quota_primary_left_percent: Some(100),
                 last_quota_next_refresh_at: Some("2026-04-18T02:02:57.804Z".to_string()),
+                persona: None,
             }],
         };
 
