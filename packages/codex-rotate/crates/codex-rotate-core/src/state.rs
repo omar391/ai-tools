@@ -615,7 +615,7 @@ mod tests {
                         "base_email": "supplyprima1@gmail.com",
                         "next_suffix": 2,
                         "max_skipped_slots": 0,
-                        "deleted": [],
+                        "relogin": [],
                         "last_created_email": "supplyprima1+1@gmail.com",
                         "created_at": "2026-04-05T00:00:00.000Z",
                         "updated_at": "2026-04-05T00:00:00.000Z"

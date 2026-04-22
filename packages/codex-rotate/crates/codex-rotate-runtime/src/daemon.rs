@@ -936,6 +936,7 @@ fn run_watch_check(
     let port = managed_codex_port();
     let previous_displayed_email = state.snapshot.current_email.clone();
     let auth_changed = refresh_auth_summary(&mut state.snapshot);
+    let _ = sync_pool_current_auth_into_pool_without_activation();
     state.snapshot.next_tick_at = None;
 
     let result = run_watch_iteration(WatchIterationOptions {
@@ -946,8 +947,7 @@ fn run_watch_check(
         progress,
     })?;
 
-    refresh_inventory_count(&mut state.snapshot);
-    refresh_auth_summary(&mut state.snapshot);
+    refresh_static_snapshot(state);
     if let Some(live) = result.live.as_ref() {
         state.snapshot.current_email = Some(live.email.clone());
         state.snapshot.current_plan = Some(live.plan_type.clone());

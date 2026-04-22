@@ -2278,7 +2278,9 @@ fn sync_pool_current_auth_from_auth(
         pool.active_index = current_index;
         changed = true;
     }
-    Ok(apply_auth_to_account(&mut pool.accounts[current_index], current_auth) || changed)
+    let applied_auth = apply_auth_to_account(&mut pool.accounts[current_index], current_auth);
+    let _ = reconcile_added_account_credential_state(&pool.accounts[current_index])?;
+    Ok(applied_auth || changed)
 }
 
 fn find_pool_account_index_by_identity(
@@ -4554,6 +4556,66 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("passive current auth sync should preserve the active pool entry");
+    }
+
+    #[test]
+    fn sync_pool_current_auth_into_pool_without_activation_clears_family_relogin_email() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            let paths = resolve_paths()?;
+            if let Some(parent) = paths.codex_auth_file.parent() {
+                std::fs::create_dir_all(parent).expect("create auth parent");
+            }
+            write_codex_auth(
+                &paths.codex_auth_file,
+                &make_auth("dev.36@astronlab.com", "acct-36", "free"),
+            )?;
+
+            let existing = configured_entry("dev.36@astronlab.com", "acct-36", "free", None, None);
+            write_rotate_state_json(&json!({
+                "accounts": [existing],
+                "active_index": 0,
+                "version": 9,
+                "default_create_template": "dev.{n}@astronlab.com",
+                "families": {
+                    "dev-1::dev.{n}@astronlab.com": {
+                        "profile_name": "dev-1",
+                        "template": "dev.{n}@astronlab.com",
+                        "next_suffix": 37,
+                        "max_skipped_slots": 0,
+                        "relogin": ["dev.36@astronlab.com"],
+                        "last_created_email": "dev.36@astronlab.com",
+                        "created_at": "2026-04-05T00:00:00.000Z",
+                        "updated_at": "2026-04-05T00:00:00.000Z"
+                    }
+                }
+            }))?;
+
+            let _ = sync_pool_current_auth_into_pool_without_activation()?;
+            let state = load_rotate_state_json()?;
+
+            assert_eq!(
+                state["families"]["dev-1::dev.{n}@astronlab.com"]["relogin"],
+                json!([])
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("passive current auth sync should clear matching family relogin entries");
     }
 
     #[test]

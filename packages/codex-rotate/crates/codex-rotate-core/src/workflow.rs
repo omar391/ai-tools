@@ -183,7 +183,7 @@ pub struct CredentialFamily {
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "relogin")]
     pub deleted: Vec<String>,
 }
 
@@ -7789,7 +7789,7 @@ end
                         "created_at": "2026-04-05T00:00:00.000Z",
                         "updated_at": "2026-04-05T00:00:00.000Z",
                         "last_created_email": "dev.1@astronlab.com",
-                        "deleted": []
+                        "relogin": []
                     }
                 }
             }))
@@ -7898,7 +7898,7 @@ end
                     "created_at": "2026-04-05T00:00:00.000Z",
                     "updated_at": "2026-04-05T00:00:00.000Z",
                     "last_created_email": "dev.22@astronlab.com",
-                    "deleted": ["DEV.2@astronlab.com", "dev.3@astronlab.com"]
+                    "relogin": ["DEV.2@astronlab.com", "dev.3@astronlab.com"]
                 }
             }
         }));
@@ -8663,7 +8663,7 @@ end
                     "created_at": "2026-04-13T05:00:00.000Z",
                     "updated_at": "2026-04-14T15:12:25.003Z",
                     "last_created_email": "dev3astronlab+4@gmail.com",
-                    "deleted": []
+                    "relogin": []
                 }
             },
             "pending": {
