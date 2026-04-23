@@ -7,6 +7,7 @@ use codex_rotate_refresh::{
 use codex_rotate_runtime::ipc::{
     daemon_is_reachable, daemon_socket_path, subscribe, SnapshotMessageKind, StatusSnapshot,
 };
+use codex_rotate_runtime::log_isolation::active_managed_codex_thread_ids;
 use codex_rotate_runtime::runtime_log::{log_tray_error, log_tray_info};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,6 +242,15 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
     }
     let sources_newer_than_binary = sources_newer_than_binary(&build)
         .map_err(|error| format!("Failed to inspect local tray freshness: {error}"))?;
+    let release_binary = preferred_release_binary(&build)
+        .map_err(|error| format!("Failed to inspect release tray freshness: {error}"))?;
+    if !sources_newer_than_binary && release_binary.is_none() {
+        return Ok(false);
+    }
+    if auto_refresh_blocked_by_active_threads()? {
+        return Ok(false);
+    }
+
     if sources_newer_than_binary {
         log_tray_info(format!(
             "Local tray sources changed. Rebuilding {}.",
@@ -254,9 +264,7 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
     {
         log_tray_info("Queued background release build for codex-rotate-tray.");
     }
-    if let Some(release_binary) = preferred_release_binary(&build)
-        .map_err(|error| format!("Failed to inspect release tray freshness: {error}"))?
-    {
+    if let Some(release_binary) = release_binary {
         log_tray_info(format!(
             "Promoting tray to release binary {}.",
             release_binary.display()
@@ -278,6 +286,12 @@ pub fn maybe_refresh_current_tray() -> Result<bool, String> {
 fn schedule_tray_relaunch(tray_binary: &Path) -> Result<(), String> {
     schedule_tray_relaunch_process(tray_binary)
         .map_err(|error| format!("Failed to relaunch local tray: {error}"))
+}
+
+fn auto_refresh_blocked_by_active_threads() -> Result<bool, String> {
+    active_managed_codex_thread_ids(None)
+        .map(|thread_ids| !thread_ids.is_empty())
+        .map_err(|error| format!("Failed to inspect active Codex threads: {error}"))
 }
 
 pub fn spawn_subscription_loop<F>(on_snapshot: F)

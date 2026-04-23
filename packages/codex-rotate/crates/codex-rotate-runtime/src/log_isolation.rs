@@ -304,6 +304,14 @@ pub(crate) fn wait_for_all_threads_idle(
     }
 }
 
+pub fn active_managed_codex_thread_ids(port: Option<u16>) -> Result<Vec<String>> {
+    let paths = resolve_paths()?;
+    if !managed_codex_is_running(&paths.debug_profile_dir)? {
+        return Ok(Vec::new());
+    }
+    read_active_thread_ids(port)
+}
+
 fn summarize_thread_ids(thread_ids: &[String]) -> String {
     const MAX_IDS: usize = 3;
     let mut preview = thread_ids.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();

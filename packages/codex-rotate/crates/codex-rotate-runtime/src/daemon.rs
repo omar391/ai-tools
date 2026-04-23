@@ -17,6 +17,7 @@ use crate::ipc::{
     RuntimeCapabilities, ServerMessage, SnapshotMessageKind, StatusSnapshot,
 };
 use crate::launcher::ensure_debug_codex_instance;
+use crate::log_isolation::active_managed_codex_thread_ids;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::rotation_hygiene::{
     recover_incomplete_rotation_state, relogin as run_shared_relogin,
@@ -458,6 +459,14 @@ fn maybe_refresh_local_tray_process() -> Result<bool> {
     }
 
     let sources_newer_than_binary = sources_newer_than_binary(&build)?;
+    let release_binary = preferred_release_binary(&build)?;
+    if !sources_newer_than_binary && release_binary.is_none() {
+        return Ok(false);
+    }
+    if auto_refresh_blocked_by_active_threads()? {
+        return Ok(false);
+    }
+
     if sources_newer_than_binary {
         log_daemon_info(format!(
             "Local tray sources changed while tray was offline. Rebuilding {}.",
@@ -468,7 +477,7 @@ fn maybe_refresh_local_tray_process() -> Result<bool> {
     if maybe_start_background_release_build(&build)? {
         log_daemon_info("Queued background release build for codex-rotate-tray.");
     }
-    if let Some(release_binary) = preferred_release_binary(&build)? {
+    if let Some(release_binary) = release_binary {
         log_daemon_info(format!(
             "Promoting tray to release binary {} from daemon supervisor.",
             release_binary.display()
@@ -769,6 +778,16 @@ fn maybe_refresh_local_daemon_process(
     let instance_home = resolve_paths()?.rotate_home;
     let daemon_socket = crate::ipc::daemon_socket_path()?;
     let sources_newer_than_binary = sources_newer_than_binary(&build)?;
+    let release_binary = preferred_release_binary(&build)?;
+    let binary_newer_than_running_socket =
+        daemon_socket_is_older_than_binary(&daemon_socket, &build.binary_path)?;
+    if !sources_newer_than_binary && release_binary.is_none() && !binary_newer_than_running_socket {
+        return Ok(false);
+    }
+    if auto_refresh_blocked_by_active_threads()? {
+        return Ok(false);
+    }
+
     if sources_newer_than_binary {
         log_daemon_info(format!(
             "Local CLI/runtime sources changed. Rebuilding {}.",
@@ -779,7 +798,7 @@ fn maybe_refresh_local_daemon_process(
     if maybe_start_background_release_build(&build)? {
         log_daemon_info("Queued background release build for codex-rotate.");
     }
-    if let Some(release_binary) = preferred_release_binary(&build)? {
+    if let Some(release_binary) = release_binary {
         log_daemon_info(format!(
             "Promoting daemon to release binary {}.",
             release_binary.display()
@@ -800,11 +819,6 @@ fn maybe_refresh_local_daemon_process(
                 )
             })?;
         return Ok(true);
-    }
-    let binary_newer_than_running_socket =
-        daemon_socket_is_older_than_binary(&daemon_socket, &build.binary_path)?;
-    if !sources_newer_than_binary && !binary_newer_than_running_socket {
-        return Ok(false);
     }
     log_daemon_info(format!(
         "Refreshing daemon with rebuilt binary {}.",
@@ -827,6 +841,10 @@ fn maybe_refresh_local_daemon_process(
             )
         })?;
     Ok(true)
+}
+
+fn auto_refresh_blocked_by_active_threads() -> Result<bool> {
+    Ok(!active_managed_codex_thread_ids(Some(managed_codex_port()))?.is_empty())
 }
 
 fn wait_for_previous_daemon_to_release_socket() {
