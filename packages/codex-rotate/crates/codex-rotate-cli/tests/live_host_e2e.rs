@@ -859,13 +859,30 @@ fn live_host_target_start_failure_rolls_back_to_source_persona() -> Result<()> {
                     .context("source persona missing host_root_rel_path")?,
             )
             .join("codex-home");
+        let source_managed_profile = paths
+            .rotate_home
+            .join(
+                source_persona
+                    .host_root_rel_path
+                    .as_ref()
+                    .context("source persona missing host_root_rel_path")?,
+            )
+            .join("managed-profile");
         let current_codex_home =
             std::fs::read_link(&paths.codex_home).context("read current codex-home symlink")?;
+        let current_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read current managed-profile symlink")?;
         ensure!(
             current_codex_home == source_codex_home,
             "expected codex-home symlink to point at {}, got {}",
             source_codex_home.display(),
             current_codex_home.display()
+        );
+        ensure!(
+            current_managed_profile == source_managed_profile,
+            "expected managed-profile symlink to point at {}, got {}",
+            source_managed_profile.display(),
+            current_managed_profile.display()
         );
 
         unsafe {
@@ -898,7 +915,10 @@ fn live_host_target_start_failure_rolls_back_to_source_persona() -> Result<()> {
 
         let restored_codex_home =
             std::fs::read_link(&paths.codex_home).context("read restored codex-home symlink")?;
+        let restored_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read restored managed-profile symlink")?;
         assert_eq!(restored_codex_home, source_codex_home);
+        assert_eq!(restored_managed_profile, source_managed_profile);
 
         Ok(())
     })();
@@ -1003,13 +1023,30 @@ fn live_host_relogin_failure_rolls_back_to_source_persona() -> Result<()> {
                     .context("source persona missing host_root_rel_path")?,
             )
             .join("codex-home");
+        let source_managed_profile = paths
+            .rotate_home
+            .join(
+                source_persona
+                    .host_root_rel_path
+                    .as_ref()
+                    .context("source persona missing host_root_rel_path")?,
+            )
+            .join("managed-profile");
         let current_codex_home =
             std::fs::read_link(&paths.codex_home).context("read current codex-home symlink")?;
+        let current_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read current managed-profile symlink")?;
         ensure!(
             current_codex_home == source_codex_home,
             "expected codex-home symlink to point at {}, got {}",
             source_codex_home.display(),
             current_codex_home.display()
+        );
+        ensure!(
+            current_managed_profile == source_managed_profile,
+            "expected managed-profile symlink to point at {}, got {}",
+            source_managed_profile.display(),
+            current_managed_profile.display()
         );
 
         unsafe {
@@ -1043,7 +1080,10 @@ fn live_host_relogin_failure_rolls_back_to_source_persona() -> Result<()> {
 
         let restored_codex_home =
             std::fs::read_link(&paths.codex_home).context("read restored codex-home symlink")?;
+        let restored_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read restored managed-profile symlink")?;
         assert_eq!(restored_codex_home, source_codex_home);
+        assert_eq!(restored_managed_profile, source_managed_profile);
 
         Ok(())
     })();
@@ -1235,13 +1275,30 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
                     .context("rotated persona missing host_root_rel_path")?,
             )
             .join("codex-home");
+        let rotated_managed_profile = paths
+            .rotate_home
+            .join(
+                rotated_persona
+                    .host_root_rel_path
+                    .as_ref()
+                    .context("rotated persona missing host_root_rel_path")?,
+            )
+            .join("managed-profile");
         let current_codex_home = std::fs::read_link(&paths.codex_home)
             .context("read codex-home symlink after watch rotation")?;
+        let current_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read managed-profile symlink after watch rotation")?;
         ensure!(
             current_codex_home == rotated_codex_home,
             "expected codex-home symlink to point at {} after watch rotation, got {}",
             rotated_codex_home.display(),
             current_codex_home.display()
+        );
+        ensure!(
+            current_managed_profile == rotated_managed_profile,
+            "expected managed-profile symlink to point at {} after watch rotation, got {}",
+            rotated_managed_profile.display(),
+            current_managed_profile.display()
         );
         ensure!(
             request_count.load(Ordering::SeqCst) > 0,
@@ -1458,6 +1515,20 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
             .get(rotated_pool.active_index)
             .and_then(|entry| entry.persona.as_ref())
             .context("rotated account missing persona metadata after watch-triggered rotation")?;
+        let target_managed_profile_path = paths
+            .rotate_home
+            .join(rotated_persona.host_root_rel_path.as_ref().context(
+                "rotated persona missing host_root_rel_path after watch-triggered rotation",
+            )?)
+            .join("managed-profile");
+        let current_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
+            .context("read managed-profile symlink after watch-triggered full-flow rotation")?;
+        ensure!(
+            current_managed_profile == target_managed_profile_path,
+            "expected managed-profile symlink to point at {} after watch-triggered rotation, got {}",
+            target_managed_profile_path.display(),
+            current_managed_profile.display()
+        );
         let target_config_path = paths
             .rotate_home
             .join(rotated_persona.host_root_rel_path.as_ref().context(

@@ -1458,7 +1458,8 @@ fn live_root_matches_persona(paths: &RuntimePaths, entry: &AccountEntry) -> Resu
         && is_symlink_to(
             &paths.codex_app_support_dir,
             &persona_paths.codex_app_support_dir,
-        )?)
+        )?
+        && is_symlink_to(&paths.debug_profile_dir, &persona_paths.debug_profile_dir)?)
 }
 
 fn recover_incomplete_rotation_state_without_lock() -> Result<()> {
@@ -2148,8 +2149,10 @@ fn ensure_live_root_bindings(paths: &RuntimePaths, entry: &AccountEntry) -> Resu
     )?;
     migrate_live_root_if_needed(&paths.codex_home, &persona.codex_home)?;
     migrate_live_root_if_needed(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
+    migrate_live_root_if_needed(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
     ensure_symlink_dir(&paths.codex_home, &persona.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
+    ensure_symlink_dir(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
     Ok(())
 }
 
@@ -2202,6 +2205,7 @@ fn switch_host_persona(
     )?;
     ensure_symlink_dir(&paths.codex_home, &target.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &target.codex_app_support_dir)?;
+    ensure_symlink_dir(&paths.debug_profile_dir, &target.debug_profile_dir)?;
     Ok(())
 }
 
@@ -6099,6 +6103,7 @@ exit 91
         assert_eq!(recovered_pool.active_index, 1);
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &target_paths.debug_profile_dir).unwrap());
         let recovered_auth =
             codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
         assert_eq!(recovered_auth.tokens.account_id, "acct-target");
@@ -6163,6 +6168,85 @@ exit 91
         assert_eq!(recovered_pool.active_index, 0);
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
+        let recovered_auth =
+            codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
+        assert_eq!(recovered_auth.tokens.account_id, "acct-source");
+        assert!(load_rotation_checkpoint()
+            .expect("load checkpoint")
+            .is_none());
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+    }
+
+    #[test]
+    fn recover_incomplete_rotation_state_activate_checkpoint_requires_managed_profile_match() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("FAST_BROWSER_HOME", paths.fast_browser_home.clone());
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                paths.codex_app_support_dir.clone(),
+            );
+        }
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
+        codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+            .expect("write source auth");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        codex_rotate_core::pool::save_rotation_checkpoint(Some(&RotationCheckpoint {
+            phase: RotationCheckpointPhase::Activate,
+            previous_index: 0,
+            target_index: 1,
+            previous_account_id: source.account_id.clone(),
+            target_account_id: target.account_id.clone(),
+        }))
+        .expect("save checkpoint");
+
+        switch_host_persona(&paths, &source, &target, false).expect("switch persona");
+        codex_rotate_core::pool::write_selected_account_auth(&target).expect("write target auth");
+        ensure_symlink_dir(&paths.debug_profile_dir, &source_paths.debug_profile_dir)
+            .expect("misbind managed profile root");
+
+        recover_incomplete_rotation_state().expect("recover rotation");
+
+        let recovered_pool = load_pool().expect("load recovered pool");
+        assert_eq!(recovered_pool.active_index, 0);
+        assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        assert!(is_symlink_to(
+            &paths.codex_app_support_dir,
+            &source_paths.codex_app_support_dir
+        )
+        .unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
+        assert!(!is_symlink_to(&paths.codex_home, &target_paths.codex_home).unwrap());
         let recovered_auth =
             codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
         assert_eq!(recovered_auth.tokens.account_id, "acct-source");
@@ -6282,11 +6366,85 @@ exit 91
 
         ensure_live_root_bindings(&paths, &source).expect("bind source roots");
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).expect("source symlink"));
+        assert!(is_symlink_to(
+            &paths.codex_app_support_dir,
+            &source_paths.codex_app_support_dir
+        )
+        .expect("source app-support symlink"));
+        assert!(
+            is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir)
+                .expect("source managed-profile symlink")
+        );
 
         switch_host_persona(&paths, &source, &target, false).expect("switch persona");
 
         assert!(is_symlink_to(&paths.codex_home, &target_paths.codex_home).expect("target symlink"));
+        assert!(is_symlink_to(
+            &paths.codex_app_support_dir,
+            &target_paths.codex_app_support_dir
+        )
+        .expect("target app-support symlink"));
+        assert!(
+            is_symlink_to(&paths.debug_profile_dir, &target_paths.debug_profile_dir)
+                .expect("target managed-profile symlink")
+        );
         assert!(source_paths.codex_home.join("history.jsonl").exists());
+    }
+
+    #[test]
+    fn switch_host_persona_materializes_missing_target_persona_without_cloning_managed_profile() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+
+        let source_paths =
+            host_persona_paths(&paths, source.persona.as_ref().expect("source persona"))
+                .expect("source persona paths");
+        let target_paths =
+            host_persona_paths(&paths, target.persona.as_ref().expect("target persona"))
+                .expect("target persona paths");
+        assert!(!target_paths.root.exists());
+
+        fs::create_dir_all(&paths.debug_profile_dir).expect("create live managed profile root");
+        fs::write(
+            paths.debug_profile_dir.join("legacy-profile-state.json"),
+            "legacy",
+        )
+        .expect("write legacy managed profile marker");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+        assert!(source_paths
+            .debug_profile_dir
+            .join("legacy-profile-state.json")
+            .exists());
+        assert!(
+            is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir)
+                .expect("source managed-profile symlink")
+        );
+        assert!(!target_paths
+            .debug_profile_dir
+            .join("legacy-profile-state.json")
+            .exists());
+
+        switch_host_persona(&paths, &source, &target, true).expect("switch persona");
+
+        assert!(target_paths.root.exists());
+        assert!(target_paths.debug_profile_dir.exists());
+        assert!(
+            is_symlink_to(&paths.debug_profile_dir, &target_paths.debug_profile_dir)
+                .expect("target managed-profile symlink")
+        );
+        assert!(!target_paths
+            .debug_profile_dir
+            .join("legacy-profile-state.json")
+            .exists());
+        assert!(source_paths
+            .debug_profile_dir
+            .join("legacy-profile-state.json")
+            .exists());
     }
 
     #[test]
@@ -7370,6 +7528,11 @@ on conflict(thread_id) do update set
         let target_persona_paths =
             host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &target_persona_paths.codex_home).unwrap());
+        assert!(is_symlink_to(
+            &paths.debug_profile_dir,
+            &target_persona_paths.debug_profile_dir
+        )
+        .unwrap());
 
         rollback_after_failed_host_activation(&paths, &prepared, false, 9333).expect("rollback");
 
@@ -7377,6 +7540,11 @@ on conflict(thread_id) do update set
         let source_persona_paths =
             host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &source_persona_paths.codex_home).unwrap());
+        assert!(is_symlink_to(
+            &paths.debug_profile_dir,
+            &source_persona_paths.debug_profile_dir
+        )
+        .unwrap());
         let restored_auth =
             codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file).expect("load auth");
         assert_eq!(restored_auth.tokens.account_id, "acct-source");
@@ -7482,6 +7650,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
 
         drop(managed_codex);
 
@@ -7633,6 +7802,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             &source_paths.codex_app_support_dir
         )
         .unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
@@ -7689,6 +7859,12 @@ insert into threads (id, rollout_path, updated_at, archived) values
         path_guard.record_symlink_target(
             &target_paths.codex_app_support_dir,
             "target app-support",
+            false,
+        );
+        assert!(is_symlink_to(&paths.debug_profile_dir, &target_paths.debug_profile_dir).unwrap());
+        path_guard.record_symlink_target(
+            &target_paths.debug_profile_dir,
+            "target managed-profile",
             false,
         );
 
@@ -9203,6 +9379,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
     }
 
     #[test]
