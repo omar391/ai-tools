@@ -300,6 +300,48 @@ fn align_pool_file_active_index_to_email(
     Ok(())
 }
 
+fn enable_rotation_for_cloned_pool_domains(pool_file: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(pool_file)
+        .with_context(|| format!("failed to read {}", pool_file.display()))?;
+    let mut json: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", pool_file.display()))?;
+    let Some(accounts) = json.get("accounts").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let domains = accounts
+        .iter()
+        .filter_map(|entry| entry.get("email").and_then(Value::as_str))
+        .filter_map(|email| email.split('@').nth(1))
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    if domains.is_empty() {
+        return Ok(());
+    }
+
+    let root = json
+        .as_object_mut()
+        .context("pool file root was not a JSON object")?;
+    let domain_map = root
+        .entry("domain".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("pool file domain section was not a JSON object")?;
+
+    for domain in domains {
+        let config = domain_map
+            .entry(domain)
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("pool file domain entry was not a JSON object")?;
+        config.insert("rotation_enabled".to_string(), Value::Bool(true));
+        config.remove("reactivate_at");
+    }
+
+    std::fs::write(pool_file, serde_json::to_vec_pretty(&json)?)
+        .with_context(|| format!("failed to update {}", pool_file.display()))?;
+    Ok(())
+}
+
 fn align_current_pool_active_index_to_email(preferred_email: Option<&str>) -> Result<()> {
     let Some(email) = preferred_email else {
         return Ok(());
@@ -408,6 +450,7 @@ fn with_cloned_live_host_environment<T>(
         &rotate_home.join("accounts.json"),
     )?;
     copy_file_if_exists(&live_paths.codex_auth_file, &codex_home.join("auth.json"))?;
+    enable_rotation_for_cloned_pool_domains(&rotate_home.join("accounts.json"))?;
     let cloned_auth_email = read_cloned_auth_email(&codex_home.join("auth.json"))?;
     align_pool_file_active_index_to_email(
         &rotate_home.join("accounts.json"),

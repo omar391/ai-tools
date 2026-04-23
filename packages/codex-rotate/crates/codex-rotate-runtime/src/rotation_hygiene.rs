@@ -15,9 +15,10 @@ use codex_rotate_core::pool::{
     load_pool, load_rotation_checkpoint, load_rotation_environment_settings,
     persist_prepared_rotation_pool, prepare_next_rotation_with_progress, prepare_prev_rotation,
     resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
-    rollback_prepared_rotation, save_pool, save_rotation_checkpoint, write_selected_account_auth,
-    AccountEntry, NextResult, PersonaEntry, PreparedRotation, PreparedRotationAction,
-    RotationCheckpoint, RotationCheckpointPhase, RotationEnvironment,
+    rollback_prepared_rotation, save_pool, save_rotation_checkpoint,
+    sync_pool_active_account_from_current_auth, write_selected_account_auth, AccountEntry,
+    NextResult, PersonaEntry, PreparedRotation, PreparedRotationAction, RotationCheckpoint,
+    RotationCheckpointPhase, RotationEnvironment,
 };
 use codex_rotate_core::state::RotationLock;
 use codex_rotate_core::workflow::{
@@ -1496,6 +1497,10 @@ fn resolve_checkpoint_account_index(
         return Ok(fallback_index);
     }
 
+    if role == "target" && !pool.accounts.is_empty() {
+        return Ok(pool.active_index.min(pool.accounts.len().saturating_sub(1)));
+    }
+
     Err(anyhow!(
         "Unable to resolve the {role} account for an interrupted rotation."
     ))
@@ -1521,6 +1526,7 @@ fn recover_incomplete_rotation_state_without_lock() -> Result<()> {
     };
 
     let paths = resolve_paths()?;
+    let _ = sync_pool_active_account_from_current_auth();
     let pool = load_pool()?;
     if pool.accounts.is_empty() {
         clear_rotation_checkpoint()?;
@@ -2314,6 +2320,8 @@ fn switch_host_persona(
             target.codex_app_support_dir.display()
         )
     })?;
+    fs::create_dir_all(&target.debug_profile_dir)
+        .with_context(|| format!("Failed to create {}.", target.debug_profile_dir.display()))?;
     ensure_symlink_dir(&paths.codex_home, &target.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &target.codex_app_support_dir)?;
     ensure_symlink_dir(&paths.debug_profile_dir, &target.debug_profile_dir)?;
@@ -4173,6 +4181,7 @@ struct HostPersonaPaths {
     root: PathBuf,
     codex_home: PathBuf,
     codex_app_support_dir: PathBuf,
+    debug_profile_dir: PathBuf,
 }
 
 fn host_persona_paths(
@@ -4192,6 +4201,7 @@ fn host_persona_paths(
     Ok(HostPersonaPaths {
         codex_home: root.join("codex-home"),
         codex_app_support_dir: root.join("codex-app-support"),
+        debug_profile_dir: root.join("managed-profile"),
         root,
     })
 }
