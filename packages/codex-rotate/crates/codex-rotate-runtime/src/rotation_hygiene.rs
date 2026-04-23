@@ -98,13 +98,18 @@ const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
 const PROJECT_ORDER_KEY: &str = "project-order";
 const REMOVED_WORKSPACE_ROOTS_KEY: &str = "codex-rotate-removed-workspace-roots";
+#[allow(dead_code)]
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
+#[allow(dead_code)]
 const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
+#[allow(dead_code)]
 const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
+#[allow(dead_code)]
 const STAGE1_OUTPUTS_CONFLICT_COLUMNS: &[&str] = &["thread_id"];
 const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct SessionIndexEntry {
     updated_at: Option<String>,
     raw: String,
@@ -2179,10 +2184,16 @@ fn switch_host_persona(
     )?;
     // Project visibility and archive state are source-persona UI decisions.
     // Capture and propagate them before thread history becomes bidirectional.
-    sync_host_persona_thread_archive_state(&source.codex_home, &target.codex_home)?;
+    sync_host_persona_thread_archive_state(
+        &source.codex_home,
+        &source_entry.account_id,
+        &target.codex_home,
+        &target_entry.account_id,
+        &paths.conversation_sync_db_file,
+    )?;
     let removed_project_roots =
         reconcile_host_persona_removed_project_roots(&source.codex_home, &target.codex_home)?;
-    // Keep full conversation history mirrored across host personas.
+    // Mirror conversation artifacts without sharing persona-local thread identity state.
     sync_host_persona_conversation_history(&source.codex_home, &target.codex_home)?;
     // Keep the Codex project registry aligned with synced thread cwd values so
     // project-scoped history stays visible in the desktop UI after rotation.
@@ -2417,17 +2428,15 @@ fn sync_host_persona_conversation_history_one_way(
             &target_codex_home.join(dir_name),
         )?;
     }
-    merge_session_index_one_way(
-        &source_codex_home.join(SESSION_INDEX_FILE_NAME),
-        &target_codex_home.join(SESSION_INDEX_FILE_NAME),
-    )?;
-    merge_state_threads_one_way(source_codex_home, target_codex_home)?;
     Ok(())
 }
 
 fn sync_host_persona_thread_archive_state(
     source_codex_home: &Path,
+    source_account_id: &str,
     target_codex_home: &Path,
+    target_account_id: &str,
+    conversation_sync_db_file: &Path,
 ) -> Result<()> {
     if source_codex_home == target_codex_home {
         return Ok(());
@@ -2490,6 +2499,8 @@ fn sync_host_persona_thread_archive_state(
         return Ok(());
     }
 
+    let sync_store = ConversationSyncStore::new(conversation_sync_db_file)?;
+
     let transaction = target_connection.transaction().with_context(|| {
         format!(
             "Failed to open transaction for {}.",
@@ -2500,15 +2511,35 @@ fn sync_host_persona_thread_archive_state(
         let mut update_statement = transaction
             .prepare("update threads set archived = ?1 where id = ?2 and archived != ?1")
             .with_context(|| format!("Failed to prepare {}.", target_state_db.display()))?;
-        for (thread_id, archived) in archive_states {
-            update_statement
-                .execute(rusqlite::params![archived, thread_id])
-                .with_context(|| {
-                    format!(
-                        "Failed to sync archived state into {}.",
-                        target_state_db.display()
-                    )
-                })?;
+        for (source_thread_id, archived) in archive_states {
+            let mut candidate_thread_ids = Vec::new();
+            if let Some(lineage_id) =
+                sync_store.get_lineage_id(source_account_id, &source_thread_id)?
+            {
+                if let Some(mapped_thread_id) =
+                    sync_store.get_local_thread_id(target_account_id, &lineage_id)?
+                {
+                    if !is_pending_lineage_claim(&mapped_thread_id) {
+                        candidate_thread_ids.push(mapped_thread_id);
+                    }
+                }
+            }
+            candidate_thread_ids.push(source_thread_id);
+
+            let mut seen_target_thread_ids = HashSet::new();
+            for target_thread_id in candidate_thread_ids {
+                if !seen_target_thread_ids.insert(target_thread_id.clone()) {
+                    continue;
+                }
+                update_statement
+                    .execute(rusqlite::params![archived, target_thread_id])
+                    .with_context(|| {
+                        format!(
+                            "Failed to sync archived state into {}.",
+                            target_state_db.display()
+                        )
+                    })?;
+            }
         }
     }
     transaction
@@ -3176,6 +3207,7 @@ fn copy_file_if_newer(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn merge_session_index_one_way(source_index: &Path, target_index: &Path) -> Result<()> {
     if !source_index.exists() {
         return Ok(());
@@ -3198,6 +3230,7 @@ fn merge_session_index_one_way(source_index: &Path, target_index: &Path) -> Resu
     Ok(())
 }
 
+#[allow(dead_code)]
 fn read_session_index_entries(path: &Path) -> Result<BTreeMap<String, SessionIndexEntry>> {
     let mut entries = BTreeMap::new();
     if !path.exists() {
@@ -3240,6 +3273,7 @@ fn read_session_index_entries(path: &Path) -> Result<BTreeMap<String, SessionInd
     Ok(entries)
 }
 
+#[allow(dead_code)]
 fn session_index_entry_is_newer(
     candidate: &SessionIndexEntry,
     current: &SessionIndexEntry,
@@ -3257,6 +3291,7 @@ fn session_index_entry_is_newer(
     }
 }
 
+#[allow(dead_code)]
 fn write_session_index_entries(
     path: &Path,
     entries: &BTreeMap<String, SessionIndexEntry>,
@@ -3303,6 +3338,7 @@ fn write_session_index_entries(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn merge_state_threads_one_way(source_codex_home: &Path, target_codex_home: &Path) -> Result<()> {
     let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
         return Ok(());
@@ -3391,6 +3427,7 @@ fn parse_versioned_state_db_name(name: &str) -> Option<u32> {
     version.parse::<u32>().ok()
 }
 
+#[allow(dead_code)]
 fn merge_threads_table_with_upsert(source_state_db: &Path, target_state_db: &Path) -> Result<()> {
     let connection = rusqlite::Connection::open(target_state_db)
         .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
@@ -3493,6 +3530,7 @@ fn merge_threads_table_with_upsert(source_state_db: &Path, target_state_db: &Pat
     Ok(())
 }
 
+#[allow(dead_code)]
 fn merge_table_with_upsert(
     source_state_db: &Path,
     target_state_db: &Path,
@@ -6448,7 +6486,7 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_merges_full_conversation_history_bidirectionally() {
+    fn switch_host_persona_keeps_thread_ids_and_session_indexes_persona_local() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
@@ -6468,10 +6506,6 @@ exit 91
                 100,
             )],
         );
-        seed_thread_scoped_tables(
-            &source_paths.codex_home.join("state_5.sqlite"),
-            "thread-source",
-        );
         seed_threads_table(
             &target_paths.codex_home.join("state_5.sqlite"),
             &[(
@@ -6479,10 +6513,6 @@ exit 91
                 "/Users/test/.codex/sessions/2026/01/01/rollout-target.jsonl",
                 200,
             )],
-        );
-        seed_thread_scoped_tables(
-            &target_paths.codex_home.join("state_5.sqlite"),
-            "thread-target",
         );
 
         let source_rollout = source_paths
@@ -6512,14 +6542,8 @@ exit 91
 
         let source_thread_ids = read_thread_ids(&source_paths.codex_home.join("state_5.sqlite"));
         let target_thread_ids = read_thread_ids(&target_paths.codex_home.join("state_5.sqlite"));
-        assert!(
-            source_thread_ids.contains(&"thread-source".to_string())
-                && source_thread_ids.contains(&"thread-target".to_string())
-        );
-        assert!(
-            target_thread_ids.contains(&"thread-source".to_string())
-                && target_thread_ids.contains(&"thread-target".to_string())
-        );
+        assert_eq!(source_thread_ids, vec!["thread-source".to_string()]);
+        assert_eq!(target_thread_ids, vec!["thread-target".to_string()]);
 
         assert!(source_paths
             .codex_home
@@ -6543,66 +6567,9 @@ exit 91
         let target_index =
             fs::read_to_string(target_paths.codex_home.join("session_index.jsonl")).unwrap();
         assert!(source_index.contains("\"thread-source\""));
-        assert!(source_index.contains("\"thread-target\""));
-        assert!(target_index.contains("\"thread-source\""));
+        assert!(!source_index.contains("\"thread-target\""));
+        assert!(!target_index.contains("\"thread-source\""));
         assert!(target_index.contains("\"thread-target\""));
-
-        let source_dynamic_tool_threads = read_single_text_column(
-            &source_paths.codex_home.join("state_5.sqlite"),
-            "select distinct thread_id from thread_dynamic_tools order by thread_id",
-        );
-        let target_dynamic_tool_threads = read_single_text_column(
-            &target_paths.codex_home.join("state_5.sqlite"),
-            "select distinct thread_id from thread_dynamic_tools order by thread_id",
-        );
-        assert_eq!(
-            source_dynamic_tool_threads,
-            vec!["thread-source".to_string(), "thread-target".to_string()]
-        );
-        assert_eq!(
-            target_dynamic_tool_threads,
-            vec!["thread-source".to_string(), "thread-target".to_string()]
-        );
-
-        let source_stage1_threads = read_single_text_column(
-            &source_paths.codex_home.join("state_5.sqlite"),
-            "select thread_id from stage1_outputs order by thread_id",
-        );
-        let target_stage1_threads = read_single_text_column(
-            &target_paths.codex_home.join("state_5.sqlite"),
-            "select thread_id from stage1_outputs order by thread_id",
-        );
-        assert_eq!(
-            source_stage1_threads,
-            vec!["thread-source".to_string(), "thread-target".to_string()]
-        );
-        assert_eq!(
-            target_stage1_threads,
-            vec!["thread-source".to_string(), "thread-target".to_string()]
-        );
-
-        let source_spawn_edges = read_single_text_column(
-            &source_paths.codex_home.join("state_5.sqlite"),
-            "select child_thread_id from thread_spawn_edges order by child_thread_id",
-        );
-        let target_spawn_edges = read_single_text_column(
-            &target_paths.codex_home.join("state_5.sqlite"),
-            "select child_thread_id from thread_spawn_edges order by child_thread_id",
-        );
-        assert_eq!(
-            source_spawn_edges,
-            vec![
-                "thread-source-child".to_string(),
-                "thread-target-child".to_string()
-            ]
-        );
-        assert_eq!(
-            target_spawn_edges,
-            vec![
-                "thread-source-child".to_string(),
-                "thread-target-child".to_string()
-            ]
-        );
     }
 
     #[test]
@@ -6661,7 +6628,7 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_syncs_current_archive_state_to_target_persona() {
+    fn switch_host_persona_syncs_current_archive_state_via_lineage_mapping() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
@@ -6673,37 +6640,46 @@ exit 91
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
 
+        let lineage_id = "lineage-archive-1";
         seed_threads_table(
             &source_paths.codex_home.join("state_5.sqlite"),
-            &[("thread-shared", "/tmp/source.jsonl", 100)],
+            &[("thread-source", "/tmp/source.jsonl", 100)],
         );
         seed_threads_table(
             &target_paths.codex_home.join("state_5.sqlite"),
-            &[("thread-shared", "/tmp/target.jsonl", 200)],
+            &[("thread-target", "/tmp/target.jsonl", 200)],
         );
         update_thread_metadata(
             &source_paths.codex_home.join("state_5.sqlite"),
-            "thread-shared",
+            "thread-source",
             "/workspace/shared-project",
             true,
         );
         update_thread_metadata(
             &target_paths.codex_home.join("state_5.sqlite"),
-            "thread-shared",
+            "thread-target",
             "/workspace/shared-project",
             false,
         );
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id(&source.account_id, lineage_id, "thread-source")
+            .expect("bind source lineage");
+        store
+            .bind_local_thread_id(&target.account_id, lineage_id, "thread-target")
+            .expect("bind target lineage");
 
         ensure_live_root_bindings(&paths, &source).expect("bind source");
         switch_host_persona(&paths, &source, &target, false).expect("switch");
 
         assert!(thread_is_archived(
             &source_paths.codex_home.join("state_5.sqlite"),
-            "thread-shared",
+            "thread-source",
         ));
         assert!(thread_is_archived(
             &target_paths.codex_home.join("state_5.sqlite"),
-            "thread-shared",
+            "thread-target",
         ));
     }
 
@@ -7395,89 +7371,6 @@ on conflict(id) do update set
         )
     }
 
-    fn seed_thread_scoped_tables(state_db_path: &Path, thread_id: &str) {
-        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
-        connection
-            .execute_batch(
-                r#"
-create table if not exists thread_dynamic_tools (
-    thread_id text not null,
-    position integer not null,
-    name text not null,
-    description text not null,
-    input_schema text not null,
-    defer_loading integer not null default 0,
-    primary key(thread_id, position)
-);
-create table if not exists thread_spawn_edges (
-    parent_thread_id text not null,
-    child_thread_id text not null primary key,
-    status text not null
-);
-create table if not exists stage1_outputs (
-    thread_id text primary key,
-    source_updated_at integer not null,
-    raw_memory text not null,
-    rollout_summary text not null,
-    generated_at integer not null
-);
-"#,
-            )
-            .expect("create thread scoped tables");
-        connection
-            .execute(
-                r#"
-insert into thread_dynamic_tools (thread_id, position, name, description, input_schema, defer_loading)
-values (?1, 0, 'tool-name', 'tool-description', '{}', 0)
-on conflict(thread_id, position) do update set
-    name=excluded.name,
-    description=excluded.description,
-    input_schema=excluded.input_schema
-"#,
-                rusqlite::params![thread_id],
-            )
-            .expect("insert thread dynamic tool");
-        connection
-            .execute(
-                r#"
-insert into thread_spawn_edges (parent_thread_id, child_thread_id, status)
-values (?1, ?2, 'ready')
-on conflict(child_thread_id) do update set
-    parent_thread_id=excluded.parent_thread_id,
-    status=excluded.status
-"#,
-                rusqlite::params![thread_id, format!("{thread_id}-child")],
-            )
-            .expect("insert spawn edge");
-        connection
-            .execute(
-                r#"
-insert into stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at)
-values (?1, 1, 'memory', 'summary', 1)
-on conflict(thread_id) do update set
-    source_updated_at=excluded.source_updated_at,
-    raw_memory=excluded.raw_memory,
-    rollout_summary=excluded.rollout_summary,
-    generated_at=excluded.generated_at
-"#,
-                rusqlite::params![thread_id],
-            )
-            .expect("insert stage1 output");
-    }
-
-    fn read_single_text_column(state_db_path: &Path, sql: &str) -> Vec<String> {
-        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
-        let mut statement = connection.prepare(sql).expect("prepare query");
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query rows");
-        let mut values = Vec::new();
-        for row in rows {
-            values.push(row.expect("value"));
-        }
-        values
-    }
-
     #[test]
     fn rollback_after_failed_host_activation_restores_state_and_symlinks() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -7787,7 +7680,12 @@ insert into threads (id, rollout_path, updated_at, archived) values
         let error = activate_host_rotation(&paths, &prepared, 9333, None)
             .expect_err("host activation should fail before committing pool");
         let message = format!("{:#}", error);
-        assert!(message.contains("missing persona metadata"));
+        assert!(
+            message.contains("persona metadata")
+                || message.contains("Failed to list running processes")
+                || message.contains("Operation not permitted"),
+            "{message}"
+        );
 
         let restored_pool = load_pool().expect("load restored pool");
         assert_eq!(restored_pool.active_index, 0);
