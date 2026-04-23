@@ -1465,10 +1465,20 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
             )?)
             .join("codex-home")
             .join("config.toml");
+        let target_global_state_path = target_config_path
+            .parent()
+            .context("target config path missing parent directory")?
+            .join(".codex-global-state.json");
         ensure!(
             config_contains_project(&target_config_path, &source_cwd)?,
             "expected rotated target config {} to register synced project cwd {}",
             target_config_path.display(),
+            source_cwd
+        );
+        ensure!(
+            global_state_contains_project(&target_global_state_path, &source_cwd)?,
+            "expected rotated target workspace visibility state {} to include {}",
+            target_global_state_path.display(),
             source_cwd
         );
 
@@ -2221,6 +2231,62 @@ fn inspect_codex_page_state(port: u16) -> Result<Value> {
     with_local_codex_connection(port, |connection| {
         connection.evaluate(
             r#"(() => {
+const requestToPromise = (request) =>
+  new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+  });
+const openDatabase = (name, version) =>
+  new Promise((resolve, reject) => {
+    const request = version === undefined ? indexedDB.open(name) : indexedDB.open(name, version);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error(`Failed to open ${name}`));
+    request.onupgradeneeded = () => {};
+  });
+const serializeValue = (value) => {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return String(value);
+  }
+};
+const inspectIndexedDb = async () => {
+  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') {
+    return [];
+  }
+  const databases = await indexedDB.databases();
+  const results = [];
+  for (const databaseInfo of databases) {
+    if (!databaseInfo || !databaseInfo.name) {
+      continue;
+    }
+    const db = await openDatabase(databaseInfo.name, databaseInfo.version);
+    const stores = [];
+    for (const storeName of Array.from(db.objectStoreNames)) {
+      const transaction = db.transaction(storeName, 'readonly');
+      const store = transaction.objectStore(storeName);
+      const count = await requestToPromise(store.count());
+      let sample = [];
+      if (count > 0) {
+        sample = await requestToPromise(store.getAll(undefined, 5)).then((values) =>
+          values.map(serializeValue),
+        );
+      }
+      stores.push({
+        name: storeName,
+        count,
+        sample,
+      });
+    }
+    db.close();
+    results.push({
+      name: databaseInfo.name,
+      version: databaseInfo.version ?? null,
+      stores,
+    });
+  }
+  return results;
+};
 const sessionStorageDump = {};
 for (let index = 0; index < sessionStorage.length; index += 1) {
   const key = sessionStorage.key(index);
@@ -2250,7 +2316,7 @@ for (let index = 0; index < localStorage.length; index += 1) {
 }
 const databasesPromise =
   typeof indexedDB !== "undefined" && indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
-return databasesPromise.then((indexedDbDatabases) => ({
+return Promise.all([databasesPromise, inspectIndexedDb()]).then(([indexedDbDatabases, indexedDbDump]) => ({
   url: location.href,
   title: document.title,
   bodyText: document.body ? document.body.innerText.slice(0, 12000) : null,
@@ -2260,8 +2326,26 @@ return databasesPromise.then((indexedDbDatabases) => ({
   relevantLocalStorage,
   sessionStorage: sessionStorageDump,
   indexedDbDatabases,
+  indexedDbDump,
+  electronBridgeKeys:
+    typeof window.electronBridge === 'object' && window.electronBridge !== null
+      ? Object.keys(window.electronBridge).sort()
+      : [],
+  electronBridgeProtoKeys:
+    typeof window.electronBridge === 'object' && window.electronBridge !== null
+      ? Object.getOwnPropertyNames(Object.getPrototypeOf(window.electronBridge) || {}).sort()
+      : [],
+  sharedObjectSnapshots:
+    typeof window.electronBridge?.getSharedObjectSnapshotValue === 'function'
+      ? {
+          activeWorkspaceRoots: window.electronBridge.getSharedObjectSnapshotValue('active-workspace-roots'),
+          workspaceRootOptions: window.electronBridge.getSharedObjectSnapshotValue('workspace-root-options'),
+          projectOrder: window.electronBridge.getSharedObjectSnapshotValue('project-order'),
+          electronSavedWorkspaceRoots: window.electronBridge.getSharedObjectSnapshotValue('electron-saved-workspace-roots'),
+        }
+      : null,
   windowKeys: Object.keys(window)
-    .filter((key) => /store|project|sidebar|thread|workspace/i.test(key))
+    .filter((key) => /store|project|sidebar|thread|workspace|electron|query|client/i.test(key))
     .sort()
     .slice(0, 200),
 }));
@@ -2282,20 +2366,51 @@ const record = (kind, detail) => {
   } catch (_) {}
 };
 const wrapBridge = (bridge) => {
-  if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+  if (!bridge) {
     return bridge;
   }
-  const original = bridge.sendMessageFromView.bind(bridge);
-  bridge.sendMessageFromView = async (request) => {
-    record("mcp", {
-      hostId: request && typeof request === "object" ? request.hostId ?? null : null,
-      method:
-        request && typeof request === "object"
-          ? request.request?.method ?? request.method ?? null
-          : null,
-    });
-    return original(request);
-  };
+  if (typeof bridge.sendMessageFromView === "function") {
+    const original = bridge.sendMessageFromView.bind(bridge);
+    bridge.sendMessageFromView = async (request) => {
+      record("mcp", {
+        hostId: request && typeof request === "object" ? request.hostId ?? null : null,
+        method:
+          request && typeof request === "object"
+            ? request.request?.method ?? request.method ?? null
+            : null,
+      });
+      return original(request);
+    };
+  }
+  if (typeof bridge.sendWorkerMessageFromView === "function") {
+    const originalWorker = bridge.sendWorkerMessageFromView.bind(bridge);
+    bridge.sendWorkerMessageFromView = async (request) => {
+      record("worker-send", {
+        keys:
+          request && typeof request === "object"
+            ? Object.keys(request).sort()
+            : null,
+        type:
+          request && typeof request === "object"
+            ? request.type ?? request.kind ?? request.message?.type ?? null
+            : null,
+        method:
+          request && typeof request === "object"
+            ? request.method ?? request.message?.method ?? null
+            : null,
+      });
+      return originalWorker(request);
+    };
+  }
+  if (typeof bridge.getSharedObjectSnapshotValue === "function") {
+    const originalSnapshot = bridge.getSharedObjectSnapshotValue.bind(bridge);
+    bridge.getSharedObjectSnapshotValue = (...args) => {
+      record("snapshot-read", {
+        args,
+      });
+      return originalSnapshot(...args);
+    };
+  }
   return bridge;
 };
 Object.defineProperty(window, "__codexRequestLog", {
@@ -2515,6 +2630,23 @@ fn config_contains_project(path: &Path, project_path: &str) -> Result<bool> {
         "[projects.\"{}\"]",
         encode_toml_basic_string(project_path)
     )))
+}
+
+fn global_state_contains_project(path: &Path, project_path: &str) -> Result<bool> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let state: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let contains_project = state
+        .get("electron-saved-workspace-roots")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.as_str() == Some(project_path))
+        })
+        .unwrap_or(false);
+    Ok(contains_project)
 }
 
 fn encode_toml_basic_string(value: &str) -> String {

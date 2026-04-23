@@ -93,6 +93,10 @@ const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", 
 const CONVERSATION_DIR_NAMES: &[&str] =
     &[concat!("ses", "sions"), concat!("archived_", "sessions")];
 const APP_SUPPORT_SYNC_DIR_NAMES: &[&str] = &["Local Storage"];
+const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
+const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
+const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
+const PROJECT_ORDER_KEY: &str = "project-order";
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
 const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
 const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
@@ -2174,6 +2178,9 @@ fn switch_host_persona(
     // Keep the Codex project registry aligned with synced thread cwd values so
     // project-scoped history stays visible in the desktop UI after rotation.
     sync_host_persona_project_registry(&source.codex_home, &target.codex_home)?;
+    // Keep the sidebar workspace-root registry aligned with synced projects so
+    // rotated personas do not hide thread history behind missing project chips.
+    sync_host_persona_workspace_visibility_state(&source.codex_home, &target.codex_home)?;
     // Keep project/sidebar local-storage state mirrored so project-scoped chats stay visible.
     sync_host_persona_app_support_state(
         &source.codex_app_support_dir,
@@ -2220,6 +2227,18 @@ fn sync_host_persona_app_support_state(
     Ok(())
 }
 
+fn sync_host_persona_workspace_visibility_state(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+    sync_host_persona_workspace_visibility_state_one_way(source_codex_home, target_codex_home)?;
+    sync_host_persona_workspace_visibility_state_one_way(target_codex_home, source_codex_home)?;
+    Ok(())
+}
+
 fn sync_host_persona_app_support_state_one_way(
     source_app_support: &Path,
     target_app_support: &Path,
@@ -2260,6 +2279,31 @@ fn sync_host_persona_project_registry_one_way(
         .filter(|path| should_sync_project_path(path, &known_projects))
         .collect::<Vec<_>>();
     append_missing_projects_to_config(&target_config, &missing_projects)
+}
+
+fn sync_host_persona_workspace_visibility_state_one_way(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    let source_global_state = source_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
+    let target_global_state = target_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
+    let mut candidates = read_config_project_paths(&source_codex_home.join("config.toml"))?;
+    candidates.extend(read_config_project_paths(
+        &target_codex_home.join("config.toml"),
+    )?);
+    candidates.extend(read_workspace_root_state_paths(&source_global_state)?);
+    candidates.extend(read_workspace_root_state_paths(&target_global_state)?);
+    candidates.extend(read_thread_cwds_from_codex_home(source_codex_home)?);
+    candidates.extend(read_thread_cwds_from_codex_home(target_codex_home)?);
+
+    let target_workspace_roots = normalize_workspace_visibility_paths(
+        read_workspace_root_state_paths(&target_global_state)?,
+    )?;
+    let missing_projects = normalize_workspace_visibility_paths(candidates)?
+        .into_iter()
+        .filter(|path| !target_workspace_roots.contains(path))
+        .collect::<Vec<_>>();
+    append_missing_workspace_roots_to_global_state(&target_global_state, &missing_projects)
 }
 
 fn sync_host_persona_conversation_history_one_way(
@@ -2431,6 +2475,214 @@ fn append_missing_projects_to_config(path: &Path, missing_projects: &[String]) -
             .with_context(|| format!("Failed to create {}.", parent.display()))?;
     }
     fs::write(path, contents).with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn read_workspace_root_state_paths(path: &Path) -> Result<BTreeSet<String>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    let state: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?;
+    let Some(object) = state.as_object() else {
+        return Err(anyhow!(
+            "Expected {} to contain a top-level JSON object.",
+            path.display()
+        ));
+    };
+    let mut roots = BTreeSet::new();
+    collect_workspace_root_strings(object.get(ACTIVE_WORKSPACE_ROOTS_KEY), &mut roots);
+    collect_workspace_root_strings(object.get(SAVED_WORKSPACE_ROOTS_KEY), &mut roots);
+    collect_workspace_root_strings(object.get(PROJECT_ORDER_KEY), &mut roots);
+    Ok(roots)
+}
+
+fn collect_workspace_root_strings(value: Option<&Value>, roots: &mut BTreeSet<String>) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for entry in values {
+        if let Some(path) = entry.as_str() {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                roots.insert(trimmed.to_string());
+            }
+        }
+    }
+}
+
+fn normalize_workspace_visibility_paths<I>(paths: I) -> Result<BTreeSet<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        if let Some(project_root) = normalize_workspace_visibility_path(&path)? {
+            normalized.insert(project_root);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_workspace_visibility_path(path: &str) -> Result<Option<String>> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut normalized = match fs::canonicalize(trimmed) {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to canonicalize workspace visibility path {trimmed}.")
+            })
+        }
+    };
+
+    if let Some(git_root) = git_repo_root_for_path(&normalized) {
+        normalized = git_root;
+    }
+    if let Some(main_root) = main_repo_root_for_worktree(&normalized) {
+        normalized = main_root;
+    }
+    if is_excluded_workspace_visibility_path(&normalized) {
+        return Ok(None);
+    }
+
+    Ok(Some(normalized.to_string_lossy().into_owned()))
+}
+
+fn is_excluded_workspace_visibility_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == ".live-host-env")
+    {
+        return true;
+    }
+
+    let mut excluded_prefixes = vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var/folders"),
+        PathBuf::from("/private/var/folders"),
+    ];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        excluded_prefixes.push(home.join(".codex"));
+        excluded_prefixes.push(home.join(".codex-rotate"));
+        excluded_prefixes.push(home.join("Documents").join("Codex"));
+    }
+
+    excluded_prefixes
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(prefix))
+}
+
+fn main_repo_root_for_worktree(path: &Path) -> Option<PathBuf> {
+    let top_level = git_repo_root_for_path(path)?;
+    let common_dir = git_common_dir_for_path(&top_level)?;
+    let main_root = common_dir.parent()?.canonicalize().ok()?;
+    (main_root != top_level).then_some(main_root)
+}
+
+fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    PathBuf::from(trimmed).canonicalize().ok()
+}
+
+fn git_common_dir_for_path(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = String::from_utf8(output.stdout).ok()?;
+    let trimmed = common_dir.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    PathBuf::from(trimmed).canonicalize().ok()
+}
+
+fn append_missing_workspace_roots_to_global_state(
+    path: &Path,
+    missing_projects: &[String],
+) -> Result<()> {
+    if missing_projects.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<Value>(&contents)
+            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Default::default()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+
+    let Some(object) = state.as_object_mut() else {
+        return Err(anyhow!(
+            "Expected {} to contain a top-level JSON object.",
+            path.display()
+        ));
+    };
+    append_missing_workspace_root_array(object, SAVED_WORKSPACE_ROOTS_KEY, missing_projects)?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string(&state)?)
+        .with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn append_missing_workspace_root_array(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    missing_projects: &[String],
+) -> Result<()> {
+    let value = object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(array) = value.as_array_mut() else {
+        return Err(anyhow!(
+            "Expected {key} in workspace visibility state to be an array."
+        ));
+    };
+
+    let existing = array
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for project in missing_projects {
+        if !existing.contains(project) {
+            array.push(Value::String(project.clone()));
+        }
+    }
+    Ok(())
 }
 
 fn encode_toml_basic_string(value: &str) -> String {
@@ -5868,6 +6120,15 @@ exit 91
         fs::create_dir_all(&source_project).expect("create source project");
         fs::create_dir_all(&target_project).expect("create target project");
         fs::create_dir_all(&archived_backfill_project).expect("create archived project");
+        for project in [&source_project, &target_project, &archived_backfill_project] {
+            let status = Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(project)
+                .status()
+                .expect("git init project");
+            assert!(status.success(), "git init failed: {status}");
+        }
 
         fs::write(
             source_paths.codex_home.join("config.toml"),
@@ -5943,6 +6204,279 @@ exit 91
             assert!(config.contains(&project_table_heading(&archived_backfill_project)));
             assert!(!config.contains(&project_table_heading(&missing_project)));
         }
+    }
+
+    #[test]
+    fn switch_host_persona_reconciles_workspace_visibility_from_project_history_bidirectionally() {
+        let temp = tempfile::Builder::new()
+            .prefix("codex-rotate-visibility-sync-")
+            .tempdir_in(std::env::current_dir().expect("current dir"))
+            .expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        let source_project = temp.path().join("projects/source-visible");
+        let target_project = temp.path().join("projects/target-visible");
+        let archived_backfill_project = temp.path().join("projects/archived-backfill");
+        let missing_project = temp.path().join("projects/missing-project");
+        fs::create_dir_all(&source_project).expect("create source project");
+        fs::create_dir_all(&target_project).expect("create target project");
+        fs::create_dir_all(&archived_backfill_project).expect("create archived project");
+        for project in [&source_project, &target_project, &archived_backfill_project] {
+            let status = Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(project)
+                .status()
+                .expect("git init project");
+            assert!(status.success(), "git init failed: {status}");
+        }
+
+        fs::write(
+            source_paths.codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&source_project.display().to_string())
+            ),
+        )
+        .expect("write source config");
+        fs::write(
+            target_paths.codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&target_project.display().to_string())
+            ),
+        )
+        .expect("write target config");
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[
+                ("thread-source", "/tmp/source.jsonl", 100),
+                ("thread-archived-backfill", "/tmp/backfill.jsonl", 101),
+                ("thread-missing", "/tmp/missing.jsonl", 102),
+            ],
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-source",
+            &source_project.display().to_string(),
+            false,
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-archived-backfill",
+            &archived_backfill_project.display().to_string(),
+            true,
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-missing",
+            &missing_project.display().to_string(),
+            false,
+        );
+
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-target", "/tmp/target.jsonl", 200)],
+        );
+        update_thread_metadata(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-target",
+            &target_project.display().to_string(),
+            false,
+        );
+
+        fs::write(
+            source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                "selected-remote-host-id": "local",
+                SAVED_WORKSPACE_ROOTS_KEY: [source_project.display().to_string()],
+                PROJECT_ORDER_KEY: [source_project.display().to_string()],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [source_project.display().to_string()],
+            }))
+            .expect("serialize source global state"),
+        )
+        .expect("write source global state");
+        fs::write(
+            target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                "electron-main-window-bounds": {"x": 1, "y": 2},
+                SAVED_WORKSPACE_ROOTS_KEY: [target_project.display().to_string()],
+                PROJECT_ORDER_KEY: [target_project.display().to_string()],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [],
+            }))
+            .expect("serialize target global state"),
+        )
+        .expect("write target global state");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        let expected_projects = vec![
+            source_project.display().to_string(),
+            target_project.display().to_string(),
+            archived_backfill_project.display().to_string(),
+        ];
+        let missing_project_string = missing_project.display().to_string();
+        for (state_path, expected_project_order) in [
+            (
+                source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+                vec![source_project.display().to_string()],
+            ),
+            (
+                target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+                vec![target_project.display().to_string()],
+            ),
+        ] {
+            let state: Value = serde_json::from_str(
+                &fs::read_to_string(&state_path).expect("read workspace visibility state"),
+            )
+            .expect("parse workspace visibility state");
+            let saved_roots = state
+                .get(SAVED_WORKSPACE_ROOTS_KEY)
+                .and_then(Value::as_array)
+                .expect("saved roots array")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let project_order = state
+                .get(PROJECT_ORDER_KEY)
+                .and_then(Value::as_array)
+                .expect("project order array")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            for project in &expected_projects {
+                assert!(
+                    saved_roots.contains(project),
+                    "expected saved roots in {} to contain {}",
+                    state_path.display(),
+                    project
+                );
+            }
+            assert!(
+                !saved_roots.contains(&missing_project_string),
+                "did not expect missing project {} in saved roots {}",
+                missing_project.display(),
+                state_path.display()
+            );
+            assert_eq!(
+                project_order,
+                expected_project_order,
+                "expected project order in {} to preserve the target selection",
+                state_path.display()
+            );
+        }
+
+        let source_state: Value = serde_json::from_str(
+            &fs::read_to_string(source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME))
+                .expect("read source global state"),
+        )
+        .expect("parse source global state");
+        assert_eq!(
+            source_state
+                .get("selected-remote-host-id")
+                .and_then(Value::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            source_state
+                .get(ACTIVE_WORKSPACE_ROOTS_KEY)
+                .and_then(Value::as_array)
+                .expect("source active roots")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![source_project.display().to_string()]
+        );
+
+        let target_state: Value = serde_json::from_str(
+            &fs::read_to_string(target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME))
+                .expect("read target global state"),
+        )
+        .expect("parse target global state");
+        assert_eq!(
+            target_state
+                .get("electron-main-window-bounds")
+                .and_then(Value::as_object)
+                .and_then(|bounds| bounds.get("x"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+        assert!(target_state
+            .get(ACTIVE_WORKSPACE_ROOTS_KEY)
+            .and_then(Value::as_array)
+            .expect("target active roots")
+            .is_empty());
+    }
+
+    #[test]
+    fn normalize_workspace_visibility_path_filters_noise_and_canonicalizes_repo_roots() {
+        let temp = tempfile::Builder::new()
+            .prefix("codex-rotate-visibility-normalize-")
+            .tempdir_in(std::env::current_dir().expect("current dir"))
+            .expect("tempdir");
+        let workspace_root = temp.path();
+
+        let repo_root = workspace_root.join("ai-rules");
+        let nested_project = repo_root.join("skills").join("domain-evaluator");
+        let repo_local_worktree = repo_root.join("worktrees").join("task-a");
+        fs::create_dir_all(&nested_project).expect("create nested project");
+        fs::create_dir_all(&repo_local_worktree).expect("create repo-local worktree");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&repo_root)
+            .status()
+            .expect("git init repo root");
+        assert!(status.success(), "git init failed: {status}");
+
+        let normalized_nested = normalize_workspace_visibility_path(
+            nested_project.to_str().expect("nested project path"),
+        )
+        .expect("normalize nested project");
+        assert_eq!(
+            normalized_nested,
+            Some(repo_root.to_string_lossy().into_owned())
+        );
+
+        let normalized_worktree = normalize_workspace_visibility_path(
+            repo_local_worktree
+                .to_str()
+                .expect("repo-local worktree path"),
+        )
+        .expect("normalize repo-local worktree");
+        assert_eq!(
+            normalized_worktree,
+            Some(repo_root.to_string_lossy().into_owned())
+        );
+
+        assert!(
+            normalize_workspace_visibility_path("/private/tmp/codex-temp-project")
+                .expect("normalize private tmp")
+                .is_none()
+        );
+        assert!(
+            normalize_workspace_visibility_path("/Users/omar/.codex-rotate")
+                .expect("normalize codex rotate home")
+                .is_none()
+        );
+        assert!(
+            normalize_workspace_visibility_path("/Users/omar/Documents/Codex/2026-04-22-hi")
+                .expect("normalize codex documents path")
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,6 +17,7 @@ const VM_UTMCTL_BIN_ENV: &str = "CODEX_ROTATE_UTMCTL_BIN";
 const VM_BASE_PACKAGE_PATH_ENV: &str = "CODEX_ROTATE_VM_BASE_PACKAGE_PATH";
 const VM_BRIDGE_ROOT_ENV: &str = "CODEX_ROTATE_VM_BRIDGE_ROOT";
 const VM_PERSONA_ROOT_ENV: &str = "CODEX_ROTATE_VM_PERSONA_ROOT";
+const LIVE_ALIAS_ROOT_ENV: &str = "CODEX_ROTATE_LIVE_ALIAS_ROOT";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LivePrereqCheck {
@@ -74,6 +76,7 @@ impl LiveCapabilityReport {
 }
 
 pub fn host_live_capability_report() -> Result<LiveCapabilityReport> {
+    ensure_host_live_alias_environment()?;
     let home = dirs::home_dir().context("Failed to resolve home directory.")?;
     let checks = vec![
         required_live_path_env(
@@ -111,6 +114,7 @@ pub fn host_live_capability_report() -> Result<LiveCapabilityReport> {
 }
 
 pub fn vm_live_capability_report() -> Result<LiveCapabilityReport> {
+    ensure_host_live_alias_environment()?;
     let home = dirs::home_dir().context("Failed to resolve home directory.")?;
     let checks = vec![
         required_live_path_env(
@@ -170,6 +174,108 @@ pub fn require_vm_live_capabilities() -> Result<LiveCapabilityReport> {
     let report = vm_live_capability_report()?;
     report.ensure_ready()?;
     Ok(report)
+}
+
+fn ensure_host_live_alias_environment() -> Result<()> {
+    let home = dirs::home_dir().context("Failed to resolve home directory.")?;
+    let alias_root = env::var_os(LIVE_ALIAS_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/codex-live-alias"));
+
+    ensure_default_live_path_alias(
+        "CODEX_ROTATE_HOME",
+        &home.join(".codex-rotate"),
+        &alias_root.join("rotate-home"),
+    )?;
+    ensure_default_live_path_alias(
+        "CODEX_HOME",
+        &home.join(".codex"),
+        &alias_root.join("codex-home"),
+    )?;
+    ensure_default_live_path_alias(
+        "FAST_BROWSER_HOME",
+        &home.join(".fast-browser"),
+        &alias_root.join("fast-browser-home"),
+    )?;
+    ensure_default_live_path_alias(
+        "CODEX_ROTATE_CODEX_APP_SUPPORT",
+        &home
+            .join("Library")
+            .join("Application Support")
+            .join("Codex"),
+        &alias_root.join("app-support-codex"),
+    )?;
+
+    Ok(())
+}
+
+fn ensure_default_live_path_alias(
+    env_name: &str,
+    default_path: &Path,
+    alias_path: &Path,
+) -> Result<()> {
+    let needs_alias = env::var_os(env_name)
+        .map(PathBuf::from)
+        .map(|path| path == default_path)
+        .unwrap_or(true);
+    if !needs_alias {
+        return Ok(());
+    }
+
+    if !default_path.exists() {
+        return Ok(());
+    }
+
+    let alias_parent = alias_path
+        .parent()
+        .ok_or_else(|| anyhow!("Alias path {} is missing a parent.", alias_path.display()))?;
+    fs::create_dir_all(alias_parent)
+        .with_context(|| format!("Failed to create {}.", alias_parent.display()))?;
+
+    if let Ok(existing_target) = fs::read_link(alias_path) {
+        if existing_target == default_path {
+            unsafe {
+                env::set_var(env_name, alias_path);
+            }
+            return Ok(());
+        }
+        fs::remove_file(alias_path)
+            .with_context(|| format!("Failed to replace stale alias {}.", alias_path.display()))?;
+    } else if alias_path.exists() {
+        if alias_path.is_dir() {
+            fs::remove_dir_all(alias_path).with_context(|| {
+                format!(
+                    "Failed to replace stale live alias directory {}.",
+                    alias_path.display()
+                )
+            })?;
+        } else {
+            fs::remove_file(alias_path)
+                .with_context(|| format!("Failed to replace {}.", alias_path.display()))?;
+        }
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(default_path, alias_path).with_context(|| {
+        format!(
+            "Failed to create live alias {} -> {}.",
+            alias_path.display(),
+            default_path.display()
+        )
+    })?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(default_path, alias_path).with_context(|| {
+        format!(
+            "Failed to create live alias {} -> {}.",
+            alias_path.display(),
+            default_path.display()
+        )
+    })?;
+
+    unsafe {
+        env::set_var(env_name, alias_path);
+    }
+    Ok(())
 }
 
 fn required_live_path_env(name: &str, default_path: &Path, label: &str) -> Result<LivePrereqCheck> {
@@ -503,4 +609,106 @@ fn filesystem_type(path: &Path) -> Result<String> {
                 path.display()
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::env_mutex;
+    use std::ffi::OsString;
+
+    fn restore_env(name: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => unsafe {
+                env::set_var(name, value);
+            },
+            None => unsafe {
+                env::remove_var(name);
+            },
+        }
+    }
+
+    #[test]
+    fn ensure_host_live_alias_environment_installs_aliases_for_default_paths() {
+        let _guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let alias_root = temp.path().join("alias-root");
+        let defaults = [
+            home.join(".codex-rotate"),
+            home.join(".codex"),
+            home.join(".fast-browser"),
+            home.join("Library")
+                .join("Application Support")
+                .join("Codex"),
+        ];
+        for path in &defaults {
+            fs::create_dir_all(path).expect("create default live path");
+        }
+
+        let previous_home = env::var_os("HOME");
+        let previous_rotate_home = env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        let previous_alias_root = env::var_os(LIVE_ALIAS_ROOT_ENV);
+
+        unsafe {
+            env::set_var("HOME", &home);
+            env::remove_var("CODEX_ROTATE_HOME");
+            env::remove_var("CODEX_HOME");
+            env::remove_var("FAST_BROWSER_HOME");
+            env::remove_var("CODEX_ROTATE_CODEX_APP_SUPPORT");
+            env::set_var(LIVE_ALIAS_ROOT_ENV, &alias_root);
+        }
+
+        ensure_host_live_alias_environment().expect("install host live aliases");
+
+        let rotate_home_alias = alias_root.join("rotate-home");
+        let codex_home_alias = alias_root.join("codex-home");
+        let fast_browser_home_alias = alias_root.join("fast-browser-home");
+        let app_support_alias = alias_root.join("app-support-codex");
+        assert_eq!(
+            env::var_os("CODEX_ROTATE_HOME"),
+            Some(rotate_home_alias.into_os_string())
+        );
+        assert_eq!(
+            env::var_os("CODEX_HOME"),
+            Some(codex_home_alias.into_os_string())
+        );
+        assert_eq!(
+            env::var_os("FAST_BROWSER_HOME"),
+            Some(fast_browser_home_alias.into_os_string())
+        );
+        assert_eq!(
+            env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT"),
+            Some(app_support_alias.into_os_string())
+        );
+
+        assert_eq!(
+            fs::read_link(alias_root.join("rotate-home")).expect("rotate-home alias"),
+            home.join(".codex-rotate")
+        );
+        assert_eq!(
+            fs::read_link(alias_root.join("codex-home")).expect("codex-home alias"),
+            home.join(".codex")
+        );
+        assert_eq!(
+            fs::read_link(alias_root.join("fast-browser-home")).expect("fast-browser alias"),
+            home.join(".fast-browser")
+        );
+        assert_eq!(
+            fs::read_link(alias_root.join("app-support-codex")).expect("app-support alias"),
+            home.join("Library")
+                .join("Application Support")
+                .join("Codex")
+        );
+
+        restore_env("HOME", previous_home);
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+        restore_env(LIVE_ALIAS_ROOT_ENV, previous_alias_root);
+    }
 }
