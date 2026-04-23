@@ -97,6 +97,7 @@ const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
 const PROJECT_ORDER_KEY: &str = "project-order";
+const REMOVED_WORKSPACE_ROOTS_KEY: &str = "codex-rotate-removed-workspace-roots";
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
 const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
 const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
@@ -2173,14 +2174,27 @@ fn switch_host_persona(
             .as_ref()
             .ok_or_else(|| anyhow!("Target account is missing persona metadata."))?,
     )?;
+    // Project visibility and archive state are source-persona UI decisions.
+    // Capture and propagate them before thread history becomes bidirectional.
+    sync_host_persona_thread_archive_state(&source.codex_home, &target.codex_home)?;
+    let removed_project_roots =
+        reconcile_host_persona_removed_project_roots(&source.codex_home, &target.codex_home)?;
     // Keep full conversation history mirrored across host personas.
     sync_host_persona_conversation_history(&source.codex_home, &target.codex_home)?;
     // Keep the Codex project registry aligned with synced thread cwd values so
     // project-scoped history stays visible in the desktop UI after rotation.
-    sync_host_persona_project_registry(&source.codex_home, &target.codex_home)?;
+    sync_host_persona_project_registry(
+        &source.codex_home,
+        &target.codex_home,
+        &removed_project_roots,
+    )?;
     // Keep the sidebar workspace-root registry aligned with synced projects so
     // rotated personas do not hide thread history behind missing project chips.
-    sync_host_persona_workspace_visibility_state(&source.codex_home, &target.codex_home)?;
+    sync_host_persona_workspace_visibility_state(
+        &source.codex_home,
+        &target.codex_home,
+        &removed_project_roots,
+    )?;
     // Keep project/sidebar local-storage state mirrored so project-scoped chats stay visible.
     sync_host_persona_app_support_state(
         &source.codex_app_support_dir,
@@ -2206,12 +2220,21 @@ fn sync_host_persona_conversation_history(
 fn sync_host_persona_project_registry(
     source_codex_home: &Path,
     target_codex_home: &Path,
+    removed_project_roots: &BTreeSet<String>,
 ) -> Result<()> {
     if source_codex_home == target_codex_home {
         return Ok(());
     }
-    sync_host_persona_project_registry_one_way(source_codex_home, target_codex_home)?;
-    sync_host_persona_project_registry_one_way(target_codex_home, source_codex_home)?;
+    sync_host_persona_project_registry_one_way(
+        source_codex_home,
+        target_codex_home,
+        removed_project_roots,
+    )?;
+    sync_host_persona_project_registry_one_way(
+        target_codex_home,
+        source_codex_home,
+        removed_project_roots,
+    )?;
     Ok(())
 }
 
@@ -2230,12 +2253,21 @@ fn sync_host_persona_app_support_state(
 fn sync_host_persona_workspace_visibility_state(
     source_codex_home: &Path,
     target_codex_home: &Path,
+    removed_project_roots: &BTreeSet<String>,
 ) -> Result<()> {
     if source_codex_home == target_codex_home {
         return Ok(());
     }
-    sync_host_persona_workspace_visibility_state_one_way(source_codex_home, target_codex_home)?;
-    sync_host_persona_workspace_visibility_state_one_way(target_codex_home, source_codex_home)?;
+    sync_host_persona_workspace_visibility_state_one_way(
+        source_codex_home,
+        target_codex_home,
+        removed_project_roots,
+    )?;
+    sync_host_persona_workspace_visibility_state_one_way(
+        target_codex_home,
+        source_codex_home,
+        removed_project_roots,
+    )?;
     Ok(())
 }
 
@@ -2260,12 +2292,19 @@ fn sync_host_persona_app_support_state_one_way(
 fn sync_host_persona_project_registry_one_way(
     source_codex_home: &Path,
     target_codex_home: &Path,
+    removed_project_roots: &BTreeSet<String>,
 ) -> Result<()> {
     let source_config = source_codex_home.join("config.toml");
     let target_config = target_codex_home.join("config.toml");
 
-    let source_projects = read_config_project_paths(&source_config)?;
-    let target_projects = read_config_project_paths(&target_config)?;
+    let source_projects = filter_removed_project_paths(
+        read_config_project_paths(&source_config)?,
+        removed_project_roots,
+    )?;
+    let target_projects = filter_removed_project_paths(
+        read_config_project_paths(&target_config)?,
+        removed_project_roots,
+    )?;
     let mut known_projects = source_projects.clone();
     known_projects.extend(target_projects.iter().cloned());
 
@@ -2273,17 +2312,25 @@ fn sync_host_persona_project_registry_one_way(
     candidates.extend(read_thread_cwds_from_codex_home(source_codex_home)?);
     candidates.extend(read_thread_cwds_from_codex_home(target_codex_home)?);
 
-    let missing_projects = candidates
-        .into_iter()
-        .filter(|path| !target_projects.contains(path))
-        .filter(|path| should_sync_project_path(path, &known_projects))
-        .collect::<Vec<_>>();
+    let mut missing_projects = Vec::new();
+    for candidate in candidates {
+        if target_projects.contains(&candidate) {
+            continue;
+        }
+        if project_path_matches_removed_root(&candidate, removed_project_roots)? {
+            continue;
+        }
+        if should_sync_project_path(&candidate, &known_projects) {
+            missing_projects.push(candidate);
+        }
+    }
     append_missing_projects_to_config(&target_config, &missing_projects)
 }
 
 fn sync_host_persona_workspace_visibility_state_one_way(
     source_codex_home: &Path,
     target_codex_home: &Path,
+    removed_project_roots: &BTreeSet<String>,
 ) -> Result<()> {
     let source_global_state = source_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
     let target_global_state = target_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
@@ -2298,12 +2345,57 @@ fn sync_host_persona_workspace_visibility_state_one_way(
 
     let target_workspace_roots = normalize_workspace_visibility_paths(
         read_workspace_root_state_paths(&target_global_state)?,
-    )?;
-    let missing_projects = normalize_workspace_visibility_paths(candidates)?
-        .into_iter()
-        .filter(|path| !target_workspace_roots.contains(path))
-        .collect::<Vec<_>>();
+    )?
+    .into_iter()
+    .filter(|path| !removed_project_roots.contains(path))
+    .collect::<BTreeSet<_>>();
+    let mut missing_projects = Vec::new();
+    for candidate in normalize_workspace_visibility_paths(candidates)? {
+        if removed_project_roots.contains(&candidate) {
+            continue;
+        }
+        if !target_workspace_roots.contains(&candidate) {
+            missing_projects.push(candidate);
+        }
+    }
     append_missing_workspace_roots_to_global_state(&target_global_state, &missing_projects)
+}
+
+fn reconcile_host_persona_removed_project_roots(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<BTreeSet<String>> {
+    let source_global_state = source_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
+    let target_global_state = target_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
+
+    let source_visible_roots = read_visible_project_roots(source_codex_home)?;
+    let target_visible_roots = read_visible_project_roots(target_codex_home)?;
+    let source_thread_roots =
+        normalize_workspace_visibility_paths(read_thread_cwds_from_codex_home(source_codex_home)?)?;
+
+    let mut removed_project_roots = read_removed_workspace_root_tombstones(&source_global_state)?;
+    removed_project_roots.extend(read_removed_workspace_root_tombstones(
+        &target_global_state,
+    )?);
+    removed_project_roots.retain(|path| !source_visible_roots.contains(path));
+    removed_project_roots.extend(source_thread_roots.into_iter().filter(|path| {
+        !source_visible_roots.contains(path) && target_visible_roots.contains(path)
+    }));
+
+    write_removed_workspace_root_tombstones(&source_global_state, &removed_project_roots)?;
+    write_removed_workspace_root_tombstones(&target_global_state, &removed_project_roots)?;
+    remove_workspace_root_entries_from_global_state(&source_global_state, &removed_project_roots)?;
+    remove_workspace_root_entries_from_global_state(&target_global_state, &removed_project_roots)?;
+    remove_projects_from_config(
+        &source_codex_home.join("config.toml"),
+        &removed_project_roots,
+    )?;
+    remove_projects_from_config(
+        &target_codex_home.join("config.toml"),
+        &removed_project_roots,
+    )?;
+
+    Ok(removed_project_roots)
 }
 
 fn sync_host_persona_conversation_history_one_way(
@@ -2329,6 +2421,98 @@ fn sync_host_persona_conversation_history_one_way(
     Ok(())
 }
 
+fn sync_host_persona_thread_archive_state(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+
+    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
+        return Ok(());
+    };
+    let Some(target_state_db) = resolve_state_db_file_in_codex_home(target_codex_home) else {
+        return Ok(());
+    };
+    if !source_state_db.exists() || !target_state_db.exists() {
+        return Ok(());
+    }
+
+    let source_connection = rusqlite::Connection::open(&source_state_db)
+        .with_context(|| format!("Failed to open {}.", source_state_db.display()))?;
+    if !sqlite_table_exists(&source_connection, "threads")? {
+        return Ok(());
+    }
+    let source_columns = sqlite_table_columns(&source_connection, "main", "threads")?;
+    if !source_columns.iter().any(|column| column == "id")
+        || !source_columns.iter().any(|column| column == "archived")
+    {
+        return Ok(());
+    }
+
+    let mut source_statement = source_connection
+        .prepare("select id, archived from threads")
+        .with_context(|| format!("Failed to query {}.", source_state_db.display()))?;
+    let source_rows = source_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .with_context(|| {
+            format!(
+                "Failed to read archive state from {}.",
+                source_state_db.display()
+            )
+        })?;
+    let mut archive_states = Vec::new();
+    for row in source_rows {
+        archive_states.push(row.with_context(|| {
+            format!(
+                "Failed to decode archived thread state from {}.",
+                source_state_db.display()
+            )
+        })?);
+    }
+
+    let mut target_connection = rusqlite::Connection::open(&target_state_db)
+        .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
+    if !sqlite_table_exists(&target_connection, "threads")? {
+        return Ok(());
+    }
+    let target_columns = sqlite_table_columns(&target_connection, "main", "threads")?;
+    if !target_columns.iter().any(|column| column == "id")
+        || !target_columns.iter().any(|column| column == "archived")
+    {
+        return Ok(());
+    }
+
+    let transaction = target_connection.transaction().with_context(|| {
+        format!(
+            "Failed to open transaction for {}.",
+            target_state_db.display()
+        )
+    })?;
+    {
+        let mut update_statement = transaction
+            .prepare("update threads set archived = ?1 where id = ?2 and archived != ?1")
+            .with_context(|| format!("Failed to prepare {}.", target_state_db.display()))?;
+        for (thread_id, archived) in archive_states {
+            update_statement
+                .execute(rusqlite::params![archived, thread_id])
+                .with_context(|| {
+                    format!(
+                        "Failed to sync archived state into {}.",
+                        target_state_db.display()
+                    )
+                })?;
+        }
+    }
+    transaction
+        .commit()
+        .with_context(|| format!("Failed to commit {}.", target_state_db.display()))?;
+    Ok(())
+}
+
 fn read_config_project_paths(path: &Path) -> Result<BTreeSet<String>> {
     let mut projects = BTreeSet::new();
     let contents = match fs::read_to_string(path) {
@@ -2344,6 +2528,80 @@ fn read_config_project_paths(path: &Path) -> Result<BTreeSet<String>> {
         }
     }
     Ok(projects)
+}
+
+fn filter_removed_project_paths(
+    projects: BTreeSet<String>,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut filtered = BTreeSet::new();
+    for project in projects {
+        if !project_path_matches_removed_root(&project, removed_project_roots)? {
+            filtered.insert(project);
+        }
+    }
+    Ok(filtered)
+}
+
+fn project_path_matches_removed_root(
+    path: &str,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<bool> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || removed_project_roots.is_empty() {
+        return Ok(false);
+    }
+    if removed_project_roots.contains(trimmed) {
+        return Ok(true);
+    }
+    Ok(normalize_workspace_visibility_path(trimmed)?
+        .as_deref()
+        .map(|normalized| removed_project_roots.contains(normalized))
+        .unwrap_or(false))
+}
+
+fn remove_projects_from_config(
+    path: &Path,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<()> {
+    if removed_project_roots.is_empty() {
+        return Ok(());
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+
+    let mut filtered = String::with_capacity(contents.len());
+    let mut skip_project_table = false;
+    for line in contents.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches('\n');
+        let trimmed = line_without_newline.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skip_project_table = match parse_project_table_heading(line_without_newline) {
+                Some(project_path) => {
+                    project_path_matches_removed_root(&project_path, removed_project_roots)?
+                }
+                None => false,
+            };
+        }
+        if !skip_project_table {
+            filtered.push_str(line);
+        }
+    }
+
+    if filtered != contents {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}.", parent.display()))?;
+        }
+        fs::write(path, filtered)
+            .with_context(|| format!("Failed to write {}.", path.display()))?;
+    }
+    Ok(())
 }
 
 fn parse_project_table_heading(line: &str) -> Option<String> {
@@ -2498,6 +2756,37 @@ fn read_workspace_root_state_paths(path: &Path) -> Result<BTreeSet<String>> {
     collect_workspace_root_strings(object.get(SAVED_WORKSPACE_ROOTS_KEY), &mut roots);
     collect_workspace_root_strings(object.get(PROJECT_ORDER_KEY), &mut roots);
     Ok(roots)
+}
+
+fn read_removed_workspace_root_tombstones(path: &Path) -> Result<BTreeSet<String>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    let state: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?;
+    let Some(object) = state.as_object() else {
+        return Err(anyhow!(
+            "Expected {} to contain a top-level JSON object.",
+            path.display()
+        ));
+    };
+    let mut roots = BTreeSet::new();
+    collect_workspace_root_strings(object.get(REMOVED_WORKSPACE_ROOTS_KEY), &mut roots);
+    Ok(roots)
+}
+
+fn read_visible_project_roots(codex_home: &Path) -> Result<BTreeSet<String>> {
+    let mut visible = normalize_workspace_visibility_paths(read_config_project_paths(
+        &codex_home.join("config.toml"),
+    )?)?;
+    visible.extend(normalize_workspace_visibility_paths(
+        read_workspace_root_state_paths(&codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME))?,
+    )?);
+    Ok(visible)
 }
 
 fn collect_workspace_root_strings(value: Option<&Value>, roots: &mut BTreeSet<String>) {
@@ -2658,6 +2947,91 @@ fn append_missing_workspace_roots_to_global_state(
         .with_context(|| format!("Failed to write {}.", path.display()))
 }
 
+fn write_removed_workspace_root_tombstones(
+    path: &Path,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<()> {
+    if removed_project_roots.is_empty() && !path.exists() {
+        return Ok(());
+    }
+
+    let mut state = match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<Value>(&contents)
+            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Default::default()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+
+    let Some(object) = state.as_object_mut() else {
+        return Err(anyhow!(
+            "Expected {} to contain a top-level JSON object.",
+            path.display()
+        ));
+    };
+    if removed_project_roots.is_empty() {
+        object.remove(REMOVED_WORKSPACE_ROOTS_KEY);
+    } else {
+        object.insert(
+            REMOVED_WORKSPACE_ROOTS_KEY.to_string(),
+            Value::Array(
+                removed_project_roots
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string(&state)?)
+        .with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn remove_workspace_root_entries_from_global_state(
+    path: &Path,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<()> {
+    if removed_project_roots.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<Value>(&contents)
+            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+
+    let Some(object) = state.as_object_mut() else {
+        return Err(anyhow!(
+            "Expected {} to contain a top-level JSON object.",
+            path.display()
+        ));
+    };
+    for key in [
+        ACTIVE_WORKSPACE_ROOTS_KEY,
+        SAVED_WORKSPACE_ROOTS_KEY,
+        PROJECT_ORDER_KEY,
+    ] {
+        remove_workspace_root_array_entries(object, key, removed_project_roots)?;
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string(&state)?)
+        .with_context(|| format!("Failed to write {}.", path.display()))
+}
+
 fn append_missing_workspace_root_array(
     object: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -2682,6 +3056,34 @@ fn append_missing_workspace_root_array(
             array.push(Value::String(project.clone()));
         }
     }
+    Ok(())
+}
+
+fn remove_workspace_root_array_entries(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    removed_project_roots: &BTreeSet<String>,
+) -> Result<()> {
+    let Some(value) = object.get_mut(key) else {
+        return Ok(());
+    };
+    let Some(array) = value.as_array_mut() else {
+        return Err(anyhow!(
+            "Expected {key} in workspace visibility state to be an array."
+        ));
+    };
+    let mut filtered = Vec::with_capacity(array.len());
+    for entry in array.drain(..) {
+        let should_remove = entry
+            .as_str()
+            .map(|path| project_path_matches_removed_root(path, removed_project_roots))
+            .transpose()?
+            .unwrap_or(false);
+        if !should_remove {
+            filtered.push(entry);
+        }
+    }
+    *array = filtered;
     Ok(())
 }
 
@@ -6101,6 +6503,208 @@ exit 91
     }
 
     #[test]
+    fn switch_host_persona_syncs_current_archive_state_to_target_persona() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-shared", "/tmp/source.jsonl", 100)],
+        );
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-shared", "/tmp/target.jsonl", 200)],
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-shared",
+            "/workspace/shared-project",
+            true,
+        );
+        update_thread_metadata(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-shared",
+            "/workspace/shared-project",
+            false,
+        );
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        assert!(thread_is_archived(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-shared",
+        ));
+        assert!(thread_is_archived(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-shared",
+        ));
+    }
+
+    #[test]
+    fn switch_host_persona_preserves_removed_projects_across_personas() {
+        let temp = tempfile::Builder::new()
+            .prefix("codex-rotate-project-removal-")
+            .tempdir_in(std::env::current_dir().expect("current dir"))
+            .expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        let removed_project = temp.path().join("projects/shared-visible");
+        fs::create_dir_all(&removed_project).expect("create removed project");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&removed_project)
+            .status()
+            .expect("git init project");
+        assert!(status.success(), "git init failed: {status}");
+
+        fs::write(
+            source_paths.codex_home.join("config.toml"),
+            "model = \"gpt-5.3-codex\"\n",
+        )
+        .expect("write source config");
+        fs::write(
+            target_paths.codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&removed_project.display().to_string())
+            ),
+        )
+        .expect("write target config");
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-source", "/tmp/source.jsonl", 100)],
+        );
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[("thread-target", "/tmp/target.jsonl", 200)],
+        );
+        update_thread_metadata(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            "thread-source",
+            &removed_project.display().to_string(),
+            false,
+        );
+        update_thread_metadata(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            "thread-target",
+            &removed_project.display().to_string(),
+            false,
+        );
+
+        fs::write(
+            source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                "selected-remote-host-id": "local",
+                SAVED_WORKSPACE_ROOTS_KEY: [],
+                PROJECT_ORDER_KEY: [],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [],
+            }))
+            .expect("serialize source global state"),
+        )
+        .expect("write source global state");
+        fs::write(
+            target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                SAVED_WORKSPACE_ROOTS_KEY: [removed_project.display().to_string()],
+                PROJECT_ORDER_KEY: [removed_project.display().to_string()],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [removed_project.display().to_string()],
+            }))
+            .expect("serialize target global state"),
+        )
+        .expect("write target global state");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+        switch_host_persona(&paths, &target, &source, false).expect("switch back");
+
+        for config_path in [
+            source_paths.codex_home.join("config.toml"),
+            target_paths.codex_home.join("config.toml"),
+        ] {
+            let config = fs::read_to_string(&config_path).expect("read config");
+            assert!(
+                !config.contains(&project_table_heading(&removed_project)),
+                "did not expect {} to contain removed project {}",
+                config_path.display(),
+                removed_project.display()
+            );
+        }
+
+        for state_path in [
+            source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+        ] {
+            let state: Value = serde_json::from_str(
+                &fs::read_to_string(&state_path).expect("read workspace visibility state"),
+            )
+            .expect("parse workspace visibility state");
+            for key in [
+                SAVED_WORKSPACE_ROOTS_KEY,
+                PROJECT_ORDER_KEY,
+                ACTIVE_WORKSPACE_ROOTS_KEY,
+            ] {
+                let values = state
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .expect("workspace visibility array")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !values.contains(&removed_project.display().to_string().as_str()),
+                    "did not expect {key} in {} to contain removed project {}",
+                    state_path.display(),
+                    removed_project.display()
+                );
+            }
+            let tombstones = state
+                .get(REMOVED_WORKSPACE_ROOTS_KEY)
+                .and_then(Value::as_array)
+                .expect("removed workspace roots array")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(
+                tombstones.contains(&removed_project.display().to_string().as_str()),
+                "expected {} to retain tombstone for removed project {}",
+                state_path.display(),
+                removed_project.display()
+            );
+        }
+
+        let expected_project = removed_project.display().to_string();
+        assert!(
+            read_thread_cwds_from_state_db(&source_paths.codex_home.join("state_5.sqlite"))
+                .expect("read source thread cwd values")
+                .contains(&expected_project)
+        );
+        assert!(
+            read_thread_cwds_from_state_db(&target_paths.codex_home.join("state_5.sqlite"))
+                .expect("read target thread cwd values")
+                .contains(&expected_project)
+        );
+    }
+
+    #[test]
     fn switch_host_persona_reconciles_config_projects_from_thread_history_bidirectionally() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
@@ -6612,6 +7216,18 @@ on conflict(id) do update set
                 rusqlite::params![cwd, archived as i64, thread_id],
             )
             .expect("update thread metadata");
+    }
+
+    fn thread_is_archived(state_db_path: &Path, thread_id: &str) -> bool {
+        let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
+        connection
+            .query_row(
+                "select archived from threads where id = ?1",
+                [thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query archived state")
+            != 0
     }
 
     fn project_table_heading(path: &Path) -> String {
