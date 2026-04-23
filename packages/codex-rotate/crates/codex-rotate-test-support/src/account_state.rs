@@ -397,12 +397,6 @@ fn materialize_accounts(
             .with_context(|| format!("create {}", host_root.display()))?;
         fs::create_dir_all(host_root.join("codex-home"))
             .with_context(|| format!("create {}", host_root.join("codex-home").display()))?;
-        fs::create_dir_all(host_root.join("fast-browser-home"))
-            .with_context(|| format!("create {}", host_root.join("fast-browser-home").display()))?;
-        fs::create_dir_all(host_root.join("codex-app-support"))
-            .with_context(|| format!("create {}", host_root.join("codex-app-support").display()))?;
-        fs::create_dir_all(host_root.join("managed-profile"))
-            .with_context(|| format!("create {}", host_root.join("managed-profile").display()))?;
 
         if let Some(persona_root) = persona_root.as_ref() {
             let package_root = persona
@@ -562,10 +556,20 @@ mod tests {
             Some(2)
         );
 
-        assert!(fixture
+        assert!(!fixture
             .rotate_home()
             .join("personas/host/persona-acct-1")
             .join("managed-profile")
+            .exists());
+        assert!(!fixture
+            .rotate_home()
+            .join("personas/host/persona-acct-1")
+            .join("codex-app-support")
+            .exists());
+        assert!(!fixture
+            .rotate_home()
+            .join("personas/host/persona-acct-1")
+            .join("fast-browser-home")
             .exists());
         assert!(fixture
             .rotate_home()

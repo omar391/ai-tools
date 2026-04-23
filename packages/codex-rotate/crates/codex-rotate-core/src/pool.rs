@@ -27,12 +27,14 @@ use crate::state::write_rotate_state_json;
 use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 use crate::workflow::{
     auto_disable_domain_for_account, cmd_create, cmd_create_with_progress,
-    create_next_fallback_options, extract_email_domain, family_has_deleted_array_for_account,
+    create_next_fallback_options, extract_email_domain,
+    family_suspends_domain_on_terminal_refresh_failure,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
-    reconcile_added_account_credential_state, record_deleted_account,
+    reconcile_added_account_credential_state, record_removed_account,
 };
 
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
@@ -43,6 +45,31 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
+
+fn debug_pool_drift_enabled() -> bool {
+    std::env::var(DEBUG_POOL_DRIFT_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn debug_prepare_pool_state(label: &str, pool: &Pool) {
+    if !debug_pool_drift_enabled() {
+        return;
+    }
+
+    let active_email = pool
+        .accounts
+        .get(pool.active_index)
+        .map(|entry| entry.email.clone());
+    eprintln!(
+        "codex-rotate core debug [{label}] active_index={} active_email={:?} account_count={}",
+        pool.active_index,
+        active_email,
+        pool.accounts.len()
+    );
+}
 
 fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> bool {
     extract_email_domain(email)
@@ -118,8 +145,8 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     let Some(entry) = pool.accounts.get(index).cloned() else {
         return Ok(false);
     };
-    let should_disable_domain = family_has_deleted_array_for_account(&entry.email)?;
-    let deleted = record_deleted_account(&entry.email)?;
+    let should_disable_domain = family_suspends_domain_on_terminal_refresh_failure(&entry.email)?;
+    let deleted = record_removed_account(&entry.email)?;
     if deleted && should_disable_domain {
         auto_disable_domain_for_account(&entry.email)?;
     }
@@ -655,17 +682,21 @@ pub fn prepare_next_rotation_with_progress(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<PreparedRotation> {
     let paths = resolve_paths()?;
-    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
+    debug_prepare_pool_state("prepare_next.loaded", &pool);
     let mut dirty = normalize_pool_entries(&mut pool);
+    debug_prepare_pool_state("prepare_next.normalized", &pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    debug_prepare_pool_state("prepare_next.synced_auth", &pool);
     dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
+    debug_prepare_pool_state("prepare_next.pruned", &pool);
     if pool.accounts.is_empty() {
         if dirty {
             save_pool(&pool)?;
         }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
+    let disabled_domains = load_disabled_rotation_domains()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -690,6 +721,16 @@ pub fn prepare_next_rotation_with_progress(
             &paths.codex_auth_file,
             false,
         )?;
+        if debug_pool_drift_enabled() {
+            eprintln!(
+                "codex-rotate core debug [prepare_next.inspect] candidate_index={} candidate_email={} usable={:?} error={:?} summary={:?}",
+                candidate_index,
+                pool.accounts[candidate_index].email,
+                inspection.usage.as_ref().map(has_usable_quota),
+                inspection.error,
+                inspection.usage.as_ref().map(format_compact_quota)
+            );
+        }
         dirty |= inspection.updated;
         if account_requires_terminal_cleanup(&pool.accounts[candidate_index]) {
             dirty |= cleanup_terminal_account(&mut pool, candidate_index)?;
@@ -953,7 +994,6 @@ pub fn rotate_next_internal_with_progress(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<NextResult> {
     let paths = resolve_paths()?;
-    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -964,6 +1004,7 @@ pub fn rotate_next_internal_with_progress(
         }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
+    let disabled_domains = load_disabled_rotation_domains()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -1188,7 +1229,6 @@ pub fn cmd_list_stream(writer: &mut dyn Write) -> Result<()> {
 
 fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     let paths = resolve_paths()?;
-    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let listed_at = Utc::now();
     let mut dirty = normalize_pool_entries(&mut pool);
@@ -1203,6 +1243,7 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         }
         return Ok(());
     }
+    let disabled_domains = load_disabled_rotation_domains()?;
     let refresh_order = build_list_quota_refresh_order(&pool, listed_at);
     let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
     let display_order = build_list_account_display_order(&pool);
@@ -1525,7 +1566,6 @@ pub fn current_pool_overview_without_activation() -> Result<PoolOverview> {
 
 fn current_pool_overview_with_activation(activate_current: bool) -> Result<PoolOverview> {
     let paths = resolve_paths()?;
-    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |=
@@ -1534,6 +1574,7 @@ fn current_pool_overview_with_activation(activate_current: bool) -> Result<PoolO
     if dirty {
         save_pool(&pool)?;
     }
+    let disabled_domains = load_disabled_rotation_domains()?;
     let visible_indices = pool
         .accounts
         .iter()
@@ -1759,7 +1800,7 @@ pub fn cmd_remove(selector: &str) -> Result<String> {
     let mut pool = load_pool()?;
     let selection = resolve_account_selector(&pool, selector)?;
     let removed = pool.accounts.remove(selection.index);
-    record_deleted_account(&removed.email)?;
+    record_removed_account(&removed.email)?;
     if pool.accounts.is_empty() || pool.active_index >= pool.accounts.len() {
         pool.active_index = 0;
     }
@@ -1780,10 +1821,10 @@ pub fn current_auth_summary() -> Result<AuthSummary> {
 
 pub fn other_usable_account_exists() -> Result<bool> {
     let paths = resolve_paths()?;
-    let disabled_domains = load_disabled_rotation_domains()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
 
     if pool.accounts.len() <= 1 {
         if dirty {
@@ -1792,6 +1833,7 @@ pub fn other_usable_account_exists() -> Result<bool> {
         return Ok(false);
     }
 
+    let disabled_domains = load_disabled_rotation_domains()?;
     let mut reasons = Vec::new();
     let skip_indices = HashSet::new();
     let (candidate, candidate_dirty) = find_next_usable_account(
@@ -2276,6 +2318,25 @@ fn sync_pool_current_auth_from_auth(
     };
 
     if activate_current && pool.active_index != current_index {
+        if debug_pool_drift_enabled() {
+            let previous_email = pool
+                .accounts
+                .get(pool.active_index)
+                .map(|entry| entry.email.clone());
+            let matched_email = pool
+                .accounts
+                .get(current_index)
+                .map(|entry| entry.email.clone());
+            eprintln!(
+                "codex-rotate core debug [sync_current_auth] previous_active_index={} previous_active_email={:?} matched_index={} matched_email={:?} auth_email={} auth_plan={}",
+                pool.active_index,
+                previous_email,
+                current_index,
+                matched_email,
+                current_email,
+                current_plan_type
+            );
+        }
         pool.active_index = current_index;
         changed = true;
     }
@@ -2290,6 +2351,15 @@ fn find_pool_account_index_by_identity(
     email: &str,
     plan_type: &str,
 ) -> Option<usize> {
+    if pool
+        .accounts
+        .get(pool.active_index)
+        .map(|entry| account_entry_matches_identity(entry, account_id, email, plan_type))
+        .unwrap_or(false)
+    {
+        return Some(pool.active_index);
+    }
+
     if let (Some(normalized_email), Some(normalized_plan)) = (
         normalize_identity_email(email),
         normalize_identity_plan_type(plan_type),
@@ -2865,6 +2935,11 @@ pub(crate) fn find_next_usable_account(
 ) -> Result<(Option<RotationCandidate>, bool)> {
     let mut next_dirty = dirty;
     next_dirty |= prune_terminal_accounts_from_pool(pool)?;
+    let mut effective_disabled_domains = if next_dirty != dirty {
+        load_disabled_rotation_domains()?
+    } else {
+        disabled_domains.clone()
+    };
     let probe_order =
         build_reusable_account_probe_order(pool.active_index, pool.accounts.len(), mode);
 
@@ -2875,7 +2950,7 @@ pub(crate) fn find_next_usable_account(
         if skip_indices.contains(&index) {
             continue;
         }
-        if !account_rotation_enabled(disabled_domains, &pool.accounts[index].email) {
+        if !account_rotation_enabled(&effective_disabled_domains, &pool.accounts[index].email) {
             if let Some(domain) = extract_email_domain(&pool.accounts[index].email) {
                 reasons.push(format!(
                     "{}: rotation disabled for {}",
@@ -2892,6 +2967,7 @@ pub(crate) fn find_next_usable_account(
         next_dirty |= inspection.updated;
         if account_requires_terminal_cleanup(&pool.accounts[index]) {
             next_dirty |= cleanup_terminal_account(pool, index)?;
+            effective_disabled_domains = load_disabled_rotation_domains()?;
             continue;
         }
         if let Some(usage) = inspection.usage.as_ref() {
@@ -3284,16 +3360,20 @@ mod tests {
         entry
     }
 
-    fn write_terminal_cleanup_state(family_field: &str) -> Result<()> {
-        let mut family = json!({
+    fn write_terminal_cleanup_state(
+        relogin: Vec<&str>,
+        suspend_domain_on_terminal_refresh_failure: bool,
+    ) -> Result<()> {
+        let family = json!({
             "profile_name": "dev-1",
             "template": "dev.{n}@astronlab.com",
             "next_suffix": 2,
             "created_at": "2026-04-05T00:00:00.000Z",
             "updated_at": "2026-04-05T00:00:00.000Z",
             "last_created_email": "dev.1@astronlab.com",
+            "relogin": relogin,
+            "suspend_domain_on_terminal_refresh_failure": suspend_domain_on_terminal_refresh_failure,
         });
-        family[family_field] = json!([]);
         write_rotate_state_json(&json!({
             "accounts": [terminal_cleanup_account("dev.1@astronlab.com")],
             "active_index": 0,
@@ -3328,7 +3408,7 @@ mod tests {
                     "created_at": "2026-04-05T00:00:00.000Z",
                     "updated_at": "2026-04-05T00:00:00.000Z",
                     "last_created_email": "dev.2@astronlab.com",
-                    "deleted": []
+                    "relogin": []
                 }
             },
             "pending": {
@@ -3382,7 +3462,7 @@ mod tests {
     #[test]
     fn prune_terminal_accounts_does_not_disable_domain_for_relogin_only_families() {
         let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-relogin-only");
-        write_terminal_cleanup_state("relogin").expect("write relogin-only state");
+        write_terminal_cleanup_state(Vec::new(), false).expect("write relogin-only state");
 
         let mut pool = Pool {
             active_index: 0,
@@ -3401,9 +3481,9 @@ mod tests {
     }
 
     #[test]
-    fn prune_terminal_accounts_disables_domain_for_legacy_deleted_families() {
-        let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-deleted");
-        write_terminal_cleanup_state("deleted").expect("write deleted state");
+    fn prune_terminal_accounts_disables_domain_for_suspend_flagged_families() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-suspend-flag");
+        write_terminal_cleanup_state(Vec::new(), true).expect("write suspend-flag state");
 
         let mut pool = Pool {
             active_index: 0,
@@ -4155,7 +4235,8 @@ mod tests {
                         "created_at": "2026-04-13T05:00:00.000Z",
                         "updated_at": "2026-04-14T06:11:25.913Z",
                         "last_created_email": "devbench.9@astronlab.com",
-                        "deleted": []
+                        "relogin": [],
+                        "suspend_domain_on_terminal_refresh_failure": true
                     }
                 }
             }))?;
@@ -4188,10 +4269,15 @@ mod tests {
             let delta_days = (parsed - Utc::now()).num_days();
             assert!((8..=9).contains(&delta_days), "{reactivate_at}");
             assert_eq!(
-                state["families"]["dev-1::devbench.{n}@astronlab.com"]["deleted"]
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
                     .as_array()
                     .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
                 Some(vec!["devbench.9@astronlab.com"])
+            );
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]
+                    ["suspend_domain_on_terminal_refresh_failure"],
+                Value::Bool(true)
             );
             Ok(())
         })();
@@ -4238,7 +4324,8 @@ mod tests {
                         "created_at": "2026-04-13T05:00:00.000Z",
                         "updated_at": "2026-04-21T00:00:00.000Z",
                         "last_created_email": "devbench.10@astronlab.com",
-                        "deleted": []
+                        "relogin": [],
+                        "suspend_domain_on_terminal_refresh_failure": true
                     }
                 }
             }))?;
@@ -4263,10 +4350,15 @@ mod tests {
                 Value::Bool(false)
             );
             assert_eq!(
-                state["families"]["dev-1::devbench.{n}@astronlab.com"]["deleted"]
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
                     .as_array()
                     .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
                 Some(vec!["devbench.10@astronlab.com"])
+            );
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]
+                    ["suspend_domain_on_terminal_refresh_failure"],
+                Value::Bool(true)
             );
             Ok(())
         })();
@@ -4274,6 +4366,60 @@ mod tests {
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
         result.expect("list should prune reused refresh-token accounts");
+    }
+
+    #[test]
+    fn record_removed_account_uses_current_relogin_shape() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let codex_home = tempdir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+
+        let result = (|| -> Result<()> {
+            write_rotate_state_json(&json!({
+                "families": {
+                    "dev-1::devbench.{n}@astronlab.com": {
+                        "profile_name": "dev-1",
+                        "template": "devbench.{n}@astronlab.com",
+                        "next_suffix": 10,
+                        "max_skipped_slots": 0,
+                        "created_at": "2026-04-13T05:00:00.000Z",
+                        "updated_at": "2026-04-14T06:11:25.913Z",
+                        "last_created_email": "devbench.9@astronlab.com",
+                        "relogin": []
+                    }
+                }
+            }))?;
+
+            assert!(!family_suspends_domain_on_terminal_refresh_failure(
+                "devbench.9@astronlab.com"
+            )?);
+            assert!(record_removed_account("devbench.9@astronlab.com")?);
+
+            let state = load_rotate_state_json()?;
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"],
+                json!(["devbench.9@astronlab.com"])
+            );
+            assert_eq!(
+                state["families"]["dev-1::devbench.{n}@astronlab.com"]
+                    ["suspend_domain_on_terminal_refresh_failure"],
+                Value::Null
+            );
+            Ok(())
+        })();
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+        result.expect("record_removed_account should keep current relogin shape");
     }
 
     #[test]
@@ -4541,6 +4687,44 @@ mod tests {
         assert!(!changed);
         assert_eq!(pool.accounts.len(), 1);
         assert_eq!(pool.active_index, 0);
+    }
+
+    #[test]
+    fn sync_pool_active_account_prefers_existing_active_match_over_duplicate() {
+        let primary = configured_entry(
+            "dev.5@hotspotprime.com",
+            "acct-shared",
+            "team",
+            Some(true),
+            Some("2026-04-07T00:00:00.000Z"),
+        );
+        let duplicate = primary.clone();
+        let other = configured_entry(
+            "dev.2.astronlab@gmail.com",
+            "acct-2",
+            "free",
+            Some(true),
+            Some("2026-04-07T00:00:00.000Z"),
+        );
+
+        let mut pool = Pool {
+            active_index: 2,
+            accounts: vec![duplicate, other, primary],
+        };
+
+        let changed = sync_pool_current_auth_from_auth(
+            &mut pool,
+            make_auth("dev.5@hotspotprime.com", "acct-shared", "team"),
+            true,
+        )
+        .expect("sync should succeed");
+
+        assert!(!changed);
+        assert_eq!(pool.active_index, 2);
+        assert_eq!(
+            pool.accounts[pool.active_index].email,
+            "dev.5@hotspotprime.com"
+        );
     }
 
     #[test]

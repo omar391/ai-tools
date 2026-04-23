@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use crate::paths::resolve_paths;
 use crate::runtime_log::log_daemon_info;
 
 const DISABLE_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH";
+const DIRECT_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_MANAGED_LAUNCH_DIRECT";
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const PROCESS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -50,29 +51,12 @@ pub fn ensure_debug_codex_instance(
     ));
 
     #[cfg(target_os = "macos")]
-    let output = Command::new("open")
-        .arg("-na")
-        .arg(app_path)
-        .arg("--args")
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--remote-debugging-port={}", port))
-        .output()
-        .with_context(|| format!("Failed to launch Codex from {}.", app_path))?;
+    launch_managed_codex(app_path, port, profile_dir)?;
 
     #[cfg(not(target_os = "macos"))]
-    let output = {
+    {
         return Err(anyhow!(
             "Managed Codex launch is currently only supported on macOS."
-        ));
-    };
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .to_string()
-                .if_empty_then(|| format!("Failed to launch Codex from {}.", app_path))
         ));
     }
 
@@ -107,6 +91,67 @@ fn managed_codex_instance_ready_state(
     has_matching_profile_process: bool,
 ) -> bool {
     has_cdp_page && has_matching_profile_process
+}
+
+#[cfg(target_os = "macos")]
+fn launch_managed_codex(app_path: &str, port: u16, profile_dir: &Path) -> Result<()> {
+    let args = managed_codex_launch_args(port, profile_dir);
+    if env_flag_enabled(DIRECT_MANAGED_LAUNCH_ENV) {
+        let executable = resolve_macos_app_executable(Path::new(app_path));
+        let child = Command::new(&executable)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("Failed to launch Codex from {}.", executable.display()))?;
+        track_managed_launch_child(profile_dir, child);
+        return Ok(());
+    }
+
+    let output = Command::new("open")
+        .arg("-na")
+        .arg(app_path)
+        .arg("--args")
+        .args(&args)
+        .output()
+        .with_context(|| format!("Failed to launch Codex from {}.", app_path))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()
+            .if_empty_then(|| format!("Failed to launch Codex from {}.", app_path))
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_app_executable(app_path: &Path) -> PathBuf {
+    if app_path.extension().and_then(|value| value.to_str()) != Some("app") {
+        return app_path.to_path_buf();
+    }
+
+    let bundle_name = app_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Codex");
+    app_path.join("Contents").join("MacOS").join(bundle_name)
+}
+
+#[cfg(target_os = "macos")]
+fn managed_codex_launch_args(port: u16, profile_dir: &Path) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile_dir.display()),
+        format!("--remote-debugging-port={}", port),
+    ];
+    if managed_launch_allowed_in_tests() {
+        args.push("--use-mock-keychain".to_string());
+    }
+    args
 }
 
 fn managed_launch_disabled_reason() -> Option<&'static str> {
@@ -169,6 +214,58 @@ fn path_looks_like_rust_test_binary(path: &Path) -> bool {
 
 fn should_track_test_managed_launches() -> bool {
     managed_launch_allowed_in_tests()
+}
+
+#[cfg(target_os = "macos")]
+struct TrackedManagedChild {
+    profile_dir: PathBuf,
+    child: Child,
+}
+
+#[cfg(target_os = "macos")]
+fn tracked_managed_launch_children() -> &'static Mutex<Vec<TrackedManagedChild>> {
+    static TRACKED: OnceLock<Mutex<Vec<TrackedManagedChild>>> = OnceLock::new();
+    TRACKED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn track_managed_launch_child(profile_dir: &Path, child: Child) {
+    let tracked = tracked_managed_launch_children();
+    let mut children = tracked.lock().unwrap_or_else(|error| error.into_inner());
+    children.retain(|entry| entry.profile_dir != profile_dir);
+    children.push(TrackedManagedChild {
+        profile_dir: profile_dir.to_path_buf(),
+        child,
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reap_tracked_managed_launch_children() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn reap_tracked_managed_launch_children() -> Result<()> {
+    let tracked = tracked_managed_launch_children();
+    let mut children = tracked.lock().unwrap_or_else(|error| error.into_inner());
+    let mut index = 0;
+    while index < children.len() {
+        let profile_display = children[index].profile_dir.display().to_string();
+        match children[index].child.try_wait().with_context(|| {
+            format!(
+                "Failed to check managed Codex child for profile {}.",
+                profile_display
+            )
+        })? {
+            Some(_) => {
+                children.remove(index);
+            }
+            None => {
+                index += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn track_test_managed_launch(profile_dir: &Path) {
@@ -260,6 +357,7 @@ fn signal_processes(signal: &str, pids: &[u32]) -> Result<()> {
 fn wait_for_processes_to_exit(pids: &[u32], timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        reap_tracked_managed_launch_children()?;
         let running = list_processes()?
             .into_iter()
             .any(|process| pids.contains(&process.pid));
@@ -420,6 +518,39 @@ mod tests {
         }
 
         assert!(!should_track_test_managed_launches());
+
+        restore_env("RUST_TEST_THREADS", previous_test_threads);
+        restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn direct_managed_launch_resolves_bundle_executable() {
+        assert_eq!(
+            resolve_macos_app_executable(Path::new("/Applications/Codex.app")),
+            PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex")
+        );
+        assert_eq!(
+            resolve_macos_app_executable(Path::new("/tmp/custom-codex")),
+            PathBuf::from("/tmp/custom-codex")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_launch_args_add_mock_keychain_during_test_opt_in() {
+        let _env_guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_test_threads = std::env::var_os("RUST_TEST_THREADS");
+        let previous_disable = std::env::var_os(DISABLE_MANAGED_LAUNCH_ENV);
+        unsafe {
+            std::env::set_var("RUST_TEST_THREADS", "1");
+            std::env::set_var(DISABLE_MANAGED_LAUNCH_ENV, "0");
+        }
+
+        let args = managed_codex_launch_args(9333, Path::new("/tmp/profile"));
+        assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
 
         restore_env("RUST_TEST_THREADS", previous_test_threads);
         restore_env(DISABLE_MANAGED_LAUNCH_ENV, previous_disable);

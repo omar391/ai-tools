@@ -1,8 +1,12 @@
 #![cfg(unix)]
 
 use anyhow::{bail, ensure, Context, Result};
+use chrono::Utc;
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
-use codex_rotate_core::pool::{load_pool, restore_codex_auth_from_active_pool, NextResult};
+use codex_rotate_core::pool::{
+    load_pool, prepare_next_rotation_with_progress, restore_codex_auth_from_active_pool, save_pool,
+    NextResult, Pool,
+};
 use codex_rotate_core::workflow::{cmd_relogin_with_progress, ReloginOptions};
 use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
 use codex_rotate_refresh::process_tracking::ProcessTracker;
@@ -18,7 +22,7 @@ use codex_rotate_runtime::log_isolation::{
 };
 use codex_rotate_runtime::paths::{resolve_paths, RuntimePaths};
 use codex_rotate_runtime::rotation_hygiene::{
-    rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+    rotate_next as run_shared_next, rotate_prev as run_shared_prev, ConversationSyncStore,
 };
 use codex_rotate_runtime::thread_recovery::{
     read_active_thread_ids, ThreadRecoveryEvent, ThreadRecoveryKind,
@@ -30,6 +34,7 @@ use codex_rotate_runtime::watch::{
 use codex_rotate_test_support::{FailureArtifactBundle, FailureArtifactCapture};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -38,6 +43,11 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const DIRECT_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_MANAGED_LAUNCH_DIRECT";
+const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
+const LIVE_ALIAS_ROOT_ENV: &str = "CODEX_ROTATE_LIVE_ALIAS_ROOT";
+const STAGING_ACCOUNTS_JSON_ENV: &str = "CODEX_ROTATE_STAGING_ACCOUNTS_JSON";
 
 struct LiveHostFailureArtifacts {
     capture: FailureArtifactCapture,
@@ -162,6 +172,999 @@ impl Drop for LiveHostFailureArtifacts {
             let _ = self.bundle.copy_file(source, relative_path);
         }
     }
+}
+
+fn env_mutex() -> &'static std::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn copy_file_if_exists(source: &Path, target: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn quota_response_body(
+    account_id: &str,
+    email: &str,
+    plan_type: &str,
+    used_percent: f64,
+    reset_after_seconds: i64,
+    reset_at: i64,
+) -> String {
+    json!({
+        "user_id": account_id,
+        "account_id": account_id,
+        "email": email,
+        "plan_type": plan_type,
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": used_percent >= 100.0,
+            "primary_window": {
+                "used_percent": used_percent,
+                "limit_window_seconds": 18_000,
+                "reset_after_seconds": reset_after_seconds,
+                "reset_at": reset_at,
+            },
+            "secondary_window": null
+        },
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": null,
+        "promo": null
+    })
+    .to_string()
+}
+
+fn request_bearer_token(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .starts_with("authorization: bearer ")
+            .then_some(line["Authorization: Bearer ".len()..].trim().to_string())
+    })
+}
+
+fn allocate_test_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("bind ephemeral localhost port for test")?;
+    let port = listener
+        .local_addr()
+        .context("read ephemeral localhost port for test")?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn read_cloned_auth_email(auth_file: &Path) -> Result<Option<String>> {
+    if !auth_file.exists() {
+        return Ok(None);
+    }
+    let auth = load_codex_auth(auth_file)
+        .with_context(|| format!("failed to read cloned auth from {}", auth_file.display()))?;
+    Ok(Some(summarize_codex_auth(&auth).email))
+}
+
+fn align_pool_file_active_index_to_email(
+    pool_file: &Path,
+    preferred_email: Option<&str>,
+) -> Result<()> {
+    let Some(email) = preferred_email else {
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(pool_file)
+        .with_context(|| format!("failed to read {}", pool_file.display()))?;
+    let mut json: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", pool_file.display()))?;
+    let accounts = json
+        .get("accounts")
+        .and_then(Value::as_array)
+        .context("pool file did not contain an accounts array")?;
+    let Some(index) = accounts.iter().position(|entry| {
+        entry
+            .get("email")
+            .and_then(Value::as_str)
+            .map(|candidate| candidate.eq_ignore_ascii_case(email))
+            .unwrap_or(false)
+    }) else {
+        return Ok(());
+    };
+
+    let current_index = json
+        .get("active_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    if current_index == Some(index) {
+        return Ok(());
+    }
+
+    let object = json
+        .as_object_mut()
+        .context("pool file root was not a JSON object")?;
+    object.insert("active_index".to_string(), Value::Number(index.into()));
+    std::fs::write(pool_file, serde_json::to_vec_pretty(&json)?)
+        .with_context(|| format!("failed to update {}", pool_file.display()))?;
+    Ok(())
+}
+
+fn align_current_pool_active_index_to_email(preferred_email: Option<&str>) -> Result<()> {
+    let Some(email) = preferred_email else {
+        return Ok(());
+    };
+    let mut pool = load_pool()?;
+    let Some(index) = pool
+        .accounts
+        .iter()
+        .position(|entry| entry.email.eq_ignore_ascii_case(email))
+    else {
+        return Ok(());
+    };
+    if pool.active_index == index {
+        return Ok(());
+    }
+    pool.active_index = index;
+    save_pool(&pool)?;
+    Ok(())
+}
+
+fn load_staging_accounts_from_pool_file(
+    pool_file: &Path,
+    preferred_email: Option<&str>,
+    minimum_accounts: usize,
+) -> Result<Vec<LiveStagingAccount>> {
+    let raw = std::fs::read_to_string(pool_file)
+        .with_context(|| format!("failed to read {}", pool_file.display()))?;
+    let json: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", pool_file.display()))?;
+    let accounts = json
+        .get("accounts")
+        .and_then(Value::as_array)
+        .context("pool file did not contain an accounts array")?;
+    let active_index = json
+        .get("active_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .filter(|index| *index < accounts.len())
+        .unwrap_or(0);
+    let start_index = preferred_email
+        .and_then(|email| {
+            accounts.iter().position(|entry| {
+                entry
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(|candidate| candidate.eq_ignore_ascii_case(email))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(active_index);
+    let staging_accounts = accounts
+        .iter()
+        .cycle()
+        .skip(start_index)
+        .take(accounts.len())
+        .filter_map(|entry| {
+            let email = entry.get("email")?.as_str()?.to_string();
+            let profile_name = entry
+                .get("profile_name")
+                .or_else(|| entry.get("alias"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(LiveStagingAccount {
+                email,
+                profile_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        staging_accounts.len() >= minimum_accounts,
+        "expected at least {minimum_accounts} accounts in cloned pool {}, found {}",
+        pool_file.display(),
+        staging_accounts.len()
+    );
+    Ok(staging_accounts)
+}
+
+fn with_cloned_live_host_environment<T>(
+    scenario: &str,
+    minimum_accounts: usize,
+    operation: impl FnOnce(RuntimePaths, Vec<LiveStagingAccount>) -> Result<T>,
+) -> Result<T> {
+    let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let live_paths = resolve_paths()?;
+
+    let temp = tempfile::tempdir().context("create isolated live host tempdir")?;
+    let home = temp.path().join("home");
+    let rotate_home = home.join(".codex-rotate");
+    let codex_home = home.join(".codex");
+    let fast_browser_home = home.join(".fast-browser");
+    let codex_app_support = home
+        .join("Library")
+        .join("Application Support")
+        .join("Codex");
+    for dir in [
+        &home,
+        &rotate_home,
+        &codex_home,
+        &fast_browser_home,
+        &codex_app_support,
+    ] {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    copy_file_if_exists(
+        &live_paths.rotate_home.join("accounts.json"),
+        &rotate_home.join("accounts.json"),
+    )?;
+    copy_file_if_exists(&live_paths.codex_auth_file, &codex_home.join("auth.json"))?;
+    let cloned_auth_email = read_cloned_auth_email(&codex_home.join("auth.json"))?;
+    align_pool_file_active_index_to_email(
+        &rotate_home.join("accounts.json"),
+        cloned_auth_email.as_deref(),
+    )?;
+    let staging_accounts = load_staging_accounts_from_pool_file(
+        &rotate_home.join("accounts.json"),
+        cloned_auth_email.as_deref(),
+        minimum_accounts,
+    )
+    .with_context(|| format!("load cloned staging accounts for {scenario}"))?;
+    let staging_accounts_json = serde_json::to_string(
+        &staging_accounts
+            .iter()
+            .map(|account| {
+                json!({
+                    "email": account.email,
+                    "profile_name": account.profile_name,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .context("serialize staging accounts")?;
+
+    let previous_home = std::env::var_os("HOME");
+    let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+    let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+    let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+    let previous_live_alias_root = std::env::var_os(LIVE_ALIAS_ROOT_ENV);
+    let previous_staging_accounts = std::env::var_os(STAGING_ACCOUNTS_JSON_ENV);
+    let previous_disable_launch = std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH");
+    let previous_direct_launch = std::env::var_os(DIRECT_MANAGED_LAUNCH_ENV);
+
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CODEX_ROTATE_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("FAST_BROWSER_HOME");
+        std::env::remove_var("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "host");
+        std::env::set_var(LIVE_ALIAS_ROOT_ENV, temp.path().join("live-aliases"));
+        std::env::set_var(STAGING_ACCOUNTS_JSON_ENV, &staging_accounts_json);
+        std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "0");
+        std::env::set_var(DIRECT_MANAGED_LAUNCH_ENV, "1");
+    }
+
+    let result = (|| -> Result<T> {
+        align_current_pool_active_index_to_email(cloned_auth_email.as_deref())?;
+        require_host_live_capabilities()?;
+        let paths = resolve_paths()?;
+        operation(paths, staging_accounts)
+    })();
+
+    restore_env(DIRECT_MANAGED_LAUNCH_ENV, previous_direct_launch);
+    restore_env(
+        "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
+        previous_disable_launch,
+    );
+    restore_env(STAGING_ACCOUNTS_JSON_ENV, previous_staging_accounts);
+    restore_env(LIVE_ALIAS_ROOT_ENV, previous_live_alias_root);
+    restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
+    restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+    restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+    restore_env("CODEX_HOME", previous_codex_home);
+    restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    restore_env("HOME", previous_home);
+
+    result
+}
+
+#[test]
+fn load_staging_accounts_from_pool_file_prefers_matching_auth_email() -> Result<()> {
+    let temp = tempfile::tempdir().context("create tempdir for cloned pool ordering")?;
+    let pool_file = temp.path().join("accounts.json");
+    std::fs::write(
+        &pool_file,
+        serde_json::to_vec(&json!({
+            "active_index": 1,
+            "accounts": [
+                { "email": "first@example.com", "profile_name": "first" },
+                { "email": "second@example.com", "profile_name": "second" },
+                { "email": "third@example.com", "profile_name": "third" }
+            ]
+        }))?,
+    )
+    .with_context(|| format!("write {}", pool_file.display()))?;
+
+    let accounts = load_staging_accounts_from_pool_file(&pool_file, Some("third@example.com"), 2)?;
+
+    assert_eq!(accounts[0].email, "third@example.com");
+    assert_eq!(accounts[1].email, "first@example.com");
+    Ok(())
+}
+
+#[test]
+fn align_pool_file_active_index_to_email_updates_cloned_pool() -> Result<()> {
+    let temp = tempfile::tempdir().context("create tempdir for cloned pool alignment")?;
+    let pool_file = temp.path().join("accounts.json");
+    std::fs::write(
+        &pool_file,
+        serde_json::to_vec(&json!({
+            "active_index": 0,
+            "accounts": [
+                { "email": "first@example.com", "profile_name": "first" },
+                { "email": "second@example.com", "profile_name": "second" },
+                { "email": "third@example.com", "profile_name": "third" }
+            ]
+        }))?,
+    )
+    .with_context(|| format!("write {}", pool_file.display()))?;
+
+    align_pool_file_active_index_to_email(&pool_file, Some("third@example.com"))?;
+
+    let aligned: Value = serde_json::from_str(&std::fs::read_to_string(&pool_file)?)?;
+    assert_eq!(aligned.get("active_index"), Some(&json!(2)));
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn live_host_cloned_environment_keeps_pool_aligned_with_auth() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_cloned_environment_keeps_pool_aligned_with_auth",
+        2,
+        |paths, staging_accounts| {
+            let auth = load_codex_auth(&paths.codex_auth_file)?;
+            let summary = summarize_codex_auth(&auth);
+            let preferred_source_email = staging_accounts
+                .first()
+                .map(|account| account.email.clone())
+                .context("expected at least one staging account")?;
+            let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+            ensure!(
+                source_email.eq_ignore_ascii_case(&summary.email),
+                "expected primed source email {} to match cloned auth {}",
+                source_email,
+                summary.email
+            );
+
+            let pool = load_pool()?;
+            let expected_index = pool
+                .accounts
+                .iter()
+                .position(|entry| entry.email.eq_ignore_ascii_case(&summary.email))
+                .context("expected cloned auth email to exist in cloned pool")?;
+            eprintln!(
+                "cloned auth email={} active_index={} expected_index={}",
+                summary.email, pool.active_index, expected_index
+            );
+            ensure!(
+                pool.active_index == expected_index,
+                "expected cloned pool active_index {} to match auth index {} for {}",
+                pool.active_index,
+                expected_index,
+                summary.email
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn live_host_managed_launch_preserves_cloned_pool_alignment() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_managed_launch_preserves_cloned_pool_alignment",
+        2,
+        |paths, staging_accounts| {
+            let port = 9333;
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let preferred_source_email = staging_accounts
+                .first()
+                .map(|account| account.email.clone())
+                .context("expected at least one staging account")?;
+            let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+            let pool_before = load_pool()?;
+            let expected_index = pool_before
+                .accounts
+                .iter()
+                .position(|entry| entry.email.eq_ignore_ascii_case(&source_email))
+                .context("expected primed source email to exist in cloned pool")?;
+            ensure!(
+                pool_before.active_index == expected_index,
+                "expected cloned pool active_index {} before launch to match source index {} for {}",
+                pool_before.active_index,
+                expected_index,
+                source_email
+            );
+
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            let pool_after = load_pool()?;
+            eprintln!(
+                "managed launch source_email={} active_index_before={} active_index_after={} expected_index={}",
+                source_email, pool_before.active_index, pool_after.active_index, expected_index
+            );
+            ensure!(
+                pool_after.active_index == expected_index,
+                "expected managed launch to preserve cloned pool active_index {} for {}, got {}",
+                expected_index,
+                source_email,
+                pool_after.active_index
+            );
+
+            stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn live_host_pre_watch_setup_preserves_cloned_pool_alignment() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_pre_watch_setup_preserves_cloned_pool_alignment",
+        2,
+        |paths, staging_accounts| {
+            let port = 9333;
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let preferred_source_email = staging_accounts
+                .first()
+                .map(|account| account.email.clone())
+                .context("expected at least one staging account")?;
+            let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+            let source_pool = load_pool()?;
+            let source_index = source_pool
+                .accounts
+                .iter()
+                .position(|entry| entry.email.eq_ignore_ascii_case(&source_email))
+                .context("expected primed source email to exist in cloned pool")?;
+            ensure!(
+                source_pool.active_index == source_index,
+                "expected cloned pool active_index {} before pre-watch setup to match source index {} for {}",
+                source_pool.active_index,
+                source_index,
+                source_email
+            );
+
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            let source_cwd = paths.rotate_home.display().to_string();
+            let active_marker = format!(
+                "pre-watch active marker {}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock before UNIX_EPOCH")?
+                    .as_millis()
+            );
+            let recoverable_marker = format!(
+                "pre-watch recoverable marker {}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock before UNIX_EPOCH")?
+                    .as_millis()
+            );
+            let source_auth = load_codex_auth(&paths.codex_auth_file)?;
+            let source_summary = summarize_codex_auth(&source_auth);
+            let source_recoverable_thread_id =
+                start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+            let _ = start_thread_with_marker(port, &source_cwd, &active_marker)?;
+            archive_thread_in_state_db(&paths.codex_state_db_file, &source_recoverable_thread_id)?;
+
+            let mut watch_state = read_watch_state()?;
+            let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+            source_watch_state.last_signal_id = Some(0);
+            source_watch_state.thread_recovery_pending = true;
+            source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+                source_log_id: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock before UNIX_EPOCH")?
+                    .as_millis() as i64,
+                source_ts: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock before UNIX_EPOCH")?
+                    .as_secs() as i64,
+                thread_id: source_recoverable_thread_id,
+                kind: ThreadRecoveryKind::QuotaExhausted,
+                exhausted_turn_id: None,
+                exhausted_email: Some(source_summary.email.clone()),
+                exhausted_account_id: Some(source_summary.account_id.clone()),
+                message: "You've hit your usage limit.".to_string(),
+                rehydration: None,
+            }];
+            source_watch_state.thread_recovery_backfill_complete = true;
+            watch_state.set_account_state(source_summary.account_id.clone(), source_watch_state);
+            write_watch_state(&watch_state)?;
+
+            let pool_after = load_pool()?;
+            eprintln!(
+                "pre-watch setup source_email={} active_index_before={} active_index_after={} expected_index={}",
+                source_email, source_pool.active_index, pool_after.active_index, source_index
+            );
+            ensure!(
+                pool_after.active_index == source_index,
+                "expected pre-watch setup to preserve cloned pool active_index {} for {}, got {}",
+                source_index,
+                source_email,
+                pool_after.active_index
+            );
+
+            stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn live_host_watch_prelude_preserves_cloned_pool_alignment_when_cooldown_blocks_rotation(
+) -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_watch_prelude_preserves_cloned_pool_alignment_when_cooldown_blocks_rotation",
+        2,
+        |paths, staging_accounts| {
+            let port = 9333;
+            let previous_watch_state = read_watch_state()?;
+            let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+            let mut stop_server = None;
+
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let outcome = (|| -> Result<()> {
+                let preferred_source_email = staging_accounts
+                    .first()
+                    .map(|account| account.email.clone())
+                    .context("expected at least one staging account")?;
+                let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+                let source_pool = load_pool()?;
+                let source_index = source_pool
+                    .accounts
+                    .iter()
+                    .position(|entry| entry.email.eq_ignore_ascii_case(&source_email))
+                    .context("expected primed source email to exist in cloned pool")?;
+                ensure!(
+                    source_pool.active_index == source_index,
+                    "expected cloned pool active_index {} before watch prelude to match source index {} for {}",
+                    source_pool.active_index,
+                    source_index,
+                    source_email
+                );
+
+                ensure_debug_codex_instance(None, Some(port), None, None)?;
+                let source_cwd = paths.rotate_home.display().to_string();
+                let active_marker = format!(
+                    "watch-prelude active marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let recoverable_marker = format!(
+                    "watch-prelude recoverable marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let source_auth = load_codex_auth(&paths.codex_auth_file)?;
+                let source_summary = summarize_codex_auth(&source_auth);
+                let source_recoverable_thread_id =
+                    start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+                let _ = start_thread_with_marker(port, &source_cwd, &active_marker)?;
+                archive_thread_in_state_db(
+                    &paths.codex_state_db_file,
+                    &source_recoverable_thread_id,
+                )?;
+
+                let mut watch_state = read_watch_state()?;
+                watch_state.last_rotation_at = Some(Utc::now().to_rfc3339());
+                let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+                source_watch_state.last_signal_id = Some(0);
+                source_watch_state.thread_recovery_pending = true;
+                source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+                    source_log_id: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis() as i64,
+                    source_ts: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_secs() as i64,
+                    thread_id: source_recoverable_thread_id,
+                    kind: ThreadRecoveryKind::QuotaExhausted,
+                    exhausted_turn_id: None,
+                    exhausted_email: Some(source_summary.email.clone()),
+                    exhausted_account_id: Some(source_summary.account_id.clone()),
+                    message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
+                }];
+                source_watch_state.thread_recovery_backfill_complete = true;
+                watch_state
+                    .set_account_state(source_summary.account_id.clone(), source_watch_state);
+                write_watch_state(&watch_state)?;
+
+                let mut quota_bodies_by_token = HashMap::new();
+                for entry in &source_pool.accounts {
+                    let used_percent = if entry.email.eq_ignore_ascii_case(&source_summary.email) {
+                        100.0
+                    } else {
+                        20.0
+                    };
+                    let reset_after_seconds = if used_percent >= 100.0 { 3_600 } else { 600 };
+                    let reset_at = if used_percent >= 100.0 {
+                        1_775_185_200
+                    } else {
+                        1_775_182_200
+                    };
+                    quota_bodies_by_token.insert(
+                        entry.auth.tokens.access_token.clone(),
+                        quota_response_body(
+                            &entry.account_id,
+                            &entry.email,
+                            &entry.plan_type,
+                            used_percent,
+                            reset_after_seconds,
+                            reset_at,
+                        ),
+                    );
+                }
+                let default_quota_body = quota_response_body(
+                    &source_summary.account_id,
+                    &source_summary.email,
+                    &source_summary.plan_type,
+                    100.0,
+                    3_600,
+                    1_775_185_200,
+                );
+                let (quota_url, _, server_stop) =
+                    spawn_quota_server_by_token(quota_bodies_by_token, default_quota_body);
+                stop_server = Some(server_stop);
+                unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
+                }
+
+                let result = run_watch_iteration(WatchIterationOptions {
+                    port: Some(port),
+                    after_signal_id: None,
+                    cooldown_ms: Some(60_000),
+                    force_quota_refresh: true,
+                    progress: None,
+                })?;
+                ensure!(
+                    !result.rotated,
+                    "expected cooldown-blocked watch prelude to skip rotation"
+                );
+                ensure!(
+                    result.decision.should_rotate,
+                    "expected watch prelude to still want rotation before cooldown block"
+                );
+
+                let pool_after = load_pool()?;
+                let auth_after = load_codex_auth(&paths.codex_auth_file)?;
+                let summary_after = summarize_codex_auth(&auth_after);
+                eprintln!(
+                    "watch prelude source_email={} auth_after={} active_index_before={} active_index_after={} expected_index={}",
+                    source_email, summary_after.email, source_pool.active_index, pool_after.active_index, source_index
+                );
+                ensure!(
+                    summary_after.email.eq_ignore_ascii_case(&source_email),
+                    "expected cooldown-blocked watch prelude to preserve auth {} but got {}",
+                    source_email,
+                    summary_after.email
+                );
+                ensure!(
+                    pool_after.active_index == source_index,
+                    "expected cooldown-blocked watch prelude to preserve cloned pool active_index {} for {}, got {}",
+                    source_index,
+                    source_email,
+                    pool_after.active_index
+                );
+                Ok(())
+            })();
+
+            if let Some(stop_server) = stop_server {
+                stop_server.store(true, Ordering::Relaxed);
+            }
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+            if let Err(error) = write_watch_state(&previous_watch_state) {
+                if outcome.is_ok() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "failed to restore watch state after watch prelude isolation test: {error:#}"
+                );
+            }
+            match previous_usage_url {
+                Some(value) => unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+                },
+            }
+
+            outcome
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn live_host_prepare_next_rotation_sees_aligned_source_after_pre_watch_setup() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_prepare_next_rotation_sees_aligned_source_after_pre_watch_setup",
+        2,
+        |paths, staging_accounts| {
+            let port = 9333;
+            let previous_watch_state = read_watch_state()?;
+
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let outcome = (|| -> Result<()> {
+                let preferred_source_email = staging_accounts
+                    .first()
+                    .map(|account| account.email.clone())
+                    .context("expected at least one staging account")?;
+                let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+                let source_pool = load_pool()?;
+                let source_index = source_pool
+                    .accounts
+                    .iter()
+                    .position(|entry| entry.email.eq_ignore_ascii_case(&source_email))
+                    .context("expected primed source email to exist in cloned pool")?;
+                ensure!(
+                    source_pool.active_index == source_index,
+                    "expected cloned pool active_index {} before prepare probe to match source index {} for {}",
+                    source_pool.active_index,
+                    source_index,
+                    source_email
+                );
+
+                ensure_debug_codex_instance(None, Some(port), None, None)?;
+                let source_cwd = paths.rotate_home.display().to_string();
+                let active_marker = format!(
+                    "prepare-probe active marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let recoverable_marker = format!(
+                    "prepare-probe recoverable marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let source_auth = load_codex_auth(&paths.codex_auth_file)?;
+                let source_summary = summarize_codex_auth(&source_auth);
+                let source_recoverable_thread_id =
+                    start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+                let _ = start_thread_with_marker(port, &source_cwd, &active_marker)?;
+                archive_thread_in_state_db(
+                    &paths.codex_state_db_file,
+                    &source_recoverable_thread_id,
+                )?;
+
+                let mut watch_state = read_watch_state()?;
+                let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+                source_watch_state.last_signal_id = Some(0);
+                source_watch_state.thread_recovery_pending = true;
+                source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+                    source_log_id: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis() as i64,
+                    source_ts: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_secs() as i64,
+                    thread_id: source_recoverable_thread_id,
+                    kind: ThreadRecoveryKind::QuotaExhausted,
+                    exhausted_turn_id: None,
+                    exhausted_email: Some(source_summary.email.clone()),
+                    exhausted_account_id: Some(source_summary.account_id.clone()),
+                    message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
+                }];
+                source_watch_state.thread_recovery_backfill_complete = true;
+                watch_state
+                    .set_account_state(source_summary.account_id.clone(), source_watch_state);
+                write_watch_state(&watch_state)?;
+
+                let prepared = prepare_next_rotation_with_progress(None)?;
+                let pool_after_prepare = load_pool()?;
+                eprintln!(
+                    "prepare probe source_email={} source_index={} prepared_previous_index={} pool_active_index_after_prepare={}",
+                    source_email, source_index, prepared.previous_index, pool_after_prepare.active_index
+                );
+                ensure!(
+                    prepared.previous_index == source_index,
+                    "expected prepare_next_rotation previous_index {} to match source index {} for {}",
+                    prepared.previous_index,
+                    source_index,
+                    source_email
+                );
+                ensure!(
+                    pool_after_prepare.active_index == source_index,
+                    "expected prepare_next_rotation to preserve active_index {} for {}, got {}",
+                    source_index,
+                    source_email,
+                    pool_after_prepare.active_index
+                );
+                Ok(())
+            })();
+
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+            if let Err(error) = write_watch_state(&previous_watch_state) {
+                if outcome.is_ok() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "failed to restore watch state after prepare probe isolation test: {error:#}"
+                );
+            }
+
+            outcome
+        },
+    )
+}
+
+#[test]
+#[ignore]
+fn live_host_direct_rotate_next_from_pre_watch_setup_emits_pool_drift_context() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_direct_rotate_next_from_pre_watch_setup_emits_pool_drift_context",
+        2,
+        |paths, staging_accounts| {
+            let port = 9333;
+            let previous_watch_state = read_watch_state()?;
+            let previous_debug = std::env::var_os(DEBUG_POOL_DRIFT_ENV);
+
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let outcome = (|| -> Result<()> {
+                let preferred_source_email = staging_accounts
+                    .first()
+                    .map(|account| account.email.clone())
+                    .context("expected at least one staging account")?;
+                let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
+                let source_pool = load_pool()?;
+                let source_index = source_pool
+                    .accounts
+                    .iter()
+                    .position(|entry| entry.email.eq_ignore_ascii_case(&source_email))
+                    .context("expected primed source email to exist in cloned pool")?;
+                ensure!(
+                    source_pool.active_index == source_index,
+                    "expected cloned pool active_index {} before direct rotate probe to match source index {} for {}",
+                    source_pool.active_index,
+                    source_index,
+                    source_email
+                );
+
+                ensure_debug_codex_instance(None, Some(port), None, None)?;
+                let source_cwd = paths.rotate_home.display().to_string();
+                let active_marker = format!(
+                    "direct-rotate active marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let recoverable_marker = format!(
+                    "direct-rotate recoverable marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+                let source_auth = load_codex_auth(&paths.codex_auth_file)?;
+                let source_summary = summarize_codex_auth(&source_auth);
+                let source_recoverable_thread_id =
+                    start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+                let _ = start_thread_with_marker(port, &source_cwd, &active_marker)?;
+                archive_thread_in_state_db(
+                    &paths.codex_state_db_file,
+                    &source_recoverable_thread_id,
+                )?;
+
+                let mut watch_state = read_watch_state()?;
+                let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+                source_watch_state.last_signal_id = Some(0);
+                source_watch_state.thread_recovery_pending = true;
+                source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+                    source_log_id: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis() as i64,
+                    source_ts: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_secs() as i64,
+                    thread_id: source_recoverable_thread_id,
+                    kind: ThreadRecoveryKind::QuotaExhausted,
+                    exhausted_turn_id: None,
+                    exhausted_email: Some(source_summary.email.clone()),
+                    exhausted_account_id: Some(source_summary.account_id.clone()),
+                    message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
+                }];
+                source_watch_state.thread_recovery_backfill_complete = true;
+                watch_state
+                    .set_account_state(source_summary.account_id.clone(), source_watch_state);
+                write_watch_state(&watch_state)?;
+
+                unsafe {
+                    std::env::set_var(DEBUG_POOL_DRIFT_ENV, "1");
+                }
+                let result = run_shared_next(Some(port), None);
+                let pool_after = load_pool()?;
+                eprintln!(
+                    "direct rotate source_email={} source_index={} pool_active_index_after_direct_rotate={}",
+                    source_email, source_index, pool_after.active_index
+                );
+                result.map(|_| ())
+            })();
+
+            match previous_debug {
+                Some(value) => unsafe {
+                    std::env::set_var(DEBUG_POOL_DRIFT_ENV, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(DEBUG_POOL_DRIFT_ENV);
+                },
+            }
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+            if let Err(error) = write_watch_state(&previous_watch_state) {
+                if outcome.is_ok() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "failed to restore watch state after direct rotate probe isolation test: {error:#}"
+                );
+            }
+
+            outcome
+        },
+    )
 }
 
 #[test]
@@ -645,6 +1648,7 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
             exhausted_email: Some(source_summary.email.clone()),
             exhausted_account_id: Some(source_summary.account_id.clone()),
             message: "You've hit your usage limit.".to_string(),
+            rehydration: None,
         }];
         account_state.thread_recovery_backfill_complete = true;
         watch_state.set_account_state(source_summary.account_id.clone(), account_state);
@@ -1342,366 +2346,347 @@ fn live_host_watch_triggered_next_acceptance_across_two_staging_accounts() -> Re
 #[test]
 #[ignore]
 fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> Result<()> {
-    require_host_live_capabilities()?;
-
-    let staging_accounts: Vec<LiveStagingAccount> = load_live_staging_accounts(2)?;
-    ensure!(
-        staging_accounts.len() >= 2,
-        "expected at least two staging accounts"
-    );
-
-    let preferred_source_email = staging_accounts[0].email.clone();
-    let paths = resolve_paths()?;
-    let artifacts = LiveHostFailureArtifacts::new(
+    with_cloned_live_host_environment(
         "live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance",
-        &paths,
-    )?;
-    let port = 9333;
-    let previous_watch_state = read_watch_state()?;
-    let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
-    let mut stop_server = None;
-
-    if managed_codex_is_running(&paths.debug_profile_dir)? {
-        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
-    }
-
-    let outcome = (|| -> Result<()> {
-        let source_cwd = paths.rotate_home.display().to_string();
-        let active_marker = format!(
-            "T047 full-flow active marker {}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock before UNIX_EPOCH")?
-                .as_millis()
-        );
-        let recoverable_marker = format!(
-            "T047 full-flow recoverable marker {}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock before UNIX_EPOCH")?
-                .as_millis()
-        );
-
-        let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
-
-        ensure_debug_codex_instance(None, Some(port), None, None)
-            .context("failed to launch managed Codex for full-flow setup")?;
-        let pre_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
-
-        let source_auth = load_codex_auth(&paths.codex_auth_file)
-            .context("failed to read source auth during full-flow setup")?;
-        let source_summary = summarize_codex_auth(&source_auth);
-        ensure!(
-            source_summary.email == source_email,
-            "expected source auth to match {}, got {}",
-            source_email,
-            source_summary.email
-        );
-        let source_pool = load_pool().context("failed to load pool before full-flow rotation")?;
-        let source_index = source_pool.active_index;
-        ensure!(
-            source_pool.accounts.len() >= 2,
-            "expected at least two pool accounts before full-flow rotation"
-        );
-        let expected_target_email = source_pool
-            .accounts
-            .get((source_index + 1) % source_pool.accounts.len())
-            .map(|entry| entry.email.clone())
-            .context("failed to resolve expected full-flow target account email")?;
-
-        let source_active_thread_id = start_thread_with_marker(port, &source_cwd, &active_marker)?;
-        let source_recoverable_thread_id =
-            start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
-        archive_thread_in_state_db(&paths.codex_state_db_file, &source_recoverable_thread_id)?;
-
-        let mut watch_state = read_watch_state()?;
-        let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
-        source_watch_state.last_signal_id = Some(0);
-        source_watch_state.thread_recovery_pending = true;
-        source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
-            source_log_id: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock before UNIX_EPOCH")?
-                .as_millis() as i64,
-            source_ts: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock before UNIX_EPOCH")?
-                .as_secs() as i64,
-            thread_id: source_recoverable_thread_id.clone(),
-            kind: ThreadRecoveryKind::QuotaExhausted,
-            exhausted_turn_id: None,
-            exhausted_email: Some(source_summary.email.clone()),
-            exhausted_account_id: Some(source_summary.account_id.clone()),
-            message: "You've hit your usage limit.".to_string(),
-        }];
-        source_watch_state.thread_recovery_backfill_complete = true;
-        watch_state.set_account_state(source_summary.account_id.clone(), source_watch_state);
-        write_watch_state(&watch_state)?;
-
-        let quota_body = serde_json::json!({
-            "user_id": source_summary.account_id,
-            "account_id": source_summary.account_id,
-            "email": source_summary.email,
-            "plan_type": source_summary.plan_type,
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": true,
-                "primary_window": {
-                    "used_percent": 100.0,
-                    "limit_window_seconds": 18_000,
-                    "reset_after_seconds": 3_600,
-                    "reset_at": 1_775_185_200,
-                },
-                "secondary_window": null
-            },
-            "code_review_rate_limit": null,
-            "additional_rate_limits": null,
-            "credits": null,
-            "promo": null
-        })
-        .to_string();
-        let (quota_url, _, server_stop) = spawn_quota_server(quota_body);
-        stop_server = Some(server_stop);
-        unsafe {
-            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
-        }
-
-        let first_iteration = run_watch_iteration(WatchIterationOptions {
-            port: Some(port),
-            after_signal_id: None,
-            cooldown_ms: Some(0),
-            force_quota_refresh: true,
-            progress: None,
-        })?;
-        ensure!(
-            first_iteration.rotated,
-            "watch trigger should have rotated during full-flow acceptance"
-        );
-        ensure!(
-            first_iteration.decision.should_rotate,
-            "watch decision should have requested rotation during full-flow acceptance"
-        );
-        ensure!(
-            first_iteration.decision.rotation_command == Some(RotationCommand::Next),
-            "expected watch-triggered full-flow rotation command to be Next, got {:?}",
-            first_iteration.decision.rotation_command
-        );
-
-        ensure_debug_codex_instance(None, Some(port), None, None)?;
-        ensure!(
-            managed_codex_is_running(&paths.debug_profile_dir)?,
-            "expected managed Codex to be running after watch-triggered rotation"
-        );
-        let post_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
-        ensure!(
-            post_rotation_root_pid != pre_rotation_root_pid,
-            "expected watch-triggered rotation to relaunch managed Codex with a new root pid, but pid stayed {}",
-            pre_rotation_root_pid
-        );
-
-        let target_auth = load_codex_auth(&paths.codex_auth_file)
-            .context("failed to read target auth after watch-triggered rotation")?;
-        let target_summary = summarize_codex_auth(&target_auth);
-        ensure!(
-            target_summary.email == expected_target_email,
-            "expected rotated auth email {}, got {}",
-            expected_target_email,
-            target_summary.email
-        );
-        let rotated_pool =
-            load_pool().context("failed to load pool after watch-triggered rotation")?;
-        let rotated_persona = rotated_pool
-            .accounts
-            .get(rotated_pool.active_index)
-            .and_then(|entry| entry.persona.as_ref())
-            .context("rotated account missing persona metadata after watch-triggered rotation")?;
-        let target_managed_profile_path = paths
-            .rotate_home
-            .join(rotated_persona.host_root_rel_path.as_ref().context(
-                "rotated persona missing host_root_rel_path after watch-triggered rotation",
-            )?)
-            .join("managed-profile");
-        let current_managed_profile = std::fs::read_link(&paths.debug_profile_dir)
-            .context("read managed-profile symlink after watch-triggered full-flow rotation")?;
-        ensure!(
-            current_managed_profile == target_managed_profile_path,
-            "expected managed-profile symlink to point at {} after watch-triggered rotation, got {}",
-            target_managed_profile_path.display(),
-            current_managed_profile.display()
-        );
-        let target_config_path = paths
-            .rotate_home
-            .join(rotated_persona.host_root_rel_path.as_ref().context(
-                "rotated persona missing host_root_rel_path after watch-triggered rotation",
-            )?)
-            .join("codex-home")
-            .join("config.toml");
-        let target_global_state_path = target_config_path
-            .parent()
-            .context("target config path missing parent directory")?
-            .join(".codex-global-state.json");
-        ensure!(
-            config_contains_project(&target_config_path, &source_cwd)?,
-            "expected rotated target config {} to register synced project cwd {}",
-            target_config_path.display(),
-            source_cwd
-        );
-        ensure!(
-            global_state_contains_project(&target_global_state_path, &source_cwd)?,
-            "expected rotated target workspace visibility state {} to include {}",
-            target_global_state_path.display(),
-            source_cwd
-        );
-
-        let target_active_threads = wait_for_active_threads_with_marker(port, &active_marker)?;
-        let target_active_thread_ids = target_active_threads
-            .iter()
-            .map(|(thread_id, _)| thread_id.as_str())
-            .collect::<Vec<_>>();
-        ensure!(
-            target_active_threads.len() == 1,
-            "expected exactly one synced active marker thread, found {} ({})",
-            target_active_threads.len(),
-            target_active_thread_ids.join(", ")
-        );
-        let target_active_thread_id = target_active_threads
-            .first()
-            .map(|(thread_id, _)| thread_id.as_str())
-            .context("missing synced active marker thread")?;
-        ensure!(
-            target_active_thread_id != source_active_thread_id,
-            "expected synced active conversation to use a target-local thread id, but matched source id {}",
-            source_active_thread_id
-        );
-
-        let watch_state_after_rotation = read_watch_state()?;
-        let source_after_rotation =
-            watch_state_after_rotation.account_state(&source_summary.account_id);
-        ensure!(
-            !source_after_rotation.thread_recovery_pending,
-            "expected source account {} to clear pending recovery state after watch rotation",
-            source_summary.account_id
-        );
-        ensure!(
-            source_after_rotation
-                .thread_recovery_pending_events
-                .is_empty(),
-            "expected source account {} to clear pending recovery events after watch rotation",
-            source_summary.account_id
-        );
-
-        let target_after_rotation =
-            watch_state_after_rotation.account_state(&target_summary.account_id);
-        ensure!(
-            target_after_rotation.thread_recovery_pending,
-            "expected target account {} to have pending interrupted-thread state after watch rotation",
-            target_summary.account_id
-        );
-        ensure!(
-            target_after_rotation.thread_recovery_pending_events.len() == 1,
-            "expected exactly one pending interrupted thread on target, got {}",
-            target_after_rotation.thread_recovery_pending_events.len()
-        );
-        let pending_target_thread_id = target_after_rotation.thread_recovery_pending_events[0]
-            .thread_id
-            .clone();
-        ensure!(
-            pending_target_thread_id != source_recoverable_thread_id,
-            "expected recoverable conversation to map to a target-local thread id distinct from source {}",
-            source_recoverable_thread_id
-        );
-        let pending_thread = read_thread_with_turns(port, &pending_target_thread_id)?
-            .with_context(|| {
-                format!("failed to read pending target thread {pending_target_thread_id}")
-            })?;
-        ensure!(
-            value_contains_text(&pending_thread, &recoverable_marker),
-            "expected pending target thread {} to preserve recoverable marker {}",
-            pending_target_thread_id,
-            recoverable_marker
-        );
-
-        if managed_codex_is_running(&paths.debug_profile_dir)? {
-            stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
-        }
-        ensure!(
-            !managed_codex_is_running(&paths.debug_profile_dir)?,
-            "expected managed Codex to be stopped before restart validation"
-        );
-        ensure_debug_codex_instance(None, Some(port), None, None)?;
-
-        let mut recovered = false;
-        for _ in 0..6 {
-            let _ = run_watch_iteration(WatchIterationOptions {
-                port: Some(port),
-                after_signal_id: target_after_rotation.last_signal_id,
-                cooldown_ms: Some(0),
-                force_quota_refresh: false,
-                progress: None,
-            })?;
-            let state_after_recovery_attempt = read_watch_state()?;
-            let target_after_recovery =
-                state_after_recovery_attempt.account_state(&target_summary.account_id);
-            if !target_after_recovery.thread_recovery_pending
-                && target_after_recovery
-                    .thread_recovery_pending_events
-                    .is_empty()
-            {
-                recovered = true;
-                break;
+        2,
+        |paths, staging_accounts| {
+            let preferred_source_email = staging_accounts[0].email.clone();
+            let artifacts = LiveHostFailureArtifacts::new(
+                "live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance",
+                &paths,
+            )?;
+            let port = allocate_test_port()?;
+            let previous_watch_state = read_watch_state()?;
+            let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+            let mut stop_server = None;
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
             }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        ensure!(
-            recovered,
-            "expected interrupted-thread recovery to auto-complete after restart for account {}",
-            target_summary.account_id
-        );
 
-        let _ = wait_for_thread_marker(
-            port,
-            &pending_target_thread_id,
-            "continue with skipped msgs",
-        )
-        .with_context(|| {
-            format!(
-                "expected interrupted thread {} to receive automatic resume input after restart",
-                pending_target_thread_id
-            )
-        })?;
+            let outcome = (|| -> Result<()> {
+                let source_project_dir = paths.home_dir.join("rotation-full-flow-project");
+                std::fs::create_dir_all(&source_project_dir).with_context(|| {
+                    format!(
+                        "failed to create full-flow project dir {}",
+                        source_project_dir.display()
+                    )
+                })?;
+                let source_cwd = source_project_dir.display().to_string();
+                let recoverable_marker = format!(
+                    "T047 full-flow recoverable marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
 
-        Ok(())
-    })();
+                let source_email = prime_source_account_for_live_rotation(&preferred_source_email)?;
 
-    if let Some(stop_server) = stop_server {
-        stop_server.store(true, Ordering::Relaxed);
-    }
+                ensure_debug_codex_instance(None, Some(port), None, Some(30_000))
+                    .context("failed to launch managed Codex for full-flow setup")?;
+                let pre_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
 
-    if managed_codex_is_running(&paths.debug_profile_dir)? {
-        stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
-    }
+                let source_auth = load_codex_auth(&paths.codex_auth_file)
+                    .context("failed to read source auth during full-flow setup")?;
+                let source_summary = summarize_codex_auth(&source_auth);
+                ensure!(
+                    source_summary.email == source_email,
+                    "expected source auth to match {}, got {}",
+                    source_email,
+                    source_summary.email
+                );
+                let source_pool =
+                    load_pool().context("failed to load pool before full-flow rotation")?;
+                let source_index = source_pool.active_index;
+                ensure!(
+                    source_pool.accounts.len() >= 2,
+                    "expected at least two pool accounts before full-flow rotation"
+                );
+                let source_entry = source_pool
+                    .accounts
+                    .get(source_index)
+                    .cloned()
+                    .context("failed to resolve source pool entry for full-flow rotation")?;
+                let target_index = (1..source_pool.accounts.len())
+                    .map(|offset| (source_index + offset) % source_pool.accounts.len())
+                    .find(|index| {
+                        source_pool.accounts[*index].account_id != source_entry.account_id
+                            && !source_pool.accounts[*index]
+                                .email
+                                .eq_ignore_ascii_case(&source_entry.email)
+                    })
+                    .context(
+                        "failed to resolve a target account with a distinct account_id for full-flow rotation",
+                    )?;
+                let target_entry = source_pool
+                    .accounts
+                    .get(target_index)
+                    .cloned()
+                    .context("failed to resolve target pool entry for full-flow rotation")?;
+                save_pool(&Pool {
+                    active_index: 0,
+                    accounts: vec![source_entry.clone(), target_entry.clone()],
+                })
+                .context("failed to persist reduced two-account pool for full-flow rotation")?;
+                let expected_target_email = target_entry.email.clone();
 
-    if let Err(error) = write_watch_state(&previous_watch_state) {
-        if outcome.is_ok() {
-            return Err(error);
-        }
-        eprintln!("failed to restore watch state after full-flow acceptance test: {error:#}");
-    }
+                let source_recoverable_thread_id =
+                    start_thread_with_marker(port, &source_cwd, &recoverable_marker)?;
+                archive_thread_in_state_db(
+                    &paths.codex_state_db_file,
+                    &source_recoverable_thread_id,
+                )?;
 
-    match previous_usage_url {
-        Some(value) => unsafe {
-            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value);
+                let mut watch_state = read_watch_state()?;
+                let mut source_watch_state = watch_state.account_state(&source_summary.account_id);
+                source_watch_state.last_signal_id = Some(0);
+                source_watch_state.thread_recovery_pending = true;
+                source_watch_state.thread_recovery_pending_events = vec![ThreadRecoveryEvent {
+                    source_log_id: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis() as i64,
+                    source_ts: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_secs() as i64,
+                    thread_id: source_recoverable_thread_id.clone(),
+                    kind: ThreadRecoveryKind::QuotaExhausted,
+                    exhausted_turn_id: None,
+                    exhausted_email: Some(source_summary.email.clone()),
+                    exhausted_account_id: Some(source_summary.account_id.clone()),
+                    message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
+                }];
+                source_watch_state.thread_recovery_backfill_complete = true;
+                watch_state
+                    .set_account_state(source_summary.account_id.clone(), source_watch_state);
+                write_watch_state(&watch_state)?;
+
+                let mut quota_bodies_by_token = HashMap::new();
+                for entry in [&source_entry, &target_entry] {
+                    let used_percent = if entry.email.eq_ignore_ascii_case(&source_summary.email) {
+                        100.0
+                    } else {
+                        20.0
+                    };
+                    let reset_after_seconds = if used_percent >= 100.0 { 3_600 } else { 600 };
+                    let reset_at = if used_percent >= 100.0 {
+                        1_775_185_200
+                    } else {
+                        1_775_182_200
+                    };
+                    quota_bodies_by_token.insert(
+                        entry.auth.tokens.access_token.clone(),
+                        quota_response_body(
+                            &entry.account_id,
+                            &entry.email,
+                            &entry.plan_type,
+                            used_percent,
+                            reset_after_seconds,
+                            reset_at,
+                        ),
+                    );
+                }
+                let default_quota_body = quota_response_body(
+                    &source_summary.account_id,
+                    &source_summary.email,
+                    &source_summary.plan_type,
+                    100.0,
+                    3_600,
+                    1_775_185_200,
+                );
+                let (quota_url, _, server_stop) =
+                    spawn_quota_server_by_token(quota_bodies_by_token, default_quota_body);
+                stop_server = Some(server_stop);
+                unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
+                }
+
+                let first_iteration = run_watch_iteration(WatchIterationOptions {
+                    port: Some(port),
+                    after_signal_id: None,
+                    cooldown_ms: Some(0),
+                    force_quota_refresh: true,
+                    progress: None,
+                })?;
+                ensure!(
+                    first_iteration.rotated,
+                    "watch trigger should have rotated during full-flow acceptance"
+                );
+                ensure!(
+                    first_iteration.decision.should_rotate,
+                    "watch decision should have requested rotation during full-flow acceptance"
+                );
+                ensure!(
+                    first_iteration.decision.rotation_command == Some(RotationCommand::Next),
+                    "expected watch-triggered full-flow rotation command to be Next, got {:?}",
+                    first_iteration.decision.rotation_command
+                );
+
+                ensure_debug_codex_instance(None, Some(port), None, Some(30_000))?;
+                ensure!(
+                    managed_codex_is_running(&paths.debug_profile_dir)?,
+                    "expected managed Codex to be running after watch-triggered rotation"
+                );
+                let post_rotation_root_pid = managed_root_pid(&paths.debug_profile_dir)?;
+                ensure!(
+                    post_rotation_root_pid != pre_rotation_root_pid,
+                    "expected watch-triggered rotation to relaunch managed Codex with a new root pid, but pid stayed {}",
+                    pre_rotation_root_pid
+                );
+
+                let target_auth = load_codex_auth(&paths.codex_auth_file)
+                    .context("failed to read target auth after watch-triggered rotation")?;
+                let target_summary = summarize_codex_auth(&target_auth);
+                ensure!(
+                    target_summary.email == expected_target_email,
+                    "expected rotated auth email {}, got {}",
+                    expected_target_email,
+                    target_summary.email
+                );
+                let _rotated_pool =
+                    load_pool().context("failed to load pool after watch-triggered rotation")?;
+
+                let watch_state_after_rotation = read_watch_state()?;
+                let target_after_rotation =
+                    watch_state_after_rotation.account_state(&target_summary.account_id);
+                if source_summary.account_id != target_summary.account_id {
+                    let source_after_rotation =
+                        watch_state_after_rotation.account_state(&source_summary.account_id);
+                    ensure!(
+                        !source_after_rotation.thread_recovery_pending,
+                        "expected source account {} to clear pending recovery state after watch rotation",
+                        source_summary.account_id
+                    );
+                    ensure!(
+                        source_after_rotation.thread_recovery_pending_events.is_empty(),
+                        "expected source account {} to clear pending recovery events after watch rotation",
+                        source_summary.account_id
+                    );
+                }
+                ensure!(
+                    target_after_rotation.thread_recovery_pending,
+                    "expected target account {} to have pending interrupted-thread state after watch rotation",
+                    target_summary.account_id
+                );
+                ensure!(
+                    target_after_rotation.thread_recovery_pending_events.len() == 1,
+                    "expected exactly one pending interrupted thread on target, got {}",
+                    target_after_rotation.thread_recovery_pending_events.len()
+                );
+                let pending_target_thread_id = target_after_rotation.thread_recovery_pending_events
+                    [0]
+                .thread_id
+                .clone();
+                if source_summary.account_id != target_summary.account_id {
+                    ensure!(
+                        pending_target_thread_id != source_recoverable_thread_id,
+                        "expected recoverable conversation to map to a target-local thread id distinct from source {}",
+                        source_recoverable_thread_id
+                    );
+                }
+                let _pending_thread = wait_for_thread_to_load(port, &pending_target_thread_id)
+                    .with_context(|| {
+                        format!(
+                            "failed to materialize pending target thread {pending_target_thread_id}"
+                        )
+                    })?;
+                std::thread::sleep(Duration::from_secs(5));
+
+                if managed_codex_is_running(&paths.debug_profile_dir)? {
+                    stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+                }
+                ensure!(
+                    !managed_codex_is_running(&paths.debug_profile_dir)?,
+                    "expected managed Codex to be stopped before restart validation"
+                );
+                ensure_debug_codex_instance(None, Some(port), None, None)?;
+
+                let mut recovered = false;
+                for _ in 0..6 {
+                    let _ = run_watch_iteration(WatchIterationOptions {
+                        port: Some(port),
+                        after_signal_id: target_after_rotation.last_signal_id,
+                        cooldown_ms: Some(0),
+                        force_quota_refresh: false,
+                        progress: None,
+                    })?;
+                    let state_after_recovery_attempt = read_watch_state()?;
+                    let target_after_recovery =
+                        state_after_recovery_attempt.account_state(&target_summary.account_id);
+                    if !target_after_recovery.thread_recovery_pending
+                        && target_after_recovery
+                            .thread_recovery_pending_events
+                            .is_empty()
+                    {
+                        recovered = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                ensure!(
+                    recovered,
+                    "expected interrupted-thread recovery to auto-complete after restart for account {}",
+                    target_summary.account_id
+                );
+
+                let recovered_thread_id =
+                    ConversationSyncStore::new(&paths.conversation_sync_db_file)?
+                        .get_local_thread_id(
+                            &target_summary.account_id,
+                            &source_recoverable_thread_id,
+                        )?
+                        .unwrap_or_else(|| pending_target_thread_id.clone());
+
+                let _ = wait_for_thread_marker(
+                    port,
+                    &recovered_thread_id,
+                    "continue with skipped msgs",
+                )
+                .with_context(|| {
+                    format!(
+                        "expected interrupted thread {} to receive automatic resume input after restart",
+                        recovered_thread_id
+                    )
+                })?;
+
+                Ok(())
+            })();
+
+            if let Some(stop_server) = stop_server {
+                stop_server.store(true, Ordering::Relaxed);
+            }
+
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            if let Err(error) = write_watch_state(&previous_watch_state) {
+                if outcome.is_ok() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "failed to restore watch state after full-flow acceptance test: {error:#}"
+                );
+            }
+
+            match previous_usage_url {
+                Some(value) => unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+                },
+            }
+
+            if outcome.is_ok() {
+                artifacts.complete()?;
+            }
+
+            outcome
         },
-        None => unsafe {
-            std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
-        },
-    }
-
-    if outcome.is_ok() {
-        artifacts.complete()?;
-    }
-
-    outcome
+    )
 }
 
 #[test]
@@ -2531,6 +3516,7 @@ fn read_thread_with_turns(port: u16, thread_id: &str) -> Result<Option<Value>> {
             let message = format!("{:#}", error);
             if message.contains("includeTurns is unavailable before first user message")
                 || message.contains("is not materialized yet")
+                || message.contains("thread not loaded")
             {
                 return Ok(None);
             }
@@ -2538,6 +3524,37 @@ fn read_thread_with_turns(port: u16, thread_id: &str) -> Result<Option<Value>> {
         }
     };
     Ok(response.get("thread").cloned())
+}
+
+fn wait_for_thread_to_load(port: u16, thread_id: &str) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match send_local_mcp_request(
+            port,
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+            }),
+        ) {
+            Ok(response) => {
+                if let Some(thread) = response.get("thread").cloned() {
+                    return Ok(thread);
+                }
+            }
+            Err(error) => {
+                let message = format!("{:#}", error);
+                if !message.contains("thread not loaded")
+                    && !message.contains("no rollout found for thread id")
+                {
+                    return Err(error);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Timed out waiting for thread {thread_id} to become readable");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn is_live_unattended_relogin_error(error: &anyhow::Error) -> bool {
@@ -2548,6 +3565,15 @@ fn is_live_unattended_relogin_error(error: &anyhow::Error) -> bool {
 }
 
 fn prime_source_account_for_live_rotation(preferred_email: &str) -> Result<String> {
+    let paths = resolve_paths()?;
+    if let Ok(auth) = load_codex_auth(&paths.codex_auth_file) {
+        let summary = summarize_codex_auth(&auth);
+        if summary.email.eq_ignore_ascii_case(preferred_email) {
+            align_current_pool_active_index_to_email(Some(&summary.email))?;
+            return Ok(summary.email);
+        }
+    }
+
     let options = ReloginOptions {
         manual_login: false,
         logout_first: true,
@@ -2694,49 +3720,6 @@ fn managed_root_pid(profile_dir: &Path) -> Result<u32> {
     ))
 }
 
-fn config_contains_project(path: &Path, project_path: &str) -> Result<bool> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(contents.contains(&format!(
-        "[projects.\"{}\"]",
-        encode_toml_basic_string(project_path)
-    )))
-}
-
-fn global_state_contains_project(path: &Path, project_path: &str) -> Result<bool> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let state: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    let contains_project = state
-        .get("electron-saved-workspace-roots")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.as_str() == Some(project_path))
-        })
-        .unwrap_or(false);
-    Ok(contains_project)
-}
-
-fn encode_toml_basic_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\u{0008}' => escaped.push_str("\\b"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\u{000C}' => escaped.push_str("\\f"),
-            '\r' => escaped.push_str("\\r"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 fn archive_thread_in_state_db(state_db_path: &Path, thread_id: &str) -> Result<()> {
     ensure!(
         state_db_path.exists(),
@@ -2815,6 +3798,54 @@ fn spawn_quota_server(response_body: String) -> (String, Arc<AtomicUsize>, Arc<A
                     request_count_thread.fetch_add(1, Ordering::SeqCst);
                     let mut buffer = [0_u8; 1024];
                     let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (
+        format!("http://127.0.0.1:{}/wham/usage", address.port()),
+        request_count,
+        stop,
+    )
+}
+
+fn spawn_quota_server_by_token(
+    response_bodies: HashMap<String, String>,
+    default_response_body: String,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("quota listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking quota listener");
+    let address = listener.local_addr().expect("quota listener addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let request_count_thread = request_count.clone();
+    let stop_thread = stop.clone();
+
+    std::thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    request_count_thread.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0_u8; 8192];
+                    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let response_body = request_bearer_token(&request)
+                        .and_then(|token| response_bodies.get(&token).cloned())
+                        .unwrap_or_else(|| default_response_body.clone());
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         response_body.len(),

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,6 +16,7 @@ use crate::cdp::{invalidate_local_codex_connection, with_local_codex_connection}
 use crate::hook::read_live_account;
 use crate::launcher::ensure_debug_codex_instance;
 use crate::paths::resolve_paths;
+use crate::rotation_hygiene::ConversationSyncStore;
 use crate::runtime_log::log_daemon_error;
 
 const DEFAULT_PORT: u16 = 9333;
@@ -46,6 +48,15 @@ pub enum ThreadRecoveryKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadRecoveryRehydration {
+    pub lineage_id: String,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub items: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadRecoveryEvent {
     pub source_log_id: i64,
     pub source_ts: i64,
@@ -56,6 +67,8 @@ pub struct ThreadRecoveryEvent {
     pub exhausted_email: Option<String>,
     pub exhausted_account_id: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydration: Option<ThreadRecoveryRehydration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -260,45 +273,12 @@ pub fn read_active_thread_ids(port: Option<u16>) -> Result<Vec<String>> {
 fn resolve_recoverable_turn_failure_event(
     connection: &Connection,
     port: u16,
-    event: &ThreadRecoveryEvent,
+    event: &mut ThreadRecoveryEvent,
     current_live_email: &Option<String>,
     can_continue_without_email: bool,
 ) -> Result<RecoveryResolution> {
     if thread_has_newer_user_turn(connection, event)? {
         return Ok(RecoveryResolution::Dropped);
-    }
-
-    let thread_summary = match read_thread_summary(port, &event.thread_id) {
-        Ok(summary) => summary,
-        Err(error) if is_terminal_thread_recovery_error(&error) => {
-            log_daemon_error(format!(
-                "dropping recoverable thread {} after terminal thread/read failure: {error:#}",
-                event.thread_id,
-            ));
-            eprintln!(
-                "codex-rotate: dropping recoverable thread {} after terminal thread/read failure: {error:#}",
-                event.thread_id,
-            );
-            return Ok(RecoveryResolution::Dropped);
-        }
-        Err(error) => {
-            log_daemon_error(format!(
-                "failed to read thread {}: {error:#}",
-                event.thread_id
-            ));
-            eprintln!(
-                "codex-rotate: failed to read thread {}: {error:#}",
-                event.thread_id
-            );
-            None
-        }
-    };
-    let thread_status_kind = thread_summary
-        .as_ref()
-        .map(|thread| thread.status.kind.as_str());
-
-    if matches!(thread_status_kind, Some("active")) {
-        return Ok(recovery_resolution_for_active_thread(event.kind));
     }
 
     match event.kind {
@@ -328,29 +308,63 @@ fn resolve_recoverable_turn_failure_event(
         }
     }
 
+    let thread_summary = match read_thread_summary(port, &event.thread_id) {
+        Ok(summary) => summary,
+        Err(error) if is_terminal_thread_recovery_error(&error) => {
+            let Some(rehydrated_cwd) = rehydrate_recoverable_thread(port, event, None)? else {
+                log_daemon_error(format!(
+                    "dropping recoverable thread {} after terminal thread/read failure: {error:#}",
+                    event.thread_id,
+                ));
+                eprintln!(
+                    "codex-rotate: dropping recoverable thread {} after terminal thread/read failure: {error:#}",
+                    event.thread_id,
+                );
+                return Ok(RecoveryResolution::Dropped);
+            };
+            return continue_or_rehydrate_thread(port, event, Some(rehydrated_cwd));
+        }
+        Err(error) => {
+            log_daemon_error(format!(
+                "failed to read thread {}: {error:#}",
+                event.thread_id
+            ));
+            eprintln!(
+                "codex-rotate: failed to read thread {}: {error:#}",
+                event.thread_id
+            );
+            None
+        }
+    };
+    let thread_status_kind = thread_summary
+        .as_ref()
+        .map(|thread| thread.status.kind.as_str());
+
+    if matches!(thread_status_kind, Some("active")) {
+        return Ok(recovery_resolution_for_active_thread(event.kind));
+    }
+
     let cwd = match continue_strategy_for_thread(thread_summary.as_ref()) {
         ContinueStrategy::Direct { cwd } => cwd,
         ContinueStrategy::DirectThenResume { initial_cwd } => {
-            match send_continue_turn(port, &event.thread_id, initial_cwd.clone()) {
-                Ok(()) => return Ok(RecoveryResolution::Continued),
-                Err(error) if is_terminal_thread_recovery_error(&error) => {
+            match continue_or_rehydrate_thread(port, event, initial_cwd.clone())? {
+                RecoveryResolution::Continued => return Ok(RecoveryResolution::Continued),
+                RecoveryResolution::Dropped => return Ok(RecoveryResolution::Dropped),
+                RecoveryResolution::Blocked => {
+                    if event.thread_id
+                        != thread_summary
+                            .as_ref()
+                            .map(|thread| thread.id.as_str())
+                            .unwrap_or_default()
+                    {
+                        return Ok(RecoveryResolution::Blocked);
+                    }
                     log_daemon_error(format!(
-                        "dropping recoverable thread {} after terminal continue failure: {error:#}",
+                        "direct continue failed for thread {}; retrying after resume.",
                         event.thread_id,
                     ));
                     eprintln!(
-                        "codex-rotate: dropping recoverable thread {} after terminal continue failure: {error:#}",
-                        event.thread_id,
-                    );
-                    return Ok(RecoveryResolution::Dropped);
-                }
-                Err(error) => {
-                    log_daemon_error(format!(
-                        "direct continue failed for thread {}; retrying after resume: {error:#}",
-                        event.thread_id,
-                    ));
-                    eprintln!(
-                        "codex-rotate: direct continue failed for thread {}; retrying after resume: {error:#}",
+                        "codex-rotate: direct continue failed for thread {}; retrying after resume.",
                         event.thread_id,
                     );
                 }
@@ -358,44 +372,32 @@ fn resolve_recoverable_turn_failure_event(
 
             match prepare_thread_for_continue(port, &event.thread_id, initial_cwd) {
                 Ok(cwd) => cwd,
+                Err(error) if is_terminal_thread_recovery_error(&error) => {
+                    let Some(rehydrated_cwd) = rehydrate_recoverable_thread(port, event, None)?
+                    else {
+                        return Ok(log_prepare_continue_error(&event.thread_id, &error));
+                    };
+                    return continue_or_rehydrate_thread(port, event, Some(rehydrated_cwd));
+                }
                 Err(error) => return Ok(log_prepare_continue_error(&event.thread_id, &error)),
             }
         }
         ContinueStrategy::ResumeThenContinue { initial_cwd } => {
             match prepare_thread_for_continue(port, &event.thread_id, initial_cwd) {
                 Ok(cwd) => cwd,
+                Err(error) if is_terminal_thread_recovery_error(&error) => {
+                    let Some(rehydrated_cwd) = rehydrate_recoverable_thread(port, event, None)?
+                    else {
+                        return Ok(log_prepare_continue_error(&event.thread_id, &error));
+                    };
+                    return continue_or_rehydrate_thread(port, event, Some(rehydrated_cwd));
+                }
                 Err(error) => return Ok(log_prepare_continue_error(&event.thread_id, &error)),
             }
         }
     };
 
-    match send_continue_turn(port, &event.thread_id, cwd) {
-        Ok(()) => Ok(RecoveryResolution::Continued),
-        Err(error) if is_terminal_thread_recovery_error(&error) => {
-            log_daemon_error(format!(
-                "dropping recoverable thread {} after terminal continue failure: {error:#}",
-                event.thread_id,
-            ));
-            eprintln!(
-                "codex-rotate: dropping recoverable thread {} after terminal continue failure: {error:#}",
-                event.thread_id,
-            );
-            Ok(RecoveryResolution::Dropped)
-        }
-        Err(error) => {
-            log_daemon_error(format!(
-                "failed to continue thread {} after {} recovery: {error:#}",
-                event.thread_id,
-                event.kind.label(),
-            ));
-            eprintln!(
-                "codex-rotate: failed to continue thread {} after {} recovery: {error:#}",
-                event.thread_id,
-                event.kind.label(),
-            );
-            Ok(RecoveryResolution::Blocked)
-        }
-    }
+    continue_or_rehydrate_thread(port, event, cwd)
 }
 
 fn thread_has_newer_user_turn(
@@ -559,6 +561,7 @@ fn parse_codex_core_recoverable_turn_failure_event(
         exhausted_email: metadata.exhausted_email,
         exhausted_account_id: metadata.exhausted_account_id,
         message,
+        rehydration: None,
     }))
 }
 
@@ -765,6 +768,7 @@ limit ?1
             exhausted_email: None,
             exhausted_account_id: None,
             message: "turn stalled without completion".to_string(),
+            rehydration: None,
         });
     }
 
@@ -929,14 +933,15 @@ fn process_thread_recovery_events<F>(
     mut resolver: F,
 ) -> Result<RecoveryProcessingResult>
 where
-    F: FnMut(&ThreadRecoveryEvent) -> Result<RecoveryResolution>,
+    F: FnMut(&mut ThreadRecoveryEvent) -> Result<RecoveryResolution>,
 {
     let mut continued_thread_ids = Vec::new();
     let mut dropped_thread_ids = Vec::new();
     let mut pending_events = Vec::new();
 
     for event in events {
-        match resolver(event)? {
+        let mut event = event.clone();
+        match resolver(&mut event)? {
             RecoveryResolution::Continued => {
                 continued_thread_ids.push(event.thread_id.clone());
             }
@@ -944,7 +949,7 @@ where
                 dropped_thread_ids.push(event.thread_id.clone());
             }
             RecoveryResolution::Blocked => {
-                pending_events.push(event.clone());
+                pending_events.push(event);
             }
         }
     }
@@ -954,6 +959,151 @@ where
         dropped_thread_ids,
         pending_events,
     })
+}
+
+fn current_account_id() -> Result<String> {
+    let paths = resolve_paths()?;
+    let auth = load_codex_auth(&paths.codex_auth_file)?;
+    Ok(summarize_codex_auth(&auth).account_id)
+}
+
+fn rehydrate_thread_binding(
+    account_id: &str,
+    lineage_id: &str,
+    local_thread_id: &str,
+) -> Result<()> {
+    let paths = resolve_paths()?;
+    let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+    store.bind_local_thread_id(account_id, lineage_id, local_thread_id)
+}
+
+fn start_rehydrated_thread(port: u16, cwd: Option<&str>) -> Result<String> {
+    let response: Value = send_codex_app_request(
+        port,
+        "thread/start",
+        json!({
+            "cwd": cwd,
+            "model": Value::Null,
+            "modelProvider": Value::Null,
+            "serviceTier": Value::Null,
+            "approvalPolicy": Value::Null,
+            "approvalsReviewer": "user",
+            "sandbox": Value::Null,
+            "personality": "pragmatic",
+        }),
+    )?;
+    response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "Codex thread/start did not return a thread id while rehydrating thread recovery."
+            )
+        })
+}
+
+fn inject_rehydrated_thread_items(port: u16, thread_id: &str, items: Vec<Value>) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let _: Value = send_codex_app_request(
+        port,
+        "thread/inject_items",
+        json!({
+            "threadId": thread_id,
+            "items": items,
+        }),
+    )?;
+    Ok(())
+}
+
+fn rehydrate_recoverable_thread(
+    port: u16,
+    event: &mut ThreadRecoveryEvent,
+    fallback_cwd: Option<String>,
+) -> Result<Option<String>> {
+    let Some(rehydration) = event.rehydration.as_ref() else {
+        return Ok(None);
+    };
+
+    let new_thread_id =
+        start_rehydrated_thread(port, rehydration.cwd.as_deref().or(fallback_cwd.as_deref()))
+            .with_context(|| {
+                format!(
+                    "Failed to create rehydrated thread for {}.",
+                    event.thread_id
+                )
+            })?;
+    inject_rehydrated_thread_items(port, &new_thread_id, rehydration.items.clone())
+        .with_context(|| format!("Failed to inject rehydration items into {}.", new_thread_id))?;
+    let account_id = current_account_id()?;
+    rehydrate_thread_binding(&account_id, &rehydration.lineage_id, &new_thread_id)?;
+    event.thread_id = new_thread_id;
+    Ok(rehydration.cwd.clone().or(fallback_cwd))
+}
+
+fn continue_or_rehydrate_thread(
+    port: u16,
+    event: &mut ThreadRecoveryEvent,
+    cwd: Option<String>,
+) -> Result<RecoveryResolution> {
+    match send_continue_turn(port, &event.thread_id, cwd.clone()) {
+        Ok(()) => Ok(RecoveryResolution::Continued),
+        Err(error) if is_terminal_thread_recovery_error(&error) => {
+            let Some(rehydrated_cwd) = rehydrate_recoverable_thread(port, event, cwd.clone())?
+            else {
+                log_daemon_error(format!(
+                    "dropping recoverable thread {} after terminal continue failure: {error:#}",
+                    event.thread_id,
+                ));
+                eprintln!(
+                    "codex-rotate: dropping recoverable thread {} after terminal continue failure: {error:#}",
+                    event.thread_id,
+                );
+                return Ok(RecoveryResolution::Dropped);
+            };
+            match send_continue_turn(port, &event.thread_id, Some(rehydrated_cwd)) {
+                Ok(()) => Ok(RecoveryResolution::Continued),
+                Err(retry_error) if is_terminal_thread_recovery_error(&retry_error) => {
+                    log_daemon_error(format!(
+                        "rehydrated recoverable thread {} still failed terminal continue: {retry_error:#}",
+                        event.thread_id,
+                    ));
+                    eprintln!(
+                        "codex-rotate: rehydrated recoverable thread {} still failed terminal continue: {retry_error:#}",
+                        event.thread_id,
+                    );
+                    Ok(RecoveryResolution::Blocked)
+                }
+                Err(retry_error) => {
+                    log_daemon_error(format!(
+                        "rehydrated recoverable thread {} failed continue: {retry_error:#}",
+                        event.thread_id,
+                    ));
+                    eprintln!(
+                        "codex-rotate: rehydrated recoverable thread {} failed continue: {retry_error:#}",
+                        event.thread_id,
+                    );
+                    Ok(RecoveryResolution::Blocked)
+                }
+            }
+        }
+        Err(error) => {
+            log_daemon_error(format!(
+                "failed to continue thread {} after {} recovery: {error:#}",
+                event.thread_id,
+                event.kind.label(),
+            ));
+            eprintln!(
+                "codex-rotate: failed to continue thread {} after {} recovery: {error:#}",
+                event.thread_id,
+                event.kind.label(),
+            );
+            Ok(RecoveryResolution::Blocked)
+        }
+    }
 }
 
 fn recovery_resolution_for_active_thread(kind: ThreadRecoveryKind) -> RecoveryResolution {
@@ -1655,6 +1805,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             exhausted_email: None,
             exhausted_account_id: None,
             message: "You've hit your usage limit.".to_string(),
+            rehydration: None,
         };
 
         assert!(thread_has_newer_user_turn(&connection, &event).unwrap());
@@ -1734,6 +1885,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             exhausted_email: None,
             exhausted_account_id: None,
             message: MODEL_CAPACITY_ERROR_MESSAGE.to_string(),
+            rehydration: None,
         };
         assert!(!transient_recovery_retry_due(&event));
 
@@ -1759,6 +1911,7 @@ insert into logs (id, ts, target, feedback_log_body) values
             exhausted_email: None,
             exhausted_account_id: None,
             message: "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)".to_string(),
+            rehydration: None,
         };
         assert!(!transient_recovery_retry_due(&event));
 
@@ -1990,6 +2143,7 @@ create table logs (
                 exhausted_email: Some("a@example.com".to_string()),
                 exhausted_account_id: None,
                 message: "You've hit your usage limit.".to_string(),
+                rehydration: None,
             }],
             vec![
                 ThreadRecoveryEvent {
@@ -2001,6 +2155,7 @@ create table logs (
                     exhausted_email: Some("b@example.com".to_string()),
                     exhausted_account_id: None,
                     message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
                 },
                 ThreadRecoveryEvent {
                     source_log_id: 12,
@@ -2011,6 +2166,7 @@ create table logs (
                     exhausted_email: Some("a@example.com".to_string()),
                     exhausted_account_id: None,
                     message: "You've hit your usage limit.".to_string(),
+                    rehydration: None,
                 },
             ],
         );
@@ -2034,6 +2190,7 @@ create table logs (
                 exhausted_email: None,
                 exhausted_account_id: None,
                 message: "You've hit your usage limit.".to_string(),
+                rehydration: None,
             },
             ThreadRecoveryEvent {
                 source_log_id: 11,
@@ -2044,6 +2201,7 @@ create table logs (
                 exhausted_email: None,
                 exhausted_account_id: None,
                 message: "You've hit your usage limit.".to_string(),
+                rehydration: None,
             },
         ];
 

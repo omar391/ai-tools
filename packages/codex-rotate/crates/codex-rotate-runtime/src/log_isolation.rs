@@ -16,7 +16,7 @@ use codex_rotate_core::pool::{load_pool, restore_pool_active_index};
 use serde::{Deserialize, Serialize};
 
 use crate::cdp::invalidate_local_codex_connection;
-use crate::launcher::ensure_debug_codex_instance;
+use crate::launcher::{ensure_debug_codex_instance, reap_tracked_managed_launch_children};
 use crate::logs::invalidate_log_connection;
 use crate::paths::resolve_paths;
 use crate::runtime_log::log_daemon_info;
@@ -688,6 +688,7 @@ fn signal_processes(signal: &str, pids: &[u32]) -> Result<()> {
 fn wait_for_processes_to_exit(pids: &[u32], timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        reap_tracked_managed_launch_children()?;
         let running = list_processes()?
             .into_iter()
             .any(|process| pids.contains(&process.pid));

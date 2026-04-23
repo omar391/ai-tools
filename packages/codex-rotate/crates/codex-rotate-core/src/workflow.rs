@@ -31,7 +31,7 @@ use crate::pool::{
     cmd_add_expected_email, find_next_usable_account, format_account_summary_for_display,
     inspect_account, load_pool, normalize_pool_entries, resolve_account_selector,
     resolve_persona_profile, save_pool, sync_pool_active_account_from_codex, AccountEntry,
-    AccountInspection, PersonaProfile, Pool, ReusableAccountProbeMode,
+    AccountInspection, PersonaEntry, PersonaProfile, Pool, ReusableAccountProbeMode,
 };
 use crate::quota::{describe_quota_blocker, format_compact_quota, has_usable_quota};
 #[cfg(test)]
@@ -183,12 +183,18 @@ pub struct CredentialFamily {
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
-    #[serde(default, rename = "relogin")]
-    pub deleted: Vec<String>,
+    #[serde(default, alias = "deleted")]
+    pub relogin: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suspend_domain_on_terminal_refresh_failure: bool,
 }
 
 fn default_max_skipped_slots_per_family() -> u32 {
     DEFAULT_MAX_SKIPPED_SLOTS_PER_FAMILY
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1037,25 +1043,7 @@ pub fn cmd_relogin_with_progress(
             format!("Preparing password for {}.", expected_email),
         );
         let generated_password = generate_password(18);
-        let paths = resolve_paths()?;
-        let pool = load_pool()?;
-        let current_account = pool.accounts.get(pool.active_index);
-        let persona_paths = current_account
-            .and_then(|entry| entry.persona.as_ref())
-            .map(|persona| {
-                persona
-                    .host_root_rel_path
-                    .as_deref()
-                    .map(|relative| paths.rotate_home.join(relative))
-                    .unwrap_or_else(|| {
-                        paths
-                            .rotate_home
-                            .join("personas")
-                            .join("host")
-                            .join(&persona.persona_id)
-                    })
-            })
-            .map(|root| root.join("managed-profile"));
+        let persona_paths = current_persona_managed_profile_dir(true)?;
         let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
 
         match run_automation_bridge::<_, CodexRotateSecretRef>(
@@ -1671,7 +1659,8 @@ fn skip_pending_account_and_advance_family(
                 created_at: started_at.to_string(),
                 updated_at,
                 last_created_email: None,
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
     }
@@ -1866,25 +1855,8 @@ fn execute_create_flow_attempt(
             format!("Preparing password for {}.", created_email),
         );
         let password = generate_password(18);
-        let paths = resolve_paths().map_err(CreateFlowAttemptFailure::Fatal)?;
-        let pool = load_pool().map_err(CreateFlowAttemptFailure::Fatal)?;
-        let current_account = pool.accounts.get(pool.active_index);
-        let persona_paths = current_account
-            .and_then(|entry| entry.persona.as_ref())
-            .map(|persona| {
-                persona
-                    .host_root_rel_path
-                    .as_deref()
-                    .map(|relative| paths.rotate_home.join(relative))
-                    .unwrap_or_else(|| {
-                        paths
-                            .rotate_home
-                            .join("personas")
-                            .join("host")
-                            .join(&persona.persona_id)
-                    })
-            })
-            .map(|root| root.join("managed-profile"));
+        let persona_paths =
+            current_persona_managed_profile_dir(true).map_err(CreateFlowAttemptFailure::Fatal)?;
         let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
 
         match run_automation_bridge::<_, CodexRotateSecretRef>(
@@ -2187,9 +2159,12 @@ fn finalize_created_account(args: FinalizeCreatedAccountArgs<'_>) -> Result<Crea
                 .unwrap_or_else(|| started_at.to_string()),
             updated_at,
             last_created_email: Some(created_email.clone()),
-            deleted: family
-                .map(|entry| entry.deleted.clone())
+            relogin: family
+                .map(|entry| entry.relogin.clone())
                 .unwrap_or_default(),
+            suspend_domain_on_terminal_refresh_failure: family
+                .map(|entry| entry.suspend_domain_on_terminal_refresh_failure)
+                .unwrap_or(false),
         },
     );
     save_credential_store(store)?;
@@ -2478,25 +2453,7 @@ fn run_complete_codex_login(args: CompleteCodexLoginArgs<'_>) -> Result<Complete
         ),
     }
 
-    let paths = resolve_paths()?;
-    let pool = load_pool()?;
-    let current_account = pool.accounts.get(pool.active_index);
-    let persona_paths = current_account
-        .and_then(|entry| entry.persona.as_ref())
-        .map(|persona| {
-            persona
-                .host_root_rel_path
-                .as_deref()
-                .map(|relative| paths.rotate_home.join(relative))
-                .unwrap_or_else(|| {
-                    paths
-                        .rotate_home
-                        .join("personas")
-                        .join("host")
-                        .join(&persona.persona_id)
-                })
-        })
-        .map(|root| root.join("managed-profile"));
+    let persona_paths = current_persona_managed_profile_dir(true)?;
     let profile_dir_str = persona_paths.as_ref().map(|path| path.to_string_lossy());
 
     let mut allow_signup_recovery = prefer_signup_recovery.unwrap_or(false);
@@ -3923,20 +3880,7 @@ fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
     let current_account = pool.accounts.get(pool.active_index);
     let persona_paths = current_account
         .and_then(|entry| entry.persona.as_ref())
-        .map(|persona| {
-            persona
-                .host_root_rel_path
-                .as_deref()
-                .map(|relative| paths.rotate_home.join(relative))
-                .unwrap_or_else(|| {
-                    paths
-                        .rotate_home
-                        .join("personas")
-                        .join("host")
-                        .join(&persona.persona_id)
-                })
-        })
-        .map(|root| root.join("managed-profile"));
+        .map(|persona| host_persona_root(&paths, persona).join("managed-profile"));
     let profile_dir = persona_paths.as_ref().map(|path| path.to_string_lossy());
 
     for record in records {
@@ -3955,6 +3899,39 @@ fn cleanup_dropped_non_dev_pending_secrets(records: &[PendingCredential]) {
             );
         }
     }
+}
+
+fn host_persona_root(paths: &crate::paths::CorePaths, persona: &PersonaEntry) -> PathBuf {
+    persona
+        .host_root_rel_path
+        .as_deref()
+        .map(|relative| paths.rotate_home.join(relative))
+        .unwrap_or_else(|| {
+            paths
+                .rotate_home
+                .join("personas")
+                .join("host")
+                .join(&persona.persona_id)
+        })
+}
+
+fn current_persona_managed_profile_dir(ensure_exists: bool) -> Result<Option<PathBuf>> {
+    let paths = resolve_paths()?;
+    let pool = load_pool()?;
+    let profile_dir = pool
+        .accounts
+        .get(pool.active_index)
+        .and_then(|entry| entry.persona.as_ref())
+        .map(|persona| host_persona_root(&paths, persona).join("managed-profile"));
+
+    if ensure_exists {
+        if let Some(path) = profile_dir.as_ref() {
+            fs::create_dir_all(path)
+                .with_context(|| format!("Failed to create {}.", path.display()))?;
+        }
+    }
+
+    Ok(profile_dir)
 }
 
 fn rotate_state_requires_template_migration(raw: &Value) -> bool {
@@ -4217,13 +4194,17 @@ fn normalize_stored_credential_map(raw: Option<&Value>) -> HashMap<String, Store
 fn normalize_credential_family(raw: &Value) -> Option<CredentialFamily> {
     let mut record = serde_json::from_value::<CredentialFamily>(raw.clone()).ok()?;
     record.template = migrate_legacy_template_value(&record.template).ok()?;
-    record.deleted = record
-        .deleted
+    record.relogin = record
+        .relogin
         .iter()
         .map(|email| normalize_email_key(email))
         .collect::<Vec<_>>();
-    record.deleted.sort();
-    record.deleted.dedup();
+    record.relogin.sort();
+    record.relogin.dedup();
+    record.suspend_domain_on_terminal_refresh_failure = raw
+        .as_object()
+        .is_some_and(|family| family.contains_key("deleted"))
+        || record.suspend_domain_on_terminal_refresh_failure;
     record.last_created_email = record
         .last_created_email
         .as_deref()
@@ -4255,9 +4236,11 @@ fn merge_normalized_family(
         Some(existing) => {
             existing.next_suffix = existing.next_suffix.max(family.next_suffix);
             existing.max_skipped_slots = existing.max_skipped_slots.max(family.max_skipped_slots);
-            existing.deleted.extend(family.deleted.iter().cloned());
-            existing.deleted.sort();
-            existing.deleted.dedup();
+            existing.relogin.extend(family.relogin.iter().cloned());
+            existing.relogin.sort();
+            existing.relogin.dedup();
+            existing.suspend_domain_on_terminal_refresh_failure |=
+                family.suspend_domain_on_terminal_refresh_failure;
             if parse_sortable_timestamp(Some(family.created_at.as_str()))
                 < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
@@ -5033,7 +5016,7 @@ fn collect_known_account_emails(pool: &Pool, store: &CredentialStore) -> Vec<Str
         .collect::<Vec<_>>();
     emails.extend(store.pending.keys().cloned());
     for family in store.families.values() {
-        emails.extend(family.deleted.iter().cloned());
+        emails.extend(family.relogin.iter().cloned());
     }
     emails
 }
@@ -5604,7 +5587,7 @@ fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCreden
             let previous = existing.clone();
             existing.next_suffix = existing.next_suffix.max(next_suffix);
             existing
-                .deleted
+                .relogin
                 .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if parse_sortable_timestamp(Some(next_created_at.as_str()))
                 < parse_sortable_timestamp(Some(existing.created_at.as_str()))
@@ -5631,7 +5614,8 @@ fn upsert_family_for_account(store: &mut CredentialStore, account: &StoredCreden
                     created_at: next_created_at,
                     updated_at: next_updated_at,
                     last_created_email: next_last_created_email,
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
             true
@@ -5653,7 +5637,7 @@ fn merge_legacy_account_into_families(
         Some(existing) => {
             existing.next_suffix = existing.next_suffix.max(account.suffix.saturating_add(1));
             existing
-                .deleted
+                .relogin
                 .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if created_at < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
@@ -5676,7 +5660,8 @@ fn merge_legacy_account_into_families(
                     created_at: account.created_at.clone(),
                     updated_at: account.updated_at.clone(),
                     last_created_email: Some(account.email.clone()),
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
         }
@@ -5694,7 +5679,7 @@ fn normalize_email_key(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-pub fn record_deleted_account(email: &str) -> Result<bool> {
+pub fn record_removed_account(email: &str) -> Result<bool> {
     let normalized_email = normalize_email_key(email);
     let mut store = load_credential_store()?;
     let Some(family_match) = select_family_for_account_email(&store, &normalized_email) else {
@@ -5712,13 +5697,13 @@ pub fn record_deleted_account(email: &str) -> Result<bool> {
     let mut dirty = removed_pending || removed_skipped;
     if let Some(family) = store.families.get_mut(&family_match.key) {
         if !family
-            .deleted
+            .relogin
             .iter()
             .any(|entry| normalize_email_key(entry) == normalized_email)
         {
-            family.deleted.push(normalized_email.clone());
-            family.deleted.sort();
-            family.deleted.dedup();
+            family.relogin.push(normalized_email.clone());
+            family.relogin.sort();
+            family.relogin.dedup();
             dirty = true;
         }
     }
@@ -5728,24 +5713,15 @@ pub fn record_deleted_account(email: &str) -> Result<bool> {
     Ok(dirty)
 }
 
-pub(crate) fn family_has_deleted_array_for_account(email: &str) -> Result<bool> {
-    let paths = resolve_paths()?;
-    let raw_state = serde_json::from_str::<Value>(
-        &fs::read_to_string(&paths.pool_file)
-            .with_context(|| format!("Failed to read {}.", paths.pool_file.display()))?,
-    )
-    .with_context(|| format!("Failed to parse {} as JSON.", paths.pool_file.display()))?;
-    let store = normalize_credential_store(raw_state.clone());
-    let Some(family_match) = select_family_for_account_email(&store, email) else {
-        return Ok(false);
-    };
-
-    Ok(raw_state
-        .get("families")
-        .and_then(Value::as_object)
-        .and_then(|families| families.get(&family_match.key))
-        .and_then(Value::as_object)
-        .is_some_and(|family| family.contains_key("deleted")))
+pub(crate) fn family_suspends_domain_on_terminal_refresh_failure(email: &str) -> Result<bool> {
+    let store = load_credential_store()?;
+    Ok(select_family_for_account_email(&store, email)
+        .map(|family_match| {
+            family_match
+                .family
+                .suspend_domain_on_terminal_refresh_failure
+        })
+        .unwrap_or(false))
 }
 
 pub fn extract_email_domain(email: &str) -> Option<String> {
@@ -6929,7 +6905,8 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: None,
-            deleted: Vec::new(),
+            relogin: Vec::new(),
+            suspend_domain_on_terminal_refresh_failure: false,
         };
 
         let next_suffix = compute_fresh_account_family_suffix(
@@ -6958,7 +6935,8 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: None,
-            deleted: Vec::new(),
+            relogin: Vec::new(),
+            suspend_domain_on_terminal_refresh_failure: false,
         };
 
         let next_suffix = compute_fresh_account_family_suffix(
@@ -6985,7 +6963,8 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-14T06:11:25.913Z".to_string(),
             last_created_email: Some("dev3astronlab+1@gmail.com".to_string()),
-            deleted: Vec::new(),
+            relogin: Vec::new(),
+            suspend_domain_on_terminal_refresh_failure: false,
         };
 
         let next_suffix = compute_fresh_account_family_suffix(
@@ -7003,7 +6982,7 @@ input:
     }
 
     #[test]
-    fn collect_known_account_emails_includes_family_deleted_entries() {
+    fn collect_known_account_emails_includes_family_relogin_entries() {
         let mut store = CredentialStore::default();
         store.families.insert(
             "dev-1::dev.{n}@astronlab.com".to_string(),
@@ -7015,7 +6994,8 @@ input:
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-13T05:00:00.000Z".to_string(),
                 last_created_email: Some("dev.9@astronlab.com".to_string()),
-                deleted: vec!["dev.2@astronlab.com".to_string()],
+                relogin: vec!["dev.2@astronlab.com".to_string()],
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -7063,7 +7043,8 @@ input:
                     created_at: "2026-04-13T05:00:00.000Z".to_string(),
                     updated_at: "2026-04-13T05:00:00.000Z".to_string(),
                     last_created_email: None,
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
 
@@ -7127,7 +7108,8 @@ input:
                     created_at: "2026-04-13T05:00:00.000Z".to_string(),
                     updated_at: "2026-04-14T19:56:10.036Z".to_string(),
                     last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
 
@@ -7200,7 +7182,8 @@ input:
                     created_at: "2026-04-13T05:00:00.000Z".to_string(),
                     updated_at: "2026-04-14T21:40:53.532Z".to_string(),
                     last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
 
@@ -7256,7 +7239,8 @@ input:
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-15T04:22:55.044Z".to_string(),
             last_created_email: Some("dev3astronlab+1@gmail.com".to_string()),
-            deleted: Vec::new(),
+            relogin: Vec::new(),
+            suspend_domain_on_terminal_refresh_failure: false,
         };
 
         let next_suffix = compute_create_attempt_family_suffix(
@@ -7771,7 +7755,8 @@ end
                     created_at: "2026-04-05T00:00:00.000Z".to_string(),
                     updated_at: "2026-04-05T00:00:00.000Z".to_string(),
                     last_created_email: Some("dev.2@astronlab.com".to_string()),
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
 
@@ -7908,7 +7893,7 @@ end
     }
 
     #[test]
-    fn normalize_credential_store_reads_family_deleted_emails() {
+    fn normalize_credential_store_reads_family_relogin_emails() {
         let store = normalize_credential_store(json!({
             "families": {
                 "dev-1::dev.{n}@astronlab.com": {
@@ -7927,12 +7912,42 @@ end
             store
                 .families
                 .get("dev-1::dev.{n}@astronlab.com")
-                .map(|family| family.deleted.clone()),
+                .map(|family| family.relogin.clone()),
             Some(vec![
                 "dev.2@astronlab.com".to_string(),
                 "dev.3@astronlab.com".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn normalize_credential_store_migrates_legacy_deleted_into_current_suspend_flag() {
+        let store = normalize_credential_store(json!({
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "template": "dev.{n}@astronlab.com",
+                    "next_suffix": 23,
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z",
+                    "last_created_email": "dev.22@astronlab.com",
+                    "deleted": ["DEV.2@astronlab.com", "dev.3@astronlab.com"]
+                }
+            }
+        }));
+
+        let family = store
+            .families
+            .get("dev-1::dev.{n}@astronlab.com")
+            .expect("family");
+        assert_eq!(
+            family.relogin,
+            vec![
+                "dev.2@astronlab.com".to_string(),
+                "dev.3@astronlab.com".to_string()
+            ]
+        );
+        assert!(family.suspend_domain_on_terminal_refresh_failure);
     }
 
     #[test]
@@ -8118,7 +8133,8 @@ end
                 created_at: "2026-04-06T16:00:00.000Z".to_string(),
                 updated_at: "2026-04-06T16:00:00.000Z".to_string(),
                 last_created_email: Some("qa.299@astronlab.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
         store.pending.insert(
@@ -8237,7 +8253,8 @@ end
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T06:11:25.913Z".to_string(),
                 last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -8277,7 +8294,8 @@ end
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T06:11:25.913Z".to_string(),
                 last_created_email: Some("dev.106@astronlab.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
         store.families.insert(
@@ -8290,7 +8308,8 @@ end
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T06:11:25.913Z".to_string(),
                 last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -8459,7 +8478,8 @@ end
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T16:01:04.952Z".to_string(),
                 last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -9013,7 +9033,8 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
         store.families.insert(
@@ -9026,7 +9047,8 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+2@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -9049,7 +9071,8 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
         store.families.insert(
@@ -9062,7 +9085,8 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T02:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+4@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -9082,7 +9106,8 @@ end
                 created_at: "2026-03-20T00:00:00.000Z".to_string(),
                 updated_at: "2026-03-20T01:00:00.000Z".to_string(),
                 last_created_email: Some("dev.user+3@gmail.com".to_string()),
-                deleted: Vec::new(),
+                relogin: Vec::new(),
+                suspend_domain_on_terminal_refresh_failure: false,
             },
         );
 
@@ -9181,7 +9206,8 @@ end
                     created_at: "2026-04-05T05:51:09.049Z".to_string(),
                     updated_at: "2026-04-05T05:51:09.049Z".to_string(),
                     last_created_email: Some("supplyprima1+2@gmail.com".to_string()),
-                    deleted: Vec::new(),
+                    relogin: Vec::new(),
+                    suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
             save_credential_store(&store).expect("save credential store");

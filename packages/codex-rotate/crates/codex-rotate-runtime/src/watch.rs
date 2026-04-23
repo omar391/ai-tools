@@ -445,12 +445,15 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     if !account_changed {
         current_account_state.last_signal_id = decision.last_signal_id;
     }
-    if should_run_thread_recovery(
-        &current_account_previous_state,
-        usage_limit_signal_seen,
-        rotated,
-        recoverable_turn_failure_log_advanced,
-    ) {
+    let defer_thread_recovery_until_next_iteration = rotated && account_changed;
+    if !defer_thread_recovery_until_next_iteration
+        && should_run_thread_recovery(
+            &current_account_previous_state,
+            usage_limit_signal_seen,
+            rotated,
+            recoverable_turn_failure_log_advanced,
+        )
+    {
         let recovery_last_log_id = if bootstrap_thread_recovery {
             current_account_state
                 .last_thread_recovery_log_id

@@ -4,9 +4,10 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use codex_rotate_core::auth::summarize_codex_auth;
+use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::bridge::{
     AutomationProgressCallback, GuestBridgeRequest, GuestBridgeResponse,
 };
@@ -31,8 +32,12 @@ use crate::log_isolation::{
     managed_codex_is_running, stop_managed_codex_instance, wait_for_all_threads_idle,
 };
 use crate::paths::{resolve_paths, RuntimePaths};
-use crate::thread_recovery::{read_active_thread_ids, send_codex_app_request};
-use crate::watch::{read_watch_state, write_watch_state};
+use crate::thread_recovery::{
+    read_active_thread_ids, send_codex_app_request, ThreadRecoveryRehydration,
+};
+use crate::watch::read_watch_state;
+#[cfg(test)]
+use crate::watch::write_watch_state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,7 +97,6 @@ const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
 const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", "skills"];
 const CONVERSATION_DIR_NAMES: &[&str] =
     &[concat!("ses", "sions"), concat!("archived_", "sessions")];
-const APP_SUPPORT_SYNC_DIR_NAMES: &[&str] = &["Local Storage"];
 const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
@@ -107,6 +111,7 @@ const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
 #[allow(dead_code)]
 const STAGE1_OUTPUTS_CONFLICT_COLUMNS: &[&str] = &["thread_id"];
 const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
+const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -143,6 +148,49 @@ fn guest_bridge_bind_addr() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "127.0.0.1:9334".to_string())
+}
+
+fn debug_pool_drift_enabled() -> bool {
+    std::env::var(DEBUG_POOL_DRIFT_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn debug_pool_drift_state(label: &str) {
+    if !debug_pool_drift_enabled() {
+        return;
+    }
+
+    let pool_snapshot = load_pool().ok().map(|pool| {
+        let active_email = pool
+            .accounts
+            .get(pool.active_index.min(pool.accounts.len().saturating_sub(1)))
+            .map(|entry| entry.email.clone());
+        (pool.active_index, active_email)
+    });
+    let auth_snapshot = resolve_paths()
+        .ok()
+        .and_then(|paths| load_codex_auth(&paths.codex_auth_file).ok())
+        .map(|auth| {
+            let summary = summarize_codex_auth(&auth);
+            (summary.email, summary.account_id)
+        });
+    let checkpoint_snapshot = load_rotation_checkpoint().ok().flatten().map(|checkpoint| {
+        (
+            checkpoint.phase,
+            checkpoint.previous_index,
+            checkpoint.target_index,
+            checkpoint.previous_account_id,
+            checkpoint.target_account_id,
+        )
+    });
+
+    eprintln!(
+        "codex-rotate debug [{label}] pool={:?} auth={:?} checkpoint={:?}",
+        pool_snapshot, auth_snapshot, checkpoint_snapshot
+    );
 }
 
 trait RotationBackend {
@@ -1542,6 +1590,7 @@ pub(crate) fn translate_recovery_events_after_rotation(
     source_account_id: &str,
     target_account_id: &str,
     port: u16,
+    source_handoffs: &[ThreadHandoff],
 ) -> Result<()> {
     use crate::watch::{read_watch_state, write_watch_state};
 
@@ -1558,17 +1607,34 @@ pub(crate) fn translate_recovery_events_after_rotation(
     let paths = crate::paths::resolve_paths()?;
     let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
     let transport = HostConversationTransport::new(port);
+    let handoffs_by_source_thread_id = source_handoffs
+        .iter()
+        .map(|handoff| (handoff.source_thread_id.clone(), handoff.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut translated_events = Vec::new();
     let mut unresolved_events = Vec::new();
     for mut event in pending_events {
+        let exported_handoff = handoffs_by_source_thread_id
+            .get(&event.thread_id)
+            .cloned()
+            .or_else(|| {
+                export_single_thread_handoff(port, &event.thread_id, source_account_id)
+                    .ok()
+                    .flatten()
+            });
         let lineage_id = store
             .get_lineage_id(source_account_id, &event.thread_id)?
+            .or_else(|| {
+                exported_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.lineage_id.clone())
+            })
             .unwrap_or_else(|| event.thread_id.clone());
         let target_thread_id = match store.get_local_thread_id(target_account_id, &lineage_id)? {
             Some(existing) => Some(existing),
-            None => match export_single_thread_handoff(port, &event.thread_id, source_account_id) {
-                Ok(Some(handoff)) => {
+            None => match exported_handoff.clone() {
+                Some(handoff) => {
                     let import_result =
                         import_thread_handoffs(&transport, target_account_id, &[handoff], None);
                     if import_result
@@ -1586,6 +1652,13 @@ pub(crate) fn translate_recovery_events_after_rotation(
         };
         if let Some(target_thread_id) = target_thread_id {
             event.thread_id = target_thread_id;
+            if let Some(handoff) = exported_handoff {
+                event.rehydration = Some(ThreadRecoveryRehydration {
+                    lineage_id: handoff.lineage_id,
+                    cwd: handoff.cwd,
+                    items: handoff.items,
+                });
+            }
             translated_events.push(event);
         } else {
             unresolved_events.push(event);
@@ -1694,9 +1767,20 @@ fn rotate_next_impl(
     allow_create: bool,
 ) -> Result<NextResult> {
     recover_incomplete_rotation_state_without_lock()?;
+    debug_pool_drift_state("after_recover");
     let mut prepared = prepare_next_rotation_with_progress(progress.clone())?;
+    if debug_pool_drift_enabled() {
+        eprintln!(
+            "codex-rotate debug [after_prepare] previous_index={} target_index={} previous_email={} target_email={}",
+            prepared.previous_index,
+            prepared.target_index,
+            prepared.previous.email,
+            prepared.target.email
+        );
+    }
     let paths = resolve_paths()?;
     let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
+    debug_pool_drift_state("after_persona_ready");
 
     if let Some(result) = maybe_complete_non_switch_next_result(
         backend,
@@ -1719,7 +1803,17 @@ fn rotate_next_impl(
             );
         }
         prepared = prepare_next_rotation_with_progress(progress.clone())?;
+        if debug_pool_drift_enabled() {
+            eprintln!(
+                "codex-rotate debug [after_reprepare] previous_index={} target_index={} previous_email={} target_email={}",
+                prepared.previous_index,
+                prepared.target_index,
+                prepared.previous.email,
+                prepared.target.email
+            );
+        }
         let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
+        debug_pool_drift_state("after_reprepare_persona_ready");
         if let Some(result) = maybe_complete_non_switch_next_result(
             backend,
             &prepared,
@@ -1746,6 +1840,7 @@ fn rotate_next_impl(
                     .unwrap_or(prepared.target.label.as_str())
             )
         })?;
+    debug_pool_drift_state("after_activate");
 
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
@@ -1765,11 +1860,13 @@ fn rotate_next_impl(
         if let Some(progress) = progress.as_ref() {
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
+        debug_pool_drift_state("before_finalize");
         finalize_rotation_after_import(&prepared, &import_outcome)?;
         let _ = translate_recovery_events_after_rotation(
             &prepared.previous.account_id,
             &prepared.target.account_id,
             port,
+            &handoffs,
         );
         Ok(())
     })();
@@ -1837,6 +1934,7 @@ fn rotate_prev_impl(
             &prepared.previous.account_id,
             &prepared.target.account_id,
             port,
+            &handoffs,
         );
         Ok(())
     })();
@@ -1942,6 +2040,11 @@ fn activate_host_rotation(
         }
         wait_for_all_threads_idle(port, progress)?;
     }
+    let exported_handoffs = if managed_running_before {
+        export_thread_handoffs(port, &prepared.previous.account_id)?
+    } else {
+        Vec::new()
+    };
 
     if managed_running_before {
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
@@ -1969,11 +2072,9 @@ fn activate_host_rotation(
                     )
                 })?;
             }
-            transfer_thread_recovery_state_between_accounts(
-                &prepared.previous.account_id,
-                &prepared.target.account_id,
-            )?;
-            Ok(HostRotationActivation { items: Vec::new() })
+            Ok(HostRotationActivation {
+                items: exported_handoffs,
+            })
         }
         Err(error) => {
             let rollback_error = rollback_after_failed_host_activation(
@@ -2033,6 +2134,7 @@ fn rollback_vm_relogin_auth_sync_failure(
     Ok(())
 }
 
+#[cfg(test)]
 fn transfer_thread_recovery_state_between_accounts(
     source_account_id: &str,
     target_account_id: &str,
@@ -2105,9 +2207,6 @@ fn provision_host_persona(
             )?;
         }
     }
-    fs::create_dir_all(&target.fast_browser_home)?;
-    fs::create_dir_all(&target.codex_app_support_dir)?;
-    fs::create_dir_all(&target.debug_profile_dir)?;
 
     // Materialize BrowserForge-backed browser persona defaults if missing
     if entry
@@ -2209,11 +2308,12 @@ fn switch_host_persona(
         &target.codex_home,
         &removed_project_roots,
     )?;
-    // Keep project/sidebar local-storage state mirrored so project-scoped chats stay visible.
-    sync_host_persona_app_support_state(
-        &source.codex_app_support_dir,
-        &target.codex_app_support_dir,
-    )?;
+    fs::create_dir_all(&target.codex_app_support_dir).with_context(|| {
+        format!(
+            "Failed to create {}.",
+            target.codex_app_support_dir.display()
+        )
+    })?;
     ensure_symlink_dir(&paths.codex_home, &target.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &target.codex_app_support_dir)?;
     ensure_symlink_dir(&paths.debug_profile_dir, &target.debug_profile_dir)?;
@@ -2253,18 +2353,6 @@ fn sync_host_persona_project_registry(
     Ok(())
 }
 
-fn sync_host_persona_app_support_state(
-    source_app_support: &Path,
-    target_app_support: &Path,
-) -> Result<()> {
-    if source_app_support == target_app_support {
-        return Ok(());
-    }
-    sync_host_persona_app_support_state_one_way(source_app_support, target_app_support)?;
-    sync_host_persona_app_support_state_one_way(target_app_support, source_app_support)?;
-    Ok(())
-}
-
 fn sync_host_persona_workspace_visibility_state(
     source_codex_home: &Path,
     target_codex_home: &Path,
@@ -2283,24 +2371,6 @@ fn sync_host_persona_workspace_visibility_state(
         source_codex_home,
         removed_project_roots,
     )?;
-    Ok(())
-}
-
-fn sync_host_persona_app_support_state_one_way(
-    source_app_support: &Path,
-    target_app_support: &Path,
-) -> Result<()> {
-    if !source_app_support.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(target_app_support)
-        .with_context(|| format!("Failed to create {}.", target_app_support.display()))?;
-    for dir_name in APP_SUPPORT_SYNC_DIR_NAMES {
-        sync_directory_tree_one_way(
-            &source_app_support.join(dir_name),
-            &target_app_support.join(dir_name),
-        )?;
-    }
     Ok(())
 }
 
@@ -2730,11 +2800,19 @@ fn should_sync_project_path(path: &str, known_projects: &BTreeSet<String>) -> bo
     if trimmed.is_empty() {
         return false;
     }
+    if is_excluded_project_registry_path(Path::new(trimmed)) {
+        return false;
+    }
     if known_projects.contains(trimmed) {
         return true;
     }
     let project_path = Path::new(trimmed);
-    project_path.exists() || fs::canonicalize(project_path).is_ok()
+    if project_path.exists() {
+        return true;
+    }
+    fs::canonicalize(project_path)
+        .map(|canonical| !is_excluded_project_registry_path(&canonical))
+        .unwrap_or(false)
 }
 
 fn append_missing_projects_to_config(path: &Path, missing_projects: &[String]) -> Result<()> {
@@ -2856,6 +2934,9 @@ fn normalize_workspace_visibility_path(path: &str) -> Result<Option<String>> {
     if trimmed.is_empty() {
         return Ok(None);
     }
+    if is_excluded_workspace_visibility_path(Path::new(trimmed)) {
+        return Ok(None);
+    }
 
     let mut normalized = match fs::canonicalize(trimmed) {
         Ok(path) => path,
@@ -2894,6 +2975,26 @@ fn is_excluded_workspace_visibility_path(path: &Path) -> bool {
         PathBuf::from("/var/folders"),
         PathBuf::from("/private/var/folders"),
     ];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        excluded_prefixes.push(home.join(".codex"));
+        excluded_prefixes.push(home.join(".codex-rotate"));
+        excluded_prefixes.push(home.join("Documents").join("Codex"));
+    }
+
+    excluded_prefixes
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(prefix))
+}
+
+fn is_excluded_project_registry_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == ".live-host-env")
+    {
+        return true;
+    }
+
+    let mut excluded_prefixes = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         excluded_prefixes.push(home.join(".codex"));
         excluded_prefixes.push(home.join(".codex-rotate"));
@@ -3677,14 +3778,13 @@ fn quote_sql_identifier(value: &str) -> String {
 
 fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHandoff>> {
     let mut thread_ids = read_active_thread_ids(Some(port))?;
+    let mut pending_recovery_thread_ids = BTreeSet::new();
     if let Ok(watch_state) = read_watch_state() {
         if let Some(account_state) = watch_state.accounts.get(account_id) {
-            thread_ids.extend(
-                account_state
-                    .thread_recovery_pending_events
-                    .iter()
-                    .map(|event| event.thread_id.clone()),
-            );
+            for event in &account_state.thread_recovery_pending_events {
+                pending_recovery_thread_ids.insert(event.thread_id.clone());
+                thread_ids.push(event.thread_id.clone());
+            }
         }
     }
     let mut unique = BTreeSet::new();
@@ -3693,7 +3793,10 @@ fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHando
         if !unique.insert(thread_id.clone()) {
             continue;
         }
-        if let Some(handoff) = export_single_thread_handoff(port, &thread_id, account_id)? {
+        if let Some(mut handoff) = export_single_thread_handoff(port, &thread_id, account_id)? {
+            if pending_recovery_thread_ids.contains(&thread_id) {
+                handoff.continue_prompt = None;
+            }
             handoffs.push(handoff);
         }
     }
@@ -4069,9 +4172,7 @@ fn truncate_handoff_text(value: &str) -> String {
 struct HostPersonaPaths {
     root: PathBuf,
     codex_home: PathBuf,
-    fast_browser_home: PathBuf,
     codex_app_support_dir: PathBuf,
-    debug_profile_dir: PathBuf,
 }
 
 fn host_persona_paths(
@@ -4090,9 +4191,7 @@ fn host_persona_paths(
     };
     Ok(HostPersonaPaths {
         codex_home: root.join("codex-home"),
-        fast_browser_home: root.join("fast-browser-home"),
         codex_app_support_dir: root.join("codex-app-support"),
-        debug_profile_dir: root.join("managed-profile"),
         root,
     })
 }
@@ -4325,6 +4424,55 @@ impl HostConversationTransport {
     }
 }
 
+fn host_thread_not_ready_message(message: &str) -> bool {
+    message.contains("includeTurns is unavailable before first user message")
+        || message.contains("thread not loaded")
+        || message.contains("is not materialized yet")
+        || message.contains("no rollout found for thread id")
+}
+
+fn wait_for_host_thread_materialization(port: u16, thread_id: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match send_codex_app_request::<Value>(port, "thread/read", json!({ "threadId": thread_id }))
+        {
+            Ok(response) if response.get("thread").is_some() => return Ok(()),
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("{:#}", error);
+                if !host_thread_not_ready_message(&message) {
+                    return Err(error);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Timed out waiting for imported thread {thread_id} to materialize in Codex."
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn wait_for_host_thread_listing(port: u16, thread_id: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if read_active_thread_ids(Some(port))
+            .unwrap_or_default()
+            .iter()
+            .any(|candidate| candidate == thread_id)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Timed out waiting for imported thread {thread_id} to appear in Codex active thread listings."
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 impl ConversationTransport for HostConversationTransport {
     fn list_threads(&self) -> Result<Vec<String>> {
         crate::thread_recovery::read_active_thread_ids(Some(self.port))
@@ -4353,12 +4501,14 @@ impl ConversationTransport for HostConversationTransport {
                 "personality": "pragmatic",
             }),
         )?;
-        response
+        let thread_id = response
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(Value::as_str)
             .map(String::from)
-            .ok_or_else(|| anyhow!("Codex thread/start did not return a thread id."))
+            .ok_or_else(|| anyhow!("Codex thread/start did not return a thread id."))?;
+        wait_for_host_thread_materialization(self.port, &thread_id)?;
+        Ok(thread_id)
     }
 
     fn inject_items(&self, thread_id: &str, items: Vec<Value>) -> Result<()> {
@@ -4400,7 +4550,9 @@ impl ConversationTransport for HostConversationTransport {
                 "attachments": [],
             }),
         )
-        .map(|_| ())
+        .map(|_| ())?;
+        wait_for_host_thread_materialization(self.port, thread_id)?;
+        wait_for_host_thread_listing(self.port, thread_id)
     }
 }
 
@@ -5367,6 +5519,7 @@ mod tests {
             exhausted_email: Some("acct-source@astronlab.com".to_string()),
             exhausted_account_id: Some("acct-source".to_string()),
             message: "quota exhausted".to_string(),
+            rehydration: None,
         };
         let unresolved_source_event = crate::thread_recovery::ThreadRecoveryEvent {
             source_log_id: 2,
@@ -5377,6 +5530,7 @@ mod tests {
             exhausted_email: Some("acct-source@astronlab.com".to_string()),
             exhausted_account_id: Some("acct-source".to_string()),
             message: "quota exhausted".to_string(),
+            rehydration: None,
         };
 
         let mut initial_watch_state = crate::watch::WatchState::default();
@@ -5396,7 +5550,7 @@ mod tests {
             .bind_local_thread_id("acct-target", "lineage-bound", "target-thread-bound")
             .expect("bind target lineage");
 
-        translate_recovery_events_after_rotation("acct-source", "acct-target", 9333)
+        translate_recovery_events_after_rotation("acct-source", "acct-target", 9333, &[])
             .expect("translate recovery events");
 
         let next_watch_state = crate::watch::read_watch_state().expect("read watch state");
@@ -6426,6 +6580,7 @@ exit 91
             is_symlink_to(&paths.debug_profile_dir, &target_paths.debug_profile_dir)
                 .expect("target managed-profile symlink")
         );
+        assert!(target_paths.codex_app_support_dir.exists());
         assert!(source_paths.codex_home.join("history.jsonl").exists());
     }
 
@@ -6483,6 +6638,45 @@ exit 91
             .debug_profile_dir
             .join("legacy-profile-state.json")
             .exists());
+    }
+
+    #[test]
+    fn provision_host_persona_keeps_fast_browser_home_live_only() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        assert!(
+            !source_paths.root.join("fast-browser-home").exists(),
+            "source persona should not materialize a persona-local fast-browser-home"
+        );
+        assert!(
+            !target_paths.root.join("fast-browser-home").exists(),
+            "target persona should not materialize a persona-local fast-browser-home"
+        );
+        assert!(
+            !source_paths.codex_app_support_dir.exists(),
+            "source persona should not materialize codex-app-support before activation"
+        );
+        assert!(
+            !target_paths.codex_app_support_dir.exists(),
+            "target persona should not materialize codex-app-support before activation"
+        );
+        assert!(
+            !source_paths.root.join("managed-profile").exists(),
+            "source persona should not materialize managed-profile before use"
+        );
+        assert!(
+            !target_paths.root.join("managed-profile").exists(),
+            "target persona should not materialize managed-profile before use"
+        );
     }
 
     #[test]
@@ -6573,7 +6767,7 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_merges_app_support_local_storage_bidirectionally() {
+    fn switch_host_persona_keeps_app_support_local_storage_persona_local() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
@@ -6614,16 +6808,16 @@ exit 91
             "source-local-storage"
         );
         assert_eq!(
-            fs::read_to_string(source_leveldb.join("target-project.marker")).unwrap(),
-            "target-local-storage"
-        );
-        assert_eq!(
-            fs::read_to_string(target_leveldb.join("source-project.marker")).unwrap(),
-            "source-local-storage"
-        );
-        assert_eq!(
             fs::read_to_string(target_leveldb.join("target-project.marker")).unwrap(),
             "target-local-storage"
+        );
+        assert!(
+            !source_leveldb.join("target-project.marker").exists(),
+            "source persona should not inherit target local storage state"
+        );
+        assert!(
+            !target_leveldb.join("source-project.marker").exists(),
+            "target persona should not inherit source local storage state"
         );
     }
 
@@ -7217,6 +7411,77 @@ exit 91
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn normalize_workspace_visibility_path_excludes_documents_symlink_before_canonicalize() {
+        use std::os::unix::fs::symlink;
+
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        let documents_root = temp.path().join("home").join("Documents").join("Codex");
+        let external_project = temp.path().join("outside-project");
+        fs::create_dir_all(&documents_root).expect("create documents root");
+        fs::create_dir_all(&external_project).expect("create external project");
+        let linked_project = documents_root.join("linked-project");
+        symlink(&external_project, &linked_project).expect("symlink linked project");
+
+        unsafe {
+            std::env::set_var("HOME", temp.path().join("home"));
+        }
+
+        let normalized = normalize_workspace_visibility_path(
+            linked_project.to_str().expect("linked project path"),
+        )
+        .expect("normalize linked project");
+        assert!(
+            normalized.is_none(),
+            "documents-root paths should be filtered before canonicalization follows symlinks"
+        );
+
+        restore_env("HOME", previous_home);
+    }
+
+    #[test]
+    fn should_sync_project_path_excludes_documents_root_even_if_known() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let previous_home = std::env::var_os("HOME");
+        let documents_project = home.join("Documents").join("Codex").join("project");
+        fs::create_dir_all(documents_project.parent().expect("documents parent"))
+            .expect("create documents root");
+
+        let mut known_projects = BTreeSet::new();
+        known_projects.insert(documents_project.display().to_string());
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        assert!(!should_sync_project_path(
+            &documents_project.display().to_string(),
+            &known_projects,
+        ));
+
+        restore_env("HOME", previous_home);
+    }
+
+    #[test]
+    fn should_sync_project_path_allows_tmp_projects() {
+        let temp = tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("create tmp project");
+
+        let mut known_projects = BTreeSet::new();
+        known_projects.insert(project.display().to_string());
+
+        assert!(should_sync_project_path(
+            &project.display().to_string(),
+            &known_projects,
+        ));
+    }
+
     #[test]
     fn transfer_thread_recovery_state_between_accounts_moves_pending_events() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -7240,6 +7505,7 @@ exit 91
             exhausted_email: Some("source@example.com".to_string()),
             exhausted_account_id: Some("acct-source".to_string()),
             message: "quota exhausted".to_string(),
+            rehydration: None,
         };
         watch_state.set_account_state(
             "acct-source".to_string(),
@@ -7820,6 +8086,38 @@ insert into threads (id, rollout_path, updated_at, archived) values
         let target = test_account("acct-target", "persona-target");
         provision_host_persona(&paths, &source, None).expect("provision source");
         provision_host_persona(&paths, &target, None).expect("provision target");
+        let source_persona_paths =
+            host_persona_paths(&paths, source.persona.as_ref().unwrap()).expect("source paths");
+        let target_persona_paths =
+            host_persona_paths(&paths, target.persona.as_ref().unwrap()).expect("target paths");
+        assert!(
+            !source_persona_paths.root.join("fast-browser-home").exists(),
+            "source persona should not provision persona-local fast-browser-home during sandbox setup"
+        );
+        assert!(
+            !target_persona_paths.root.join("fast-browser-home").exists(),
+            "target persona should not provision persona-local fast-browser-home during sandbox setup"
+        );
+        let source_leveldb = source_persona_paths
+            .codex_app_support_dir
+            .join("Local Storage")
+            .join("leveldb");
+        let target_leveldb = target_persona_paths
+            .codex_app_support_dir
+            .join("Local Storage")
+            .join("leveldb");
+        fs::create_dir_all(&source_leveldb).expect("create source leveldb");
+        fs::create_dir_all(&target_leveldb).expect("create target leveldb");
+        fs::write(
+            source_leveldb.join("source-project.marker"),
+            "source-local-storage",
+        )
+        .expect("write source local storage marker");
+        fs::write(
+            target_leveldb.join("target-project.marker"),
+            "target-local-storage",
+        )
+        .expect("write target local storage marker");
         ensure_live_root_bindings(&paths, &source).expect("bind source roots");
 
         fs::create_dir_all(paths.codex_auth_file.parent().unwrap()).expect("create auth parent");
@@ -7903,6 +8201,24 @@ insert into threads (id, rollout_path, updated_at, archived) values
             &first_target_paths.codex_app_support_dir
         )
         .unwrap());
+        assert_eq!(
+            fs::read_to_string(source_leveldb.join("source-project.marker"))
+                .expect("read source marker after forward rotation"),
+            "source-local-storage"
+        );
+        assert_eq!(
+            fs::read_to_string(target_leveldb.join("target-project.marker"))
+                .expect("read target marker after forward rotation"),
+            "target-local-storage"
+        );
+        assert!(
+            !source_leveldb.join("target-project.marker").exists(),
+            "source persona should remain isolated from target local storage during forward rotation"
+        );
+        assert!(
+            !target_leveldb.join("source-project.marker").exists(),
+            "target persona should remain isolated from source local storage during forward rotation"
+        );
         let first_checkpoint_cleared = load_rotation_checkpoint()
             .expect("load checkpoint")
             .is_none();
@@ -7932,6 +8248,24 @@ insert into threads (id, rollout_path, updated_at, archived) values
             &second_target_paths.codex_app_support_dir
         )
         .unwrap());
+        assert_eq!(
+            fs::read_to_string(source_leveldb.join("source-project.marker"))
+                .expect("read source marker after return rotation"),
+            "source-local-storage"
+        );
+        assert_eq!(
+            fs::read_to_string(target_leveldb.join("target-project.marker"))
+                .expect("read target marker after return rotation"),
+            "target-local-storage"
+        );
+        assert!(
+            !source_leveldb.join("target-project.marker").exists(),
+            "source persona should remain isolated from target local storage after return rotation"
+        );
+        assert!(
+            !target_leveldb.join("source-project.marker").exists(),
+            "target persona should remain isolated from source local storage after return rotation"
+        );
         let second_checkpoint_cleared = load_rotation_checkpoint()
             .expect("load checkpoint after return rotation")
             .is_none();
