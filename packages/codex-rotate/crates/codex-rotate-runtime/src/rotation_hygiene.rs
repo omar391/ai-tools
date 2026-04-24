@@ -95,14 +95,21 @@ const DEFAULT_PORT: u16 = 9333;
 const MAX_HANDOFF_ITEMS: usize = 48;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
 const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
-const SEED_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "AGENTS.md", "rules", "skills"];
-const CONVERSATION_DIR_NAMES: &[&str] =
-    &[concat!("ses", "sions"), concat!("archived_", "sessions")];
+const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
+    "config.toml",
+    CODEX_GLOBAL_STATE_FILE_NAME,
+    "AGENTS.md",
+    "rules",
+    "skills",
+    "vendor_imports",
+];
 const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
+#[cfg(test)]
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
+#[cfg(test)]
 const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
+#[cfg(test)]
 const PROJECT_ORDER_KEY: &str = "project-order";
-const REMOVED_WORKSPACE_ROOTS_KEY: &str = "codex-rotate-removed-workspace-roots";
 #[allow(dead_code)]
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
 #[allow(dead_code)]
@@ -238,6 +245,14 @@ struct VmBackend {
     config: Option<codex_rotate_core::pool::VmEnvironmentConfig>,
 }
 
+fn conversation_sync_identity(entry: &AccountEntry) -> String {
+    entry
+        .persona
+        .as_ref()
+        .map(|persona| format!("host-persona:{}", persona.persona_id))
+        .unwrap_or_else(|| entry.account_id.clone())
+}
+
 pub fn rotate_next(
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -289,7 +304,9 @@ pub fn repair_host_history(
 
     let source_entry = resolve_pool_account(source_selector)?
         .ok_or_else(|| anyhow!("Unknown source selector \"{source_selector}\"."))?;
-    if source_entry.account_id != active_entry.account_id {
+    let source_sync_identity = conversation_sync_identity(&source_entry);
+    let active_sync_identity = conversation_sync_identity(&active_entry);
+    if source_sync_identity != active_sync_identity {
         return Err(anyhow!(
             "repair-host-history currently requires --source to be the active account (active: {}, requested: {}).",
             active_entry.label,
@@ -301,7 +318,11 @@ pub fn repair_host_history(
     }
 
     let port = DEFAULT_PORT;
-    let handoffs = export_thread_handoffs(port, &source_entry.account_id)?;
+    let handoffs = export_thread_handoffs_with_identity(
+        port,
+        &source_entry.account_id,
+        &source_sync_identity,
+    )?;
     if handoffs.is_empty() {
         let mode = if apply { "apply" } else { "dry-run" };
         return Ok(format!(
@@ -315,10 +336,11 @@ pub fn repair_host_history(
     let mut seen_target_ids = BTreeSet::<String>::new();
     if all_targets || target_selectors.is_empty() {
         for entry in &pool.accounts {
-            if entry.account_id == source_entry.account_id {
+            let target_sync_identity = conversation_sync_identity(entry);
+            if target_sync_identity == source_sync_identity {
                 continue;
             }
-            if seen_target_ids.insert(entry.account_id.clone()) {
+            if seen_target_ids.insert(target_sync_identity) {
                 targets.push(entry.clone());
             }
         }
@@ -326,10 +348,11 @@ pub fn repair_host_history(
         for selector in target_selectors {
             let target_entry = resolve_pool_account(selector)?
                 .ok_or_else(|| anyhow!("Unknown target selector \"{selector}\"."))?;
-            if target_entry.account_id == source_entry.account_id {
+            let target_sync_identity = conversation_sync_identity(&target_entry);
+            if target_sync_identity == source_sync_identity {
                 continue;
             }
-            if seen_target_ids.insert(target_entry.account_id.clone()) {
+            if seen_target_ids.insert(target_sync_identity) {
                 targets.push(target_entry);
             }
         }
@@ -354,11 +377,12 @@ pub fn repair_host_history(
         }
 
         let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+        let target_sync_identity = conversation_sync_identity(&target);
         let mut planned_creates = 0;
         let mut planned_updates = 0;
         for handoff in &handoffs {
             if store
-                .get_local_thread_id(&target.account_id, &handoff.lineage_id)?
+                .get_local_thread_id(&target_sync_identity, &handoff.lineage_id)?
                 .is_some()
             {
                 planned_updates += 1;
@@ -380,13 +404,13 @@ pub fn repair_host_history(
 
             let transport = HostConversationTransport::new(port);
             let import_outcome =
-                import_thread_handoffs(&transport, &target.account_id, &handoffs, None)?;
+                import_thread_handoffs(&transport, &target_sync_identity, &handoffs, None)?;
             output.push_str(&format!("  Import result: {}\n", import_outcome.describe()));
             current_persona = target;
         }
     }
 
-    if apply && current_persona.account_id != source_entry.account_id {
+    if apply && conversation_sync_identity(&current_persona) != source_sync_identity {
         output.push_str("\nRestoring source persona...\n");
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
         switch_host_persona(&paths, &current_persona, &source_entry, false)?;
@@ -1425,10 +1449,11 @@ fn ensure_no_rotation_drift(prepared: &PreparedRotation) -> Result<()> {
 
 fn ensure_target_account_still_valid(prepared: &PreparedRotation) -> Result<()> {
     let pool = load_pool()?;
+    let target_sync_identity = conversation_sync_identity(&prepared.target);
     if !pool
         .accounts
         .iter()
-        .any(|a| a.account_id == prepared.target.account_id)
+        .any(|a| conversation_sync_identity(a) == target_sync_identity)
     {
         return Err(anyhow!(
             "Target account {} was removed mid-flow.",
@@ -1485,6 +1510,12 @@ fn resolve_checkpoint_account_index(
     fallback_index: usize,
     role: &str,
 ) -> Result<usize> {
+    if fallback_index < pool.accounts.len()
+        && pool.accounts[fallback_index].account_id == account_id
+    {
+        return Ok(fallback_index);
+    }
+
     if let Some(index) = pool
         .accounts
         .iter()
@@ -1592,9 +1623,28 @@ fn finalize_rotation_after_import(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn translate_recovery_events_after_rotation(
     source_account_id: &str,
     target_account_id: &str,
+    port: u16,
+    source_handoffs: &[ThreadHandoff],
+) -> Result<()> {
+    translate_recovery_events_after_rotation_with_identity(
+        source_account_id,
+        target_account_id,
+        source_account_id,
+        target_account_id,
+        port,
+        source_handoffs,
+    )
+}
+
+fn translate_recovery_events_after_rotation_with_identity(
+    source_account_id: &str,
+    target_account_id: &str,
+    source_sync_identity: &str,
+    target_sync_identity: &str,
     port: u16,
     source_handoffs: &[ThreadHandoff],
 ) -> Result<()> {
@@ -1625,30 +1675,34 @@ pub(crate) fn translate_recovery_events_after_rotation(
             .get(&event.thread_id)
             .cloned()
             .or_else(|| {
-                export_single_thread_handoff(port, &event.thread_id, source_account_id)
-                    .ok()
-                    .flatten()
+                export_single_thread_handoff_with_identity(
+                    port,
+                    &event.thread_id,
+                    source_sync_identity,
+                )
+                .ok()
+                .flatten()
             });
         let lineage_id = store
-            .get_lineage_id(source_account_id, &event.thread_id)?
+            .get_lineage_id(source_sync_identity, &event.thread_id)?
             .or_else(|| {
                 exported_handoff
                     .as_ref()
                     .map(|handoff| handoff.lineage_id.clone())
             })
             .unwrap_or_else(|| event.thread_id.clone());
-        let target_thread_id = match store.get_local_thread_id(target_account_id, &lineage_id)? {
+        let target_thread_id = match store.get_local_thread_id(target_sync_identity, &lineage_id)? {
             Some(existing) => Some(existing),
             None => match exported_handoff.clone() {
                 Some(handoff) => {
                     let import_result =
-                        import_thread_handoffs(&transport, target_account_id, &[handoff], None);
+                        import_thread_handoffs(&transport, target_sync_identity, &[handoff], None);
                     if import_result
                         .as_ref()
                         .map(|outcome| outcome.is_complete())
                         .unwrap_or(false)
                     {
-                        store.get_local_thread_id(target_account_id, &lineage_id)?
+                        store.get_local_thread_id(target_sync_identity, &lineage_id)?
                     } else {
                         None
                     }
@@ -1836,6 +1890,37 @@ fn rotate_next_impl_with_retry(
         );
     }
     let paths = resolve_paths()?;
+    if prepared.action == PreparedRotationAction::Switch {
+        if let Err(error) = ensure_target_account_still_valid(&prepared) {
+            if !is_disabled_target_validation_error(&error) {
+                return Err(error);
+            }
+            if disabled_retry_budget == 0 {
+                return Err(error);
+            }
+            disabled_retry_budget = disabled_retry_budget.saturating_sub(1);
+            if let Some(progress) = progress.as_ref() {
+                progress(
+                    "Rotation target became disabled before activation; re-evaluating eligible target."
+                        .to_string(),
+                );
+            }
+            prepared = prepare_next_rotation_with_progress(progress.clone())?;
+            if debug_pool_drift_enabled() {
+                eprintln!(
+                    "codex-rotate debug [after_reprepare] previous_index={} target_index={} previous_email={} target_email={}",
+                    prepared.previous_index,
+                    prepared.target_index,
+                    prepared.previous.email,
+                    prepared.target.email
+                );
+            }
+            if prepared.action == PreparedRotationAction::Switch {
+                ensure_target_account_still_valid(&prepared)?;
+            }
+        }
+    }
+
     let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
     debug_pool_drift_state("after_persona_ready");
 
@@ -1874,6 +1959,9 @@ fn rotate_next_impl_with_retry(
                 prepared.target.email
             );
         }
+        if prepared.action == PreparedRotationAction::Switch {
+            ensure_target_account_still_valid(&prepared)?;
+        }
         let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
         debug_pool_drift_state("after_reprepare_persona_ready");
         if let Some(result) = maybe_complete_non_switch_next_result(
@@ -1886,7 +1974,6 @@ fn rotate_next_impl_with_retry(
         )? {
             return Ok(result);
         }
-        ensure_target_account_still_valid(&prepared)?;
     }
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
@@ -1943,9 +2030,10 @@ fn rotate_next_impl_with_retry(
         ThreadHandoffImportOutcome::default()
     } else {
         let transport = HostConversationTransport::new(port);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
         import_thread_handoffs(
             &transport,
-            &prepared.target.account_id,
+            &target_sync_identity,
             &handoffs,
             progress.as_ref(),
         )?
@@ -1957,10 +2045,15 @@ fn rotate_next_impl_with_retry(
         }
         debug_pool_drift_state("before_finalize");
         ensure_target_account_still_valid(&prepared)?;
+        sync_host_archive_state_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
-        let _ = translate_recovery_events_after_rotation(
+        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
+        let _ = translate_recovery_events_after_rotation_with_identity(
             &prepared.previous.account_id,
             &prepared.target.account_id,
+            &previous_sync_identity,
+            &target_sync_identity,
             port,
             &handoffs,
         );
@@ -2015,6 +2108,9 @@ fn rotate_prev_impl(
     recover_incomplete_rotation_state_without_lock()?;
     let mut prepared = prepare_prev_rotation()?;
     let paths = resolve_paths()?;
+    if prepared.action == PreparedRotationAction::Switch {
+        ensure_target_account_still_valid(&prepared)?;
+    }
     let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
     if prepared.action != PreparedRotationAction::Switch {
         if prepared.persist_pool {
@@ -2035,9 +2131,10 @@ fn rotate_prev_impl(
         ThreadHandoffImportOutcome::default()
     } else {
         let transport = HostConversationTransport::new(port);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
         import_thread_handoffs(
             &transport,
-            &prepared.target.account_id,
+            &target_sync_identity,
             &handoffs,
             progress.as_ref(),
         )?
@@ -2047,10 +2144,15 @@ fn rotate_prev_impl(
         if let Some(progress) = progress.as_ref() {
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
+        sync_host_archive_state_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
-        let _ = translate_recovery_events_after_rotation(
+        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
+        let _ = translate_recovery_events_after_rotation_with_identity(
             &prepared.previous.account_id,
             &prepared.target.account_id,
+            &previous_sync_identity,
+            &target_sync_identity,
             port,
             &handoffs,
         );
@@ -2159,7 +2261,12 @@ fn activate_host_rotation(
         wait_for_all_threads_idle(port, progress)?;
     }
     let exported_handoffs = if managed_running_before {
-        export_thread_handoffs(port, &prepared.previous.account_id)?
+        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
+        export_thread_handoffs_with_identity(
+            port,
+            &prepared.previous.account_id,
+            &previous_sync_identity,
+        )?
     } else {
         Vec::new()
     };
@@ -2209,6 +2316,36 @@ fn activate_host_rotation(
             Err(error)
         }
     }
+}
+
+fn sync_host_archive_state_after_import(prepared: &PreparedRotation) -> Result<()> {
+    if current_environment()? != RotationEnvironment::Host {
+        return Ok(());
+    }
+    let paths = resolve_paths()?;
+    let source = host_persona_paths(
+        &paths,
+        prepared
+            .previous
+            .persona
+            .as_ref()
+            .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
+    )?;
+    let target = host_persona_paths(
+        &paths,
+        prepared
+            .target
+            .persona
+            .as_ref()
+            .ok_or_else(|| anyhow!("Target account is missing persona metadata."))?,
+    )?;
+    sync_host_persona_thread_archive_state(
+        &source.codex_home,
+        &conversation_sync_identity(&prepared.previous),
+        &target.codex_home,
+        &conversation_sync_identity(&prepared.target),
+        &paths.conversation_sync_db_file,
+    )
 }
 
 fn rollback_after_failed_host_activation(
@@ -2291,8 +2428,8 @@ fn ensure_host_personas_ready(
     }
     let active_index = pool.active_index.min(pool.accounts.len().saturating_sub(1));
     let active_entry = pool.accounts[active_index].clone();
-    provision_host_persona(paths, &active_entry, None)?;
     ensure_live_root_bindings(paths, &active_entry)?;
+    provision_host_persona(paths, &active_entry, None)?;
     Ok(false)
 }
 
@@ -2318,13 +2455,10 @@ fn provision_host_persona(
                     .as_ref()
                     .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
             )?;
-            copy_allowlisted_entries(
-                &source.codex_home,
-                &target.codex_home,
-                SEED_CODEX_HOME_ENTRIES,
-            )?;
+            ensure_host_persona_shared_codex_home_links(paths, &source)?;
         }
     }
+    ensure_host_persona_shared_codex_home_links(paths, &target)?;
 
     // Materialize BrowserForge-backed browser persona defaults if missing
     if entry
@@ -2372,6 +2506,7 @@ fn ensure_live_root_bindings(paths: &RuntimePaths, entry: &AccountEntry) -> Resu
     migrate_live_root_if_needed(&paths.codex_home, &persona.codex_home)?;
     migrate_live_root_if_needed(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
     migrate_live_root_if_needed(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
+    ensure_host_persona_shared_codex_home_links(paths, &persona)?;
     ensure_symlink_dir(&paths.codex_home, &persona.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
     ensure_symlink_dir(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
@@ -2403,29 +2538,13 @@ fn switch_host_persona(
     // Capture and propagate them before thread history becomes bidirectional.
     sync_host_persona_thread_archive_state(
         &source.codex_home,
-        &source_entry.account_id,
+        &conversation_sync_identity(source_entry),
         &target.codex_home,
-        &target_entry.account_id,
+        &conversation_sync_identity(target_entry),
         &paths.conversation_sync_db_file,
     )?;
-    let removed_project_roots =
-        reconcile_host_persona_removed_project_roots(&source.codex_home, &target.codex_home)?;
-    // Mirror conversation artifacts without sharing persona-local thread identity state.
-    sync_host_persona_conversation_history(&source.codex_home, &target.codex_home)?;
-    // Keep the Codex project registry aligned with synced thread cwd values so
-    // project-scoped history stays visible in the desktop UI after rotation.
-    sync_host_persona_project_registry(
-        &source.codex_home,
-        &target.codex_home,
-        &removed_project_roots,
-    )?;
-    // Keep the sidebar workspace-root registry aligned with synced projects so
-    // rotated personas do not hide thread history behind missing project chips.
-    sync_host_persona_workspace_visibility_state(
-        &source.codex_home,
-        &target.codex_home,
-        &removed_project_roots,
-    )?;
+    ensure_host_persona_shared_codex_home_links(paths, &source)?;
+    ensure_host_persona_shared_codex_home_links(paths, &target)?;
     fs::create_dir_all(&target.codex_app_support_dir).with_context(|| {
         format!(
             "Failed to create {}.",
@@ -2440,185 +2559,150 @@ fn switch_host_persona(
     Ok(())
 }
 
-fn sync_host_persona_conversation_history(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
+fn ensure_host_persona_shared_codex_home_links(
+    paths: &RuntimePaths,
+    persona: &HostPersonaPaths,
 ) -> Result<()> {
-    if source_codex_home == target_codex_home {
-        return Ok(());
-    }
-    sync_host_persona_conversation_history_one_way(source_codex_home, target_codex_home)?;
-    sync_host_persona_conversation_history_one_way(target_codex_home, source_codex_home)?;
-    Ok(())
-}
-
-fn sync_host_persona_project_registry(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    if source_codex_home == target_codex_home {
-        return Ok(());
-    }
-    sync_host_persona_project_registry_one_way(
-        source_codex_home,
-        target_codex_home,
-        removed_project_roots,
-    )?;
-    sync_host_persona_project_registry_one_way(
-        target_codex_home,
-        source_codex_home,
-        removed_project_roots,
-    )?;
-    Ok(())
-}
-
-fn sync_host_persona_workspace_visibility_state(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    if source_codex_home == target_codex_home {
-        return Ok(());
-    }
-    sync_host_persona_workspace_visibility_state_one_way(
-        source_codex_home,
-        target_codex_home,
-        removed_project_roots,
-    )?;
-    sync_host_persona_workspace_visibility_state_one_way(
-        target_codex_home,
-        source_codex_home,
-        removed_project_roots,
-    )?;
-    Ok(())
-}
-
-fn sync_host_persona_project_registry_one_way(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    let source_config = source_codex_home.join("config.toml");
-    let target_config = target_codex_home.join("config.toml");
-
-    let source_projects = filter_removed_project_paths(
-        read_config_project_paths(&source_config)?,
-        removed_project_roots,
-    )?;
-    let target_projects = filter_removed_project_paths(
-        read_config_project_paths(&target_config)?,
-        removed_project_roots,
-    )?;
-    let mut known_projects = source_projects.clone();
-    known_projects.extend(target_projects.iter().cloned());
-
-    let mut candidates = known_projects.clone();
-    candidates.extend(read_thread_cwds_from_codex_home(source_codex_home)?);
-    candidates.extend(read_thread_cwds_from_codex_home(target_codex_home)?);
-
-    let mut missing_projects = Vec::new();
-    for candidate in candidates {
-        if target_projects.contains(&candidate) {
-            continue;
-        }
-        if project_path_matches_removed_root(&candidate, removed_project_roots)? {
-            continue;
-        }
-        if should_sync_project_path(&candidate, &known_projects) {
-            missing_projects.push(candidate);
-        }
-    }
-    append_missing_projects_to_config(&target_config, &missing_projects)
-}
-
-fn sync_host_persona_workspace_visibility_state_one_way(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    let source_global_state = source_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
-    let target_global_state = target_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
-    let mut candidates = read_config_project_paths(&source_codex_home.join("config.toml"))?;
-    candidates.extend(read_config_project_paths(
-        &target_codex_home.join("config.toml"),
-    )?);
-    candidates.extend(read_workspace_root_state_paths(&source_global_state)?);
-    candidates.extend(read_workspace_root_state_paths(&target_global_state)?);
-    candidates.extend(read_thread_cwds_from_codex_home(source_codex_home)?);
-    candidates.extend(read_thread_cwds_from_codex_home(target_codex_home)?);
-
-    let target_workspace_roots = normalize_workspace_visibility_paths(
-        read_workspace_root_state_paths(&target_global_state)?,
-    )?
-    .into_iter()
-    .filter(|path| !removed_project_roots.contains(path))
-    .collect::<BTreeSet<_>>();
-    let mut missing_projects = Vec::new();
-    for candidate in normalize_workspace_visibility_paths(candidates)? {
-        if removed_project_roots.contains(&candidate) {
-            continue;
-        }
-        if !target_workspace_roots.contains(&candidate) {
-            missing_projects.push(candidate);
-        }
-    }
-    append_missing_workspace_roots_to_global_state(&target_global_state, &missing_projects)
-}
-
-fn reconcile_host_persona_removed_project_roots(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-) -> Result<BTreeSet<String>> {
-    let source_global_state = source_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
-    let target_global_state = target_codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME);
-
-    let source_visible_roots = read_visible_project_roots(source_codex_home)?;
-    let target_visible_roots = read_visible_project_roots(target_codex_home)?;
-    let source_thread_roots =
-        normalize_workspace_visibility_paths(read_thread_cwds_from_codex_home(source_codex_home)?)?;
-
-    let mut removed_project_roots = read_removed_workspace_root_tombstones(&source_global_state)?;
-    removed_project_roots.extend(read_removed_workspace_root_tombstones(
-        &target_global_state,
-    )?);
-    removed_project_roots.retain(|path| !source_visible_roots.contains(path));
-    removed_project_roots.extend(source_thread_roots.into_iter().filter(|path| {
-        !source_visible_roots.contains(path) && target_visible_roots.contains(path)
-    }));
-
-    write_removed_workspace_root_tombstones(&source_global_state, &removed_project_roots)?;
-    write_removed_workspace_root_tombstones(&target_global_state, &removed_project_roots)?;
-    remove_workspace_root_entries_from_global_state(&source_global_state, &removed_project_roots)?;
-    remove_workspace_root_entries_from_global_state(&target_global_state, &removed_project_roots)?;
-    remove_projects_from_config(
-        &source_codex_home.join("config.toml"),
-        &removed_project_roots,
-    )?;
-    remove_projects_from_config(
-        &target_codex_home.join("config.toml"),
-        &removed_project_roots,
-    )?;
-
-    Ok(removed_project_roots)
-}
-
-fn sync_host_persona_conversation_history_one_way(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-) -> Result<()> {
-    if !source_codex_home.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(target_codex_home)
-        .with_context(|| format!("Failed to create {}.", target_codex_home.display()))?;
-    for dir_name in CONVERSATION_DIR_NAMES {
-        sync_directory_tree_one_way(
-            &source_codex_home.join(dir_name),
-            &target_codex_home.join(dir_name),
+    fs::create_dir_all(&persona.codex_home)
+        .with_context(|| format!("Failed to create {}.", persona.codex_home.display()))?;
+    let shared_codex_home = host_shared_codex_home_root(paths);
+    fs::create_dir_all(&shared_codex_home)
+        .with_context(|| format!("Failed to create {}.", shared_codex_home.display()))?;
+    for entry in SHARED_CODEX_HOME_ENTRIES {
+        ensure_shared_codex_home_entry_link(
+            entry,
+            &persona.codex_home.join(entry),
+            &shared_codex_home.join(entry),
         )?;
     }
     Ok(())
+}
+
+fn host_shared_codex_home_root(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .rotate_home
+        .join("personas")
+        .join("shared-data")
+        .join("codex-home")
+}
+
+fn ensure_shared_codex_home_entry_link(
+    entry: &str,
+    persona_path: &Path,
+    shared_path: &Path,
+) -> Result<()> {
+    if !path_exists_or_symlink(shared_path) {
+        if is_symlink_to(persona_path, shared_path)? {
+            materialize_shared_codex_home_default(entry, shared_path)?;
+        } else if let Some(link_target) = existing_symlink_target(persona_path)? {
+            if link_target.exists() {
+                copy_path(&link_target, shared_path)?;
+            } else {
+                materialize_shared_codex_home_default(entry, shared_path)?;
+            }
+        } else if path_exists_or_symlink(persona_path) {
+            copy_path(persona_path, shared_path)?;
+        } else {
+            materialize_shared_codex_home_default(entry, shared_path)?;
+        }
+    }
+    ensure_shared_codex_home_entry_shape(entry, shared_path)?;
+
+    if is_symlink_to(persona_path, shared_path)? {
+        return Ok(());
+    }
+    remove_path_if_exists(persona_path)?;
+    ensure_symlink_path(persona_path, shared_path)
+}
+
+fn materialize_shared_codex_home_default(entry: &str, shared_path: &Path) -> Result<()> {
+    if let Some(parent) = shared_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    match shared_codex_home_entry_kind(entry) {
+        SharedCodexHomeEntryKind::Directory => fs::create_dir_all(shared_path)
+            .with_context(|| format!("Failed to create {}.", shared_path.display())),
+        SharedCodexHomeEntryKind::File(default_contents) => {
+            fs::write(shared_path, default_contents)
+                .with_context(|| format!("Failed to write {}.", shared_path.display()))
+        }
+    }
+}
+
+fn ensure_shared_codex_home_entry_shape(entry: &str, shared_path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(shared_path)
+        .with_context(|| format!("Failed to inspect {}.", shared_path.display()))?;
+    match shared_codex_home_entry_kind(entry) {
+        SharedCodexHomeEntryKind::Directory if metadata.is_dir() => Ok(()),
+        SharedCodexHomeEntryKind::File(_) if metadata.is_file() => Ok(()),
+        SharedCodexHomeEntryKind::Directory => Err(anyhow!(
+            "Expected shared Codex-home path {} for {entry} to be a directory.",
+            shared_path.display()
+        )),
+        SharedCodexHomeEntryKind::File(_) => Err(anyhow!(
+            "Expected shared Codex-home path {} for {entry} to be a file.",
+            shared_path.display()
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SharedCodexHomeEntryKind {
+    File(&'static str),
+    Directory,
+}
+
+fn shared_codex_home_entry_kind(entry: &str) -> SharedCodexHomeEntryKind {
+    match entry {
+        "rules" | "skills" | "vendor_imports" => SharedCodexHomeEntryKind::Directory,
+        CODEX_GLOBAL_STATE_FILE_NAME => SharedCodexHomeEntryKind::File("{}\n"),
+        _ => SharedCodexHomeEntryKind::File(""),
+    }
+}
+
+fn ensure_symlink_path(link_path: &Path, target_path: &Path) -> Result<()> {
+    ensure_symlink_dir_with(link_path, target_path, symlink_path)
+}
+
+fn path_exists_or_symlink(path: &Path) -> bool {
+    path.exists() || path.is_symlink()
+}
+
+fn existing_symlink_target(path: &Path) -> Result<Option<PathBuf>> {
+    let Some(metadata) = symlink_metadata_optional(path)? else {
+        return Ok(None);
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let link_target = fs::read_link(path)
+        .with_context(|| format!("Failed to read symlink {}.", path.display()))?;
+    if link_target.is_absolute() {
+        return Ok(Some(link_target));
+    }
+    Ok(path.parent().map(|parent| parent.join(link_target)))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let Some(metadata) = symlink_metadata_optional(path)? else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove {}.", path.display()))?;
+    } else {
+        fs::remove_file(path).with_context(|| format!("Failed to remove {}.", path.display()))?;
+    }
+    Ok(())
+}
+
+fn symlink_metadata_optional(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}.", path.display())),
+    }
 }
 
 fn sync_host_persona_thread_archive_state(
@@ -2738,137 +2822,7 @@ fn sync_host_persona_thread_archive_state(
     Ok(())
 }
 
-fn read_config_project_paths(path: &Path) -> Result<BTreeSet<String>> {
-    let mut projects = BTreeSet::new();
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(projects),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-    for line in contents.lines() {
-        if let Some(project_path) = parse_project_table_heading(line) {
-            projects.insert(project_path);
-        }
-    }
-    Ok(projects)
-}
-
-fn filter_removed_project_paths(
-    projects: BTreeSet<String>,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<BTreeSet<String>> {
-    let mut filtered = BTreeSet::new();
-    for project in projects {
-        if !project_path_matches_removed_root(&project, removed_project_roots)? {
-            filtered.insert(project);
-        }
-    }
-    Ok(filtered)
-}
-
-fn project_path_matches_removed_root(
-    path: &str,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<bool> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() || removed_project_roots.is_empty() {
-        return Ok(false);
-    }
-    if removed_project_roots.contains(trimmed) {
-        return Ok(true);
-    }
-    Ok(normalize_workspace_visibility_path(trimmed)?
-        .as_deref()
-        .map(|normalized| removed_project_roots.contains(normalized))
-        .unwrap_or(false))
-}
-
-fn remove_projects_from_config(
-    path: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    if removed_project_roots.is_empty() {
-        return Ok(());
-    }
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-
-    let mut filtered = String::with_capacity(contents.len());
-    let mut skip_project_table = false;
-    for line in contents.split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches('\n');
-        let trimmed = line_without_newline.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skip_project_table = match parse_project_table_heading(line_without_newline) {
-                Some(project_path) => {
-                    project_path_matches_removed_root(&project_path, removed_project_roots)?
-                }
-                None => false,
-            };
-        }
-        if !skip_project_table {
-            filtered.push_str(line);
-        }
-    }
-
-    if filtered != contents {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}.", parent.display()))?;
-        }
-        fs::write(path, filtered)
-            .with_context(|| format!("Failed to write {}.", path.display()))?;
-    }
-    Ok(())
-}
-
-fn parse_project_table_heading(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let prefix = "[projects.\"";
-    let suffix = "\"]";
-    if !trimmed.starts_with(prefix) || !trimmed.ends_with(suffix) {
-        return None;
-    }
-    decode_toml_basic_string(&trimmed[prefix.len()..trimmed.len() - suffix.len()])
-}
-
-fn decode_toml_basic_string(value: &str) -> Option<String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            decoded.push(ch);
-            continue;
-        }
-        let escaped = chars.next()?;
-        match escaped {
-            'b' => decoded.push('\u{0008}'),
-            't' => decoded.push('\t'),
-            'n' => decoded.push('\n'),
-            'f' => decoded.push('\u{000C}'),
-            'r' => decoded.push('\r'),
-            '"' => decoded.push('"'),
-            '\\' => decoded.push('\\'),
-            _ => return None,
-        }
-    }
-    Some(decoded)
-}
-
-fn read_thread_cwds_from_codex_home(codex_home: &Path) -> Result<BTreeSet<String>> {
-    let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) else {
-        return Ok(BTreeSet::new());
-    };
-    read_thread_cwds_from_state_db(&state_db_path)
-}
-
+#[cfg(test)]
 fn read_thread_cwds_from_state_db(state_db_path: &Path) -> Result<BTreeSet<String>> {
     let mut cwd_values = BTreeSet::new();
     if !state_db_path.exists() {
@@ -2915,6 +2869,7 @@ fn read_thread_cwds_from_state_db(state_db_path: &Path) -> Result<BTreeSet<Strin
     Ok(cwd_values)
 }
 
+#[cfg(test)]
 fn should_sync_project_path(path: &str, known_projects: &BTreeSet<String>) -> bool {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -2935,120 +2890,7 @@ fn should_sync_project_path(path: &str, known_projects: &BTreeSet<String>) -> bo
         .unwrap_or(false)
 }
 
-fn append_missing_projects_to_config(path: &Path, missing_projects: &[String]) -> Result<()> {
-    if missing_projects.is_empty() {
-        return Ok(());
-    }
-    let mut contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    if !contents.is_empty() {
-        contents.push('\n');
-    }
-    for (index, project_path) in missing_projects.iter().enumerate() {
-        if index > 0 {
-            contents.push('\n');
-        }
-        contents.push_str("[projects.\"");
-        contents.push_str(&encode_toml_basic_string(project_path));
-        contents.push_str("\"]\n");
-        contents.push_str("trust_level = \"trusted\"\n");
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    fs::write(path, contents).with_context(|| format!("Failed to write {}.", path.display()))
-}
-
-fn read_workspace_root_state_paths(path: &Path) -> Result<BTreeSet<String>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-    let state: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?;
-    let Some(object) = state.as_object() else {
-        return Err(anyhow!(
-            "Expected {} to contain a top-level JSON object.",
-            path.display()
-        ));
-    };
-    let mut roots = BTreeSet::new();
-    collect_workspace_root_strings(object.get(ACTIVE_WORKSPACE_ROOTS_KEY), &mut roots);
-    collect_workspace_root_strings(object.get(SAVED_WORKSPACE_ROOTS_KEY), &mut roots);
-    collect_workspace_root_strings(object.get(PROJECT_ORDER_KEY), &mut roots);
-    Ok(roots)
-}
-
-fn read_removed_workspace_root_tombstones(path: &Path) -> Result<BTreeSet<String>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-    let state: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?;
-    let Some(object) = state.as_object() else {
-        return Err(anyhow!(
-            "Expected {} to contain a top-level JSON object.",
-            path.display()
-        ));
-    };
-    let mut roots = BTreeSet::new();
-    collect_workspace_root_strings(object.get(REMOVED_WORKSPACE_ROOTS_KEY), &mut roots);
-    Ok(roots)
-}
-
-fn read_visible_project_roots(codex_home: &Path) -> Result<BTreeSet<String>> {
-    let mut visible = normalize_workspace_visibility_paths(read_config_project_paths(
-        &codex_home.join("config.toml"),
-    )?)?;
-    visible.extend(normalize_workspace_visibility_paths(
-        read_workspace_root_state_paths(&codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME))?,
-    )?);
-    Ok(visible)
-}
-
-fn collect_workspace_root_strings(value: Option<&Value>, roots: &mut BTreeSet<String>) {
-    let Some(values) = value.and_then(Value::as_array) else {
-        return;
-    };
-    for entry in values {
-        if let Some(path) = entry.as_str() {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                roots.insert(trimmed.to_string());
-            }
-        }
-    }
-}
-
-fn normalize_workspace_visibility_paths<I>(paths: I) -> Result<BTreeSet<String>>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut normalized = BTreeSet::new();
-    for path in paths {
-        if let Some(project_root) = normalize_workspace_visibility_path(&path)? {
-            normalized.insert(project_root);
-        }
-    }
-    Ok(normalized)
-}
-
+#[cfg(test)]
 fn normalize_workspace_visibility_path(path: &str) -> Result<Option<String>> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -3081,6 +2923,7 @@ fn normalize_workspace_visibility_path(path: &str) -> Result<Option<String>> {
     Ok(Some(normalized.to_string_lossy().into_owned()))
 }
 
+#[cfg(test)]
 fn is_excluded_workspace_visibility_path(path: &Path) -> bool {
     if path
         .components()
@@ -3098,7 +2941,8 @@ fn is_excluded_workspace_visibility_path(path: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         excluded_prefixes.push(home.join(".codex"));
         excluded_prefixes.push(home.join(".codex-rotate"));
-        excluded_prefixes.push(home.join("Documents").join("Codex"));
+        excluded_prefixes.push(home.join("Documents"));
+        excluded_prefixes.push(home.join("Downloads"));
     }
 
     excluded_prefixes
@@ -3106,6 +2950,7 @@ fn is_excluded_workspace_visibility_path(path: &Path) -> bool {
         .any(|prefix| path == prefix || path.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn is_excluded_project_registry_path(path: &Path) -> bool {
     if path
         .components()
@@ -3118,7 +2963,8 @@ fn is_excluded_project_registry_path(path: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         excluded_prefixes.push(home.join(".codex"));
         excluded_prefixes.push(home.join(".codex-rotate"));
-        excluded_prefixes.push(home.join("Documents").join("Codex"));
+        excluded_prefixes.push(home.join("Documents"));
+        excluded_prefixes.push(home.join("Downloads"));
     }
 
     excluded_prefixes
@@ -3126,6 +2972,7 @@ fn is_excluded_project_registry_path(path: &Path) -> bool {
         .any(|prefix| path == prefix || path.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn main_repo_root_for_worktree(path: &Path) -> Option<PathBuf> {
     let top_level = git_repo_root_for_path(path)?;
     let common_dir = git_common_dir_for_path(&top_level)?;
@@ -3133,6 +2980,7 @@ fn main_repo_root_for_worktree(path: &Path) -> Option<PathBuf> {
     (main_root != top_level).then_some(main_root)
 }
 
+#[cfg(test)]
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
@@ -3151,6 +2999,7 @@ fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
     PathBuf::from(trimmed).canonicalize().ok()
 }
 
+#[cfg(test)]
 fn git_common_dir_for_path(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
@@ -3170,179 +3019,7 @@ fn git_common_dir_for_path(path: &Path) -> Option<PathBuf> {
     PathBuf::from(trimmed).canonicalize().ok()
 }
 
-fn append_missing_workspace_roots_to_global_state(
-    path: &Path,
-    missing_projects: &[String],
-) -> Result<()> {
-    if missing_projects.is_empty() {
-        return Ok(());
-    }
-
-    let mut state = match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str::<Value>(&contents)
-            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Default::default()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-
-    let Some(object) = state.as_object_mut() else {
-        return Err(anyhow!(
-            "Expected {} to contain a top-level JSON object.",
-            path.display()
-        ));
-    };
-    append_missing_workspace_root_array(object, SAVED_WORKSPACE_ROOTS_KEY, missing_projects)?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_string(&state)?)
-        .with_context(|| format!("Failed to write {}.", path.display()))
-}
-
-fn write_removed_workspace_root_tombstones(
-    path: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    if removed_project_roots.is_empty() && !path.exists() {
-        return Ok(());
-    }
-
-    let mut state = match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str::<Value>(&contents)
-            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Default::default()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-
-    let Some(object) = state.as_object_mut() else {
-        return Err(anyhow!(
-            "Expected {} to contain a top-level JSON object.",
-            path.display()
-        ));
-    };
-    if removed_project_roots.is_empty() {
-        object.remove(REMOVED_WORKSPACE_ROOTS_KEY);
-    } else {
-        object.insert(
-            REMOVED_WORKSPACE_ROOTS_KEY.to_string(),
-            Value::Array(
-                removed_project_roots
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_string(&state)?)
-        .with_context(|| format!("Failed to write {}.", path.display()))
-}
-
-fn remove_workspace_root_entries_from_global_state(
-    path: &Path,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    if removed_project_roots.is_empty() {
-        return Ok(());
-    }
-
-    let mut state = match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str::<Value>(&contents)
-            .with_context(|| format!("Failed to parse {} as JSON.", path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
-        }
-    };
-
-    let Some(object) = state.as_object_mut() else {
-        return Err(anyhow!(
-            "Expected {} to contain a top-level JSON object.",
-            path.display()
-        ));
-    };
-    for key in [
-        ACTIVE_WORKSPACE_ROOTS_KEY,
-        SAVED_WORKSPACE_ROOTS_KEY,
-        PROJECT_ORDER_KEY,
-    ] {
-        remove_workspace_root_array_entries(object, key, removed_project_roots)?;
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_string(&state)?)
-        .with_context(|| format!("Failed to write {}.", path.display()))
-}
-
-fn append_missing_workspace_root_array(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    missing_projects: &[String],
-) -> Result<()> {
-    let value = object
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(array) = value.as_array_mut() else {
-        return Err(anyhow!(
-            "Expected {key} in workspace visibility state to be an array."
-        ));
-    };
-
-    let existing = array
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-    for project in missing_projects {
-        if !existing.contains(project) {
-            array.push(Value::String(project.clone()));
-        }
-    }
-    Ok(())
-}
-
-fn remove_workspace_root_array_entries(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    removed_project_roots: &BTreeSet<String>,
-) -> Result<()> {
-    let Some(value) = object.get_mut(key) else {
-        return Ok(());
-    };
-    let Some(array) = value.as_array_mut() else {
-        return Err(anyhow!(
-            "Expected {key} in workspace visibility state to be an array."
-        ));
-    };
-    let mut filtered = Vec::with_capacity(array.len());
-    for entry in array.drain(..) {
-        let should_remove = entry
-            .as_str()
-            .map(|path| project_path_matches_removed_root(path, removed_project_roots))
-            .transpose()?
-            .unwrap_or(false);
-        if !should_remove {
-            filtered.push(entry);
-        }
-    }
-    *array = filtered;
-    Ok(())
-}
-
+#[cfg(test)]
 fn encode_toml_basic_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -3358,74 +3035,6 @@ fn encode_toml_basic_string(value: &str) -> String {
         }
     }
     escaped
-}
-
-fn sync_directory_tree_one_way(source_root: &Path, target_root: &Path) -> Result<()> {
-    if !source_root.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(source_root)
-        .with_context(|| format!("Failed to inspect {}.", source_root.display()))?;
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(target_root)
-        .with_context(|| format!("Failed to create {}.", target_root.display()))?;
-    for entry in fs::read_dir(source_root)
-        .with_context(|| format!("Failed to read {}.", source_root.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target_root.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("Failed to inspect {}.", source_path.display()))?;
-        if file_type.is_dir() {
-            sync_directory_tree_one_way(&source_path, &target_path)?;
-            continue;
-        }
-        if file_type.is_file() {
-            copy_file_if_newer(&source_path, &target_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_file_if_newer(source: &Path, target: &Path) -> Result<()> {
-    let source_meta =
-        fs::metadata(source).with_context(|| format!("Failed to inspect {}.", source.display()))?;
-    let should_copy = if !target.exists() {
-        true
-    } else {
-        let target_meta = fs::metadata(target)
-            .with_context(|| format!("Failed to inspect {}.", target.display()))?;
-        if !target_meta.is_file() {
-            true
-        } else {
-            let source_newer = source_meta
-                .modified()
-                .ok()
-                .zip(target_meta.modified().ok())
-                .map(|(source_modified, target_modified)| source_modified > target_modified)
-                .unwrap_or(false);
-            source_meta.len() != target_meta.len() || source_newer
-        }
-    };
-    if !should_copy {
-        return Ok(());
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    fs::copy(source, target).with_context(|| {
-        format!(
-            "Failed to copy conversation file {} -> {}.",
-            source.display(),
-            target.display()
-        )
-    })?;
-    Ok(())
 }
 
 #[allow(dead_code)]
@@ -3897,10 +3506,18 @@ fn quote_sql_identifier(value: &str) -> String {
 }
 
 fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHandoff>> {
+    export_thread_handoffs_with_identity(port, account_id, account_id)
+}
+
+fn export_thread_handoffs_with_identity(
+    port: u16,
+    watch_account_id: &str,
+    sync_identity: &str,
+) -> Result<Vec<ThreadHandoff>> {
     let mut thread_ids = read_active_thread_ids(Some(port))?;
     let mut pending_recovery_thread_ids = BTreeSet::new();
     if let Ok(watch_state) = read_watch_state() {
-        if let Some(account_state) = watch_state.accounts.get(account_id) {
+        if let Some(account_state) = watch_state.accounts.get(watch_account_id) {
             for event in &account_state.thread_recovery_pending_events {
                 pending_recovery_thread_ids.insert(event.thread_id.clone());
                 thread_ids.push(event.thread_id.clone());
@@ -3913,7 +3530,9 @@ fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHando
         if !unique.insert(thread_id.clone()) {
             continue;
         }
-        if let Some(mut handoff) = export_single_thread_handoff(port, &thread_id, account_id)? {
+        if let Some(mut handoff) =
+            export_single_thread_handoff_with_identity(port, &thread_id, sync_identity)?
+        {
             if pending_recovery_thread_ids.contains(&thread_id) {
                 handoff.continue_prompt = None;
             }
@@ -3923,10 +3542,10 @@ fn export_thread_handoffs(port: u16, account_id: &str) -> Result<Vec<ThreadHando
     Ok(handoffs)
 }
 
-fn export_single_thread_handoff(
+fn export_single_thread_handoff_with_identity(
     port: u16,
     thread_id: &str,
-    account_id: &str,
+    sync_identity: &str,
 ) -> Result<Option<ThreadHandoff>> {
     let response: Value = send_codex_app_request(
         port,
@@ -3970,7 +3589,7 @@ fn export_single_thread_handoff(
     let paths = crate::paths::resolve_paths()?;
     let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
     let lineage_id = store
-        .get_lineage_id(account_id, thread_id)?
+        .get_lineage_id(sync_identity, thread_id)?
         .unwrap_or_else(|| thread_id.to_string());
     let watermark = thread
         .get("turns")
@@ -4337,25 +3956,6 @@ fn require_relative_persona_root(path: &str, field: &str) -> Result<PathBuf> {
     Ok(candidate)
 }
 
-fn copy_allowlisted_entries(
-    source_root: &Path,
-    target_root: &Path,
-    entries: &[&str],
-) -> Result<()> {
-    for entry in entries {
-        let source = source_root.join(entry);
-        if !source.exists() {
-            continue;
-        }
-        let target = target_root.join(entry);
-        if target.exists() {
-            continue;
-        }
-        copy_path(&source, &target)?;
-    }
-    Ok(())
-}
-
 fn copy_path(source: &Path, target: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("Failed to inspect {}.", source.display()))?;
@@ -4523,9 +4123,23 @@ fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
+#[cfg(unix)]
+fn symlink_path(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
 #[cfg(windows)]
 fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_path(target: &Path, link: &Path) -> io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 pub trait ConversationTransport {
@@ -5308,6 +4922,7 @@ pub fn report_duplicates() -> Result<String> {
     let pool = load_pool()?;
     let active_index = pool.active_index.min(pool.accounts.len().saturating_sub(1));
     let account = &pool.accounts[active_index];
+    let sync_identity = conversation_sync_identity(account);
 
     let port = 9333;
     let transport = HostConversationTransport::new(port);
@@ -5318,10 +4933,7 @@ pub fn report_duplicates() -> Result<String> {
     let mut historical_duplicates = Vec::new();
 
     for thread_id in threads {
-        if store
-            .get_lineage_id(&account.account_id, &thread_id)?
-            .is_some()
-        {
+        if store.get_lineage_id(&sync_identity, &thread_id)?.is_some() {
             bound_count += 1;
         } else {
             historical_duplicates.push(thread_id);
@@ -5330,7 +4942,7 @@ pub fn report_duplicates() -> Result<String> {
 
     let mut output = format!(
         "Duplicate observability report for {} ({})\n",
-        account.label, account.account_id
+        account.label, sync_identity
     );
     output.push_str(&format!(
         "- Bound threads (active lineages): {}\n",
@@ -5476,6 +5088,89 @@ mod tests {
         assert_eq!(
             outcome2.completed_source_thread_ids,
             vec![lineage_id.to_string()]
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn host_conversation_sync_identity_distinguishes_same_account_personas() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-team", "persona-source");
+        let target = test_account("acct-team", "persona-target");
+        let source_sync_identity = conversation_sync_identity(&source);
+        let target_sync_identity = conversation_sync_identity(&target);
+        assert_ne!(source_sync_identity, target_sync_identity);
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("store");
+        store
+            .bind_local_thread_id(&source_sync_identity, "lineage-team", "source-thread")
+            .expect("bind source");
+
+        struct MockConversationTransport;
+        impl ConversationTransport for MockConversationTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                Ok("target-thread".to_string())
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                Ok(())
+            }
+            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-team".to_string(),
+            watermark: Some("turn-1".to_string()),
+            cwd: None,
+            items: vec![],
+            continue_prompt: None,
+        };
+        let outcome = import_thread_handoffs(
+            &MockConversationTransport,
+            &target_sync_identity,
+            &[handoff],
+            None,
+        )
+        .expect("import");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            store
+                .get_local_thread_id(&source_sync_identity, "lineage-team")
+                .expect("get source"),
+            Some("source-thread".to_string())
+        );
+        assert_eq!(
+            store
+                .get_local_thread_id(&target_sync_identity, "lineage-team")
+                .expect("get target"),
+            Some("target-thread".to_string())
+        );
+        assert_ne!(
+            store
+                .get_local_thread_id(&source_sync_identity, "lineage-team")
+                .expect("get source")
+                .unwrap(),
+            store
+                .get_local_thread_id(&target_sync_identity, "lineage-team")
+                .expect("get target")
+                .unwrap()
         );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
@@ -5999,6 +5694,51 @@ while True:
 
     fn start_guest_bridge(response_body: impl Into<String>) -> Result<TestHttpServer> {
         TestHttpServer::start(response_body)
+    }
+
+    fn disable_rotation_domain_in_accounts_file(accounts_file: &Path, domain: &str) {
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(accounts_file).expect("read accounts file"))
+                .expect("parse accounts file");
+        let object = state.as_object_mut().expect("accounts file object");
+        let domain_state = object
+            .entry("domain".to_string())
+            .or_insert_with(|| json!({}));
+        domain_state
+            .as_object_mut()
+            .expect("domain state object")
+            .insert(domain.to_string(), json!({ "rotation_enabled": false }));
+        fs::write(
+            accounts_file,
+            serde_json::to_string_pretty(&state).expect("serialize accounts file"),
+        )
+        .expect("write accounts file");
+    }
+
+    fn start_usage_server_that_disables_domain(
+        accounts_file: PathBuf,
+        domain: &'static str,
+        response_body: impl Into<String>,
+    ) -> Result<(String, thread::JoinHandle<()>)> {
+        let response_body = response_body.into();
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind usage server")?;
+        let address = listener.local_addr().context("usage server local addr")?;
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept usage request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            disable_rotation_domain_in_accounts_file(&accounts_file, domain);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write usage response");
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+        Ok((format!("http://{address}"), handle))
     }
 
     struct RecordingGuestBridge {
@@ -6663,8 +6403,8 @@ exit 91
     fn switch_host_persona_repoints_live_roots_to_target_persona() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
-        let source = test_account("acct-source", "persona-source");
-        let target = test_account("acct-target", "persona-target");
+        let source = test_account("acct-team", "persona-source");
+        let target = test_account("acct-team", "persona-target");
 
         provision_host_persona(&paths, &source, None).expect("provision source");
         provision_host_persona(&paths, &target, None).expect("provision target");
@@ -6865,11 +6605,11 @@ exit 91
             .codex_home
             .join("sessions/2026/01/01/rollout-source.jsonl")
             .exists());
-        assert!(source_paths
+        assert!(!source_paths
             .codex_home
             .join("sessions/2026/01/01/rollout-target.jsonl")
             .exists());
-        assert!(target_paths
+        assert!(!target_paths
             .codex_home
             .join("sessions/2026/01/01/rollout-source.jsonl")
             .exists());
@@ -6944,6 +6684,326 @@ exit 91
     }
 
     #[test]
+    fn switch_host_persona_links_shared_settings_and_local_skills() {
+        let temp = tempfile::Builder::new()
+            .prefix("codex-rotate-shared-state-")
+            .tempdir_in(std::env::current_dir().expect("current dir"))
+            .expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        fs::create_dir_all(&target_paths.codex_home).expect("create stale target codex home");
+
+        let source_project = temp.path().join("projects/source-visible");
+        let target_project = temp.path().join("projects/target-only");
+        fs::create_dir_all(&source_project).expect("create source project");
+        fs::create_dir_all(&target_project).expect("create target project");
+        for project in [&source_project, &target_project] {
+            let status = Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(project)
+                .status()
+                .expect("git init project");
+            assert!(status.success(), "git init failed: {status}");
+        }
+
+        fs::write(
+            source_paths.codex_home.join("config.toml"),
+            format!(
+                "model = \"gpt-5.3-codex\"\napproval_policy = \"never\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&source_project.display().to_string())
+            ),
+        )
+        .expect("write source config");
+        fs::write(
+            target_paths.codex_home.join("config.toml"),
+            format!(
+                "model = \"old-model\"\npersonality = \"target-only\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                encode_toml_basic_string(&target_project.display().to_string())
+            ),
+        )
+        .expect("write target config");
+
+        fs::write(
+            source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                "default-service-tier": "flex",
+                "skip-full-access-confirm": true,
+                SAVED_WORKSPACE_ROOTS_KEY: [source_project.display().to_string()],
+                PROJECT_ORDER_KEY: [source_project.display().to_string()],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [source_project.display().to_string()],
+            }))
+            .expect("serialize source global state"),
+        )
+        .expect("write source global state");
+        fs::write(
+            target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            serde_json::to_string(&json!({
+                "target-only-setting": true,
+                SAVED_WORKSPACE_ROOTS_KEY: [target_project.display().to_string()],
+                PROJECT_ORDER_KEY: [target_project.display().to_string()],
+                ACTIVE_WORKSPACE_ROOTS_KEY: [target_project.display().to_string()],
+            }))
+            .expect("serialize target global state"),
+        )
+        .expect("write target global state");
+
+        fs::write(source_paths.codex_home.join("AGENTS.md"), "source agents\n")
+            .expect("write source agents");
+        fs::write(target_paths.codex_home.join("AGENTS.md"), "target agents\n")
+            .expect("write target agents");
+        fs::create_dir_all(source_paths.codex_home.join("rules")).expect("create source rules");
+        fs::write(
+            source_paths.codex_home.join("rules").join("default.rules"),
+            "source rules\n",
+        )
+        .expect("write source rules");
+        fs::create_dir_all(target_paths.codex_home.join("rules")).expect("create target rules");
+        fs::write(
+            target_paths.codex_home.join("rules").join("obsolete.rules"),
+            "obsolete\n",
+        )
+        .expect("write obsolete rule");
+        fs::create_dir_all(source_paths.codex_home.join("skills").join("local-skill"))
+            .expect("create source skill");
+        fs::write(
+            source_paths
+                .codex_home
+                .join("skills")
+                .join("local-skill")
+                .join("SKILL.md"),
+            "# Source Skill\n",
+        )
+        .expect("write source skill");
+        fs::create_dir_all(
+            target_paths
+                .codex_home
+                .join("skills")
+                .join("obsolete-skill"),
+        )
+        .expect("create target skill");
+        fs::write(
+            target_paths
+                .codex_home
+                .join("skills")
+                .join("obsolete-skill")
+                .join("SKILL.md"),
+            "# Obsolete Skill\n",
+        )
+        .expect("write obsolete skill");
+        fs::create_dir_all(source_paths.codex_home.join("vendor_imports"))
+            .expect("create source imports");
+        fs::write(
+            source_paths
+                .codex_home
+                .join("vendor_imports")
+                .join("skills-curated-cache.json"),
+            "{}\n",
+        )
+        .expect("write source imports");
+        fs::create_dir_all(target_paths.codex_home.join("vendor_imports"))
+            .expect("create target imports");
+        fs::write(
+            target_paths
+                .codex_home
+                .join("vendor_imports")
+                .join("stale.json"),
+            "{}\n",
+        )
+        .expect("write stale imports");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+        let shared_codex_home = host_shared_codex_home_root(&paths);
+        for entry in SHARED_CODEX_HOME_ENTRIES {
+            assert_eq!(
+                fs::read_link(source_paths.codex_home.join(entry)).expect("source shared link"),
+                shared_codex_home.join(entry)
+            );
+            assert_eq!(
+                fs::read_link(target_paths.codex_home.join(entry)).expect("target shared link"),
+                shared_codex_home.join(entry)
+            );
+        }
+
+        let target_config =
+            fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
+        assert!(target_config.contains("model = \"gpt-5.3-codex\""));
+        assert!(target_config.contains("approval_policy = \"never\""));
+        assert!(!target_config.contains("personality = \"target-only\""));
+        assert!(target_config.contains(&project_table_heading(&source_project)));
+        assert!(!target_config.contains(&project_table_heading(&target_project)));
+
+        let target_state: Value = serde_json::from_str(
+            &fs::read_to_string(target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME))
+                .expect("target global state"),
+        )
+        .expect("parse target global state");
+        assert_eq!(
+            target_state
+                .get("default-service-tier")
+                .and_then(Value::as_str),
+            Some("flex")
+        );
+        assert_eq!(
+            target_state
+                .get("skip-full-access-confirm")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(target_state.get("target-only-setting").is_none());
+        let saved_roots = target_state
+            .get(SAVED_WORKSPACE_ROOTS_KEY)
+            .and_then(Value::as_array)
+            .expect("saved roots")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(saved_roots.contains(&source_project.display().to_string().as_str()));
+        assert!(!saved_roots.contains(&target_project.display().to_string().as_str()));
+
+        assert_eq!(
+            fs::read_to_string(target_paths.codex_home.join("AGENTS.md")).unwrap(),
+            "source agents\n"
+        );
+        assert_eq!(
+            fs::read_to_string(target_paths.codex_home.join("rules").join("default.rules"))
+                .unwrap(),
+            "source rules\n"
+        );
+        assert!(!target_paths
+            .codex_home
+            .join("rules")
+            .join("obsolete.rules")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("skills")
+            .join("local-skill")
+            .join("SKILL.md")
+            .exists());
+        assert!(!target_paths
+            .codex_home
+            .join("skills")
+            .join("obsolete-skill")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("vendor_imports")
+            .join("skills-curated-cache.json")
+            .exists());
+        assert!(!target_paths
+            .codex_home
+            .join("vendor_imports")
+            .join("stale.json")
+            .exists());
+
+        fs::create_dir_all(source_paths.codex_home.join("skills").join("runtime-skill"))
+            .expect("create runtime skill");
+        fs::write(
+            source_paths
+                .codex_home
+                .join("skills")
+                .join("runtime-skill")
+                .join("SKILL.md"),
+            "# Runtime Skill\n",
+        )
+        .expect("write runtime skill");
+        assert!(target_paths
+            .codex_home
+            .join("skills")
+            .join("runtime-skill")
+            .join("SKILL.md")
+            .exists());
+        fs::remove_dir_all(source_paths.codex_home.join("skills").join("runtime-skill"))
+            .expect("remove runtime skill");
+        assert!(!target_paths
+            .codex_home
+            .join("skills")
+            .join("runtime-skill")
+            .exists());
+    }
+
+    #[test]
+    fn shared_codex_home_migrates_entries_linked_to_legacy_host_shared_data() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let legacy_shared_codex_home = paths
+            .rotate_home
+            .join("personas")
+            .join("host")
+            .join("shared-data")
+            .join("codex-home");
+
+        fs::create_dir_all(&source_paths.codex_home).expect("create source codex home");
+        fs::create_dir_all(legacy_shared_codex_home.join("skills").join("legacy-skill"))
+            .expect("create legacy skill");
+        fs::write(
+            legacy_shared_codex_home.join("config.toml"),
+            "model = \"gpt-5.5\"\n",
+        )
+        .expect("write legacy config");
+        fs::write(
+            legacy_shared_codex_home
+                .join("skills")
+                .join("legacy-skill")
+                .join("SKILL.md"),
+            "# Legacy Skill\n",
+        )
+        .expect("write legacy skill");
+        ensure_symlink_path(
+            &source_paths.codex_home.join("config.toml"),
+            &legacy_shared_codex_home.join("config.toml"),
+        )
+        .expect("link legacy config");
+        ensure_symlink_path(
+            &source_paths.codex_home.join("skills"),
+            &legacy_shared_codex_home.join("skills"),
+        )
+        .expect("link legacy skills");
+
+        ensure_host_persona_shared_codex_home_links(&paths, &source_paths)
+            .expect("migrate shared links");
+
+        let shared_codex_home = host_shared_codex_home_root(&paths);
+        assert_eq!(
+            shared_codex_home,
+            paths.rotate_home.join("personas/shared-data/codex-home")
+        );
+        assert_eq!(
+            fs::read_to_string(shared_codex_home.join("config.toml")).unwrap(),
+            "model = \"gpt-5.5\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                shared_codex_home
+                    .join("skills")
+                    .join("legacy-skill")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            "# Legacy Skill\n"
+        );
+        assert_eq!(
+            fs::read_link(source_paths.codex_home.join("config.toml")).unwrap(),
+            shared_codex_home.join("config.toml")
+        );
+        assert_eq!(
+            fs::read_link(source_paths.codex_home.join("skills")).unwrap(),
+            shared_codex_home.join("skills")
+        );
+    }
+
+    #[test]
     fn switch_host_persona_syncs_current_archive_state_via_lineage_mapping() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
@@ -6980,10 +7040,18 @@ exit 91
         let mut store =
             ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
         store
-            .bind_local_thread_id(&source.account_id, lineage_id, "thread-source")
+            .bind_local_thread_id(
+                &conversation_sync_identity(&source),
+                lineage_id,
+                "thread-source",
+            )
             .expect("bind source lineage");
         store
-            .bind_local_thread_id(&target.account_id, lineage_id, "thread-target")
+            .bind_local_thread_id(
+                &conversation_sync_identity(&target),
+                lineage_id,
+                "thread-target",
+            )
             .expect("bind target lineage");
 
         ensure_live_root_bindings(&paths, &source).expect("bind source");
@@ -7000,7 +7068,7 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_preserves_removed_projects_across_personas() {
+    fn switch_host_persona_does_not_resurrect_deleted_projects_from_thread_history() {
         let temp = tempfile::Builder::new()
             .prefix("codex-rotate-project-removal-")
             .tempdir_in(std::env::current_dir().expect("current dir"))
@@ -7010,10 +7078,10 @@ exit 91
         let target = test_account("acct-target", "persona-target");
 
         provision_host_persona(&paths, &source, None).expect("provision source");
-        provision_host_persona(&paths, &target, None).expect("provision target");
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        fs::create_dir_all(&target_paths.codex_home).expect("create stale target codex home");
 
         let removed_project = temp.path().join("projects/shared-visible");
         fs::create_dir_all(&removed_project).expect("create removed project");
@@ -7086,6 +7154,15 @@ exit 91
         switch_host_persona(&paths, &source, &target, false).expect("switch");
         switch_host_persona(&paths, &target, &source, false).expect("switch back");
 
+        assert_eq!(
+            fs::read_link(source_paths.codex_home.join("config.toml")).expect("source config link"),
+            host_shared_codex_home_root(&paths).join("config.toml")
+        );
+        assert_eq!(
+            fs::read_link(target_paths.codex_home.join("config.toml")).expect("target config link"),
+            host_shared_codex_home_root(&paths).join("config.toml")
+        );
+
         for config_path in [
             source_paths.codex_home.join("config.toml"),
             target_paths.codex_home.join("config.toml"),
@@ -7126,19 +7203,6 @@ exit 91
                     removed_project.display()
                 );
             }
-            let tombstones = state
-                .get(REMOVED_WORKSPACE_ROOTS_KEY)
-                .and_then(Value::as_array)
-                .expect("removed workspace roots array")
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>();
-            assert!(
-                tombstones.contains(&removed_project.display().to_string().as_str()),
-                "expected {} to retain tombstone for removed project {}",
-                state_path.display(),
-                removed_project.display()
-            );
         }
 
         let expected_project = removed_project.display().to_string();
@@ -7155,17 +7219,17 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_reconciles_config_projects_from_thread_history_bidirectionally() {
+    fn switch_host_persona_keeps_config_projects_in_shared_state_only() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
         let target = test_account("acct-target", "persona-target");
 
         provision_host_persona(&paths, &source, None).expect("provision source");
-        provision_host_persona(&paths, &target, None).expect("provision target");
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        fs::create_dir_all(&target_paths.codex_home).expect("create stale target codex home");
 
         let source_project = temp.path().join("projects/source-visible");
         let target_project = temp.path().join("projects/target-visible");
@@ -7246,22 +7310,30 @@ exit 91
             fs::read_to_string(source_paths.codex_home.join("config.toml")).expect("source config");
         let target_config =
             fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
+        assert_eq!(source_config, target_config);
+        assert_eq!(
+            fs::read_link(target_paths.codex_home.join("config.toml")).expect("target config link"),
+            host_shared_codex_home_root(&paths).join("config.toml")
+        );
 
         assert!(source_config.contains("model = \"gpt-5.3-codex\""));
         assert!(!source_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
-        assert!(!target_config.contains("model = \"gpt-5.3-codex\""));
-        assert!(target_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
+        assert!(target_config.contains("model = \"gpt-5.3-codex\""));
+        assert!(!target_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
 
-        for config in [&source_config, &target_config] {
-            assert!(config.contains(&project_table_heading(&source_project)));
-            assert!(config.contains(&project_table_heading(&target_project)));
-            assert!(config.contains(&project_table_heading(&archived_backfill_project)));
-            assert!(!config.contains(&project_table_heading(&missing_project)));
-        }
+        assert!(source_config.contains(&project_table_heading(&source_project)));
+        assert!(!source_config.contains(&project_table_heading(&target_project)));
+        assert!(!source_config.contains(&project_table_heading(&archived_backfill_project)));
+        assert!(!source_config.contains(&project_table_heading(&missing_project)));
+
+        assert!(target_config.contains(&project_table_heading(&source_project)));
+        assert!(!target_config.contains(&project_table_heading(&target_project)));
+        assert!(!target_config.contains(&project_table_heading(&archived_backfill_project)));
+        assert!(!target_config.contains(&project_table_heading(&missing_project)));
     }
 
     #[test]
-    fn switch_host_persona_reconciles_workspace_visibility_from_project_history_bidirectionally() {
+    fn switch_host_persona_keeps_workspace_visibility_in_shared_state_only() {
         let temp = tempfile::Builder::new()
             .prefix("codex-rotate-visibility-sync-")
             .tempdir_in(std::env::current_dir().expect("current dir"))
@@ -7271,10 +7343,10 @@ exit 91
         let target = test_account("acct-target", "persona-target");
 
         provision_host_persona(&paths, &source, None).expect("provision source");
-        provision_host_persona(&paths, &target, None).expect("provision target");
 
         let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
         let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        fs::create_dir_all(&target_paths.codex_home).expect("create stale target codex home");
 
         let source_project = temp.path().join("projects/source-visible");
         let target_project = temp.path().join("projects/target-visible");
@@ -7374,21 +7446,11 @@ exit 91
         ensure_live_root_bindings(&paths, &source).expect("bind source");
         switch_host_persona(&paths, &source, &target, false).expect("switch");
 
-        let expected_projects = vec![
-            source_project.display().to_string(),
-            target_project.display().to_string(),
-            archived_backfill_project.display().to_string(),
-        ];
+        let expected_projects = vec![source_project.display().to_string()];
         let missing_project_string = missing_project.display().to_string();
-        for (state_path, expected_project_order) in [
-            (
-                source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
-                vec![source_project.display().to_string()],
-            ),
-            (
-                target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
-                vec![target_project.display().to_string()],
-            ),
+        for state_path in [
+            source_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
+            target_paths.codex_home.join(CODEX_GLOBAL_STATE_FILE_NAME),
         ] {
             let state: Value = serde_json::from_str(
                 &fs::read_to_string(&state_path).expect("read workspace visibility state"),
@@ -7402,32 +7464,28 @@ exit 91
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            let project_order = state
-                .get(PROJECT_ORDER_KEY)
-                .and_then(Value::as_array)
-                .expect("project order array")
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            for project in &expected_projects {
-                assert!(
-                    saved_roots.contains(project),
-                    "expected saved roots in {} to contain {}",
-                    state_path.display(),
-                    project
-                );
-            }
+            assert_eq!(
+                saved_roots,
+                expected_projects,
+                "expected saved roots in {} to stay on shared active state",
+                state_path.display()
+            );
+            assert!(
+                !saved_roots.contains(&target_project.display().to_string()),
+                "did not expect target-only project {} in saved roots {}",
+                target_project.display(),
+                state_path.display()
+            );
+            assert!(
+                !saved_roots.contains(&archived_backfill_project.display().to_string()),
+                "did not expect thread cwd history to recreate archived project {} in saved roots {}",
+                archived_backfill_project.display(),
+                state_path.display()
+            );
             assert!(
                 !saved_roots.contains(&missing_project_string),
                 "did not expect missing project {} in saved roots {}",
                 missing_project.display(),
-                state_path.display()
-            );
-            assert_eq!(
-                project_order,
-                expected_project_order,
-                "expected project order in {} to preserve the target selection",
                 state_path.display()
             );
         }
@@ -7462,17 +7520,22 @@ exit 91
         .expect("parse target global state");
         assert_eq!(
             target_state
-                .get("electron-main-window-bounds")
-                .and_then(Value::as_object)
-                .and_then(|bounds| bounds.get("x"))
-                .and_then(Value::as_i64),
-            Some(1)
+                .get("selected-remote-host-id")
+                .and_then(Value::as_str),
+            Some("local")
         );
-        assert!(target_state
-            .get(ACTIVE_WORKSPACE_ROOTS_KEY)
-            .and_then(Value::as_array)
-            .expect("target active roots")
-            .is_empty());
+        assert!(target_state.get("electron-main-window-bounds").is_none());
+        assert_eq!(
+            target_state
+                .get(ACTIVE_WORKSPACE_ROOTS_KEY)
+                .and_then(Value::as_array)
+                .expect("target active roots")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![source_project.display().to_string()]
+        );
     }
 
     #[test]
@@ -7527,8 +7590,13 @@ exit 91
                 .is_none()
         );
         assert!(
-            normalize_workspace_visibility_path("/Users/omar/Documents/Codex/2026-04-22-hi")
-                .expect("normalize codex documents path")
+            normalize_workspace_visibility_path("/Users/omar/Documents/project")
+                .expect("normalize documents path")
+                .is_none()
+        );
+        assert!(
+            normalize_workspace_visibility_path("/Users/omar/Downloads/project")
+                .expect("normalize downloads path")
                 .is_none()
         );
     }
@@ -7541,7 +7609,7 @@ exit 91
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let previous_home = std::env::var_os("HOME");
-        let documents_root = temp.path().join("home").join("Documents").join("Codex");
+        let documents_root = temp.path().join("home").join("Documents");
         let external_project = temp.path().join("outside-project");
         fs::create_dir_all(&documents_root).expect("create documents root");
         fs::create_dir_all(&external_project).expect("create external project");
@@ -7570,12 +7638,16 @@ exit 91
         let temp = tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let previous_home = std::env::var_os("HOME");
-        let documents_project = home.join("Documents").join("Codex").join("project");
+        let documents_project = home.join("Documents").join("project");
+        let downloads_project = home.join("Downloads").join("project");
         fs::create_dir_all(documents_project.parent().expect("documents parent"))
             .expect("create documents root");
+        fs::create_dir_all(downloads_project.parent().expect("downloads parent"))
+            .expect("create downloads root");
 
         let mut known_projects = BTreeSet::new();
         known_projects.insert(documents_project.display().to_string());
+        known_projects.insert(downloads_project.display().to_string());
 
         unsafe {
             std::env::set_var("HOME", &home);
@@ -7583,6 +7655,10 @@ exit 91
 
         assert!(!should_sync_project_path(
             &documents_project.display().to_string(),
+            &known_projects,
+        ));
+        assert!(!should_sync_project_path(
+            &downloads_project.display().to_string(),
             &known_projects,
         ));
 
@@ -8092,6 +8168,163 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn rotate_next_rechecks_disabled_target_before_persona_ready_mutates_live_roots() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
+        let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "host");
+            std::env::set_var("CODEX_ROTATE_HOME", &paths.rotate_home);
+            std::env::set_var("CODEX_HOME", &paths.codex_home);
+            std::env::set_var("FAST_BROWSER_HOME", &paths.fast_browser_home);
+            std::env::set_var(
+                "CODEX_ROTATE_CODEX_APP_SUPPORT",
+                &paths.codex_app_support_dir,
+            );
+        }
+
+        struct NoActivationBackend;
+        impl RotationBackend for NoActivationBackend {
+            fn activate(
+                &self,
+                _prepared: &PreparedRotation,
+                _port: u16,
+                _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            ) -> Result<Vec<ThreadHandoff>> {
+                panic!("disabled target must be rejected before activation");
+            }
+
+            fn rollback_after_failed_activation(
+                &self,
+                _prepared: &PreparedRotation,
+                _port: u16,
+                _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            ) -> Result<()> {
+                panic!("disabled target must be rejected before rollback is needed");
+            }
+
+            fn rotate_next(
+                &self,
+                _port: u16,
+                _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            ) -> Result<NextResult> {
+                unreachable!()
+            }
+
+            fn rotate_prev(
+                &self,
+                _port: u16,
+                _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            ) -> Result<String> {
+                unreachable!()
+            }
+
+            fn relogin(
+                &self,
+                _port: u16,
+                _selector: &str,
+                _options: ReloginOptions,
+                _progress: Option<AutomationProgressCallback>,
+            ) -> Result<String> {
+                unreachable!()
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            let mut source = test_account("acct-source", "persona-source");
+            source.email = "acct-source@gmail.com".to_string();
+            source.label = "acct-source@gmail.com_free".to_string();
+            let mut target = test_account("acct-target", "persona-target");
+            target.email = "acct-target@astronlab.com".to_string();
+            target.label = "acct-target@astronlab.com_free".to_string();
+
+            provision_host_persona(&paths, &source, None).expect("provision source");
+            ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+            fs::create_dir_all(paths.codex_auth_file.parent().unwrap())
+                .expect("create auth parent");
+            codex_rotate_core::auth::write_codex_auth(&paths.codex_auth_file, &source.auth)
+                .expect("write source auth");
+            codex_rotate_core::pool::save_pool(&codex_rotate_core::pool::Pool {
+                active_index: 0,
+                accounts: vec![source.clone(), target.clone()],
+            })
+            .expect("save pool");
+
+            let target_paths =
+                host_persona_paths(&paths, target.persona.as_ref().unwrap()).expect("target paths");
+            assert!(
+                !target_paths.root.exists(),
+                "target persona should start unmaterialized"
+            );
+
+            let (usage_url, handle) = start_usage_server_that_disables_domain(
+                paths.rotate_home.join("accounts.json"),
+                "astronlab.com",
+                json!({
+                    "user_id": target.account_id.clone(),
+                    "account_id": target.account_id.clone(),
+                    "email": target.email.clone(),
+                    "plan_type": target.plan_type.clone(),
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 10.0,
+                            "limit_window_seconds": 3600,
+                            "reset_after_seconds": 3600,
+                            "reset_at": 2_000_000_000,
+                        },
+                        "secondary_window": null
+                    },
+                    "code_review_rate_limit": null,
+                    "additional_rate_limits": null,
+                    "credits": null,
+                    "promo": null
+                })
+                .to_string(),
+            )?;
+            unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", usage_url);
+            }
+
+            let error = rotate_next_impl_with_retry(&NoActivationBackend, 9333, None, false, 0)
+                .expect_err("disabled target should abort before activation");
+            handle.join().expect("usage server should finish");
+            assert!(error
+                .to_string()
+                .contains("is in a disabled domain and cannot be activated"));
+
+            let source_paths =
+                host_persona_paths(&paths, source.persona.as_ref().unwrap()).expect("source paths");
+            assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+            assert!(
+                !target_paths.root.exists(),
+                "target persona must not be provisioned after becoming disabled"
+            );
+            let auth_after = codex_rotate_core::auth::load_codex_auth(&paths.codex_auth_file)
+                .expect("load auth after rejected rotation");
+            assert_eq!(auth_after.tokens.account_id, source.account_id);
+            Ok(())
+        })();
+
+        restore_env("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+        restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
+        restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+        result.expect("disabled target should be rejected before live root mutation");
     }
 
     #[test]
@@ -9787,6 +10020,20 @@ insert into threads (id, rollout_path, updated_at, archived) values
         restore_env("CODEX_HOME", previous_codex_home);
         restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);
         restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
+    }
+
+    #[test]
+    fn checkpoint_recovery_prefers_fallback_index_when_account_ids_repeat() {
+        let source = test_account("acct-team", "persona-source");
+        let target = test_account("acct-team", "persona-target");
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source, target],
+        };
+
+        let resolved =
+            resolve_checkpoint_account_index(&pool, "acct-team", 1, "target").expect("resolve");
+        assert_eq!(resolved, 1);
     }
 
     #[test]
