@@ -5,7 +5,7 @@ use chrono::Utc;
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::pool::{
     load_pool, prepare_next_rotation_with_progress, restore_codex_auth_from_active_pool, save_pool,
-    NextResult, Pool,
+    AccountEntry, NextResult, Pool,
 };
 use codex_rotate_core::workflow::{cmd_relogin_with_progress, ReloginOptions};
 use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
@@ -134,6 +134,14 @@ impl LiveHostFailureArtifacts {
         self.copy_targets.push((
             paths.watch_state_file.clone(),
             PathBuf::from("state/watch-state.json"),
+        ));
+        self.copy_targets.push((
+            paths.rotate_home.join("accounts.json"),
+            PathBuf::from("state/accounts.json"),
+        ));
+        self.copy_targets.push((
+            paths.conversation_sync_db_file.clone(),
+            PathBuf::from("state/conversation_sync.sqlite"),
         ));
     }
 
@@ -417,6 +425,49 @@ fn load_staging_accounts_from_pool_file(
         staging_accounts.len()
     );
     Ok(staging_accounts)
+}
+
+fn select_same_account_persona_pair(
+    pool: &Pool,
+    preferred_source_email: &str,
+) -> Result<(AccountEntry, AccountEntry)> {
+    if let Some(source) = pool.accounts.iter().find(|entry| {
+        entry.email.eq_ignore_ascii_case(preferred_source_email) && entry.persona.is_some()
+    }) {
+        if let Some(target) = pool.accounts.iter().find(|entry| {
+            entry.account_id == source.account_id
+                && entry.persona.is_some()
+                && entry
+                    .persona
+                    .as_ref()
+                    .map(|persona| persona.persona_id.as_str())
+                    != source
+                        .persona
+                        .as_ref()
+                        .map(|persona| persona.persona_id.as_str())
+        }) {
+            return Ok((source.clone(), target.clone()));
+        }
+    }
+
+    for source in pool.accounts.iter().filter(|entry| entry.persona.is_some()) {
+        if let Some(target) = pool.accounts.iter().find(|entry| {
+            entry.account_id == source.account_id
+                && entry.persona.is_some()
+                && entry
+                    .persona
+                    .as_ref()
+                    .map(|persona| persona.persona_id.as_str())
+                    != source
+                        .persona
+                        .as_ref()
+                        .map(|persona| persona.persona_id.as_str())
+        }) {
+            return Ok((source.clone(), target.clone()));
+        }
+    }
+
+    bail!("expected at least two host personas with the same account_id in the cloned pool")
 }
 
 fn with_cloned_live_host_environment<T>(
@@ -3056,6 +3107,220 @@ fn live_host_codex_desktop_auto_close_on_exit() -> Result<()> {
 
 #[test]
 #[ignore]
+fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Result<()> {
+    with_cloned_live_host_environment(
+        "live_host_isolated_same_account_persona_thread_ids_are_target_local",
+        2,
+        |paths, staging_accounts| {
+            let artifacts = LiveHostFailureArtifacts::new(
+                "live_host_isolated_same_account_persona_thread_ids_are_target_local",
+                &paths,
+            )?;
+            let port = allocate_test_port()?;
+            let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+            let mut stop_server = None;
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            let outcome = (|| -> Result<()> {
+                let source_project_dir = paths
+                    .home_dir
+                    .join("same-account-persona-session-id-project");
+                std::fs::create_dir_all(&source_project_dir).with_context(|| {
+                    format!(
+                        "failed to create source project {}",
+                        source_project_dir.display()
+                    )
+                })?;
+                let source_cwd = source_project_dir.display().to_string();
+                let marker = format!(
+                    "same-account persona session id marker {}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before UNIX_EPOCH")?
+                        .as_millis()
+                );
+
+                let pool = load_pool().context("failed to load cloned pool")?;
+                let preferred_source_email = staging_accounts
+                    .first()
+                    .map(|account| account.email.as_str())
+                    .unwrap_or_default();
+                let (mut source_entry, mut target_entry) =
+                    select_same_account_persona_pair(&pool, preferred_source_email)?;
+                ensure!(
+                    source_entry.account_id == target_entry.account_id,
+                    "test setup expected source and target to share account_id"
+                );
+                ensure!(
+                    source_entry
+                        .persona
+                        .as_ref()
+                        .map(|persona| persona.persona_id.as_str())
+                        != target_entry
+                            .persona
+                            .as_ref()
+                            .map(|persona| persona.persona_id.as_str()),
+                    "test setup expected distinct host persona IDs"
+                );
+                source_entry.last_quota_usable = Some(true);
+                source_entry.last_quota_blocker = None;
+                target_entry.last_quota_usable = Some(true);
+                target_entry.last_quota_blocker = None;
+                save_pool(&Pool {
+                    active_index: 0,
+                    accounts: vec![source_entry.clone(), target_entry.clone()],
+                })
+                .context("failed to persist two-persona cloned pool")?;
+                restore_codex_auth_from_active_pool()
+                    .context("failed to restore source auth from cloned pool")?;
+                let source_auth = load_codex_auth(&paths.codex_auth_file)
+                    .context("failed to read restored source auth")?;
+                let source_summary = summarize_codex_auth(&source_auth);
+                ensure!(
+                    source_summary
+                        .email
+                        .eq_ignore_ascii_case(&source_entry.email),
+                    "expected restored source auth {}, got {}",
+                    source_entry.email,
+                    source_summary.email
+                );
+
+                let mut quota_bodies_by_token = HashMap::new();
+                for entry in [&source_entry, &target_entry] {
+                    quota_bodies_by_token.insert(
+                        entry.auth.tokens.access_token.clone(),
+                        quota_response_body(
+                            &entry.account_id,
+                            &entry.email,
+                            &entry.plan_type,
+                            20.0,
+                            600,
+                            1_775_182_200,
+                        ),
+                    );
+                }
+                let default_quota_body = quota_response_body(
+                    &target_entry.account_id,
+                    &target_entry.email,
+                    &target_entry.plan_type,
+                    20.0,
+                    600,
+                    1_775_182_200,
+                );
+                let (quota_url, _, server_stop) =
+                    spawn_quota_server_by_token(quota_bodies_by_token, default_quota_body);
+                stop_server = Some(server_stop);
+                unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &quota_url);
+                }
+
+                ensure_debug_codex_instance(None, Some(port), None, Some(30_000))
+                    .context("failed to launch isolated managed Codex for source persona")?;
+                ensure!(
+                    managed_codex_is_running(&paths.debug_profile_dir)?,
+                    "expected isolated managed Codex to be running before rotation"
+                );
+                let source_thread_id = start_thread_with_marker(port, &source_cwd, &marker)?;
+                ensure!(
+                    path_tree_contains_file_name_fragment(&paths.codex_home, &source_thread_id)?,
+                    "expected source rollout filename to contain source thread id {source_thread_id}"
+                );
+                let source_state_db = wait_for_resolved_state_thread_id(&source_thread_id)?;
+                eprintln!(
+                    "same-account isolated rotation: source thread {source_thread_id} visible in {}",
+                    source_state_db.display()
+                );
+
+                let progress = Some(Arc::new(|message: String| {
+                    eprintln!("same-account isolated rotation: {message}");
+                }) as Arc<dyn Fn(String) + Send + Sync>);
+                match run_shared_next(Some(port), progress)? {
+                    NextResult::Rotated { .. } => {}
+                    other => bail!("expected same-account persona rotation, got {other:?}"),
+                }
+                let rotated_pool = load_pool().context("failed to load pool after rotation")?;
+                let rotated_persona = rotated_pool
+                    .accounts
+                    .get(rotated_pool.active_index)
+                    .and_then(|entry| entry.persona.as_ref())
+                    .context("rotated pool active account is missing persona")?;
+                ensure!(
+                    Some(rotated_persona.persona_id.as_str())
+                        == target_entry
+                            .persona
+                            .as_ref()
+                            .map(|persona| persona.persona_id.as_str()),
+                    "expected rotation to target persona {}, got {}",
+                    target_entry
+                        .persona
+                        .as_ref()
+                        .map(|persona| persona.persona_id.as_str())
+                        .unwrap_or("<missing>"),
+                    rotated_persona.persona_id
+                );
+
+                ensure_debug_codex_instance(None, Some(port), None, Some(30_000))
+                    .context("failed to launch isolated managed Codex for target persona")?;
+
+                let source_identity = host_sync_identity(&source_entry);
+                let target_identity = host_sync_identity(&target_entry);
+                let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)
+                    .context("failed to open conversation sync store")?;
+                let lineage = store
+                    .get_lineage_id(&source_identity, &source_thread_id)?
+                    .context("missing source lineage binding after export")?;
+                let target_local_id = store
+                    .get_local_thread_id(&target_identity, &lineage)?
+                    .context("missing target local lineage binding after import")?;
+                ensure!(
+                    target_local_id != source_thread_id,
+                    "conversation_sync.sqlite target binding reused source id {source_thread_id}"
+                );
+                let target_thread = wait_for_thread_marker(port, &target_local_id, &marker)?;
+                ensure!(
+                    value_contains_text(&target_thread, &marker),
+                    "target-local thread {target_local_id} did not preserve marker {marker}"
+                );
+
+                let target_codex_home = persona_codex_home(&paths, &target_entry)?;
+                ensure!(
+                    !path_tree_contains_file_name_fragment(
+                        &target_codex_home,
+                        &source_thread_id
+                    )?,
+                    "target persona contains a raw copied rollout for source thread id {source_thread_id}"
+                );
+
+                Ok(())
+            })();
+
+            if let Some(stop_server) = stop_server {
+                stop_server.store(true, Ordering::Relaxed);
+            }
+            match previous_usage_url {
+                Some(value) => unsafe {
+                    std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+                },
+            }
+            if managed_codex_is_running(&paths.debug_profile_dir)? {
+                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            }
+
+            if outcome.is_ok() {
+                artifacts.complete()?;
+            }
+            outcome
+        },
+    )
+}
+
+#[test]
+#[ignore]
 fn live_host_full_lineage_sync_acceptance() -> Result<()> {
     require_host_live_capabilities()?;
 
@@ -3751,6 +4016,85 @@ fn wait_for_imported_thread(port: u16, marker: &str) -> Result<(String, Value)> 
             );
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn host_sync_identity(entry: &AccountEntry) -> String {
+    entry
+        .persona
+        .as_ref()
+        .map(|persona| format!("host-persona:{}", persona.persona_id))
+        .unwrap_or_else(|| entry.account_id.clone())
+}
+
+fn persona_codex_home(paths: &RuntimePaths, entry: &AccountEntry) -> Result<PathBuf> {
+    let host_root = entry
+        .persona
+        .as_ref()
+        .and_then(|persona| persona.host_root_rel_path.as_ref())
+        .context("account is missing host persona root")?;
+    Ok(paths.rotate_home.join(host_root).join("codex-home"))
+}
+
+fn path_tree_contains_file_name_fragment(root: &Path, fragment: &str) -> Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(fragment))
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn wait_for_resolved_state_thread_id(thread_id: &str) -> Result<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state_db_path = resolve_paths()?.codex_state_db_file;
+        if state_db_path.exists() {
+            let connection = Connection::open(&state_db_path)
+                .with_context(|| format!("failed to open state DB {}", state_db_path.display()))?;
+            let has_threads_table: i64 = connection.query_row(
+                "select count(*) from sqlite_master where type = 'table' and name = 'threads'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_threads_table > 0 {
+                let count: i64 = connection.query_row(
+                    "select count(*) from threads where id = ?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )?;
+                if count > 0 {
+                    return Ok(state_db_path);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for resolved source state DB {} to include thread {}",
+                state_db_path.display(),
+                thread_id
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

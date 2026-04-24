@@ -104,38 +104,21 @@ const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
     "vendor_imports",
 ];
 const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
-const HOST_PERSONA_CONVERSATION_SEED_ENTRIES: &[&str] = &[
-    "sessions",
-    concat!("archived_", "sessions"),
-    SESSION_INDEX_FILE_NAME,
-];
 #[cfg(test)]
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 #[cfg(test)]
 const SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
 #[cfg(test)]
 const PROJECT_ORDER_KEY: &str = "project-order";
-#[allow(dead_code)]
+#[cfg(test)]
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
-#[allow(dead_code)]
-const THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS: &[&str] = &["thread_id", "position"];
-#[allow(dead_code)]
-const THREAD_SPAWN_EDGES_CONFLICT_COLUMNS: &[&str] = &["child_thread_id"];
-#[allow(dead_code)]
-const STAGE1_OUTPUTS_CONFLICT_COLUMNS: &[&str] = &["thread_id"];
 const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
 const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct SessionIndexEntry {
-    updated_at: Option<String>,
-    raw: String,
-}
 #[cfg(test)]
 const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
 - API handoff sync creates different local thread IDs across personas while preserving continuity.
-- First materialization may seed persona-local storage from the previous persona before API handoff lineage exists.
+- First materialization uses API handoff/import rather than copying persona-local conversation files.
 - Additive sync means one local thread per lineage per persona with no duplicate logical conversations on repeated sync.
 - Host and VM execute the same sync semantics through the shared rotation engine; only transport wiring differs.
 "#;
@@ -208,11 +191,16 @@ fn debug_pool_drift_state(label: &str) {
 }
 
 trait RotationBackend {
+    fn capture_source_thread_candidates(&self, _port: u16) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     fn activate(
         &self,
         prepared: &PreparedRotation,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        source_thread_candidates: Vec<String>,
     ) -> Result<Vec<ThreadHandoff>>;
 
     fn rollback_after_failed_activation(
@@ -837,14 +825,25 @@ fn select_rotation_backend() -> Result<Box<dyn RotationBackend>> {
 }
 
 impl RotationBackend for HostBackend {
+    fn capture_source_thread_candidates(&self, port: u16) -> Result<Vec<String>> {
+        capture_host_source_thread_candidates(port)
+    }
+
     fn activate(
         &self,
         prepared: &PreparedRotation,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        source_thread_candidates: Vec<String>,
     ) -> Result<Vec<ThreadHandoff>> {
         let paths = resolve_paths()?;
-        let activation = activate_host_rotation(&paths, prepared, port, progress.as_ref())?;
+        let activation = activate_host_rotation(
+            &paths,
+            prepared,
+            port,
+            progress.as_ref(),
+            source_thread_candidates,
+        )?;
         Ok(activation.items)
     }
 
@@ -894,6 +893,7 @@ impl RotationBackend for VmBackend {
         prepared: &PreparedRotation,
         _port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        _source_thread_candidates: Vec<String>,
     ) -> Result<Vec<ThreadHandoff>> {
         self.validate_config()?;
         let handoffs = match self.export_guest_handoffs(&prepared.previous.account_id) {
@@ -1637,6 +1637,18 @@ pub(crate) fn recover_incomplete_rotation_state() -> Result<()> {
     recover_incomplete_rotation_state_without_lock()
 }
 
+fn capture_host_source_thread_candidates(port: u16) -> Result<Vec<String>> {
+    let paths = resolve_paths()?;
+    if !managed_codex_is_running(&paths.debug_profile_dir)? {
+        return Ok(Vec::new());
+    }
+    let mut thread_ids = read_active_thread_ids(Some(port)).unwrap_or_default();
+    thread_ids.extend(read_thread_handoff_candidate_ids_from_state_db(
+        &paths.codex_state_db_file,
+    )?);
+    Ok(thread_ids)
+}
+
 fn finalize_rotation_after_import(
     prepared: &PreparedRotation,
     import_outcome: &ThreadHandoffImportOutcome,
@@ -1702,7 +1714,7 @@ fn translate_recovery_events_after_rotation_with_identity(
             .cloned()
             .or_else(|| {
                 export_single_thread_handoff_with_identity(
-                    port,
+                    &transport,
                     &event.thread_id,
                     source_sync_identity,
                 )
@@ -1905,6 +1917,7 @@ fn rotate_next_impl_with_retry(
 ) -> Result<NextResult> {
     recover_incomplete_rotation_state_without_lock()?;
     debug_pool_drift_state("after_recover");
+    let source_thread_candidates = backend.capture_source_thread_candidates(port)?;
     let mut prepared = prepare_next_rotation_with_progress(progress.clone())?;
     if debug_pool_drift_enabled() {
         eprintln!(
@@ -2004,7 +2017,12 @@ fn rotate_next_impl_with_retry(
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend
-        .activate(&prepared, port, progress.clone())
+        .activate(
+            &prepared,
+            port,
+            progress.clone(),
+            source_thread_candidates.clone(),
+        )
         .with_context(|| {
             format!(
                 "Failed to activate persona {}.",
@@ -2132,6 +2150,7 @@ fn rotate_prev_impl(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
     recover_incomplete_rotation_state_without_lock()?;
+    let source_thread_candidates = backend.capture_source_thread_candidates(port)?;
     let mut prepared = prepare_prev_rotation()?;
     let paths = resolve_paths()?;
     if prepared.action == PreparedRotationAction::Switch {
@@ -2149,7 +2168,7 @@ fn rotate_prev_impl(
     ensure_target_account_still_valid(&prepared)?;
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
-    let handoffs = backend.activate(&prepared, port, progress.clone())?;
+    let handoffs = backend.activate(&prepared, port, progress.clone(), source_thread_candidates)?;
 
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
@@ -2207,6 +2226,7 @@ fn rotate_set_impl(
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
     recover_incomplete_rotation_state_without_lock()?;
+    let source_thread_candidates = backend.capture_source_thread_candidates(port)?;
     let mut prepared = prepare_set_rotation(selector)?;
     let paths = resolve_paths()?;
     if prepared.action == PreparedRotationAction::Switch {
@@ -2224,7 +2244,7 @@ fn rotate_set_impl(
     ensure_target_account_still_present(&prepared)?;
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
-    let handoffs = backend.activate(&prepared, port, progress.clone())?;
+    let handoffs = backend.activate(&prepared, port, progress.clone(), source_thread_candidates)?;
 
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
@@ -2354,8 +2374,16 @@ fn activate_host_rotation(
     prepared: &PreparedRotation,
     port: u16,
     progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+    source_thread_candidates: Vec<String>,
 ) -> Result<HostRotationActivation> {
     let managed_running_before = managed_codex_is_running(&paths.debug_profile_dir)?;
+    let mut pre_wait_thread_ids = source_thread_candidates;
+    if managed_running_before {
+        pre_wait_thread_ids.extend(read_active_thread_ids(Some(port))?);
+        pre_wait_thread_ids.extend(read_thread_handoff_candidate_ids_from_state_db(
+            &paths.codex_state_db_file,
+        )?);
+    }
     if managed_running_before {
         if let Some(progress) = progress {
             progress("Waiting for active Codex work to become handoff-safe.".to_string());
@@ -2364,10 +2392,11 @@ fn activate_host_rotation(
     }
     let exported_handoffs = if managed_running_before {
         let previous_sync_identity = conversation_sync_identity(&prepared.previous);
-        export_thread_handoffs_with_identity(
+        export_thread_handoffs_with_identity_and_candidates(
             port,
             &prepared.previous.account_id,
             &previous_sync_identity,
+            pre_wait_thread_ids,
         )?
     } else {
         Vec::new()
@@ -2377,14 +2406,8 @@ fn activate_host_rotation(
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
     }
 
-    let seed_missing_target_from_source = exported_handoffs.is_empty();
     let transition = (|| -> Result<()> {
-        switch_host_persona(
-            paths,
-            &prepared.previous,
-            &prepared.target,
-            seed_missing_target_from_source,
-        )?;
+        switch_host_persona(paths, &prepared.previous, &prepared.target, false)?;
         write_selected_account_auth(&prepared.target)?;
 
         Ok(())
@@ -2544,7 +2567,7 @@ fn ensure_host_personas_ready(
 fn provision_host_persona(
     paths: &RuntimePaths,
     entry: &AccountEntry,
-    seed_from: Option<&AccountEntry>,
+    _seed_from: Option<&AccountEntry>,
 ) -> Result<()> {
     let persona = entry
         .persona
@@ -2555,25 +2578,6 @@ fn provision_host_persona(
         .with_context(|| format!("Failed to create {}.", target.root.display()))?;
     if !target.codex_home.exists() {
         fs::create_dir_all(&target.codex_home)?;
-    }
-    if let Some(source_entry) = seed_from {
-        let source = host_persona_paths(
-            paths,
-            source_entry
-                .persona
-                .as_ref()
-                .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
-        )?;
-        ensure_host_persona_shared_codex_home_links(paths, &source)?;
-        if host_persona_needs_conversation_seed(paths, entry)? {
-            seed_host_persona_conversation_state_from_source(
-                paths,
-                source_entry,
-                &source,
-                entry,
-                &target,
-            )?;
-        }
     }
     ensure_host_persona_shared_codex_home_links(paths, &target)?;
 
@@ -2612,15 +2616,6 @@ fn provision_host_persona(
     Ok(())
 }
 
-fn host_persona_needs_conversation_seed(
-    paths: &RuntimePaths,
-    entry: &AccountEntry,
-) -> Result<bool> {
-    let sync_identity = conversation_sync_identity(entry);
-    let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
-    Ok(!store.has_account_bindings(&sync_identity)?)
-}
-
 fn ensure_live_root_bindings(paths: &RuntimePaths, entry: &AccountEntry) -> Result<()> {
     let persona = host_persona_paths(
         paths,
@@ -2643,9 +2638,9 @@ fn switch_host_persona(
     paths: &RuntimePaths,
     source_entry: &AccountEntry,
     target_entry: &AccountEntry,
-    allow_seed: bool,
+    _allow_seed: bool,
 ) -> Result<()> {
-    provision_host_persona(paths, target_entry, allow_seed.then_some(source_entry))?;
+    provision_host_persona(paths, target_entry, None)?;
     let source = host_persona_paths(
         paths,
         source_entry
@@ -2704,167 +2699,41 @@ fn ensure_host_persona_shared_codex_home_links(
     Ok(())
 }
 
-fn seed_host_persona_conversation_state_from_source(
-    paths: &RuntimePaths,
-    source_entry: &AccountEntry,
-    source: &HostPersonaPaths,
-    target_entry: &AccountEntry,
-    target: &HostPersonaPaths,
-) -> Result<()> {
-    if source.codex_home == target.codex_home {
-        return Ok(());
+fn read_thread_handoff_candidate_ids_from_state_db(state_db_path: &Path) -> Result<Vec<String>> {
+    if !state_db_path.exists() {
+        return Ok(Vec::new());
     }
-
-    for &entry in HOST_PERSONA_CONVERSATION_SEED_ENTRIES {
-        let source_path = source.codex_home.join(entry);
-        let target_path = target.codex_home.join(entry);
-        if entry == SESSION_INDEX_FILE_NAME {
-            merge_session_index_one_way(&source_path, &target_path)?;
-        } else {
-            copy_missing_path_one_way(&source_path, &target_path)?;
-        }
-    }
-    if resolve_state_db_file_in_codex_home(&target.codex_home)
-        .filter(|path| path.exists())
-        .is_some()
-    {
-        merge_state_threads_one_way(&source.codex_home, &target.codex_home)?;
-    } else {
-        seed_host_persona_state_db_from_source(&source.codex_home, &target.codex_home)?;
-    }
-    seed_host_persona_conversation_bindings(
-        paths,
-        source_entry,
-        &source.codex_home,
-        target_entry,
-        &target.codex_home,
-    )?;
-    Ok(())
-}
-
-fn seed_host_persona_state_db_from_source(
-    source_codex_home: &Path,
-    target_codex_home: &Path,
-) -> Result<()> {
-    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
-        return Ok(());
-    };
-    if !source_state_db.exists() {
-        return Ok(());
-    }
-    let file_name = source_state_db
-        .file_name()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| std::ffi::OsString::from("state.sqlite"));
-    let target_state_db = target_codex_home.join(file_name);
-    copy_path_if_exists(&source_state_db, &target_state_db)?;
-    for suffix in ["-wal", "-shm"] {
-        copy_path_if_exists(
-            &sqlite_sidecar_path(&source_state_db, suffix),
-            &sqlite_sidecar_path(&target_state_db, suffix),
-        )?;
-    }
-    Ok(())
-}
-
-fn seed_host_persona_conversation_bindings(
-    paths: &RuntimePaths,
-    source_entry: &AccountEntry,
-    source_codex_home: &Path,
-    target_entry: &AccountEntry,
-    _target_codex_home: &Path,
-) -> Result<()> {
-    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
-        return Ok(());
-    };
-    if !source_state_db.exists() {
-        return Ok(());
-    }
-
-    let thread_ids = read_all_thread_ids_from_state_db(&source_state_db)?;
-    if thread_ids.is_empty() {
-        return Ok(());
-    }
-
-    let source_sync_identity = conversation_sync_identity(source_entry);
-    let target_sync_identity = conversation_sync_identity(target_entry);
-    let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
-    for thread_id in thread_ids {
-        let lineage_id = store
-            .get_lineage_id(&source_sync_identity, &thread_id)?
-            .unwrap_or_else(|| thread_id.clone());
-        store.bind_local_thread_id(&source_sync_identity, &lineage_id, &thread_id)?;
-        store.bind_local_thread_id(&target_sync_identity, &lineage_id, &thread_id)?;
-    }
-    Ok(())
-}
-
-fn read_all_thread_ids_from_state_db(state_db_path: &Path) -> Result<Vec<String>> {
     let connection = rusqlite::Connection::open(state_db_path)
         .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
     if !sqlite_table_exists(&connection, "threads")? {
         return Ok(Vec::new());
     }
-    let mut statement = connection.prepare(
-        r#"
-select id
-from threads
-where id is not null
-  and trim(id) != ''
-order by id
-        "#,
-    )?;
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(Vec::new());
+    }
+    let mut order_terms = Vec::new();
+    if columns.iter().any(|column| column == "archived") {
+        order_terms.push("coalesce(archived, 0) asc".to_string());
+    }
+    if columns.iter().any(|column| column == "updated_at_ms") {
+        order_terms.push("coalesce(updated_at_ms, 0) desc".to_string());
+    }
+    if columns.iter().any(|column| column == "updated_at") {
+        order_terms.push("coalesce(updated_at, 0) desc".to_string());
+    }
+    order_terms.push("id asc".to_string());
+    let sql = format!(
+        "select id from threads where id is not null and trim(id) != '' order by {}",
+        order_terms.join(", ")
+    );
+    let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut thread_ids = Vec::new();
     for row in rows {
         thread_ids.push(row?);
     }
     Ok(thread_ids)
-}
-
-fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
-    let file_name = db_path
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "state.sqlite".to_string());
-    db_path.with_file_name(format!("{file_name}{suffix}"))
-}
-
-fn copy_path_if_exists(source: &Path, target: &Path) -> Result<bool> {
-    if !path_exists_or_symlink(source) || path_exists_or_symlink(target) {
-        return Ok(false);
-    }
-    copy_path(source, target)?;
-    Ok(true)
-}
-
-fn copy_missing_path_one_way(source: &Path, target: &Path) -> Result<()> {
-    let Some(metadata) = symlink_metadata_optional(source)? else {
-        return Ok(());
-    };
-    if metadata.is_dir() {
-        if let Some(target_metadata) = symlink_metadata_optional(target)? {
-            if !target_metadata.is_dir() {
-                return Err(anyhow!(
-                    "Failed to merge {} into {} because the target is not a directory.",
-                    source.display(),
-                    target.display()
-                ));
-            }
-        } else {
-            fs::create_dir_all(target)
-                .with_context(|| format!("Failed to create {}.", target.display()))?;
-        }
-        for entry in
-            fs::read_dir(source).with_context(|| format!("Failed to read {}.", source.display()))?
-        {
-            let entry = entry?;
-            copy_missing_path_one_way(&entry.path(), &target.join(entry.file_name()))?;
-        }
-        return Ok(());
-    }
-    let _ = copy_path_if_exists(source, target)?;
-    Ok(())
 }
 
 fn host_shared_codex_home_root(paths: &RuntimePaths) -> PathBuf {
@@ -3326,189 +3195,6 @@ fn encode_toml_basic_string(value: &str) -> String {
     escaped
 }
 
-#[allow(dead_code)]
-fn merge_session_index_one_way(source_index: &Path, target_index: &Path) -> Result<()> {
-    if !source_index.exists() {
-        return Ok(());
-    }
-    let source_entries = read_session_index_entries(source_index)?;
-    if source_entries.is_empty() {
-        return Ok(());
-    }
-    let mut merged = read_session_index_entries(target_index)?;
-    for (id, source_entry) in source_entries {
-        let should_replace = match merged.get(&id) {
-            Some(existing_entry) => session_index_entry_is_newer(&source_entry, existing_entry),
-            None => true,
-        };
-        if should_replace {
-            merged.insert(id, source_entry);
-        }
-    }
-    write_session_index_entries(target_index, &merged)?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn read_session_index_entries(path: &Path) -> Result<BTreeMap<String, SessionIndexEntry>> {
-    let mut entries = BTreeMap::new();
-    if !path.exists() {
-        return Ok(entries);
-    }
-    let file =
-        fs::File::open(path).with_context(|| format!("Failed to read {}.", path.display()))?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("Failed to read {}.", path.display()))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let Some(id) = parsed
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let entry = SessionIndexEntry {
-            updated_at: parsed
-                .get("updated_at")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            raw: trimmed.to_string(),
-        };
-        match entries.get(id) {
-            Some(existing) if !session_index_entry_is_newer(&entry, existing) => {}
-            _ => {
-                entries.insert(id.to_string(), entry);
-            }
-        }
-    }
-    Ok(entries)
-}
-
-#[allow(dead_code)]
-fn session_index_entry_is_newer(
-    candidate: &SessionIndexEntry,
-    current: &SessionIndexEntry,
-) -> bool {
-    match (
-        candidate.updated_at.as_deref(),
-        current.updated_at.as_deref(),
-    ) {
-        (Some(candidate_updated_at), Some(current_updated_at)) => {
-            candidate_updated_at > current_updated_at
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => candidate.raw.len() > current.raw.len(),
-    }
-}
-
-#[allow(dead_code)]
-fn write_session_index_entries(
-    path: &Path,
-    entries: &BTreeMap<String, SessionIndexEntry>,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}.", parent.display()))?;
-    }
-    let mut ordered = entries
-        .iter()
-        .map(|(id, entry)| (id.clone(), entry.clone()))
-        .collect::<Vec<_>>();
-    ordered.sort_by(|(id_a, entry_a), (id_b, entry_b)| {
-        match (entry_a.updated_at.as_deref(), entry_b.updated_at.as_deref()) {
-            (Some(updated_a), Some(updated_b)) => {
-                updated_b.cmp(updated_a).then_with(|| id_a.cmp(id_b))
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => id_a.cmp(id_b),
-        }
-    });
-
-    let file_name = path
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| SESSION_INDEX_FILE_NAME.to_string());
-    let temp_path = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
-    let mut file = fs::File::create(&temp_path)
-        .with_context(|| format!("Failed to create {}.", temp_path.display()))?;
-    for (_, entry) in ordered {
-        writeln!(file, "{}", entry.raw)
-            .with_context(|| format!("Failed to write {}.", temp_path.display()))?;
-    }
-    file.flush()
-        .with_context(|| format!("Failed to flush {}.", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "Failed to replace {} with merged session index {}.",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn merge_state_threads_one_way(source_codex_home: &Path, target_codex_home: &Path) -> Result<()> {
-    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
-        return Ok(());
-    };
-    if !source_state_db.exists() {
-        return Ok(());
-    }
-    let target_state_db =
-        resolve_state_db_file_in_codex_home(target_codex_home).unwrap_or_else(|| {
-            let file_name = source_state_db
-                .file_name()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| std::ffi::OsString::from("state_5.sqlite"));
-            target_codex_home.join(file_name)
-        });
-    if !target_state_db.exists() {
-        if let Some(parent) = target_state_db.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}.", parent.display()))?;
-        }
-        fs::copy(&source_state_db, &target_state_db).with_context(|| {
-            format!(
-                "Failed to seed {} from {}.",
-                target_state_db.display(),
-                source_state_db.display()
-            )
-        })?;
-        return Ok(());
-    }
-    merge_threads_table_with_upsert(&source_state_db, &target_state_db)?;
-    merge_table_with_upsert(
-        &source_state_db,
-        &target_state_db,
-        "thread_dynamic_tools",
-        THREAD_DYNAMIC_TOOLS_CONFLICT_COLUMNS,
-    )?;
-    merge_table_with_upsert(
-        &source_state_db,
-        &target_state_db,
-        "thread_spawn_edges",
-        THREAD_SPAWN_EDGES_CONFLICT_COLUMNS,
-    )?;
-    merge_table_with_upsert(
-        &source_state_db,
-        &target_state_db,
-        "stage1_outputs",
-        STAGE1_OUTPUTS_CONFLICT_COLUMNS,
-    )?;
-    Ok(())
-}
-
 fn resolve_state_db_file_in_codex_home(codex_home: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(codex_home).ok()?;
     let mut best_versioned = None::<(u32, PathBuf)>;
@@ -3544,213 +3230,6 @@ fn parse_versioned_state_db_name(name: &str) -> Option<u32> {
     }
     let version = &name["state_".len()..name.len() - ".sqlite".len()];
     version.parse::<u32>().ok()
-}
-
-#[allow(dead_code)]
-fn merge_threads_table_with_upsert(source_state_db: &Path, target_state_db: &Path) -> Result<()> {
-    let connection = rusqlite::Connection::open(target_state_db)
-        .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
-    if !sqlite_table_exists(&connection, "threads")? {
-        return Ok(());
-    }
-
-    let source_path_escaped = source_state_db.to_string_lossy().replace('\'', "''");
-    connection
-        .execute_batch(&format!(
-            "ATTACH DATABASE '{source_path_escaped}' AS source_db;"
-        ))
-        .with_context(|| format!("Failed to attach {}.", source_state_db.display()))?;
-    let merge_result = (|| -> Result<()> {
-        if !sqlite_table_exists_in_schema(&connection, "source_db", "threads")? {
-            return Ok(());
-        }
-        let target_columns = sqlite_table_columns(&connection, "main", "threads")?;
-        let source_columns = sqlite_table_columns(&connection, "source_db", "threads")?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let shared_columns = target_columns
-            .into_iter()
-            .filter(|column| source_columns.contains(column))
-            .collect::<Vec<_>>();
-        let id_column = String::from("id");
-        if !shared_columns.contains(&id_column) {
-            return Ok(());
-        }
-        let insert_columns = shared_columns
-            .iter()
-            .map(|column| quote_sql_identifier(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let update_columns = shared_columns
-            .iter()
-            .filter(|column| column.as_str() != "id")
-            .cloned()
-            .collect::<Vec<_>>();
-        if update_columns.is_empty() {
-            return Ok(());
-        }
-        let update_assignments = update_columns
-            .iter()
-            .map(|column| {
-                let escaped = quote_sql_identifier(column);
-                format!("{escaped}=excluded.{escaped}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let has_updated_at_ms = shared_columns
-            .iter()
-            .any(|column| column.as_str() == "updated_at_ms");
-        let has_updated_at = shared_columns
-            .iter()
-            .any(|column| column.as_str() == "updated_at");
-        let threads_table = quote_sql_identifier("threads");
-        let updated_at_ms_column = quote_sql_identifier("updated_at_ms");
-        let updated_at_column = quote_sql_identifier("updated_at");
-        let where_clause = if has_updated_at_ms && has_updated_at {
-            format!(
-                " WHERE coalesce(excluded.{updated_at_ms_column}, excluded.{updated_at_column} * 1000, 0) >= \
-                 coalesce({threads_table}.{updated_at_ms_column}, {threads_table}.{updated_at_column} * 1000, 0)"
-            )
-        } else if has_updated_at_ms {
-            format!(
-                " WHERE coalesce(excluded.{updated_at_ms_column}, 0) >= \
-                 coalesce({threads_table}.{updated_at_ms_column}, 0)"
-            )
-        } else if has_updated_at {
-            format!(
-                " WHERE coalesce(excluded.{updated_at_column}, 0) >= \
-                 coalesce({threads_table}.{updated_at_column}, 0)"
-            )
-        } else {
-            String::new()
-        };
-        let source_threads_table = format!(
-            "{}.{}",
-            quote_sql_identifier("source_db"),
-            quote_sql_identifier("threads")
-        );
-        let sql = format!(
-            "INSERT INTO {threads_table} ({insert_columns}) \
-             SELECT {insert_columns} FROM {source_threads_table} WHERE 1 \
-             ON CONFLICT({id_column}) DO UPDATE SET {update_assignments}{where_clause};",
-            id_column = quote_sql_identifier("id")
-        );
-        connection
-            .execute_batch(&sql)
-            .context("Failed to merge threads table between personas.")?;
-        Ok(())
-    })();
-    let detach_result = connection.execute_batch("DETACH DATABASE source_db;");
-    if let Err(error) = merge_result {
-        let _ = detach_result;
-        return Err(error);
-    }
-    detach_result.context("Failed to detach source DB after thread merge.")?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn merge_table_with_upsert(
-    source_state_db: &Path,
-    target_state_db: &Path,
-    table_name: &str,
-    conflict_columns: &[&str],
-) -> Result<()> {
-    if conflict_columns.is_empty() {
-        return Ok(());
-    }
-    let connection = rusqlite::Connection::open(target_state_db)
-        .with_context(|| format!("Failed to open {}.", target_state_db.display()))?;
-    if !sqlite_table_exists(&connection, table_name)? {
-        return Ok(());
-    }
-
-    let source_path_escaped = source_state_db.to_string_lossy().replace('\'', "''");
-    connection
-        .execute_batch(&format!(
-            "ATTACH DATABASE '{source_path_escaped}' AS source_db;"
-        ))
-        .with_context(|| format!("Failed to attach {}.", source_state_db.display()))?;
-    let merge_result = (|| -> Result<()> {
-        if !sqlite_table_exists_in_schema(&connection, "source_db", table_name)? {
-            return Ok(());
-        }
-        let target_columns = sqlite_table_columns(&connection, "main", table_name)?;
-        let source_columns = sqlite_table_columns(&connection, "source_db", table_name)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let shared_columns = target_columns
-            .into_iter()
-            .filter(|column| source_columns.contains(column))
-            .collect::<Vec<_>>();
-        if shared_columns.is_empty() {
-            return Ok(());
-        }
-        let shared_column_set = shared_columns
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        if !conflict_columns
-            .iter()
-            .all(|column| shared_column_set.contains(column))
-        {
-            return Ok(());
-        }
-
-        let insert_columns = shared_columns
-            .iter()
-            .map(|column| quote_sql_identifier(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let update_columns = shared_columns
-            .iter()
-            .filter(|column| !conflict_columns.contains(&column.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let conflict_clause = conflict_columns
-            .iter()
-            .map(|column| quote_sql_identifier(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let target_table = quote_sql_identifier(table_name);
-        let source_table = format!(
-            "{}.{}",
-            quote_sql_identifier("source_db"),
-            quote_sql_identifier(table_name)
-        );
-        let sql = if update_columns.is_empty() {
-            format!(
-                "INSERT INTO {target_table} ({insert_columns}) \
-                 SELECT {insert_columns} FROM {source_table} WHERE 1 \
-                 ON CONFLICT({conflict_clause}) DO NOTHING;"
-            )
-        } else {
-            let update_assignments = update_columns
-                .iter()
-                .map(|column| {
-                    let escaped = quote_sql_identifier(column);
-                    format!("{escaped}=excluded.{escaped}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "INSERT INTO {target_table} ({insert_columns}) \
-                 SELECT {insert_columns} FROM {source_table} WHERE 1 \
-                 ON CONFLICT({conflict_clause}) DO UPDATE SET {update_assignments};"
-            )
-        };
-        connection
-            .execute_batch(&sql)
-            .with_context(|| format!("Failed to merge {table_name} table between personas."))?;
-        Ok(())
-    })();
-    let detach_result = connection.execute_batch("DETACH DATABASE source_db;");
-    if let Err(error) = merge_result {
-        let _ = detach_result;
-        return Err(error);
-    }
-    detach_result.context("Failed to detach source DB after table merge.")?;
-    Ok(())
 }
 
 fn sqlite_table_exists(connection: &rusqlite::Connection, table_name: &str) -> Result<bool> {
@@ -3803,7 +3282,27 @@ fn export_thread_handoffs_with_identity(
     watch_account_id: &str,
     sync_identity: &str,
 ) -> Result<Vec<ThreadHandoff>> {
-    let mut thread_ids = read_active_thread_ids(Some(port))?;
+    export_thread_handoffs_with_identity_and_candidates(
+        port,
+        watch_account_id,
+        sync_identity,
+        vec![],
+    )
+}
+
+fn export_thread_handoffs_with_identity_and_candidates(
+    port: u16,
+    watch_account_id: &str,
+    sync_identity: &str,
+    initial_thread_ids: Vec<String>,
+) -> Result<Vec<ThreadHandoff>> {
+    let paths = crate::paths::resolve_paths()?;
+    let active_thread_ids = read_active_thread_ids(Some(port))?;
+    let mut thread_ids = initial_thread_ids.clone();
+    thread_ids.extend(active_thread_ids.clone());
+    let state_thread_ids =
+        read_thread_handoff_candidate_ids_from_state_db(&paths.codex_state_db_file)?;
+    thread_ids.extend(state_thread_ids);
     let mut pending_recovery_thread_ids = BTreeSet::new();
     if let Ok(watch_state) = read_watch_state() {
         if let Some(account_state) = watch_state.accounts.get(watch_account_id) {
@@ -3813,34 +3312,75 @@ fn export_thread_handoffs_with_identity(
             }
         }
     }
+    let active_thread_ids = active_thread_ids
+        .into_iter()
+        .chain(initial_thread_ids)
+        .collect::<BTreeSet<_>>();
+    let transport = HostConversationTransport::new(port);
+    export_thread_handoffs_from_candidates(
+        &transport,
+        sync_identity,
+        thread_ids,
+        &active_thread_ids,
+        &pending_recovery_thread_ids,
+    )
+}
+
+fn export_thread_handoffs_from_candidates(
+    transport: &dyn ConversationTransport,
+    sync_identity: &str,
+    thread_ids: Vec<String>,
+    continue_thread_ids: &BTreeSet<String>,
+    pending_recovery_thread_ids: &BTreeSet<String>,
+) -> Result<Vec<ThreadHandoff>> {
     let mut unique = BTreeSet::new();
     let mut handoffs = Vec::new();
     for thread_id in thread_ids {
         if !unique.insert(thread_id.clone()) {
             continue;
         }
-        if let Some(mut handoff) =
-            export_single_thread_handoff_with_identity(port, &thread_id, sync_identity)?
-        {
-            if pending_recovery_thread_ids.contains(&thread_id) {
-                handoff.continue_prompt = None;
+        match export_single_thread_handoff_with_identity(transport, &thread_id, sync_identity) {
+            Ok(Some(mut handoff)) => {
+                if pending_recovery_thread_ids.contains(&thread_id)
+                    || !continue_thread_ids.contains(&thread_id)
+                {
+                    handoff.continue_prompt = None;
+                }
+                handoffs.push(handoff);
             }
-            handoffs.push(handoff);
+            Ok(None) => {}
+            Err(error) if is_terminal_thread_read_error(&error) => {
+                continue;
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(handoffs)
 }
 
+fn is_terminal_thread_read_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_lowercase();
+    message.contains("no rollout found for thread id")
+        || message.contains("thread not found")
+        || message.contains("no thread found")
+        || message.contains("unknown thread")
+        || message.contains("does not exist")
+}
+
 fn export_single_thread_handoff_with_identity(
-    port: u16,
+    transport: &dyn ConversationTransport,
     thread_id: &str,
     sync_identity: &str,
 ) -> Result<Option<ThreadHandoff>> {
-    let response: Value = send_codex_app_request(
-        port,
-        "thread/read",
-        json!({ "threadId": thread_id, "includeTurns": true }),
-    )?;
+    let response = transport.read_thread(thread_id)?;
+    export_single_thread_handoff_from_response(response, thread_id, sync_identity)
+}
+
+fn export_single_thread_handoff_from_response(
+    response: Value,
+    thread_id: &str,
+    sync_identity: &str,
+) -> Result<Option<ThreadHandoff>> {
     let Some(thread) = response.get("thread") else {
         return Ok(None);
     };
@@ -3876,10 +3416,14 @@ fn export_single_thread_handoff_with_identity(
     }
 
     let paths = crate::paths::resolve_paths()?;
-    let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
-    let lineage_id = store
-        .get_lineage_id(sync_identity, thread_id)?
-        .unwrap_or_else(|| thread_id.to_string());
+    let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+    let lineage_id = match store.get_lineage_id(sync_identity, thread_id)? {
+        Some(lineage_id) => lineage_id,
+        None => {
+            store.bind_local_thread_id(sync_identity, thread_id, thread_id)?;
+            thread_id.to_string()
+        }
+    };
     let watermark = thread
         .get("turns")
         .and_then(Value::as_array)
@@ -3926,7 +3470,19 @@ fn import_thread_handoffs(
         let mut lineage_claim_token = None;
         let existing_local_id =
             match store.claim_lineage_binding(target_account_id, &handoff.lineage_id)? {
-                LineageBindingClaim::Existing(local_id) => Some(local_id),
+                LineageBindingClaim::Existing(local_id) => {
+                    if local_id == handoff.source_thread_id {
+                        outcome.failures.push(ThreadHandoffImportFailure {
+                            source_thread_id: handoff.source_thread_id.clone(),
+                            created_thread_id: None,
+                            stage: ThreadHandoffImportFailureStage::Start,
+                            error: "Existing target lineage binding reuses the source thread ID."
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    Some(local_id)
+                }
                 LineageBindingClaim::Claimed { claim_token } => {
                     lineage_claim_token = Some(claim_token);
                     None
@@ -5474,6 +5030,187 @@ mod tests {
     }
 
     #[test]
+    fn state_backed_export_includes_historical_threads_without_auto_continue() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let state_db = temp.path().join("state_5.sqlite");
+        seed_threads_table(
+            &state_db,
+            &[
+                ("thread-old", "/tmp/old.jsonl", 10),
+                ("thread-new", "/tmp/new.jsonl", 30),
+                ("thread-archived", "/tmp/archived.jsonl", 20),
+            ],
+        );
+        update_thread_metadata(&state_db, "thread-archived", "/tmp/archived", true);
+
+        assert_eq!(
+            read_thread_handoff_candidate_ids_from_state_db(&state_db).expect("read candidates"),
+            vec![
+                "thread-new".to_string(),
+                "thread-old".to_string(),
+                "thread-archived".to_string(),
+            ]
+        );
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        struct ExportMockTransport {
+            responses: BTreeMap<String, Value>,
+        }
+        impl ConversationTransport for ExportMockTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                self.responses
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("thread not found"))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("export should not start threads")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("export should not inject items")
+            }
+            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
+                unreachable!("export should not start turns")
+            }
+        }
+        fn thread_response(id: &str) -> Value {
+            json!({
+                "thread": {
+                    "id": id,
+                    "cwd": "/tmp/project",
+                    "preview": format!("preview {id}"),
+                    "turns": [
+                        {
+                            "id": format!("turn-{id}"),
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "content": [
+                                        { "type": "text", "text": format!("hello {id}") }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+        }
+        let transport = ExportMockTransport {
+            responses: BTreeMap::from([
+                ("thread-new".to_string(), thread_response("thread-new")),
+                ("thread-old".to_string(), thread_response("thread-old")),
+                (
+                    "thread-archived".to_string(),
+                    thread_response("thread-archived"),
+                ),
+            ]),
+        };
+        let continue_thread_ids = BTreeSet::from(["thread-new".to_string()]);
+        let pending_thread_ids = BTreeSet::new();
+        let handoffs = export_thread_handoffs_from_candidates(
+            &transport,
+            "source-sync",
+            vec![
+                "thread-new".to_string(),
+                "thread-old".to_string(),
+                "thread-archived".to_string(),
+                "thread-missing".to_string(),
+            ],
+            &continue_thread_ids,
+            &pending_thread_ids,
+        )
+        .expect("export handoffs");
+
+        assert_eq!(
+            handoffs
+                .iter()
+                .map(|handoff| handoff.source_thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-new", "thread-old", "thread-archived"]
+        );
+        assert!(handoffs[0].continue_prompt.is_some());
+        assert!(handoffs[1].continue_prompt.is_none());
+        assert!(handoffs[2].continue_prompt.is_none());
+
+        let store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        for thread_id in ["thread-new", "thread-old", "thread-archived"] {
+            assert_eq!(
+                store
+                    .get_lineage_id("source-sync", thread_id)
+                    .expect("source lineage"),
+                Some(thread_id.to_string())
+            );
+        }
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_rejects_poisoned_same_id_target_binding() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id("target-sync", "lineage-1", "source-thread")
+            .expect("seed poisoned binding");
+
+        struct NoStartTransport;
+        impl ConversationTransport for NoStartTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                panic!("poisoned existing binding must fail before thread/start");
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                Ok(())
+            }
+            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some("turn-1".to_string()),
+            cwd: None,
+            items: vec![],
+            continue_prompt: None,
+        };
+        let outcome = import_thread_handoffs(&NoStartTransport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(!outcome.is_complete());
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.failures[0]
+            .error
+            .contains("reuses the source thread ID"));
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
     fn test_sync_store_migration_resilience() {
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("test.sqlite");
@@ -6182,9 +5919,7 @@ exit 91
         assert!(
             LINEAGE_SYNC_CONTRACT.contains("API handoff sync creates different local thread IDs")
         );
-        assert!(LINEAGE_SYNC_CONTRACT.contains(
-            "First materialization may seed persona-local storage from the previous persona"
-        ));
+        assert!(LINEAGE_SYNC_CONTRACT.contains("First materialization uses API handoff/import"));
         assert!(LINEAGE_SYNC_CONTRACT.contains(
             "one local thread per lineage per persona with no duplicate logical conversations on repeated sync"
         ));
@@ -6843,7 +6578,7 @@ exit 91
     }
 
     #[test]
-    fn switch_host_persona_seeds_missing_target_conversation_state_once() {
+    fn switch_host_persona_does_not_seed_missing_target_conversation_state() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
@@ -6890,21 +6625,19 @@ exit 91
 
         switch_host_persona(&paths, &source, &target, true).expect("switch persona");
 
-        assert_eq!(
-            read_thread_ids(&target_paths.codex_home.join("state_5.sqlite")),
-            vec!["thread-archived".to_string(), "thread-source".to_string()]
-        );
-        assert!(target_paths
+        assert!(!target_paths.codex_home.join("state_5.sqlite").exists());
+        assert!(!target_paths
             .codex_home
             .join("sessions/2026/01/01/rollout-source.jsonl")
             .exists());
-        assert!(target_paths
+        assert!(!target_paths
             .codex_home
             .join("archived_sessions/rollout-archived.jsonl")
             .exists());
-        let target_index =
-            fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME)).unwrap();
-        assert!(target_index.contains("\"thread-source\""));
+        assert!(!target_paths
+            .codex_home
+            .join(SESSION_INDEX_FILE_NAME)
+            .exists());
 
         let store =
             ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
@@ -6912,18 +6645,18 @@ exit 91
             store
                 .get_lineage_id(&conversation_sync_identity(&source), "thread-source")
                 .expect("source binding"),
-            Some("thread-source".to_string())
+            None
         );
         assert_eq!(
             store
                 .get_local_thread_id(&conversation_sync_identity(&target), "thread-source")
                 .expect("target binding"),
-            Some("thread-source".to_string())
+            None
         );
     }
 
     #[test]
-    fn switch_host_persona_repairs_existing_unbound_target_conversation_state() {
+    fn switch_host_persona_preserves_existing_target_conversation_state_without_raw_merge() {
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
         let source = test_account("acct-source", "persona-source");
@@ -6992,17 +6725,13 @@ exit 91
 
         assert_eq!(
             read_thread_ids(&target_paths.codex_home.join("state_5.sqlite")),
-            vec![
-                "thread-archived".to_string(),
-                "thread-source".to_string(),
-                "thread-target-local".to_string(),
-            ]
+            vec!["thread-target-local".to_string()]
         );
-        assert!(target_paths
+        assert!(!target_paths
             .codex_home
             .join("sessions/2026/01/01/rollout-source.jsonl")
             .exists());
-        assert!(target_paths
+        assert!(!target_paths
             .codex_home
             .join("archived_sessions/rollout-archived.jsonl")
             .exists());
@@ -7013,8 +6742,8 @@ exit 91
 
         let target_index =
             fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME)).unwrap();
-        assert!(target_index.contains("\"thread-source\""));
-        assert!(target_index.contains("\"thread-archived\""));
+        assert!(!target_index.contains("\"thread-source\""));
+        assert!(!target_index.contains("\"thread-archived\""));
         assert!(target_index.contains("\"thread-target-local\""));
 
         let store =
@@ -7024,13 +6753,13 @@ exit 91
             store
                 .get_local_thread_id(&target_sync_identity, "thread-source")
                 .expect("target source binding"),
-            Some("thread-source".to_string())
+            None
         );
         assert_eq!(
             store
                 .get_local_thread_id(&target_sync_identity, "thread-archived")
                 .expect("target archived binding"),
-            Some("thread-archived".to_string())
+            None
         );
         assert_eq!(
             store
@@ -8485,7 +8214,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         // Export should fail here due to no listening app server (connection refused)
-        let error = activate_host_rotation(&paths, &prepared, 9333, None)
+        let error = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
             .expect_err("host activation should fail during export phase");
 
         let message = format!("{:#}", error);
@@ -8571,7 +8300,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
         let port = probe.local_addr().expect("probe local addr").port();
         drop(probe);
 
-        let error = activate_host_rotation(&paths, &prepared, port, None)
+        let error = activate_host_rotation(&paths, &prepared, port, None, Vec::new())
             .expect_err("host activation should fail after commit");
         let message = format!("{:#}", error);
         assert!(!message.trim().is_empty());
@@ -8640,7 +8369,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             persist_pool: false,
         };
 
-        let error = activate_host_rotation(&paths, &prepared, 9333, None)
+        let error = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
             .expect_err("host activation should fail before committing pool");
         let message = format!("{:#}", error);
         assert!(
@@ -8700,6 +8429,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                 _prepared: &PreparedRotation,
                 _port: u16,
                 _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+                _source_thread_candidates: Vec<String>,
             ) -> Result<Vec<ThreadHandoff>> {
                 panic!("disabled target must be rejected before activation");
             }
@@ -8865,8 +8595,8 @@ insert into threads (id, rollout_path, updated_at, archived) values
             persist_pool: false,
         };
 
-        let activation =
-            activate_host_rotation(&paths, &prepared, 9333, None).expect("host activation");
+        let activation = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
+            .expect("host activation");
         assert!(activation.items.is_empty());
 
         let committed_pool = load_pool().expect("load committed pool");
@@ -9711,7 +9441,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
         // This bypasses rotate_next_impl's need for a correctly initialized pool
         // which is hard to test due to OnceLock caching of CorePaths.
         let backend = VmBackend { config: None };
-        let result = backend.activate(&prepared, 9333, None);
+        let result = backend.activate(&prepared, 9333, None, Vec::new());
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
 
@@ -10003,7 +9733,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         let handoffs = backend
-            .activate(&prepared, 9333, None)
+            .activate(&prepared, 9333, None, Vec::new())
             .expect("activate vm");
         assert!(
             handoffs.is_empty(),
@@ -10310,7 +10040,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         let error = backend
-            .activate(&prepared, 9333, None)
+            .activate(&prepared, 9333, None, Vec::new())
             .expect_err("activate should fail");
         let message = error.to_string();
         assert!(
@@ -10577,6 +10307,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             _prepared: &PreparedRotation,
             _port: u16,
             _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            _source_thread_candidates: Vec<String>,
         ) -> Result<Vec<ThreadHandoff>> {
             panic!("activate should not run in rollback/retry helper tests");
         }
