@@ -151,8 +151,18 @@ pub struct WatchIterationResult {
     pub decision: RotationDecision,
     pub rotated: bool,
     pub rotation: Option<AuthSummary>,
+    pub rotation_reason: Option<String>,
+    pub status_message: Option<String>,
     pub live: Option<LiveSwitchResult>,
     pub logs_availability: CodexLogsAvailability,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WatchRotationExecution {
+    changed: bool,
+    summary: Option<AuthSummary>,
+    rotation_reason: Option<String>,
+    status_message: Option<String>,
 }
 
 pub struct WatchIterationOptions {
@@ -300,8 +310,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         },
     };
 
-    let mut rotated = false;
-    let mut rotation = None;
+    let mut rotation_execution = WatchRotationExecution::default();
     let mut live = Some(
         live_account
             .account
@@ -326,12 +335,13 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
     let source_live = live.clone();
 
     if decision.should_rotate && !cooldown_active(&previous_state, cooldown_ms) {
-        rotation = execute_watch_rotation(
+        rotation_execution = execute_watch_rotation(
+            &decision,
             decision.rotation_command,
             Some(port),
             options.progress.clone(),
         )?;
-        if rotation.is_some() {
+        if rotation_execution.summary.is_some() {
             let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
             current_summary = summarize_codex_auth(&refreshed_auth);
             live = Some(LiveSwitchResult {
@@ -346,7 +356,6 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
                 None,
             )?);
         }
-        rotated = rotation.is_some();
     }
 
     let usage_limit_signal_seen = decision
@@ -354,6 +363,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         .iter()
         .any(|signal| signal.kind == CodexSignalKind::UsageLimitReached);
     let account_changed = current_summary.account_id != previous_account_id;
+    let rotated = rotation_execution.changed && account_changed;
+    let rotation = rotated.then_some(current_summary.clone());
     let persisted_state_after_rotation = if rotated && account_changed {
         read_watch_state().ok()
     } else {
@@ -401,7 +412,10 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         previous_state.last_rotation_at.clone()
     };
     next_state.last_rotation_reason = if should_record_rotation_metadata {
-        decision.reason.clone()
+        rotation_execution
+            .rotation_reason
+            .clone()
+            .or_else(|| decision.reason.clone())
     } else {
         previous_state.last_rotation_reason.clone()
     };
@@ -512,6 +526,8 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         decision,
         rotated,
         rotation,
+        rotation_reason: rotation_execution.rotation_reason,
+        status_message: rotation_execution.status_message,
         live,
         logs_availability,
     })
@@ -531,20 +547,40 @@ fn normalize_log_cursor(
 }
 
 fn execute_watch_rotation(
+    decision: &RotationDecision,
     command: Option<RotationCommand>,
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
-) -> Result<Option<AuthSummary>> {
+) -> Result<WatchRotationExecution> {
     let port = port.unwrap_or(9333);
     match command {
-        Some(RotationCommand::Next) => {
-            let next_result = run_shared_next(Some(port), progress.clone())?;
-            Ok(match next_result {
-                NextResult::Rotated { summary, .. }
-                | NextResult::Stayed { summary, .. }
-                | NextResult::Created { summary, .. } => Some(summary),
-            })
-        }
+        Some(RotationCommand::Next) => match run_shared_next(Some(port), progress.clone()) {
+            Ok(next_result) => Ok(match next_result {
+                NextResult::Rotated { summary, .. } | NextResult::Created { summary, .. } => {
+                    WatchRotationExecution {
+                        changed: true,
+                        summary: Some(summary),
+                        rotation_reason: Some(watch_rotation_reason(decision)),
+                        status_message: Some(watch_changed_status_message(decision)),
+                    }
+                }
+                NextResult::Stayed { message, .. } => WatchRotationExecution {
+                    changed: false,
+                    summary: None,
+                    rotation_reason: None,
+                    status_message: Some(first_line(&message)),
+                },
+            }),
+            Err(error) if is_disabled_rotation_blocked_error(&error) => {
+                Ok(WatchRotationExecution {
+                    changed: false,
+                    summary: None,
+                    rotation_reason: None,
+                    status_message: Some(watch_blocked_status_message(decision)),
+                })
+            }
+            Err(error) => Err(error),
+        },
         Some(RotationCommand::Create) => {
             if let Some(progress) = progress.as_ref() {
                 progress("Auto rotation is creating a replacement account.".to_string());
@@ -573,7 +609,14 @@ fn execute_watch_rotation(
                 })
             };
             match create_attempt() {
-                Ok(result) => return Ok(result.current_summary.or(result.previous_summary)),
+                Ok(result) => {
+                    return Ok(WatchRotationExecution {
+                        changed: true,
+                        summary: result.current_summary.or(result.previous_summary),
+                        rotation_reason: decision.reason.clone(),
+                        status_message: Some(watch_changed_status_message(decision)),
+                    });
+                }
                 Err(error) if is_auto_create_retry_stopped_for_reusable_account(&error) => {
                     let next_result = run_account_operation_with_log_isolation(
                         Some(port),
@@ -584,7 +627,12 @@ fn execute_watch_rotation(
                             )
                         },
                     )?;
-                    return Ok(next_result.current_summary.or(next_result.previous_summary));
+                    return Ok(WatchRotationExecution {
+                        changed: true,
+                        summary: next_result.current_summary.or(next_result.previous_summary),
+                        rotation_reason: Some(watch_rotation_reason(decision)),
+                        status_message: Some(watch_changed_status_message(decision)),
+                    });
                 }
                 Err(error) if is_retryable_watch_create_error(&error) => {
                     if let Err(retry_error) = create_attempt() {
@@ -598,14 +646,24 @@ fn execute_watch_rotation(
                                     )
                                 },
                             )?;
-                            return Ok(next_result
-                                .current_summary
-                                .or(next_result.previous_summary));
+                            return Ok(WatchRotationExecution {
+                                changed: true,
+                                summary: next_result
+                                    .current_summary
+                                    .or(next_result.previous_summary),
+                                rotation_reason: Some(watch_rotation_reason(decision)),
+                                status_message: Some(watch_changed_status_message(decision)),
+                            });
                         }
                         if let Some(summary) =
                             recover_completed_watch_create(previous_summary.as_ref())?
                         {
-                            return Ok(Some(summary));
+                            return Ok(WatchRotationExecution {
+                                changed: true,
+                                summary: Some(summary),
+                                rotation_reason: decision.reason.clone(),
+                                status_message: Some(watch_changed_status_message(decision)),
+                            });
                         }
                         return Err(retry_error);
                     }
@@ -614,17 +672,72 @@ fn execute_watch_rotation(
                     if let Some(summary) =
                         recover_completed_watch_create(previous_summary.as_ref())?
                     {
-                        return Ok(Some(summary));
+                        return Ok(WatchRotationExecution {
+                            changed: true,
+                            summary: Some(summary),
+                            rotation_reason: decision.reason.clone(),
+                            status_message: Some(watch_changed_status_message(decision)),
+                        });
                     }
                     return Err(error);
                 }
             }
 
             let refreshed_auth = load_codex_auth(&paths.codex_auth_file)?;
-            Ok(Some(summarize_codex_auth(&refreshed_auth)))
+            Ok(WatchRotationExecution {
+                changed: true,
+                summary: Some(summarize_codex_auth(&refreshed_auth)),
+                rotation_reason: decision.reason.clone(),
+                status_message: Some(watch_changed_status_message(decision)),
+            })
         }
-        None => Ok(None),
+        None => Ok(WatchRotationExecution::default()),
     }
+}
+
+fn first_line(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(output)
+        .to_string()
+}
+
+fn disabled_domain_from_reason(reason: Option<&str>) -> Option<&str> {
+    reason
+        .and_then(|value| value.strip_prefix("account domain "))
+        .and_then(|value| value.strip_suffix(" is disabled"))
+}
+
+fn watch_rotation_reason(decision: &RotationDecision) -> String {
+    if let Some(domain) = disabled_domain_from_reason(decision.reason.as_deref()) {
+        return format!("switched away from disabled domain {domain}");
+    }
+    decision
+        .reason
+        .clone()
+        .unwrap_or_else(|| "quota exhausted".to_string())
+}
+
+fn watch_changed_status_message(decision: &RotationDecision) -> String {
+    watch_rotation_reason(decision)
+}
+
+fn watch_blocked_status_message(decision: &RotationDecision) -> String {
+    if let Some(domain) = disabled_domain_from_reason(decision.reason.as_deref()) {
+        return format!(
+            "rotation blocked: disabled domain {domain} has no enabled rotation target"
+        );
+    }
+    "rotation blocked: a target account domain is disabled; re-enable it in ~/.codex-rotate/accounts.json or use rotate prev".to_string()
+}
+
+fn is_disabled_rotation_blocked_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("No rotation target is available because rotation is disabled")
+            || message.contains("is in a disabled domain and cannot be activated")
+    })
 }
 
 fn recover_completed_watch_create(
@@ -1073,6 +1186,58 @@ mod tests {
     fn retryable_watch_create_error_ignores_non_transient_failures() {
         let error = anyhow!("quota inspection unavailable");
         assert!(!is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn watch_changed_status_message_describes_disabled_source_escape() {
+        let decision = RotationDecision {
+            last_signal_id: None,
+            signals: Vec::new(),
+            assessment: None,
+            assessment_error: None,
+            should_rotate: true,
+            reason: Some("account domain astronlab.com is disabled".to_string()),
+            rotation_command: Some(RotationCommand::Next),
+        };
+
+        assert_eq!(
+            watch_changed_status_message(&decision),
+            "switched away from disabled domain astronlab.com"
+        );
+        assert_eq!(
+            watch_rotation_reason(&decision),
+            "switched away from disabled domain astronlab.com"
+        );
+    }
+
+    #[test]
+    fn watch_blocked_status_message_describes_disabled_source_without_target() {
+        let decision = RotationDecision {
+            last_signal_id: None,
+            signals: Vec::new(),
+            assessment: None,
+            assessment_error: None,
+            should_rotate: true,
+            reason: Some("account domain astronlab.com is disabled".to_string()),
+            rotation_command: Some(RotationCommand::Next),
+        };
+
+        assert_eq!(
+            watch_blocked_status_message(&decision),
+            "rotation blocked: disabled domain astronlab.com has no enabled rotation target"
+        );
+    }
+
+    #[test]
+    fn disabled_rotation_blocked_error_matches_core_and_runtime_failures() {
+        let core_error = anyhow!(
+            "No rotation target is available because rotation is disabled for astronlab.com account(s)."
+        );
+        let runtime_error =
+            anyhow!("Target account acct-1 is in a disabled domain and cannot be activated.");
+
+        assert!(is_disabled_rotation_blocked_error(&core_error));
+        assert!(is_disabled_rotation_blocked_error(&runtime_error));
     }
 
     #[test]

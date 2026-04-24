@@ -1703,6 +1703,7 @@ fn maybe_complete_non_switch_next_result(
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
+    disabled_retry_budget: usize,
 ) -> Result<Option<NextResult>> {
     match prepared.action {
         PreparedRotationAction::Stay => {
@@ -1733,7 +1734,8 @@ fn maybe_complete_non_switch_next_result(
                 progress.clone(),
             )?;
             restore_pool_active_index(prepared.previous_index)?;
-            let next = rotate_next_impl(backend, port, progress, false)?;
+            let next =
+                rotate_next_impl_with_retry(backend, port, progress, false, disabled_retry_budget)?;
             let summary = match &next {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -1766,11 +1768,60 @@ fn is_disabled_target_validation_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains(DISABLED_TARGET_ERROR_SNIPPET))
 }
 
+struct DisabledTargetRetryContext<'a> {
+    budget: usize,
+    error: anyhow::Error,
+    message: &'a str,
+}
+
+fn rollback_and_maybe_retry_after_disabled_target<F>(
+    backend: &dyn RotationBackend,
+    prepared: &PreparedRotation,
+    port: u16,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    retry_context: DisabledTargetRetryContext<'_>,
+    retry: F,
+) -> Result<NextResult>
+where
+    F: FnOnce(Option<Arc<dyn Fn(String) + Send + Sync>>) -> Result<NextResult>,
+{
+    save_rotation_checkpoint_for_prepared(prepared, RotationCheckpointPhase::Rollback).ok();
+    backend
+        .rollback_after_failed_activation(prepared, port, progress.clone())
+        .with_context(|| {
+            format!(
+                "Failed to roll back disabled target {} after activation.",
+                prepared.target.label
+            )
+        })?;
+    clear_rotation_checkpoint().ok();
+
+    if retry_context.budget == 0 {
+        return Err(retry_context.error);
+    }
+
+    if let Some(progress) = progress.as_ref() {
+        progress(retry_context.message.to_string());
+    }
+
+    retry(progress)
+}
+
 fn rotate_next_impl(
     backend: &dyn RotationBackend,
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
+) -> Result<NextResult> {
+    rotate_next_impl_with_retry(backend, port, progress, allow_create, 1)
+}
+
+fn rotate_next_impl_with_retry(
+    backend: &dyn RotationBackend,
+    port: u16,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    allow_create: bool,
+    mut disabled_retry_budget: usize,
 ) -> Result<NextResult> {
     recover_incomplete_rotation_state_without_lock()?;
     debug_pool_drift_state("after_recover");
@@ -1794,6 +1845,7 @@ fn rotate_next_impl(
         port,
         progress.clone(),
         allow_create,
+        disabled_retry_budget,
     )? {
         return Ok(result);
     }
@@ -1802,6 +1854,10 @@ fn rotate_next_impl(
         if !is_disabled_target_validation_error(&error) {
             return Err(error);
         }
+        if disabled_retry_budget == 0 {
+            return Err(error);
+        }
+        disabled_retry_budget = disabled_retry_budget.saturating_sub(1);
         if let Some(progress) = progress.as_ref() {
             progress(
                 "Rotation target became disabled mid-flow; re-evaluating eligible target."
@@ -1826,6 +1882,7 @@ fn rotate_next_impl(
             port,
             progress.clone(),
             allow_create,
+            disabled_retry_budget,
         )? {
             return Ok(result);
         }
@@ -1848,6 +1905,38 @@ fn rotate_next_impl(
         })?;
     debug_pool_drift_state("after_activate");
 
+    if let Err(error) = ensure_target_account_still_valid(&prepared) {
+        if is_disabled_target_validation_error(&error) {
+            return rollback_and_maybe_retry_after_disabled_target(
+                backend,
+                &prepared,
+                port,
+                progress.clone(),
+                DisabledTargetRetryContext {
+                    budget: disabled_retry_budget,
+                    error,
+                    message: "Rotation target became disabled after activation; restored the previous account and re-evaluating eligible target.",
+                },
+                |progress| {
+                    rotate_next_impl_with_retry(
+                        backend,
+                        port,
+                        progress,
+                        allow_create,
+                        disabled_retry_budget.saturating_sub(1),
+                    )
+                },
+            );
+        }
+        save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Rollback).ok();
+        let rollback_result =
+            backend.rollback_after_failed_activation(&prepared, port, progress.clone());
+        if rollback_result.is_ok() {
+            clear_rotation_checkpoint().ok();
+        }
+        return Err(error);
+    }
+
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
     let import_outcome = if handoffs.is_empty() {
@@ -1867,6 +1956,7 @@ fn rotate_next_impl(
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
         debug_pool_drift_state("before_finalize");
+        ensure_target_account_still_valid(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
         let _ = translate_recovery_events_after_rotation(
             &prepared.previous.account_id,
@@ -1878,6 +1968,28 @@ fn rotate_next_impl(
     })();
 
     if let Err(error) = result {
+        if is_disabled_target_validation_error(&error) {
+            return rollback_and_maybe_retry_after_disabled_target(
+                backend,
+                &prepared,
+                port,
+                progress.clone(),
+                DisabledTargetRetryContext {
+                    budget: disabled_retry_budget,
+                    error,
+                    message: "Rotation target became disabled before commit; restored the previous account and re-evaluating eligible target.",
+                },
+                |progress| {
+                    rotate_next_impl_with_retry(
+                        backend,
+                        port,
+                        progress,
+                        allow_create,
+                        disabled_retry_budget.saturating_sub(1),
+                    )
+                },
+            );
+        }
         save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Rollback).ok();
         let rollback_result =
             backend.rollback_after_failed_activation(&prepared, port, progress.clone());
@@ -9707,6 +9819,173 @@ insert into threads (id, rollout_path, updated_at, archived) values
             .unwrap_err()
             .to_string()
             .contains("cannot contain path separators"));
+    }
+
+    struct RecordingRetryBackend {
+        rollback_calls: Arc<Mutex<usize>>,
+    }
+
+    impl RotationBackend for RecordingRetryBackend {
+        fn activate(
+            &self,
+            _prepared: &PreparedRotation,
+            _port: u16,
+            _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        ) -> Result<Vec<ThreadHandoff>> {
+            panic!("activate should not run in rollback/retry helper tests");
+        }
+
+        fn rollback_after_failed_activation(
+            &self,
+            _prepared: &PreparedRotation,
+            _port: u16,
+            _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        ) -> Result<()> {
+            let mut calls = self.rollback_calls.lock().expect("rollback calls");
+            *calls += 1;
+            Ok(())
+        }
+
+        fn rotate_next(
+            &self,
+            _port: u16,
+            _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        ) -> Result<NextResult> {
+            panic!("rotate_next should not run in rollback/retry helper tests");
+        }
+
+        fn rotate_prev(
+            &self,
+            _port: u16,
+            _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        ) -> Result<String> {
+            panic!("rotate_prev should not run in rollback/retry helper tests");
+        }
+
+        fn relogin(
+            &self,
+            _port: u16,
+            _selector: &str,
+            _options: ReloginOptions,
+            _progress: Option<AutomationProgressCallback>,
+        ) -> Result<String> {
+            panic!("relogin should not run in rollback/retry helper tests");
+        }
+    }
+
+    #[test]
+    fn rollback_and_maybe_retry_after_disabled_target_retries_once_after_rollback() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "vm");
+        }
+        let rollback_calls = Arc::new(Mutex::new(0usize));
+        let backend = RecordingRetryBackend {
+            rollback_calls: rollback_calls.clone(),
+        };
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: codex_rotate_core::pool::Pool {
+                active_index: 0,
+                accounts: vec![source.clone(), target.clone()],
+            },
+            previous_index: 0,
+            target_index: 1,
+            previous: source,
+            target,
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+        let progress_messages = Arc::new(Mutex::new(Vec::new()));
+        let progress_sink = progress_messages.clone();
+        let progress: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |message| progress_sink.lock().expect("progress").push(message));
+
+        let result = rollback_and_maybe_retry_after_disabled_target(
+            &backend,
+            &prepared,
+            9333,
+            Some(progress),
+            DisabledTargetRetryContext {
+                budget: 1,
+                error: anyhow!(
+                    "Target account acct-target is in a disabled domain and cannot be activated."
+                ),
+                message: "Rotation target became disabled after activation; restored the previous account and re-evaluating eligible target.",
+            },
+            |_| {
+                Ok(NextResult::Rotated {
+                    message: "retried".to_string(),
+                    summary: codex_rotate_core::auth::AuthSummary {
+                        email: "acct-target@astronlab.com".to_string(),
+                        account_id: "acct-target".to_string(),
+                        plan_type: "free".to_string(),
+                    },
+                })
+            },
+        )
+        .expect("retry result");
+
+        assert!(matches!(result, NextResult::Rotated { .. }));
+        assert_eq!(*rollback_calls.lock().expect("rollback calls"), 1);
+        assert_eq!(
+            progress_messages.lock().expect("progress").as_slice(),
+            ["Rotation target became disabled after activation; restored the previous account and re-evaluating eligible target."]
+        );
+        restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
+    }
+
+    #[test]
+    fn rollback_and_maybe_retry_after_disabled_target_returns_error_when_budget_exhausted() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "vm");
+        }
+        let rollback_calls = Arc::new(Mutex::new(0usize));
+        let backend = RecordingRetryBackend {
+            rollback_calls: rollback_calls.clone(),
+        };
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: codex_rotate_core::pool::Pool {
+                active_index: 0,
+                accounts: vec![source.clone(), target.clone()],
+            },
+            previous_index: 0,
+            target_index: 1,
+            previous: source,
+            target,
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        let error = rollback_and_maybe_retry_after_disabled_target(
+            &backend,
+            &prepared,
+            9333,
+            None,
+            DisabledTargetRetryContext {
+                budget: 0,
+                error: anyhow!(
+                    "Target account acct-target is in a disabled domain and cannot be activated."
+                ),
+                message: "unused",
+            },
+            |_| panic!("retry closure should not run when the retry budget is exhausted"),
+        )
+        .expect_err("budget exhausted should preserve the disabled-target error");
+
+        assert!(error
+            .to_string()
+            .contains("is in a disabled domain and cannot be activated"));
+        assert_eq!(*rollback_calls.lock().expect("rollback calls"), 1);
+        restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
     }
 
     fn test_runtime_paths(root: &Path) -> RuntimePaths {

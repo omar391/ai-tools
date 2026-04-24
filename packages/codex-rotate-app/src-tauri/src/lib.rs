@@ -495,6 +495,21 @@ mod tests {
     }
 
     #[test]
+    fn rendered_snapshot_preserves_explicit_disabled_domain_message() {
+        let snapshot = StatusSnapshot {
+            last_message: Some("switched away from disabled domain astronlab.com".to_string()),
+            ..StatusSnapshot::default()
+        };
+
+        let rendered = rendered_snapshot(&snapshot);
+
+        assert_eq!(
+            rendered.status_text,
+            "Status: switched away from disabled domain astronlab.com"
+        );
+    }
+
+    #[test]
     fn resolve_cli_binary_prefers_override() {
         let _guard = env_mutex().lock().expect("env mutex");
         let previous = std::env::var_os("CODEX_ROTATE_CLI_BIN");

@@ -62,6 +62,10 @@ const CLIENT_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_TAKEOVER_ARG: &str = "--takeover";
 const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
+const DISABLED_ROTATION_TARGET_ERROR_SNIPPET: &str =
+    "No rotation target is available because rotation is disabled";
+const DISABLED_DOMAIN_BLOCKED_MESSAGE: &str =
+    "rotation blocked: a target account domain is disabled; re-enable it in ~/.codex-rotate/accounts.json or use rotate prev";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DaemonRunOptions {
@@ -975,37 +979,7 @@ fn run_watch_check(
     if let Some(quota) = result.current_account_state.quota.as_ref() {
         set_quota_summary(state, quota);
     }
-    if result.rotated {
-        if let Some(rotation) = result.rotation.as_ref() {
-            state.snapshot.last_rotation_from_email = previous_displayed_email;
-            state.snapshot.last_rotation_to_email = Some(rotation.email.clone());
-        }
-        state.snapshot.last_rotation_reason = result.decision.reason.clone();
-        set_snapshot_message(
-            &mut state.snapshot,
-            SnapshotMessageKind::Status,
-            format!(
-                "rotated: {}",
-                result
-                    .decision
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "quota exhausted".to_string())
-            ),
-        );
-    } else if let Some(error) = result.decision.assessment_error.as_deref() {
-        set_snapshot_message(
-            &mut state.snapshot,
-            SnapshotMessageKind::Error,
-            format!("quota probe failed: {}", error),
-        );
-    } else {
-        set_snapshot_message(
-            &mut state.snapshot,
-            SnapshotMessageKind::Status,
-            "watch healthy",
-        );
-    }
+    apply_watch_result_to_snapshot(state, previous_displayed_email, &result);
     Ok(())
 }
 
@@ -1029,37 +1003,75 @@ fn run_manual_next(
         }
     };
     refresh_static_snapshot(state);
-    if let Some(summary) = next_result_summary(&result) {
-        state.snapshot.last_rotation_from_email = previous_displayed_email;
-        state.snapshot.last_rotation_to_email = Some(summary.email.clone());
-    }
-    if let Some(summary) = next_result_summary(&result) {
-        state.snapshot.current_email = Some(summary.email.clone());
-        state.snapshot.current_plan = Some(summary.plan_type.clone());
-    }
+    let normalized = normalized_next_result(&result);
+    apply_manual_next_result_to_snapshot(state, previous_displayed_email, &normalized);
     refresh_quota_state(state, false);
-    state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
-    let output = match result {
-        NextResult::Rotated { message, .. }
-        | NextResult::Stayed { message, .. }
-        | NextResult::Created {
-            output: message, ..
-        } => message,
-    };
     set_snapshot_message(
         &mut state.snapshot,
         SnapshotMessageKind::Status,
-        first_line(&output),
+        first_line(&normalized.output),
     );
-    Ok(output)
+    Ok(normalized.output)
 }
 
 fn manual_rotation_error_message(error: &anyhow::Error) -> String {
     let detail = format!("{error:#}");
-    if detail.contains(DISABLED_TARGET_ERROR_SNIPPET) {
-        return "rotation blocked: a target account domain is disabled; re-enable it in ~/.codex-rotate/accounts.json or use rotate prev".to_string();
+    if detail.contains(DISABLED_TARGET_ERROR_SNIPPET)
+        || detail.contains(DISABLED_ROTATION_TARGET_ERROR_SNIPPET)
+    {
+        return DISABLED_DOMAIN_BLOCKED_MESSAGE.to_string();
     }
     format!("rotation failed: {}", first_line(&detail))
+}
+
+fn apply_watch_result_to_snapshot(
+    state: &mut DaemonState,
+    previous_displayed_email: Option<String>,
+    result: &crate::watch::WatchIterationResult,
+) {
+    if let Some(message) = result.status_message.as_deref() {
+        if result.rotated {
+            if let Some(rotation) = result.rotation.as_ref() {
+                state.snapshot.last_rotation_from_email = previous_displayed_email;
+                state.snapshot.last_rotation_to_email = Some(rotation.email.clone());
+            }
+            state.snapshot.last_rotation_reason = result
+                .rotation_reason
+                .clone()
+                .or_else(|| result.decision.reason.clone());
+        }
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            message.to_string(),
+        );
+    } else if let Some(error) = result.decision.assessment_error.as_deref() {
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Error,
+            format!("quota probe failed: {}", error),
+        );
+    } else {
+        set_snapshot_message(
+            &mut state.snapshot,
+            SnapshotMessageKind::Status,
+            "watch healthy",
+        );
+    }
+}
+
+fn apply_manual_next_result_to_snapshot(
+    state: &mut DaemonState,
+    previous_displayed_email: Option<String>,
+    result: &NormalizedNextResult,
+) {
+    state.snapshot.current_email = Some(result.summary.email.clone());
+    state.snapshot.current_plan = Some(result.summary.plan_type.clone());
+    if result.changed {
+        state.snapshot.last_rotation_from_email = previous_displayed_email;
+        state.snapshot.last_rotation_to_email = Some(result.summary.email.clone());
+        state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
+    }
 }
 
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
@@ -1135,11 +1147,29 @@ fn run_manual_relogin(
     Ok(output)
 }
 
-fn next_result_summary(result: &NextResult) -> Option<codex_rotate_core::auth::AuthSummary> {
+struct NormalizedNextResult {
+    changed: bool,
+    summary: codex_rotate_core::auth::AuthSummary,
+    output: String,
+}
+
+fn normalized_next_result(result: &NextResult) -> NormalizedNextResult {
     match result {
-        NextResult::Rotated { summary, .. }
-        | NextResult::Stayed { summary, .. }
-        | NextResult::Created { summary, .. } => Some(summary.clone()),
+        NextResult::Rotated { summary, message } => NormalizedNextResult {
+            changed: true,
+            summary: summary.clone(),
+            output: message.clone(),
+        },
+        NextResult::Stayed { summary, message } => NormalizedNextResult {
+            changed: false,
+            summary: summary.clone(),
+            output: message.clone(),
+        },
+        NextResult::Created { summary, output } => NormalizedNextResult {
+            changed: true,
+            summary: summary.clone(),
+            output: output.clone(),
+        },
     }
 }
 
@@ -2034,5 +2064,150 @@ mod tests {
 
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
         assert_eq!(state.snapshot.current_quota.as_deref(), Some("5h 60% left"));
+    }
+
+    #[test]
+    fn apply_watch_result_to_snapshot_preserves_history_for_stayed_result() {
+        let mut state = DaemonState::new();
+        state.snapshot.last_rotation_from_email = Some("dev.0@astronlab.com".to_string());
+        state.snapshot.last_rotation_to_email = Some("dev.1@astronlab.com".to_string());
+        state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
+
+        let result = crate::watch::WatchIterationResult {
+            state: WatchState::default(),
+            current_account_id: "acct-1".to_string(),
+            current_account_state: crate::watch::AccountWatchState::default(),
+            decision: crate::watch::RotationDecision {
+                last_signal_id: None,
+                signals: Vec::new(),
+                assessment: None,
+                assessment_error: None,
+                should_rotate: true,
+                reason: Some("account domain astronlab.com is disabled".to_string()),
+                rotation_command: Some(crate::watch::RotationCommand::Next),
+            },
+            rotated: false,
+            rotation: None,
+            rotation_reason: None,
+            status_message: Some("ROTATE Stayed on dev.1@hotspotprime.com".to_string()),
+            live: None,
+            logs_availability: crate::logs::CodexLogsAvailability::Ready,
+        };
+
+        apply_watch_result_to_snapshot(
+            &mut state,
+            Some("dev.1@hotspotprime.com".to_string()),
+            &result,
+        );
+
+        assert_eq!(
+            state.snapshot.last_rotation_from_email.as_deref(),
+            Some("dev.0@astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_to_email.as_deref(),
+            Some("dev.1@astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_reason.as_deref(),
+            Some("manual rotation")
+        );
+        assert_eq!(
+            state.snapshot.last_message.as_deref(),
+            Some("ROTATE Stayed on dev.1@hotspotprime.com")
+        );
+    }
+
+    #[test]
+    fn apply_watch_result_to_snapshot_records_disabled_source_escape() {
+        let mut state = DaemonState::new();
+        let result = crate::watch::WatchIterationResult {
+            state: WatchState::default(),
+            current_account_id: "acct-2".to_string(),
+            current_account_state: crate::watch::AccountWatchState::default(),
+            decision: crate::watch::RotationDecision {
+                last_signal_id: None,
+                signals: Vec::new(),
+                assessment: None,
+                assessment_error: None,
+                should_rotate: true,
+                reason: Some("account domain astronlab.com is disabled".to_string()),
+                rotation_command: Some(crate::watch::RotationCommand::Next),
+            },
+            rotated: true,
+            rotation: Some(codex_rotate_core::auth::AuthSummary {
+                email: "dev.1@hotspotprime.com".to_string(),
+                account_id: "acct-2".to_string(),
+                plan_type: "plus".to_string(),
+            }),
+            rotation_reason: Some("switched away from disabled domain astronlab.com".to_string()),
+            status_message: Some("switched away from disabled domain astronlab.com".to_string()),
+            live: None,
+            logs_availability: crate::logs::CodexLogsAvailability::Ready,
+        };
+
+        apply_watch_result_to_snapshot(
+            &mut state,
+            Some("dev.1@astronlab.com".to_string()),
+            &result,
+        );
+
+        assert_eq!(
+            state.snapshot.last_rotation_from_email.as_deref(),
+            Some("dev.1@astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_to_email.as_deref(),
+            Some("dev.1@hotspotprime.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_reason.as_deref(),
+            Some("switched away from disabled domain astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_message.as_deref(),
+            Some("switched away from disabled domain astronlab.com")
+        );
+    }
+
+    #[test]
+    fn apply_manual_next_result_to_snapshot_keeps_history_for_stayed_result() {
+        let mut state = DaemonState::new();
+        state.snapshot.last_rotation_from_email = Some("dev.0@astronlab.com".to_string());
+        state.snapshot.last_rotation_to_email = Some("dev.1@astronlab.com".to_string());
+        state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
+
+        let result = NormalizedNextResult {
+            changed: false,
+            summary: codex_rotate_core::auth::AuthSummary {
+                email: "dev.1@hotspotprime.com".to_string(),
+                account_id: "acct-2".to_string(),
+                plan_type: "plus".to_string(),
+            },
+            output: "ROTATE Stayed on dev.1@hotspotprime.com".to_string(),
+        };
+
+        apply_manual_next_result_to_snapshot(
+            &mut state,
+            Some("dev.1@hotspotprime.com".to_string()),
+            &result,
+        );
+
+        assert_eq!(
+            state.snapshot.last_rotation_from_email.as_deref(),
+            Some("dev.0@astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_to_email.as_deref(),
+            Some("dev.1@astronlab.com")
+        );
+        assert_eq!(
+            state.snapshot.last_rotation_reason.as_deref(),
+            Some("manual rotation")
+        );
+        assert_eq!(
+            state.snapshot.current_email.as_deref(),
+            Some("dev.1@hotspotprime.com")
+        );
     }
 }
