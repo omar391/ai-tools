@@ -21,7 +21,7 @@ use crate::log_isolation::active_managed_codex_thread_ids;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::rotation_hygiene::{
     recover_incomplete_rotation_state, relogin as run_shared_relogin,
-    rotate_next as run_shared_next, rotate_prev as run_shared_prev,
+    rotate_next as run_shared_next, rotate_prev as run_shared_prev, rotate_set as run_shared_set,
 };
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
@@ -905,6 +905,12 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
             daemon.with_state_mut(|state| run_manual_next(state, Some(progress)))
         }
         InvokeAction::Prev => daemon.with_state_mut(run_manual_prev),
+        InvokeAction::Set { selector } => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| run_manual_set(state, &selector, Some(progress)))
+        }
         InvokeAction::Create { options } => {
             let progress_daemon = daemon.clone();
             let progress: Arc<dyn Fn(String) + Send + Sync> =
@@ -1077,6 +1083,29 @@ fn apply_manual_next_result_to_snapshot(
 fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
     let previous_displayed_email = state.snapshot.current_email.clone();
     let result = run_shared_prev(Some(managed_codex_port()), None)?;
+    refresh_static_snapshot(state);
+    state.snapshot.last_rotation_from_email = previous_displayed_email;
+    let summary = summarize_codex_auth(&load_codex_auth(&resolve_paths()?.codex_auth_file)?);
+    state.snapshot.last_rotation_to_email = Some(summary.email.clone());
+    state.snapshot.last_rotation_reason = Some("manual rotation".to_string());
+    state.snapshot.current_email = Some(summary.email.clone());
+    state.snapshot.current_plan = Some(summary.plan_type.clone());
+    refresh_quota_state(state, false);
+    set_snapshot_message(
+        &mut state.snapshot,
+        SnapshotMessageKind::Status,
+        first_line(&result),
+    );
+    Ok(result)
+}
+
+fn run_manual_set(
+    state: &mut DaemonState,
+    selector: &str,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
+    let previous_displayed_email = state.snapshot.current_email.clone();
+    let result = run_shared_set(Some(managed_codex_port()), selector, progress)?;
     refresh_static_snapshot(state);
     state.snapshot.last_rotation_from_email = previous_displayed_email;
     let summary = summarize_codex_auth(&load_codex_auth(&resolve_paths()?.codex_auth_file)?);

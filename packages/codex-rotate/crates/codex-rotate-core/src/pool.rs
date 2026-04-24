@@ -950,6 +950,70 @@ pub fn prepare_prev_rotation() -> Result<PreparedRotation> {
     })
 }
 
+pub fn prepare_set_rotation(selector: &str) -> Result<PreparedRotation> {
+    let paths = resolve_paths()?;
+    let mut pool = load_pool()?;
+    let mut dirty = normalize_pool_entries(&mut pool);
+    dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    if pool.accounts.is_empty() {
+        return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
+    }
+
+    let previous_index = pool.active_index.min(pool.accounts.len().saturating_sub(1));
+    let previous = pool.accounts[previous_index].clone();
+    let selection = resolve_account_selector(&pool, selector)?;
+    let target_index = selection.index;
+    let target = selection.entry;
+
+    let previous_label = previous.label.clone();
+    let previous_email = previous.email.clone();
+    let previous_plan_type = previous.plan_type.clone();
+    let target_label = target.label.clone();
+    let target_email = target.email.clone();
+    let target_plan_type = target.plan_type.clone();
+    let total_accounts = pool.accounts.len();
+
+    if target_index == previous_index {
+        return Ok(PreparedRotation {
+            action: PreparedRotationAction::Stay,
+            pool,
+            previous_index,
+            target_index,
+            previous: previous.clone(),
+            target: previous,
+            message: format!(
+                "{GREEN}ROTATE{RESET} Stayed on {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  [{}/{}] | selected explicitly{RESET}",
+                previous_label,
+                previous_email,
+                previous_plan_type,
+                previous_index + 1,
+                total_accounts,
+            ),
+            persist_pool: dirty,
+        });
+    }
+
+    Ok(PreparedRotation {
+        action: PreparedRotationAction::Switch,
+        pool,
+        previous_index,
+        target_index,
+        previous,
+        target,
+        message: format!(
+            "{GREEN}ROTATE{RESET} {} ({}) -> {BOLD}{}{RESET} ({CYAN}{}{RESET}, {})\n{DIM}  [{}/{}] | selected explicitly{RESET}",
+            previous_label,
+            previous_email,
+            target_label,
+            target_email,
+            target_plan_type,
+            target_index + 1,
+            total_accounts,
+        ),
+        persist_pool: dirty,
+    })
+}
+
 pub fn persist_prepared_rotation_pool(prepared: &PreparedRotation) -> Result<()> {
     let mut pool = prepared.pool.clone();
     pool.active_index = prepared
@@ -3623,6 +3687,70 @@ mod tests {
             crate::auth::load_codex_auth(&resolve_paths().expect("resolve paths").codex_auth_file)
                 .expect("load committed auth");
         assert_eq!(committed_auth.tokens.account_id, "acct-1");
+    }
+
+    #[test]
+    fn prepare_set_rotation_stages_selected_target_until_commit() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-prepare-set-stage");
+        let mut previous =
+            configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None);
+        previous.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+        previous.last_quota_next_refresh_at = Some("2099-01-01T01:00:00.000Z".to_string());
+        let mut target =
+            configured_entry("dev.2@astronlab.com", "acct-2", "free", Some(false), None);
+        target.last_quota_checked_at = Some("2099-01-01T00:00:00.000Z".to_string());
+        target.last_quota_next_refresh_at = Some("2099-01-01T01:00:00.000Z".to_string());
+        write_rotate_state_json(&json!({
+            "accounts": [previous, target],
+            "active_index": 0
+        }))
+        .expect("write rotate state");
+
+        let initial_pool = load_pool().expect("load pool");
+        write_selected_account_auth(&initial_pool.accounts[0]).expect("write current auth");
+
+        let prepared = prepare_set_rotation("acct-2").expect("prepare set");
+        assert_eq!(prepared.action, PreparedRotationAction::Switch);
+        assert_eq!(prepared.previous_index, 0);
+        assert_eq!(prepared.target_index, 1);
+
+        let staged_state = load_rotate_state_json().expect("load staged state");
+        assert_eq!(staged_state["active_index"], json!(0));
+        let staged_auth =
+            crate::auth::load_codex_auth(&resolve_paths().expect("resolve paths").codex_auth_file)
+                .expect("load staged auth");
+        assert_eq!(staged_auth.tokens.account_id, "acct-1");
+
+        persist_prepared_rotation_pool(&prepared).expect("persist prepared pool");
+        write_selected_account_auth(&prepared.target).expect("write target auth");
+
+        let committed_state = load_rotate_state_json().expect("load committed state");
+        assert_eq!(committed_state["active_index"], json!(1));
+        let committed_auth =
+            crate::auth::load_codex_auth(&resolve_paths().expect("resolve paths").codex_auth_file)
+                .expect("load committed auth");
+        assert_eq!(committed_auth.tokens.account_id, "acct-2");
+    }
+
+    #[test]
+    fn prepare_set_rotation_returns_stay_for_active_selector() {
+        let _guard = RotateHomeGuard::enter("codex-rotate-prepare-set-stay");
+        let first = configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None);
+        let second = configured_entry("dev.2@astronlab.com", "acct-2", "free", Some(false), None);
+        write_rotate_state_json(&json!({
+            "accounts": [first, second],
+            "active_index": 0
+        }))
+        .expect("write rotate state");
+
+        let initial_pool = load_pool().expect("load pool");
+        write_selected_account_auth(&initial_pool.accounts[0]).expect("write current auth");
+
+        let prepared = prepare_set_rotation("acct-1").expect("prepare set");
+        assert_eq!(prepared.action, PreparedRotationAction::Stay);
+        assert_eq!(prepared.previous_index, 0);
+        assert_eq!(prepared.target_index, 0);
+        assert!(prepared.message.contains("Stayed on"));
     }
 
     #[test]

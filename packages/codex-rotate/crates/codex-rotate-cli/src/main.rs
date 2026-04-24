@@ -34,7 +34,7 @@ use codex_rotate_runtime::ipc::{
 use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::rotation_hygiene::{
     relogin as run_shared_relogin, repair_host_history, rotate_next as run_shared_next,
-    rotate_prev as run_shared_prev, run_guest_bridge_server,
+    rotate_prev as run_shared_prev, rotate_set as run_shared_set, run_guest_bridge_server,
 };
 use codex_rotate_runtime::vm_bootstrap::bootstrap_vm_base;
 use codex_rotate_runtime::watch::set_tray_enabled;
@@ -106,6 +106,14 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
             write_output(writer, &output)?
         }
         Some("prev") => write_output(writer, &run_shared_prev(None, None)?)?,
+        Some("set") => write_output(
+            writer,
+            &run_shared_set(
+                None,
+                parse_set_selector(&args[1..])?,
+                cli_progress_callback(),
+            )?,
+        )?,
         Some("list") => cmd_list_stream(writer)?,
         Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
@@ -176,6 +184,9 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         }),
         Some("next") => Some(InvokeAction::Next),
         Some("prev") => Some(InvokeAction::Prev),
+        Some("set") => Some(InvokeAction::Set {
+            selector: parse_set_selector(args)?.to_string(),
+        }),
         Some("relogin") => Some(InvokeAction::Relogin {
             options: parse_public_relogin_invocation(args)?,
         }),
@@ -280,7 +291,10 @@ fn snapshot_contains_progress(snapshot: &StatusSnapshot) -> bool {
 }
 
 fn command_streams_progress(command: Option<&str>) -> bool {
-    matches!(command, Some("create") | Some("next") | Some("relogin"))
+    matches!(
+        command,
+        Some("create") | Some("next") | Some("set") | Some("relogin")
+    )
 }
 
 fn run_daemon_command(writer: &mut dyn Write, args: &[String]) -> Result<()> {
@@ -1072,6 +1086,13 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
+fn parse_set_selector(args: &[String]) -> Result<&str> {
+    if args.len() != 1 || args[0].starts_with('-') {
+        return Err(anyhow!("Usage: codex-rotate set <selector>"));
+    }
+    Ok(args[0].as_str())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepairHostHistoryOptions {
     source_selector: String,
@@ -1350,6 +1371,7 @@ fn help_text() -> String {
   {CYAN}repair-host-history{RESET} --source <selector> [--target <selector> ...|--all] [--apply]
   {CYAN}next{RESET}             Swap to the next account with usable quota
   {CYAN}prev{RESET}             Swap to the previous account
+  {CYAN}set{RESET} <selector>   Swap to the selected account (skip quota/health gating)
   {CYAN}list{RESET}             Show all accounts with cached quota info
   {CYAN}status{RESET}           Show the current active account info and quota
   {CYAN}relogin{RESET} <selector> Repair that account in one step
@@ -1741,6 +1763,19 @@ mod tests {
     }
 
     #[test]
+    fn set_parser_requires_single_selector() {
+        assert_eq!(
+            parse_set_selector(&["acct-123".to_string()]).expect("set selector"),
+            "acct-123"
+        );
+        let error =
+            parse_set_selector(&[]).expect_err("missing selector should fail for set command");
+        assert!(error
+            .to_string()
+            .contains("Usage: codex-rotate set <selector>"));
+    }
+
+    #[test]
     fn repair_host_history_parser_accepts_source_targets_and_apply() {
         let options = parse_repair_host_history_options(&[
             "--source".to_string(),
@@ -1824,6 +1859,7 @@ mod tests {
         assert!(help.contains("Start the background runtime daemon"));
         assert!(help.contains("guest-bridge"));
         assert!(help.contains("tray"));
+        assert!(help.contains("set"));
     }
 
     #[test]
@@ -2227,6 +2263,13 @@ mod tests {
             (Some("next"), Vec::new(), InvokeAction::Next),
             (Some("prev"), Vec::new(), InvokeAction::Prev),
             (
+                Some("set"),
+                vec!["acct-456".to_string()],
+                InvokeAction::Set {
+                    selector: "acct-456".to_string(),
+                },
+            ),
+            (
                 Some("relogin"),
                 vec!["acct-123".to_string()],
                 InvokeAction::Relogin {
@@ -2303,7 +2346,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{command:?} should be allowed: {error}"));
         }
 
-        for command in ["add", "relogin", "remove", "list", "prev", "daemon", "tray"] {
+        for command in [
+            "add", "relogin", "remove", "list", "prev", "set", "daemon", "tray",
+        ] {
             ensure_account_creation_commands_allowed(Some(command))
                 .unwrap_or_else(|error| panic!("{command} should stay allowed: {error}"));
         }

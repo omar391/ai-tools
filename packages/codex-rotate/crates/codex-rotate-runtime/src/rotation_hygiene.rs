@@ -14,7 +14,7 @@ use codex_rotate_core::bridge::{
 use codex_rotate_core::pool::{
     load_pool, load_rotation_checkpoint, load_rotation_environment_settings,
     persist_prepared_rotation_pool, prepare_next_rotation_with_progress, prepare_prev_rotation,
-    resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
+    prepare_set_rotation, resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
     rollback_prepared_rotation, save_pool, save_rotation_checkpoint,
     sync_pool_active_account_from_current_auth, write_selected_account_auth, AccountEntry,
     NextResult, PersonaEntry, PreparedRotation, PreparedRotationAction, RotationCheckpoint,
@@ -104,6 +104,11 @@ const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
     "vendor_imports",
 ];
 const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
+const HOST_PERSONA_CONVERSATION_SEED_ENTRIES: &[&str] = &[
+    "sessions",
+    concat!("archived_", "sessions"),
+    SESSION_INDEX_FILE_NAME,
+];
 #[cfg(test)]
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 #[cfg(test)]
@@ -129,7 +134,8 @@ struct SessionIndexEntry {
 }
 #[cfg(test)]
 const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
-- The same logical conversation across personas must use different local thread IDs while preserving continuity.
+- API handoff sync creates different local thread IDs across personas while preserving continuity.
+- First materialization may seed persona-local storage from the previous persona before API handoff lineage exists.
 - Additive sync means one local thread per lineage per persona with no duplicate logical conversations on repeated sync.
 - Host and VM execute the same sync semantics through the shared rotation engine; only transport wiring differs.
 "#;
@@ -267,6 +273,21 @@ pub fn rotate_prev(
 ) -> Result<String> {
     let _lock = RotationLock::acquire()?;
     select_rotation_backend()?.rotate_prev(port.unwrap_or(DEFAULT_PORT), progress)
+}
+
+pub fn rotate_set(
+    port: Option<u16>,
+    selector: &str,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
+    let _lock = RotationLock::acquire()?;
+    let backend = select_rotation_backend()?;
+    rotate_set_impl(
+        backend.as_ref(),
+        port.unwrap_or(DEFAULT_PORT),
+        selector,
+        progress,
+    )
 }
 
 pub fn relogin(
@@ -1448,6 +1469,21 @@ fn ensure_no_rotation_drift(prepared: &PreparedRotation) -> Result<()> {
 }
 
 fn ensure_target_account_still_valid(prepared: &PreparedRotation) -> Result<()> {
+    ensure_target_account_still_present(prepared)?;
+
+    let disabled_domains = codex_rotate_core::workflow::load_disabled_rotation_domains()?;
+    let domain = codex_rotate_core::workflow::extract_email_domain(&prepared.target.email)
+        .unwrap_or_default();
+    if disabled_domains.contains(&domain) {
+        return Err(anyhow!(
+            "Target account {} is in a disabled domain and cannot be activated.",
+            prepared.target.label
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_target_account_still_present(prepared: &PreparedRotation) -> Result<()> {
     let pool = load_pool()?;
     let target_sync_identity = conversation_sync_identity(&prepared.target);
     if !pool
@@ -1457,16 +1493,6 @@ fn ensure_target_account_still_valid(prepared: &PreparedRotation) -> Result<()> 
     {
         return Err(anyhow!(
             "Target account {} was removed mid-flow.",
-            prepared.target.label
-        ));
-    }
-
-    let disabled_domains = codex_rotate_core::workflow::load_disabled_rotation_domains()?;
-    let domain = codex_rotate_core::workflow::extract_email_domain(&prepared.target.email)
-        .unwrap_or_default();
-    if disabled_domains.contains(&domain) {
-        return Err(anyhow!(
-            "Target account {} is in a disabled domain and cannot be activated.",
             prepared.target.label
         ));
     }
@@ -2174,6 +2200,82 @@ fn rotate_prev_impl(
     Ok(prepared.message)
 }
 
+fn rotate_set_impl(
+    backend: &dyn RotationBackend,
+    port: u16,
+    selector: &str,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
+    recover_incomplete_rotation_state_without_lock()?;
+    let mut prepared = prepare_set_rotation(selector)?;
+    let paths = resolve_paths()?;
+    if prepared.action == PreparedRotationAction::Switch {
+        ensure_target_account_still_present(&prepared)?;
+    }
+    let _ = ensure_host_personas_ready(&paths, &mut prepared.pool)?;
+    if prepared.action != PreparedRotationAction::Switch {
+        if prepared.persist_pool {
+            ensure_no_rotation_drift(&prepared)?;
+            persist_prepared_rotation_pool(&prepared)?;
+        }
+        return Ok(prepared.message);
+    }
+
+    ensure_target_account_still_present(&prepared)?;
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
+
+    let handoffs = backend.activate(&prepared, port, progress.clone())?;
+
+    save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
+
+    let import_outcome = if handoffs.is_empty() {
+        ThreadHandoffImportOutcome::default()
+    } else {
+        let transport = HostConversationTransport::new(port);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
+        import_thread_handoffs(
+            &transport,
+            &target_sync_identity,
+            &handoffs,
+            progress.as_ref(),
+        )?
+    };
+
+    let result = (|| -> Result<()> {
+        if let Some(progress) = progress.as_ref() {
+            progress(format!("Activated persona for {}.", prepared.target.label));
+        }
+        ensure_target_account_still_present(&prepared)?;
+        sync_host_archive_state_after_import(&prepared)?;
+        finalize_rotation_after_import(&prepared, &import_outcome)?;
+        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
+        let target_sync_identity = conversation_sync_identity(&prepared.target);
+        let _ = translate_recovery_events_after_rotation_with_identity(
+            &prepared.previous.account_id,
+            &prepared.target.account_id,
+            &previous_sync_identity,
+            &target_sync_identity,
+            port,
+            &handoffs,
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Rollback).ok();
+        let rollback_result =
+            backend.rollback_after_failed_activation(&prepared, port, progress.clone());
+        if rollback_result.is_ok() {
+            clear_rotation_checkpoint().ok();
+        }
+        return Err(error);
+    }
+
+    clear_rotation_checkpoint()?;
+
+    Ok(prepared.message)
+}
+
 fn relogin_host(
     port: u16,
     selector: &str,
@@ -2275,8 +2377,14 @@ fn activate_host_rotation(
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
     }
 
+    let seed_missing_target_from_source = exported_handoffs.is_empty();
     let transition = (|| -> Result<()> {
-        switch_host_persona(paths, &prepared.previous, &prepared.target, true)?;
+        switch_host_persona(
+            paths,
+            &prepared.previous,
+            &prepared.target,
+            seed_missing_target_from_source,
+        )?;
         write_selected_account_auth(&prepared.target)?;
 
         Ok(())
@@ -2447,15 +2555,24 @@ fn provision_host_persona(
         .with_context(|| format!("Failed to create {}.", target.root.display()))?;
     if !target.codex_home.exists() {
         fs::create_dir_all(&target.codex_home)?;
-        if let Some(source_entry) = seed_from {
-            let source = host_persona_paths(
+    }
+    if let Some(source_entry) = seed_from {
+        let source = host_persona_paths(
+            paths,
+            source_entry
+                .persona
+                .as_ref()
+                .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
+        )?;
+        ensure_host_persona_shared_codex_home_links(paths, &source)?;
+        if host_persona_needs_conversation_seed(paths, entry)? {
+            seed_host_persona_conversation_state_from_source(
                 paths,
-                source_entry
-                    .persona
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Source account is missing persona metadata."))?,
+                source_entry,
+                &source,
+                entry,
+                &target,
             )?;
-            ensure_host_persona_shared_codex_home_links(paths, &source)?;
         }
     }
     ensure_host_persona_shared_codex_home_links(paths, &target)?;
@@ -2493,6 +2610,15 @@ fn provision_host_persona(
         }
     }
     Ok(())
+}
+
+fn host_persona_needs_conversation_seed(
+    paths: &RuntimePaths,
+    entry: &AccountEntry,
+) -> Result<bool> {
+    let sync_identity = conversation_sync_identity(entry);
+    let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+    Ok(!store.has_account_bindings(&sync_identity)?)
 }
 
 fn ensure_live_root_bindings(paths: &RuntimePaths, entry: &AccountEntry) -> Result<()> {
@@ -2575,6 +2701,169 @@ fn ensure_host_persona_shared_codex_home_links(
             &shared_codex_home.join(entry),
         )?;
     }
+    Ok(())
+}
+
+fn seed_host_persona_conversation_state_from_source(
+    paths: &RuntimePaths,
+    source_entry: &AccountEntry,
+    source: &HostPersonaPaths,
+    target_entry: &AccountEntry,
+    target: &HostPersonaPaths,
+) -> Result<()> {
+    if source.codex_home == target.codex_home {
+        return Ok(());
+    }
+
+    for &entry in HOST_PERSONA_CONVERSATION_SEED_ENTRIES {
+        let source_path = source.codex_home.join(entry);
+        let target_path = target.codex_home.join(entry);
+        if entry == SESSION_INDEX_FILE_NAME {
+            merge_session_index_one_way(&source_path, &target_path)?;
+        } else {
+            copy_missing_path_one_way(&source_path, &target_path)?;
+        }
+    }
+    if resolve_state_db_file_in_codex_home(&target.codex_home)
+        .filter(|path| path.exists())
+        .is_some()
+    {
+        merge_state_threads_one_way(&source.codex_home, &target.codex_home)?;
+    } else {
+        seed_host_persona_state_db_from_source(&source.codex_home, &target.codex_home)?;
+    }
+    seed_host_persona_conversation_bindings(
+        paths,
+        source_entry,
+        &source.codex_home,
+        target_entry,
+        &target.codex_home,
+    )?;
+    Ok(())
+}
+
+fn seed_host_persona_state_db_from_source(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
+        return Ok(());
+    };
+    if !source_state_db.exists() {
+        return Ok(());
+    }
+    let file_name = source_state_db
+        .file_name()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| std::ffi::OsString::from("state.sqlite"));
+    let target_state_db = target_codex_home.join(file_name);
+    copy_path_if_exists(&source_state_db, &target_state_db)?;
+    for suffix in ["-wal", "-shm"] {
+        copy_path_if_exists(
+            &sqlite_sidecar_path(&source_state_db, suffix),
+            &sqlite_sidecar_path(&target_state_db, suffix),
+        )?;
+    }
+    Ok(())
+}
+
+fn seed_host_persona_conversation_bindings(
+    paths: &RuntimePaths,
+    source_entry: &AccountEntry,
+    source_codex_home: &Path,
+    target_entry: &AccountEntry,
+    _target_codex_home: &Path,
+) -> Result<()> {
+    let Some(source_state_db) = resolve_state_db_file_in_codex_home(source_codex_home) else {
+        return Ok(());
+    };
+    if !source_state_db.exists() {
+        return Ok(());
+    }
+
+    let thread_ids = read_all_thread_ids_from_state_db(&source_state_db)?;
+    if thread_ids.is_empty() {
+        return Ok(());
+    }
+
+    let source_sync_identity = conversation_sync_identity(source_entry);
+    let target_sync_identity = conversation_sync_identity(target_entry);
+    let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
+    for thread_id in thread_ids {
+        let lineage_id = store
+            .get_lineage_id(&source_sync_identity, &thread_id)?
+            .unwrap_or_else(|| thread_id.clone());
+        store.bind_local_thread_id(&source_sync_identity, &lineage_id, &thread_id)?;
+        store.bind_local_thread_id(&target_sync_identity, &lineage_id, &thread_id)?;
+    }
+    Ok(())
+}
+
+fn read_all_thread_ids_from_state_db(state_db_path: &Path) -> Result<Vec<String>> {
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        r#"
+select id
+from threads
+where id is not null
+  and trim(id) != ''
+order by id
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut thread_ids = Vec::new();
+    for row in rows {
+        thread_ids.push(row?);
+    }
+    Ok(thread_ids)
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state.sqlite".to_string());
+    db_path.with_file_name(format!("{file_name}{suffix}"))
+}
+
+fn copy_path_if_exists(source: &Path, target: &Path) -> Result<bool> {
+    if !path_exists_or_symlink(source) || path_exists_or_symlink(target) {
+        return Ok(false);
+    }
+    copy_path(source, target)?;
+    Ok(true)
+}
+
+fn copy_missing_path_one_way(source: &Path, target: &Path) -> Result<()> {
+    let Some(metadata) = symlink_metadata_optional(source)? else {
+        return Ok(());
+    };
+    if metadata.is_dir() {
+        if let Some(target_metadata) = symlink_metadata_optional(target)? {
+            if !target_metadata.is_dir() {
+                return Err(anyhow!(
+                    "Failed to merge {} into {} because the target is not a directory.",
+                    source.display(),
+                    target.display()
+                ));
+            }
+        } else {
+            fs::create_dir_all(target)
+                .with_context(|| format!("Failed to create {}.", target.display()))?;
+        }
+        for entry in
+            fs::read_dir(source).with_context(|| format!("Failed to read {}.", source.display()))?
+        {
+            let entry = entry?;
+            copy_missing_path_one_way(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    let _ = copy_path_if_exists(source, target)?;
     Ok(())
 }
 
@@ -4693,6 +4982,14 @@ impl ConversationSyncStore {
         Ok(Self { db })
     }
 
+    pub fn has_account_bindings(&self, account_id: &str) -> Result<bool> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT 1 FROM conversation_bindings WHERE account_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query([account_id])?;
+        Ok(rows.next()?.is_some())
+    }
+
     fn migrate(db: &mut rusqlite::Connection) -> Result<()> {
         let tx = db.transaction()?;
         tx.execute(
@@ -5882,8 +6179,12 @@ exit 91
 
     #[test]
     fn lineage_sync_contract_states_unique_ids_and_additive_sync() {
-        assert!(LINEAGE_SYNC_CONTRACT
-            .contains("different local thread IDs while preserving continuity"));
+        assert!(
+            LINEAGE_SYNC_CONTRACT.contains("API handoff sync creates different local thread IDs")
+        );
+        assert!(LINEAGE_SYNC_CONTRACT.contains(
+            "First materialization may seed persona-local storage from the previous persona"
+        ));
         assert!(LINEAGE_SYNC_CONTRACT.contains(
             "one local thread per lineage per persona with no duplicate logical conversations on repeated sync"
         ));
@@ -6538,6 +6839,204 @@ exit 91
         assert!(
             !target_paths.root.join("managed-profile").exists(),
             "target persona should not materialize managed-profile before use"
+        );
+    }
+
+    #[test]
+    fn switch_host_persona_seeds_missing_target_conversation_state_once() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[
+                (
+                    "thread-source",
+                    "/Users/test/.codex/sessions/2026/01/01/rollout-source.jsonl",
+                    100,
+                ),
+                (
+                    "thread-archived",
+                    "/Users/test/.codex/archived_sessions/rollout-archived.jsonl",
+                    90,
+                ),
+            ],
+        );
+
+        let source_rollout = source_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl");
+        let source_archive = source_paths
+            .codex_home
+            .join("archived_sessions/rollout-archived.jsonl");
+        fs::create_dir_all(source_rollout.parent().unwrap()).expect("create source rollout parent");
+        fs::create_dir_all(source_archive.parent().unwrap()).expect("create source archive parent");
+        fs::write(&source_rollout, "{\"thread\":\"source\"}\n").expect("write source rollout");
+        fs::write(&source_archive, "{\"thread\":\"archived\"}\n").expect("write source archive");
+        fs::write(
+            source_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            "{\"id\":\"thread-source\",\"thread_name\":\"source\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+        )
+        .expect("write source index");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        assert!(!target_paths.root.exists());
+
+        switch_host_persona(&paths, &source, &target, true).expect("switch persona");
+
+        assert_eq!(
+            read_thread_ids(&target_paths.codex_home.join("state_5.sqlite")),
+            vec!["thread-archived".to_string(), "thread-source".to_string()]
+        );
+        assert!(target_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("archived_sessions/rollout-archived.jsonl")
+            .exists());
+        let target_index =
+            fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME)).unwrap();
+        assert!(target_index.contains("\"thread-source\""));
+
+        let store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        assert_eq!(
+            store
+                .get_lineage_id(&conversation_sync_identity(&source), "thread-source")
+                .expect("source binding"),
+            Some("thread-source".to_string())
+        );
+        assert_eq!(
+            store
+                .get_local_thread_id(&conversation_sync_identity(&target), "thread-source")
+                .expect("target binding"),
+            Some("thread-source".to_string())
+        );
+    }
+
+    #[test]
+    fn switch_host_persona_repairs_existing_unbound_target_conversation_state() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+
+        seed_threads_table(
+            &source_paths.codex_home.join("state_5.sqlite"),
+            &[
+                (
+                    "thread-source",
+                    "/Users/test/.codex/sessions/2026/01/01/rollout-source.jsonl",
+                    100,
+                ),
+                (
+                    "thread-archived",
+                    "/Users/test/.codex/archived_sessions/rollout-archived.jsonl",
+                    90,
+                ),
+            ],
+        );
+        seed_threads_table(
+            &target_paths.codex_home.join("state_5.sqlite"),
+            &[(
+                "thread-target-local",
+                "/Users/test/.codex/sessions/2026/01/02/rollout-target.jsonl",
+                110,
+            )],
+        );
+
+        let source_rollout = source_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl");
+        let source_archive = source_paths
+            .codex_home
+            .join("archived_sessions/rollout-archived.jsonl");
+        let target_rollout = target_paths
+            .codex_home
+            .join("sessions/2026/01/02/rollout-target.jsonl");
+        fs::create_dir_all(source_rollout.parent().unwrap()).expect("create source rollout parent");
+        fs::create_dir_all(source_archive.parent().unwrap()).expect("create source archive parent");
+        fs::create_dir_all(target_rollout.parent().unwrap()).expect("create target rollout parent");
+        fs::write(&source_rollout, "{\"thread\":\"source\"}\n").expect("write source rollout");
+        fs::write(&source_archive, "{\"thread\":\"archived\"}\n").expect("write source archive");
+        fs::write(&target_rollout, "{\"thread\":\"target\"}\n").expect("write target rollout");
+        fs::write(
+            source_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            concat!(
+                "{\"id\":\"thread-source\",\"thread_name\":\"source\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+                "{\"id\":\"thread-archived\",\"thread_name\":\"archived\",\"updated_at\":\"2026-01-01T00:00:01Z\"}\n"
+            ),
+        )
+        .expect("write source index");
+        fs::write(
+            target_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            "{\"id\":\"thread-target-local\",\"thread_name\":\"target\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n",
+        )
+        .expect("write target index");
+
+        ensure_live_root_bindings(&paths, &source).expect("bind source");
+        switch_host_persona(&paths, &source, &target, true).expect("switch persona");
+
+        assert_eq!(
+            read_thread_ids(&target_paths.codex_home.join("state_5.sqlite")),
+            vec![
+                "thread-archived".to_string(),
+                "thread-source".to_string(),
+                "thread-target-local".to_string(),
+            ]
+        );
+        assert!(target_paths
+            .codex_home
+            .join("sessions/2026/01/01/rollout-source.jsonl")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("archived_sessions/rollout-archived.jsonl")
+            .exists());
+        assert!(target_paths
+            .codex_home
+            .join("sessions/2026/01/02/rollout-target.jsonl")
+            .exists());
+
+        let target_index =
+            fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME)).unwrap();
+        assert!(target_index.contains("\"thread-source\""));
+        assert!(target_index.contains("\"thread-archived\""));
+        assert!(target_index.contains("\"thread-target-local\""));
+
+        let store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        let target_sync_identity = conversation_sync_identity(&target);
+        assert_eq!(
+            store
+                .get_local_thread_id(&target_sync_identity, "thread-source")
+                .expect("target source binding"),
+            Some("thread-source".to_string())
+        );
+        assert_eq!(
+            store
+                .get_local_thread_id(&target_sync_identity, "thread-archived")
+                .expect("target archived binding"),
+            Some("thread-archived".to_string())
+        );
+        assert_eq!(
+            store
+                .get_lineage_id(&target_sync_identity, "thread-target-local")
+                .expect("target local lineage"),
+            None
         );
     }
 

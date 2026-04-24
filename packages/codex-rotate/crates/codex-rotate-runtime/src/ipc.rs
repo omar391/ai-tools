@@ -103,6 +103,7 @@ pub enum InvokeAction {
     ShutdownWhenIdle,
     Next,
     Prev,
+    Set { selector: String },
     Create { options: CreateInvocation },
     Relogin { options: ReloginInvocation },
     Remove { selector: String },
