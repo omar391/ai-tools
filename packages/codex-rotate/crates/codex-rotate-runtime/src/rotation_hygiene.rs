@@ -95,9 +95,9 @@ impl From<RotationCheckpointPhase> for RotationPhase {
 }
 
 const DEFAULT_PORT: u16 = 9333;
-const MAX_HANDOFF_ITEMS: usize = 48;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
 const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
+const LINEAGE_CLAIM_STALE_AFTER_NANOS: u128 = 10 * 60 * 1_000_000_000;
 const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
     "config.toml",
     CODEX_GLOBAL_STATE_FILE_NAME,
@@ -206,6 +206,7 @@ trait RotationBackend {
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
         source_thread_candidates: Vec<String>,
+        options: RotationCommandOptions,
     ) -> Result<Vec<ThreadHandoff>>;
 
     fn rollback_after_failed_activation(
@@ -219,12 +220,14 @@ trait RotationBackend {
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<NextResult>;
 
     fn rotate_prev(
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<String>;
 
     fn relogin(
@@ -252,26 +255,56 @@ fn conversation_sync_identity(entry: &AccountEntry) -> String {
         .unwrap_or_else(|| entry.account_id.clone())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RotationCommandOptions {
+    pub force_managed_window: bool,
+}
+
 pub fn rotate_next(
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<NextResult> {
+    rotate_next_with_options(port, progress, RotationCommandOptions::default())
+}
+
+pub fn rotate_next_with_options(
+    port: Option<u16>,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
+) -> Result<NextResult> {
     let _lock = RotationLock::acquire()?;
-    select_rotation_backend()?.rotate_next(port.unwrap_or(DEFAULT_PORT), progress)
+    select_rotation_backend()?.rotate_next(port.unwrap_or(DEFAULT_PORT), progress, options)
 }
 
 pub fn rotate_prev(
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<String> {
+    rotate_prev_with_options(port, progress, RotationCommandOptions::default())
+}
+
+pub fn rotate_prev_with_options(
+    port: Option<u16>,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
+) -> Result<String> {
     let _lock = RotationLock::acquire()?;
-    select_rotation_backend()?.rotate_prev(port.unwrap_or(DEFAULT_PORT), progress)
+    select_rotation_backend()?.rotate_prev(port.unwrap_or(DEFAULT_PORT), progress, options)
 }
 
 pub fn rotate_set(
     port: Option<u16>,
     selector: &str,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<String> {
+    rotate_set_with_options(port, selector, progress, RotationCommandOptions::default())
+}
+
+pub fn rotate_set_with_options(
+    port: Option<u16>,
+    selector: &str,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
 ) -> Result<String> {
     let _lock = RotationLock::acquire()?;
     let backend = select_rotation_backend()?;
@@ -280,6 +313,7 @@ pub fn rotate_set(
         port.unwrap_or(DEFAULT_PORT),
         selector,
         progress,
+        options,
     )
 }
 
@@ -797,6 +831,7 @@ impl RotationBackend for HostBackend {
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
         source_thread_candidates: Vec<String>,
+        options: RotationCommandOptions,
     ) -> Result<Vec<ThreadHandoff>> {
         let paths = resolve_paths()?;
         let activation = activate_host_rotation(
@@ -805,6 +840,7 @@ impl RotationBackend for HostBackend {
             port,
             progress.as_ref(),
             source_thread_candidates,
+            options,
         )?;
         Ok(activation.items)
     }
@@ -826,16 +862,18 @@ impl RotationBackend for HostBackend {
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<NextResult> {
-        rotate_next_impl(self, port, progress, true)
+        rotate_next_impl(self, port, progress, true, options)
     }
 
     fn rotate_prev(
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<String> {
-        rotate_prev_impl(self, port, progress)
+        rotate_prev_impl(self, port, progress, options)
     }
 
     fn relogin(
@@ -856,6 +894,7 @@ impl RotationBackend for VmBackend {
         _port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
         _source_thread_candidates: Vec<String>,
+        _options: RotationCommandOptions,
     ) -> Result<Vec<ThreadHandoff>> {
         self.validate_config()?;
         let handoffs = match self.export_guest_handoffs(&prepared.previous.account_id) {
@@ -903,18 +942,20 @@ impl RotationBackend for VmBackend {
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<NextResult> {
         self.validate_config()?;
-        rotate_next_impl(self, port, progress, true)
+        rotate_next_impl(self, port, progress, true, options)
     }
 
     fn rotate_prev(
         &self,
         port: u16,
         progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        options: RotationCommandOptions,
     ) -> Result<String> {
         self.validate_config()?;
-        rotate_prev_impl(self, port, progress)
+        rotate_prev_impl(self, port, progress, options)
     }
 
     fn relogin(
@@ -1842,6 +1883,7 @@ fn maybe_complete_non_switch_next_result(
     prepared: &PreparedRotation,
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
     allow_create: bool,
     disabled_retry_budget: usize,
 ) -> Result<Option<NextResult>> {
@@ -1874,8 +1916,14 @@ fn maybe_complete_non_switch_next_result(
                 progress.clone(),
             )?;
             restore_pool_active_index(prepared.previous_index)?;
-            let next =
-                rotate_next_impl_with_retry(backend, port, progress, false, disabled_retry_budget)?;
+            let next = rotate_next_impl_with_retry(
+                backend,
+                port,
+                progress,
+                false,
+                options,
+                disabled_retry_budget,
+            )?;
             let summary = match &next {
                 NextResult::Rotated { summary, .. }
                 | NextResult::Stayed { summary, .. }
@@ -1952,8 +2000,9 @@ fn rotate_next_impl(
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
+    options: RotationCommandOptions,
 ) -> Result<NextResult> {
-    rotate_next_impl_with_retry(backend, port, progress, allow_create, 1)
+    rotate_next_impl_with_retry(backend, port, progress, allow_create, options, 1)
 }
 
 fn rotate_next_impl_with_retry(
@@ -1961,6 +2010,7 @@ fn rotate_next_impl_with_retry(
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     allow_create: bool,
+    options: RotationCommandOptions,
     mut disabled_retry_budget: usize,
 ) -> Result<NextResult> {
     recover_incomplete_rotation_state_without_lock()?;
@@ -2016,6 +2066,7 @@ fn rotate_next_impl_with_retry(
         &prepared,
         port,
         progress.clone(),
+        options,
         allow_create,
         disabled_retry_budget,
     )? {
@@ -2056,6 +2107,7 @@ fn rotate_next_impl_with_retry(
             &prepared,
             port,
             progress.clone(),
+            options,
             allow_create,
             disabled_retry_budget,
         )? {
@@ -2070,6 +2122,7 @@ fn rotate_next_impl_with_retry(
             port,
             progress.clone(),
             source_thread_candidates.clone(),
+            options,
         )
         .with_context(|| {
             format!(
@@ -2102,6 +2155,7 @@ fn rotate_next_impl_with_retry(
                         port,
                         progress,
                         allow_create,
+                        options,
                         disabled_retry_budget.saturating_sub(1),
                     )
                 },
@@ -2166,6 +2220,7 @@ fn rotate_next_impl_with_retry(
                         port,
                         progress,
                         allow_create,
+                        options,
                         disabled_retry_budget.saturating_sub(1),
                     )
                 },
@@ -2192,6 +2247,7 @@ fn rotate_prev_impl(
     backend: &dyn RotationBackend,
     port: u16,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
 ) -> Result<String> {
     recover_incomplete_rotation_state_without_lock()?;
     let source_thread_candidates = backend.capture_source_thread_candidates(port)?;
@@ -2212,7 +2268,13 @@ fn rotate_prev_impl(
     ensure_target_account_still_valid(&prepared)?;
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
-    let handoffs = backend.activate(&prepared, port, progress.clone(), source_thread_candidates)?;
+    let handoffs = backend.activate(
+        &prepared,
+        port,
+        progress.clone(),
+        source_thread_candidates,
+        options,
+    )?;
 
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
@@ -2264,6 +2326,7 @@ fn rotate_set_impl(
     port: u16,
     selector: &str,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
 ) -> Result<String> {
     recover_incomplete_rotation_state_without_lock()?;
     let source_thread_candidates = backend.capture_source_thread_candidates(port)?;
@@ -2284,7 +2347,13 @@ fn rotate_set_impl(
     ensure_target_account_still_present(&prepared)?;
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
-    let handoffs = backend.activate(&prepared, port, progress.clone(), source_thread_candidates)?;
+    let handoffs = backend.activate(
+        &prepared,
+        port,
+        progress.clone(),
+        source_thread_candidates,
+        options,
+    )?;
 
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Import)?;
 
@@ -2411,22 +2480,42 @@ fn activate_host_rotation(
     port: u16,
     progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     source_thread_candidates: Vec<String>,
+    options: RotationCommandOptions,
 ) -> Result<HostRotationActivation> {
     let managed_running_before = managed_codex_is_running(&paths.debug_profile_dir)?;
+    let mut managed_running_for_handoff = managed_running_before;
     let mut pre_wait_thread_ids = source_thread_candidates;
-    if managed_running_before {
+    if !managed_running_for_handoff && options.force_managed_window {
+        if let Some(progress) = progress {
+            progress(
+                "Managed Codex is not running; opening a managed window for thread handoff sync."
+                    .to_string(),
+            );
+        }
+        ensure_debug_codex_instance(None, Some(port), None, None)
+            .context("Failed to open managed Codex window requested by -mw.")?;
+        managed_running_for_handoff = true;
+    } else if !managed_running_for_handoff {
+        if let Some(progress) = progress {
+            progress(
+                "Managed Codex is not running; switching personas without thread handoff sync. Use -mw to open a managed window first."
+                    .to_string(),
+            );
+        }
+    }
+    if managed_running_for_handoff {
         pre_wait_thread_ids.extend(read_active_thread_ids(Some(port))?);
         pre_wait_thread_ids.extend(read_thread_handoff_candidate_ids_from_state_db(
             &paths.codex_state_db_file,
         )?);
     }
-    if managed_running_before {
+    if managed_running_for_handoff {
         if let Some(progress) = progress {
             progress("Waiting for active Codex work to become handoff-safe.".to_string());
         }
         wait_for_all_threads_idle(port, progress)?;
     }
-    let exported_handoffs = if managed_running_before {
+    let exported_handoffs = if managed_running_for_handoff {
         let previous_sync_identity = conversation_sync_identity(&prepared.previous);
         export_thread_handoffs_with_identity_and_candidates(
             port,
@@ -2438,7 +2527,7 @@ fn activate_host_rotation(
         Vec::new()
     };
 
-    if managed_running_before {
+    if managed_running_for_handoff {
         stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
     }
 
@@ -2451,7 +2540,7 @@ fn activate_host_rotation(
 
     match transition {
         Ok(_) => {
-            if managed_running_before {
+            if managed_running_for_handoff {
                 if let Some(progress) = progress {
                     progress(
                         "Restarting managed Codex after committing the target persona.".to_string(),
@@ -2472,7 +2561,7 @@ fn activate_host_rotation(
             let rollback_error = rollback_after_failed_host_activation(
                 paths,
                 prepared,
-                managed_running_before,
+                managed_running_for_handoff,
                 port,
             );
             if let Err(rollback_error) = rollback_error {
@@ -3394,6 +3483,8 @@ fn is_terminal_thread_read_error(error: &anyhow::Error) -> bool {
         || message.contains("no thread found")
         || message.contains("unknown thread")
         || message.contains("does not exist")
+        || (message.contains("failed to load thread history")
+            && message.contains("no such file or directory"))
 }
 
 fn export_single_thread_handoff_with_identity(
@@ -3425,27 +3516,7 @@ fn export_single_thread_handoff_from_response(
         .get("cwd")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let mut items = Vec::new();
-    for turn in thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for item in turn
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(mapped) = map_thread_item_to_response_item(item) {
-                items.push(mapped);
-            }
-        }
-    }
-    if items.len() > MAX_HANDOFF_ITEMS {
-        items = items.split_off(items.len().saturating_sub(MAX_HANDOFF_ITEMS));
-    }
+    let items = mapped_response_items_from_thread(thread);
     let metadata = thread_handoff_metadata_from_thread(thread_id, thread, &items);
 
     let paths = crate::paths::resolve_paths()?;
@@ -3457,16 +3528,8 @@ fn export_single_thread_handoff_from_response(
             thread_id.to_string()
         }
     };
-    let watermark = thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .and_then(|turns| {
-            turns.iter().rev().find_map(|turn| {
-                turn.get("id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-        });
+    let watermark = thread_handoff_content_watermark(&items);
+    store.set_watermark(sync_identity, &lineage_id, watermark.as_deref())?;
 
     Ok(Some(ThreadHandoff {
         source_thread_id: thread_id.to_string(),
@@ -3476,6 +3539,41 @@ fn export_single_thread_handoff_from_response(
         items,
         metadata,
     }))
+}
+
+fn thread_handoff_content_watermark(items: &[Value]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let serialized = serde_json::to_vec(items).ok()?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in &serialized {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("items-fnv1a64-{hash:016x}-{}", items.len()))
+}
+
+fn mapped_response_items_from_thread(thread: &Value) -> Vec<Value> {
+    thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(map_thread_item_to_response_item)
+        .collect()
+}
+
+fn mapped_response_items_from_thread_read_response(response: &Value) -> Option<Vec<Value>> {
+    response
+        .get("thread")
+        .map(mapped_response_items_from_thread)
 }
 
 fn import_thread_handoffs(
@@ -3496,6 +3594,10 @@ fn import_thread_handoffs(
             ));
         }
 
+        let current_watermark = store.get_watermark(target_account_id, &handoff.lineage_id)?;
+        let current_content_is_synced = current_watermark.as_deref()
+            == handoff.watermark.as_deref()
+            && handoff.watermark.is_some();
         let mut created_thread_id = None;
         let mut lineage_claim_token = None;
         let existing_local_id = match store
@@ -3504,6 +3606,8 @@ fn import_thread_handoffs(
             LineageBindingClaim::Existing(local_id) => {
                 let should_reclaim = if local_id == handoff.source_thread_id {
                     true
+                } else if current_content_is_synced {
+                    false
                 } else {
                     match transport.thread_exists(&local_id) {
                         Ok(exists) => !exists,
@@ -3616,13 +3720,118 @@ fn import_thread_handoffs(
             }
         };
 
-        let current_watermark = store.get_watermark(target_account_id, &handoff.lineage_id)?;
         let needs_update = current_watermark.as_deref() != handoff.watermark.as_deref();
+        let mut items_to_inject = if created_thread_id.is_some() || needs_update {
+            handoff.items.clone()
+        } else {
+            Vec::new()
+        };
+        let mut replaced_thread_id = None::<String>;
+
+        if created_thread_id.is_none() && needs_update && !handoff.items.is_empty() {
+            match plan_existing_thread_materialization(transport, &target_thread_id, handoff) {
+                Ok(ExistingThreadMaterializationPlan::AlreadyCurrent) => {
+                    items_to_inject.clear();
+                }
+                Ok(ExistingThreadMaterializationPlan::AppendSuffix(suffix)) => {
+                    items_to_inject = suffix;
+                }
+                Ok(ExistingThreadMaterializationPlan::Recreate) => {
+                    match store.reclaim_lineage_binding(
+                        target_account_id,
+                        &handoff.lineage_id,
+                        &target_thread_id,
+                    )? {
+                        LineageBindingClaim::Claimed { claim_token } => {
+                            lineage_claim_token = Some(claim_token);
+                            let old_thread_id = target_thread_id.clone();
+                            let new_thread_id = match transport.start_thread(handoff.cwd.as_deref())
+                            {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    if let Some(claim_token) = lineage_claim_token.as_deref() {
+                                        let _ = store.release_lineage_claim(
+                                            target_account_id,
+                                            &handoff.lineage_id,
+                                            claim_token,
+                                        );
+                                    }
+                                    outcome.failures.push(ThreadHandoffImportFailure {
+                                        source_thread_id: handoff.source_thread_id.clone(),
+                                        created_thread_id: None,
+                                        stage: ThreadHandoffImportFailureStage::Start,
+                                        error: error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            };
+                            if new_thread_id == handoff.source_thread_id {
+                                if let Some(claim_token) = lineage_claim_token.as_deref() {
+                                    let _ = store.release_lineage_claim(
+                                        target_account_id,
+                                        &handoff.lineage_id,
+                                        claim_token,
+                                    );
+                                }
+                                outcome.failures.push(ThreadHandoffImportFailure {
+                                    source_thread_id: handoff.source_thread_id.clone(),
+                                    created_thread_id: None,
+                                    stage: ThreadHandoffImportFailureStage::Start,
+                                    error:
+                                        "Codex thread/start unexpectedly reused the source thread ID."
+                                            .to_string(),
+                                });
+                                continue;
+                            }
+                            target_thread_id = new_thread_id.clone();
+                            created_thread_id = Some(new_thread_id);
+                            replaced_thread_id = Some(old_thread_id);
+                            items_to_inject = handoff.items.clone();
+                        }
+                        LineageBindingClaim::Existing(repaired_local_id) => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
+                                source_thread_id: handoff.source_thread_id.clone(),
+                                created_thread_id: None,
+                                stage: ThreadHandoffImportFailureStage::Start,
+                                error: format!(
+                                    "Mapped local thread {} needed replacement, but lineage was concurrently rebound to {}.",
+                                    target_thread_id, repaired_local_id
+                                ),
+                            });
+                            continue;
+                        }
+                        LineageBindingClaim::Busy => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
+                                source_thread_id: handoff.source_thread_id.clone(),
+                                created_thread_id: None,
+                                stage: ThreadHandoffImportFailureStage::Start,
+                                error: format!(
+                                    "Lineage {} is already being synchronized for account {}; retry.",
+                                    handoff.lineage_id, target_account_id
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    outcome.failures.push(ThreadHandoffImportFailure {
+                        source_thread_id: handoff.source_thread_id.clone(),
+                        created_thread_id: None,
+                        stage: ThreadHandoffImportFailureStage::Start,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
+
         let should_materialize = created_thread_id.is_some() || needs_update;
 
         if should_materialize {
-            if !handoff.items.is_empty() {
-                if let Err(error) = transport.inject_items(&target_thread_id, handoff.items.clone())
+            if !items_to_inject.is_empty() {
+                if let Err(error) =
+                    transport.inject_items(&target_thread_id, items_to_inject.clone())
                 {
                     let error_message = format!("{:#}", error);
                     if created_thread_id.is_none() && thread_not_found_message(&error_message) {
@@ -3633,6 +3842,7 @@ fn import_thread_handoffs(
                         )? {
                             LineageBindingClaim::Claimed { claim_token } => {
                                 lineage_claim_token = Some(claim_token);
+                                let old_thread_id = target_thread_id.clone();
                                 let new_thread_id = match transport
                                     .start_thread(handoff.cwd.as_deref())
                                 {
@@ -3673,8 +3883,10 @@ fn import_thread_handoffs(
                                 }
                                 target_thread_id = new_thread_id.clone();
                                 created_thread_id = Some(new_thread_id);
-                                if let Err(retry_error) =
-                                    transport.inject_items(&target_thread_id, handoff.items.clone())
+                                replaced_thread_id = Some(old_thread_id);
+                                items_to_inject = handoff.items.clone();
+                                if let Err(retry_error) = transport
+                                    .inject_items(&target_thread_id, items_to_inject.clone())
                                 {
                                     let _ = store.bind_local_thread_id(
                                         target_account_id,
@@ -3736,6 +3948,13 @@ fn import_thread_handoffs(
                 if let Err(error) =
                     transport.ensure_thread_user_message_event(&target_thread_id, handoff)
                 {
+                    if created_thread_id.is_some() || lineage_claim_token.is_some() {
+                        let _ = store.bind_local_thread_id(
+                            target_account_id,
+                            &handoff.lineage_id,
+                            &target_thread_id,
+                        );
+                    }
                     outcome.failures.push(ThreadHandoffImportFailure {
                         source_thread_id: handoff.source_thread_id.clone(),
                         created_thread_id: created_thread_id.clone(),
@@ -3748,6 +3967,14 @@ fn import_thread_handoffs(
         }
 
         if let Err(error) = transport.publish_thread_handoff_metadata(&target_thread_id, handoff) {
+            if created_thread_id.is_some() || lineage_claim_token.is_some() {
+                let _ = store.bind_and_update_watermark(
+                    target_account_id,
+                    &handoff.lineage_id,
+                    &target_thread_id,
+                    handoff.watermark.as_deref(),
+                );
+            }
             outcome.failures.push(ThreadHandoffImportFailure {
                 source_thread_id: handoff.source_thread_id.clone(),
                 created_thread_id: created_thread_id.clone(),
@@ -3786,6 +4013,22 @@ fn import_thread_handoffs(
             continue;
         }
 
+        if let Some(stale_thread_id) = replaced_thread_id.as_deref() {
+            if let Err(error) =
+                transport.cleanup_replaced_thread(&target_thread_id, stale_thread_id)
+            {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id,
+                    stage: ThreadHandoffImportFailureStage::Persist,
+                    error: format!(
+                        "Failed to remove replaced local thread {stale_thread_id}: {error}"
+                    ),
+                });
+                continue;
+            }
+        }
+
         outcome
             .completed_source_thread_ids
             .push(handoff.source_thread_id.clone());
@@ -3793,9 +4036,52 @@ fn import_thread_handoffs(
     Ok(outcome)
 }
 
+enum ExistingThreadMaterializationPlan {
+    AlreadyCurrent,
+    AppendSuffix(Vec<Value>),
+    Recreate,
+}
+
+fn plan_existing_thread_materialization(
+    transport: &dyn ConversationTransport,
+    target_thread_id: &str,
+    handoff: &ThreadHandoff,
+) -> Result<ExistingThreadMaterializationPlan> {
+    let response = match transport.read_thread(target_thread_id) {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("{error:#}");
+            if thread_not_found_message(&message) {
+                return Ok(ExistingThreadMaterializationPlan::Recreate);
+            }
+            return Err(error);
+        }
+    };
+    let Some(existing_items) = mapped_response_items_from_thread_read_response(&response) else {
+        return Ok(ExistingThreadMaterializationPlan::Recreate);
+    };
+    if existing_items == handoff.items {
+        return Ok(ExistingThreadMaterializationPlan::AlreadyCurrent);
+    }
+    if response_items_are_prefix(&existing_items, &handoff.items) {
+        return Ok(ExistingThreadMaterializationPlan::AppendSuffix(
+            handoff.items[existing_items.len()..].to_vec(),
+        ));
+    }
+    Ok(ExistingThreadMaterializationPlan::Recreate)
+}
+
+fn response_items_are_prefix(prefix: &[Value], items: &[Value]) -> bool {
+    prefix.len() <= items.len() && prefix.iter().zip(items).all(|(left, right)| left == right)
+}
+
+#[cfg(not(test))]
 fn wait_for_imported_thread_persistence() {
     std::thread::sleep(Duration::from_secs(2));
 }
+
+#[cfg(test)]
+fn wait_for_imported_thread_persistence() {}
 
 fn thread_handoff_metadata_from_thread(
     thread_id: &str,
@@ -4016,6 +4302,7 @@ fn merge_thread_sidebar_metadata(
     fill_if_missing(&mut target.approval_mode, source.approval_mode);
     fill_if_missing_bool(&mut target.projectless, source.projectless);
     fill_if_missing(&mut target.workspace_root_hint, source.workspace_root_hint);
+    fill_if_missing_bool(&mut target.archived, source.archived);
 }
 
 fn read_thread_sidebar_metadata_from_state_db(
@@ -4072,6 +4359,10 @@ fn read_thread_sidebar_metadata_from_state_db(
         metadata.approval_mode =
             query_thread_optional_string(&connection, "approval_mode", thread_id)?
                 .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "archived") {
+        metadata.archived =
+            query_thread_optional_i64(&connection, "archived", thread_id)?.map(|value| value != 0);
     }
     Ok(metadata)
 }
@@ -4259,6 +4550,7 @@ fn prepared_thread_sidebar_metadata(
             .unwrap_or_default()
             .trim()
             .is_empty()
+        && metadata.archived.is_none()
     {
         return Ok(None);
     }
@@ -4297,11 +4589,18 @@ fn thread_sidebar_metadata_visible(
         return Ok(true);
     }
     let actual = read_thread_sidebar_metadata_from_state_db(&state_db_path, thread_id)?;
-    let title_visible = actual
+    let title_visible = match expected
         .title
         .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(_) => actual
+            .title
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        None => true,
+    };
     let first_user_visible = match expected
         .first_user_message
         .as_deref()
@@ -4314,7 +4613,11 @@ fn thread_sidebar_metadata_visible(
             .unwrap_or(false),
         None => true,
     };
-    Ok(title_visible && first_user_visible)
+    let archived_visible = match expected.archived {
+        Some(expected_archived) => actual.archived == Some(expected_archived),
+        None => true,
+    };
+    Ok(title_visible && first_user_visible && archived_visible)
 }
 
 fn publish_thread_sidebar_metadata_to_state_db(
@@ -4388,6 +4691,14 @@ fn publish_thread_sidebar_metadata_to_state_db(
             "update threads set has_user_event = 1 where id = ?1",
             [thread_id],
         )?;
+    }
+    if columns.iter().any(|column| column == "archived") {
+        if let Some(archived) = metadata.archived {
+            connection.execute(
+                "update threads set archived = ?1 where id = ?2 and archived != ?1",
+                rusqlite::params![archived as i64, thread_id],
+            )?;
+        }
     }
     if columns.iter().any(|column| column == "updated_at") {
         if let Some(updated_at) = metadata.updated_at {
@@ -4509,7 +4820,10 @@ fn insert_thread_sidebar_metadata_row_if_missing(
     );
     push("tokens_used", 0_i64.into());
     push("has_user_event", 1_i64.into());
-    push("archived", 0_i64.into());
+    push(
+        "archived",
+        (metadata.archived.unwrap_or(false) as i64).into(),
+    );
 
     if !insert_columns.iter().any(|column| column == "id") {
         return Ok(());
@@ -4743,6 +5057,7 @@ fn cleanup_stale_thread_handoff_source(
         }
     }
     cleanup_stale_thread_session_index_row(codex_home, source_thread_id)?;
+    cleanup_stale_thread_artifact_files(codex_home, source_thread_id)?;
     Ok(())
 }
 
@@ -4806,6 +5121,51 @@ fn cleanup_stale_thread_session_index_row(codex_home: &Path, source_thread_id: &
     fs::write(&path, output).with_context(|| format!("Failed to write {}.", path.display()))
 }
 
+fn cleanup_stale_thread_artifact_files(codex_home: &Path, source_thread_id: &str) -> Result<()> {
+    for root in [
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+        codex_home.join("shell_snapshots"),
+    ] {
+        remove_thread_artifact_files_with_id(&root, source_thread_id)?;
+    }
+    Ok(())
+}
+
+fn remove_thread_artifact_files_with_id(root: &Path, thread_id: &str) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).with_context(|| {
+            format!(
+                "Failed to read thread artifact directory {}.",
+                dir.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("Failed to inspect {}.", path.display()))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                stack.push(path);
+                continue;
+            }
+            let file_name_matches = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(thread_id))
+                .unwrap_or(false);
+            if file_name_matches {
+                remove_path_if_exists(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn timestamp_millis_to_rfc3339(value: i64) -> Option<String> {
     Utc.timestamp_millis_opt(value)
         .single()
@@ -4855,7 +5215,7 @@ fn map_thread_item_to_response_item(item: &Value) -> Option<Value> {
                     "content": [
                         {
                             "type": "input_text",
-                            "text": truncate_handoff_text(&text),
+                            "text": normalize_handoff_item_text(&text),
                         }
                     ]
                 })
@@ -4924,7 +5284,7 @@ fn message_item_to_response_item(item: &Value) -> Option<Value> {
             "content": [
                 {
                     "type": "input_text",
-                    "text": truncate_handoff_text(&text),
+                    "text": normalize_handoff_item_text(&text),
                 }
             ]
         }));
@@ -4939,7 +5299,7 @@ fn assistant_message_item(text: &str) -> Value {
         "content": [
             {
                 "type": "output_text",
-                "text": truncate_handoff_text(text),
+                "text": normalize_handoff_item_text(text),
             }
         ]
     })
@@ -4981,6 +5341,10 @@ fn truncate_handoff_text(value: &str) -> String {
         normalized.push_str("\n[… truncated]");
     }
     normalized
+}
+
+fn normalize_handoff_item_text(value: &str) -> String {
+    value.trim().to_string()
 }
 
 #[derive(Debug)]
@@ -5250,6 +5614,9 @@ pub trait ConversationTransport {
     ) -> Result<()> {
         self.publish_thread_metadata(thread_id, &handoff.metadata)
     }
+    fn cleanup_replaced_thread(&self, _kept_thread_id: &str, _stale_thread_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct HostConversationTransport {
@@ -5270,7 +5637,72 @@ fn host_thread_not_ready_message(message: &str) -> bool {
 }
 
 fn thread_not_found_message(message: &str) -> bool {
+    let message = message.to_lowercase();
     message.contains("thread not found")
+        || message.contains("no rollout found for thread id")
+        || message.contains("no thread found")
+        || message.contains("unknown thread")
+        || message.contains("does not exist")
+        || (message.contains("failed to load thread history")
+            && message.contains("no such file or directory"))
+}
+
+fn thread_rollout_artifact_exists(codex_home: &Path, thread_id: &str) -> bool {
+    find_thread_rollout_path(&codex_home.join("sessions"), thread_id).is_some()
+        || find_thread_rollout_path(&codex_home.join("archived_sessions"), thread_id).is_some()
+}
+
+fn thread_state_db_indicates_existing_thread(codex_home: &Path, thread_id: &str) -> Result<bool> {
+    let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) else {
+        return Ok(false);
+    };
+    if !state_db_path.exists() {
+        return Ok(false);
+    }
+    let connection = rusqlite::Connection::open(&state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .with_context(|| format!("Failed to configure {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(false);
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(false);
+    }
+
+    let archived_expr = if columns.iter().any(|column| column == "archived") {
+        "coalesce(archived, 0)"
+    } else {
+        "0"
+    };
+    let rollout_path_expr = if columns.iter().any(|column| column == "rollout_path") {
+        "coalesce(rollout_path, '')"
+    } else {
+        "''"
+    };
+    let sql =
+        format!("select {archived_expr}, {rollout_path_expr} from threads where id = ?1 limit 1");
+    let row = connection
+        .query_row(&sql, [thread_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()
+        .with_context(|| {
+            format!(
+                "Failed to query thread row {thread_id} in {}.",
+                state_db_path.display()
+            )
+        })?;
+    let Some((archived, rollout_path)) = row else {
+        return Ok(false);
+    };
+    if archived != 0 {
+        return Ok(true);
+    }
+    let rollout_path = rollout_path.trim();
+    Ok(!rollout_path.is_empty() && Path::new(rollout_path).exists())
 }
 
 fn wait_for_host_thread_materialization(port: u16, thread_id: &str) -> Result<()> {
@@ -5402,25 +5834,25 @@ impl ConversationTransport for HostConversationTransport {
     }
 
     fn thread_exists(&self, thread_id: &str) -> Result<bool> {
+        let paths = crate::paths::resolve_paths()?;
+        if thread_state_db_indicates_existing_thread(&paths.codex_home, thread_id)? {
+            return Ok(true);
+        }
+        if !thread_rollout_artifact_exists(&paths.codex_home, thread_id) {
+            return Ok(false);
+        }
         match wait_for_host_thread_materialization(self.port, thread_id) {
-            Ok(()) => {
-                let paths = crate::paths::resolve_paths()?;
-                if find_thread_rollout_path(&paths.codex_home.join("sessions"), thread_id).is_none()
-                {
-                    return Ok(false);
-                }
-                match self.read_thread(thread_id) {
-                    Ok(_) => Ok(true),
-                    Err(error) => {
-                        let message = format!("{:#}", error);
-                        if thread_not_found_message(&message) {
-                            Ok(false)
-                        } else {
-                            Err(error)
-                        }
+            Ok(()) => match self.read_thread(thread_id) {
+                Ok(_) => Ok(true),
+                Err(error) => {
+                    let message = format!("{:#}", error);
+                    if thread_not_found_message(&message) {
+                        Ok(false)
+                    } else {
+                        Err(error)
                     }
                 }
-            }
+            },
             Err(error) => {
                 let message = format!("{:#}", error);
                 if thread_not_found_message(&message) {
@@ -5512,7 +5944,6 @@ impl ConversationTransport for HostConversationTransport {
         handoff: &ThreadHandoff,
     ) -> Result<()> {
         let paths = crate::paths::resolve_paths()?;
-        wait_for_host_thread_materialization(self.port, thread_id)?;
         let mut metadata = handoff.metadata.clone();
         fill_if_missing(
             &mut metadata.first_user_message,
@@ -5548,6 +5979,11 @@ impl ConversationTransport for HostConversationTransport {
             Some(&handoff.source_thread_id),
             &metadata,
         )
+    }
+
+    fn cleanup_replaced_thread(&self, kept_thread_id: &str, stale_thread_id: &str) -> Result<()> {
+        let paths = crate::paths::resolve_paths()?;
+        cleanup_stale_thread_handoff_source(&paths.codex_home, kept_thread_id, stale_thread_id)
     }
 }
 
@@ -5643,6 +6079,8 @@ pub struct ThreadHandoffMetadata {
     pub projectless: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5957,6 +6395,23 @@ fn is_pending_lineage_claim(local_thread_id: &str) -> bool {
     local_thread_id.starts_with(LINEAGE_CLAIM_PREFIX)
 }
 
+fn pending_lineage_claim_is_stale(local_thread_id: &str) -> bool {
+    if !is_pending_lineage_claim(local_thread_id) {
+        return false;
+    }
+    let Some((_, timestamp_nanos)) = local_thread_id.rsplit_once('-') else {
+        return true;
+    };
+    let Ok(claim_nanos) = timestamp_nanos.parse::<u128>() else {
+        return true;
+    };
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    now_nanos.saturating_sub(claim_nanos) >= LINEAGE_CLAIM_STALE_AFTER_NANOS
+}
+
 fn encode_watermark(watermark: Option<&str>) -> &str {
     watermark.unwrap_or("")
 }
@@ -6108,13 +6563,34 @@ impl ConversationSyncStore {
         lineage_id: &str,
     ) -> Result<LineageBindingClaim> {
         let tx = self.db.transaction()?;
-        let mut stmt = tx.prepare(
-            "SELECT local_thread_id FROM conversation_bindings WHERE account_id = ?1 AND lineage_id = ?2",
-        )?;
-        let mut rows = stmt.query([account_id, lineage_id])?;
-        let claim = if let Some(row) = rows.next()? {
-            let local_thread_id: String = row.get(0)?;
-            if is_pending_lineage_claim(&local_thread_id) {
+        let existing_local_thread_id =
+            Self::query_lineage_local_thread_id(&tx, account_id, lineage_id)?;
+        let claim = if let Some(local_thread_id) = existing_local_thread_id {
+            if pending_lineage_claim_is_stale(&local_thread_id) {
+                let claim_token = make_lineage_claim_token();
+                let changed = tx.execute(
+                    "UPDATE conversation_bindings
+                     SET local_thread_id = ?3
+                     WHERE account_id = ?1 AND lineage_id = ?2 AND local_thread_id = ?4",
+                    [
+                        account_id,
+                        lineage_id,
+                        claim_token.as_str(),
+                        local_thread_id.as_str(),
+                    ],
+                )?;
+                if changed == 1 {
+                    LineageBindingClaim::Claimed { claim_token }
+                } else {
+                    match Self::query_lineage_local_thread_id(&tx, account_id, lineage_id)? {
+                        Some(current) if is_pending_lineage_claim(&current) => {
+                            LineageBindingClaim::Busy
+                        }
+                        Some(current) => LineageBindingClaim::Existing(current),
+                        None => LineageBindingClaim::Busy,
+                    }
+                }
+            } else if is_pending_lineage_claim(&local_thread_id) {
                 LineageBindingClaim::Busy
             } else {
                 LineageBindingClaim::Existing(local_thread_id)
@@ -6127,8 +6603,6 @@ impl ConversationSyncStore {
             )?;
             LineageBindingClaim::Claimed { claim_token }
         };
-        drop(rows);
-        drop(stmt);
         tx.commit()?;
         Ok(claim)
     }
@@ -6155,13 +6629,27 @@ impl ConversationSyncStore {
         let claim = if changed == 1 {
             LineageBindingClaim::Claimed { claim_token }
         } else {
-            let mut stmt = tx.prepare(
-                "SELECT local_thread_id FROM conversation_bindings WHERE account_id = ?1 AND lineage_id = ?2",
-            )?;
-            let mut rows = stmt.query([account_id, lineage_id])?;
-            let claim = if let Some(row) = rows.next()? {
-                let local_thread_id: String = row.get(0)?;
-                if is_pending_lineage_claim(&local_thread_id) {
+            let existing_local_thread_id =
+                Self::query_lineage_local_thread_id(&tx, account_id, lineage_id)?;
+            let claim = if let Some(local_thread_id) = existing_local_thread_id {
+                if pending_lineage_claim_is_stale(&local_thread_id) {
+                    let changed = tx.execute(
+                        "UPDATE conversation_bindings
+                         SET local_thread_id = ?3
+                         WHERE account_id = ?1 AND lineage_id = ?2 AND local_thread_id = ?4",
+                        [
+                            account_id,
+                            lineage_id,
+                            claim_token.as_str(),
+                            local_thread_id.as_str(),
+                        ],
+                    )?;
+                    if changed == 1 {
+                        LineageBindingClaim::Claimed { claim_token }
+                    } else {
+                        LineageBindingClaim::Busy
+                    }
+                } else if is_pending_lineage_claim(&local_thread_id) {
                     LineageBindingClaim::Busy
                 } else {
                     LineageBindingClaim::Existing(local_thread_id)
@@ -6173,12 +6661,24 @@ impl ConversationSyncStore {
                 )?;
                 LineageBindingClaim::Claimed { claim_token }
             };
-            drop(rows);
-            drop(stmt);
             claim
         };
         tx.commit()?;
         Ok(claim)
+    }
+
+    fn query_lineage_local_thread_id(
+        tx: &rusqlite::Transaction<'_>,
+        account_id: &str,
+        lineage_id: &str,
+    ) -> Result<Option<String>> {
+        tx.query_row(
+            "SELECT local_thread_id FROM conversation_bindings WHERE account_id = ?1 AND lineage_id = ?2",
+            [account_id, lineage_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn release_lineage_claim(
@@ -6332,6 +6832,7 @@ mod tests {
                     || line.contains("line.contains(")
                     || line.contains("global_state")
                     || line.contains("codex_home.join(\"session_index.jsonl\")")
+                    || line.contains("codex_home.join(\"archived_sessions\")")
                 {
                     return false;
                 }
@@ -6639,6 +7140,135 @@ mod tests {
     }
 
     #[test]
+    fn exported_handoff_watermark_is_stable_across_persona_local_thread_ids() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        fn thread_response(thread_id: &str, turn_id: &str) -> Value {
+            json!({
+                "thread": {
+                    "id": thread_id,
+                    "cwd": "/tmp/project",
+                    "turns": [
+                        {
+                            "id": turn_id,
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "content": [
+                                        { "type": "text", "text": "Greet user" }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+        }
+
+        let source_handoff = export_single_thread_handoff_from_response(
+            thread_response("source-local-thread", "source-local-turn"),
+            "source-local-thread",
+            "source-sync",
+        )
+        .expect("export source")
+        .expect("source handoff");
+        let source_watermark = source_handoff
+            .watermark
+            .clone()
+            .expect("source content watermark");
+        assert!(source_watermark.starts_with("items-fnv1a64-"));
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open store");
+        assert_eq!(
+            store
+                .get_watermark("source-sync", "source-local-thread")
+                .expect("source watermark"),
+            Some(source_watermark.clone())
+        );
+        store
+            .bind_and_update_watermark(
+                "target-sync",
+                "source-local-thread",
+                "target-local-thread",
+                Some(&source_watermark),
+            )
+            .expect("seed target binding");
+
+        let target_handoff = export_single_thread_handoff_from_response(
+            thread_response("target-local-thread", "target-local-turn"),
+            "target-local-thread",
+            "target-sync",
+        )
+        .expect("export target")
+        .expect("target handoff");
+        assert_eq!(target_handoff.lineage_id, source_handoff.lineage_id);
+        assert_eq!(target_handoff.watermark, Some(source_watermark));
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn export_handoff_preserves_full_mapped_history() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let long_text = "x".repeat(MAX_HANDOFF_TEXT_CHARS + 128);
+        let turns = (0..64)
+            .map(|index| {
+                let text = if index == 0 {
+                    long_text.clone()
+                } else {
+                    format!("message {index}")
+                };
+                json!({
+                    "id": format!("turn-{index}"),
+                    "items": [
+                        {
+                            "type": "userMessage",
+                            "content": [{ "type": "text", "text": text }]
+                        }
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let handoff = export_single_thread_handoff_from_response(
+            json!({ "thread": { "id": "source-thread", "turns": turns } }),
+            "source-thread",
+            "source-sync",
+        )
+        .expect("export")
+        .expect("handoff");
+
+        assert_eq!(handoff.items.len(), 64);
+        assert_eq!(
+            handoff.watermark.as_deref(),
+            thread_handoff_content_watermark(&handoff.items).as_deref()
+        );
+        assert!(handoff.watermark.as_deref().unwrap().ends_with("-64"));
+        let first_text = handoff.items[0]["content"][0]["text"]
+            .as_str()
+            .expect("first item text");
+        assert_eq!(first_text.len(), MAX_HANDOFF_TEXT_CHARS + 128);
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
     fn export_handoff_captures_projectless_ui_metadata() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
@@ -6726,6 +7356,245 @@ mod tests {
         let serialized = serde_json::to_value(handoff).expect("serialize handoff");
         assert!(serialized.get("continue_prompt").is_none());
         assert!(serialized.get("continuePrompt").is_none());
+    }
+
+    #[test]
+    fn import_appends_only_missing_suffix_for_existing_prefix() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let items = numbered_user_response_items(5);
+        let watermark = thread_handoff_content_watermark(&items).expect("watermark");
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open store");
+        store
+            .bind_and_update_watermark("target-sync", "lineage-1", "target-thread", Some("old"))
+            .expect("seed old target binding");
+
+        struct PrefixTransport {
+            existing_items: Vec<Value>,
+            injected: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
+        }
+        impl ConversationTransport for PrefixTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                assert_eq!(id, "target-thread");
+                Ok(thread_read_response_from_response_items(
+                    id,
+                    &self.existing_items,
+                ))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                panic!("prefix update must preserve the existing target-local thread")
+            }
+            fn inject_items(&self, id: &str, items: Vec<Value>) -> Result<()> {
+                self.injected
+                    .lock()
+                    .expect("injected")
+                    .push((id.to_string(), items));
+                Ok(())
+            }
+        }
+
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let transport = PrefixTransport {
+            existing_items: items[..2].to_vec(),
+            injected: Arc::clone(&injected),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some(watermark.clone()),
+            cwd: None,
+            items: items.clone(),
+            metadata: ThreadHandoffMetadata::default(),
+        };
+
+        let outcome = import_thread_handoffs(&transport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding"),
+            Some("target-thread".to_string())
+        );
+        assert_eq!(
+            store
+                .get_watermark("target-sync", "lineage-1")
+                .expect("target watermark"),
+            Some(watermark)
+        );
+        let injected = injected.lock().expect("injected");
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "target-thread");
+        assert_eq!(injected[0].1, items[2..].to_vec());
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_replaces_truncated_suffix_without_duplicating_history() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let items = numbered_user_response_items(5);
+        let watermark = thread_handoff_content_watermark(&items).expect("watermark");
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open store");
+        store
+            .bind_and_update_watermark("target-sync", "lineage-1", "partial-thread", Some("old"))
+            .expect("seed old target binding");
+
+        struct SuffixTransport {
+            existing_items: Vec<Value>,
+            injected: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
+            cleaned: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        impl ConversationTransport for SuffixTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                assert_eq!(id, "partial-thread");
+                Ok(thread_read_response_from_response_items(
+                    id,
+                    &self.existing_items,
+                ))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                Ok("replacement-thread".to_string())
+            }
+            fn inject_items(&self, id: &str, items: Vec<Value>) -> Result<()> {
+                self.injected
+                    .lock()
+                    .expect("injected")
+                    .push((id.to_string(), items));
+                Ok(())
+            }
+            fn cleanup_replaced_thread(
+                &self,
+                kept_thread_id: &str,
+                stale_thread_id: &str,
+            ) -> Result<()> {
+                self.cleaned
+                    .lock()
+                    .expect("cleaned")
+                    .push((kept_thread_id.to_string(), stale_thread_id.to_string()));
+                Ok(())
+            }
+        }
+
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+        let transport = SuffixTransport {
+            existing_items: items[3..].to_vec(),
+            injected: Arc::clone(&injected),
+            cleaned: Arc::clone(&cleaned),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some(watermark.clone()),
+            cwd: None,
+            items: items.clone(),
+            metadata: ThreadHandoffMetadata::default(),
+        };
+
+        let outcome = import_thread_handoffs(&transport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding"),
+            Some("replacement-thread".to_string())
+        );
+        assert_eq!(
+            store
+                .get_watermark("target-sync", "lineage-1")
+                .expect("target watermark"),
+            Some(watermark)
+        );
+        let injected = injected.lock().expect("injected");
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "replacement-thread");
+        assert_eq!(injected[0].1, items);
+        assert_eq!(
+            cleaned.lock().expect("cleaned").as_slice(),
+            &[(
+                "replacement-thread".to_string(),
+                "partial-thread".to_string()
+            )]
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_carries_archived_state_in_handoff_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        let target_thread_id = "target-thread-local";
+        let rollout_path = sessions.join(format!("rollout-{target_thread_id}.jsonl"));
+        fs::write(&rollout_path, "{}\n").expect("write rollout");
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    title text not null,
+    first_user_message text not null default '',
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        drop(connection);
+
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            target_thread_id,
+            &ThreadHandoffMetadata {
+                title: Some("Archived import".to_string()),
+                first_user_message: Some("archive me".to_string()),
+                archived: Some(true),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let archived: i64 = connection
+            .query_row(
+                "select archived from threads where id = ?1",
+                [target_thread_id],
+                |row| row.get(0),
+            )
+            .expect("query archived state");
+        assert_eq!(archived, 1);
     }
 
     #[test]
@@ -6895,8 +7764,8 @@ mod tests {
             fn list_threads(&self) -> Result<Vec<String>> {
                 Ok(vec![])
             }
-            fn read_thread(&self, _id: &str) -> Result<Value> {
-                Ok(json!({}))
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                Ok(json!({ "thread": { "id": id, "turns": [] } }))
             }
             fn thread_exists(&self, _id: &str) -> Result<bool> {
                 Ok(true)
@@ -7035,6 +7904,96 @@ mod tests {
                 Some("Greet user".to_string()),
                 Some(true)
             )]
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_preserves_matching_established_binding_without_materialization_probe() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let items = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Greet user"}],
+        })];
+        let watermark = thread_handoff_content_watermark(&items).expect("watermark");
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open store");
+        store
+            .bind_and_update_watermark(
+                "source-sync",
+                "lineage-1",
+                "source-local-thread",
+                Some(&watermark),
+            )
+            .expect("seed source binding");
+
+        struct MatchingTransport {
+            metadata_calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl ConversationTransport for MatchingTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn thread_exists(&self, _id: &str) -> Result<bool> {
+                panic!("matching content watermark should not probe materialization")
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                panic!("matching content watermark should not create a replacement thread")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                panic!("matching content watermark should not reinject items")
+            }
+            fn publish_thread_metadata(
+                &self,
+                thread_id: &str,
+                _metadata: &ThreadHandoffMetadata,
+            ) -> Result<()> {
+                self.metadata_calls
+                    .lock()
+                    .expect("metadata calls")
+                    .push(thread_id.to_string());
+                Ok(())
+            }
+        }
+
+        let metadata_calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = MatchingTransport {
+            metadata_calls: metadata_calls.clone(),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "target-local-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some(watermark),
+            cwd: None,
+            items,
+            metadata: ThreadHandoffMetadata::default(),
+        };
+
+        let outcome = import_thread_handoffs(&transport, "source-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            store
+                .get_local_thread_id("source-sync", "lineage-1")
+                .expect("source binding"),
+            Some("source-local-thread".to_string())
+        );
+        assert_eq!(
+            metadata_calls.lock().expect("metadata calls").as_slice(),
+            &["source-local-thread".to_string()]
         );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
@@ -7218,9 +8177,9 @@ create table threads (
         let index = fs::read_to_string(codex_home.join("session_index.jsonl")).expect("read index");
         assert!(!index.contains(source_thread_id));
         assert!(index.contains(target_thread_id));
-        assert!(stale_rollout.exists());
-        assert!(stale_archived.exists());
-        assert!(stale_snapshot.exists());
+        assert!(!stale_rollout.exists());
+        assert!(!stale_archived.exists());
+        assert!(!stale_snapshot.exists());
         assert!(target_rollout.exists());
     }
 
@@ -7318,6 +8277,86 @@ create table threads (
                 "actual user text".to_string(),
                 1
             )
+        );
+    }
+
+    #[test]
+    fn thread_not_found_message_accepts_host_rollout_errors() {
+        assert!(thread_not_found_message(
+            "thread not found: stale-target-thread"
+        ));
+        assert!(thread_not_found_message(
+            "Codex thread/read request failed: no rollout found for thread id stale-target-thread"
+        ));
+        assert!(thread_not_found_message(
+            "No thread found for stale-target-thread"
+        ));
+        assert!(thread_not_found_message(
+            "unknown thread stale-target-thread"
+        ));
+        assert!(thread_not_found_message(
+            "thread stale-target-thread does not exist"
+        ));
+        assert!(thread_not_found_message(
+            "thread-store internal error: failed to load thread history : No such file or directory (os error 2)"
+        ));
+        assert!(is_terminal_thread_read_error(&anyhow!(
+            "Codex thread/read request failed: thread-store internal error: failed to load thread history : No such file or directory (os error 2)"
+        )));
+    }
+
+    #[test]
+    fn archived_state_db_row_keeps_thread_binding_existing_without_rollout() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        let state_db = codex_home.join("state_5.sqlite");
+        let existing_rollout = codex_home.join("sessions/rollout-active-existing.jsonl");
+        fs::create_dir_all(existing_rollout.parent().unwrap()).expect("create sessions");
+        fs::write(&existing_rollout, "{}\n").expect("write rollout");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    rollout_path text not null default '',
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        connection
+            .execute(
+                "insert into threads (id, rollout_path, archived) values (?1, ?2, ?3)",
+                rusqlite::params!["archived-thread", "/missing/rollout.jsonl", 1],
+            )
+            .expect("insert archived");
+        connection
+            .execute(
+                "insert into threads (id, rollout_path, archived) values (?1, ?2, ?3)",
+                rusqlite::params!["active-missing", "/missing/rollout.jsonl", 0],
+            )
+            .expect("insert active missing");
+        connection
+            .execute(
+                "insert into threads (id, rollout_path, archived) values (?1, ?2, ?3)",
+                rusqlite::params!["active-existing", existing_rollout.display().to_string(), 0],
+            )
+            .expect("insert active existing");
+        drop(connection);
+
+        assert!(
+            thread_state_db_indicates_existing_thread(&codex_home, "archived-thread")
+                .expect("archived exists")
+        );
+        assert!(
+            !thread_state_db_indicates_existing_thread(&codex_home, "active-missing")
+                .expect("active missing")
+        );
+        assert!(
+            thread_state_db_indicates_existing_thread(&codex_home, "active-existing")
+                .expect("active existing")
         );
     }
 
@@ -7566,6 +8605,81 @@ create table threads (
     }
 
     #[test]
+    fn import_metadata_failure_persists_created_thread_binding_for_retry() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        struct MetadataFailingTransport;
+        impl ConversationTransport for MetadataFailingTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                Ok("target-local-thread".to_string())
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                Ok(())
+            }
+            fn publish_thread_metadata(
+                &self,
+                _thread_id: &str,
+                _metadata: &ThreadHandoffMetadata,
+            ) -> Result<()> {
+                Err(anyhow!("metadata write failed"))
+            }
+        }
+
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some("items-fnv1a64-1234-1".to_string()),
+            cwd: None,
+            items: vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Greet user"}],
+            })],
+            metadata: ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("Greet user".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        };
+
+        let outcome =
+            import_thread_handoffs(&MetadataFailingTransport, "target-sync", &[handoff], None)
+                .expect("import call");
+        assert!(!outcome.is_complete());
+        assert_eq!(outcome.failures.len(), 1);
+
+        let store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open store");
+        let local_thread_id = store
+            .get_local_thread_id("target-sync", "lineage-1")
+            .expect("read local binding")
+            .expect("binding should survive metadata failure");
+        assert_eq!(local_thread_id, "target-local-thread");
+        assert!(!is_pending_lineage_claim(&local_thread_id));
+        assert_eq!(
+            store
+                .get_watermark("target-sync", "lineage-1")
+                .expect("read watermark"),
+            Some("items-fnv1a64-1234-1".to_string())
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
     fn test_lineage_claim_prevents_duplicate_materialization_race() {
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("conversation-sync.sqlite");
@@ -7612,6 +8726,48 @@ create table threads (
                 .get_watermark("acct-target", "lineage-a")
                 .expect("get watermark"),
             Some("turn-123".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_lineage_claim_can_be_reclaimed() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("conversation-sync.sqlite");
+        let mut store = ConversationSyncStore::new(&db_path).expect("store");
+        store
+            .bind_local_thread_id(
+                "acct-target",
+                "lineage-stale",
+                "__pending_lineage_claim__:123-1",
+            )
+            .expect("seed stale claim");
+
+        let claim_token = match store
+            .claim_lineage_binding("acct-target", "lineage-stale")
+            .expect("claim stale lineage")
+        {
+            LineageBindingClaim::Claimed { claim_token } => claim_token,
+            LineageBindingClaim::Busy => panic!("stale claim should not stay busy"),
+            LineageBindingClaim::Existing(local_thread_id) => {
+                panic!("stale claim should not return existing {local_thread_id}")
+            }
+        };
+        assert!(is_pending_lineage_claim(&claim_token));
+
+        store
+            .finalize_lineage_claim(
+                "acct-target",
+                "lineage-stale",
+                &claim_token,
+                "target-thread",
+                Some("watermark"),
+            )
+            .expect("finalize reclaimed claim");
+        assert_eq!(
+            store
+                .get_local_thread_id("acct-target", "lineage-stale")
+                .expect("read binding"),
+            Some("target-thread".to_string())
         );
     }
 
@@ -10235,6 +11391,37 @@ exit 91
         restore_env("CODEX_HOME", previous_codex_home);
     }
 
+    fn numbered_user_response_items(count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|index| {
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": format!("message {index}"),
+                        }
+                    ]
+                })
+            })
+            .collect()
+    }
+
+    fn thread_read_response_from_response_items(thread_id: &str, items: &[Value]) -> Value {
+        json!({
+            "thread": {
+                "id": thread_id,
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "items": items,
+                    }
+                ]
+            }
+        })
+    }
+
     fn seed_threads_table(state_db_path: &Path, rows: &[(&str, &str, i64)]) {
         let connection = rusqlite::Connection::open(state_db_path).expect("open state db");
         connection
@@ -10482,8 +11669,15 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         // Export should fail here due to no listening app server (connection refused)
-        let error = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
-            .expect_err("host activation should fail during export phase");
+        let error = activate_host_rotation(
+            &paths,
+            &prepared,
+            9333,
+            None,
+            Vec::new(),
+            RotationCommandOptions::default(),
+        )
+        .expect_err("host activation should fail during export phase");
 
         let message = format!("{:#}", error);
         assert!(
@@ -10568,8 +11762,15 @@ insert into threads (id, rollout_path, updated_at, archived) values
         let port = probe.local_addr().expect("probe local addr").port();
         drop(probe);
 
-        let error = activate_host_rotation(&paths, &prepared, port, None, Vec::new())
-            .expect_err("host activation should fail after commit");
+        let error = activate_host_rotation(
+            &paths,
+            &prepared,
+            port,
+            None,
+            Vec::new(),
+            RotationCommandOptions::default(),
+        )
+        .expect_err("host activation should fail after commit");
         let message = format!("{:#}", error);
         assert!(!message.trim().is_empty());
 
@@ -10637,8 +11838,15 @@ insert into threads (id, rollout_path, updated_at, archived) values
             persist_pool: false,
         };
 
-        let error = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
-            .expect_err("host activation should fail before committing pool");
+        let error = activate_host_rotation(
+            &paths,
+            &prepared,
+            9333,
+            None,
+            Vec::new(),
+            RotationCommandOptions::default(),
+        )
+        .expect_err("host activation should fail before committing pool");
         let message = format!("{:#}", error);
         assert!(
             message.contains("persona metadata")
@@ -10698,6 +11906,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                 _port: u16,
                 _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
                 _source_thread_candidates: Vec<String>,
+                _options: RotationCommandOptions,
             ) -> Result<Vec<ThreadHandoff>> {
                 panic!("disabled target must be rejected before activation");
             }
@@ -10715,6 +11924,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                 &self,
                 _port: u16,
                 _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+                _options: RotationCommandOptions,
             ) -> Result<NextResult> {
                 unreachable!()
             }
@@ -10723,6 +11933,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                 &self,
                 _port: u16,
                 _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+                _options: RotationCommandOptions,
             ) -> Result<String> {
                 unreachable!()
             }
@@ -10795,8 +12006,15 @@ insert into threads (id, rollout_path, updated_at, archived) values
                 std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", usage_url);
             }
 
-            let error = rotate_next_impl_with_retry(&NoActivationBackend, 9333, None, false, 0)
-                .expect_err("disabled target should abort before activation");
+            let error = rotate_next_impl_with_retry(
+                &NoActivationBackend,
+                9333,
+                None,
+                false,
+                RotationCommandOptions::default(),
+                0,
+            )
+            .expect_err("disabled target should abort before activation");
             handle.join().expect("usage server should finish");
             assert!(error
                 .to_string()
@@ -10863,8 +12081,15 @@ insert into threads (id, rollout_path, updated_at, archived) values
             persist_pool: false,
         };
 
-        let activation = activate_host_rotation(&paths, &prepared, 9333, None, Vec::new())
-            .expect("host activation");
+        let activation = activate_host_rotation(
+            &paths,
+            &prepared,
+            9333,
+            None,
+            Vec::new(),
+            RotationCommandOptions::default(),
+        )
+        .expect("host activation");
         assert!(activation.items.is_empty());
 
         let committed_pool = load_pool().expect("load committed pool");
@@ -10891,6 +12116,88 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn host_activation_force_managed_window_failure_aborts_before_switch() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_disable_launch = std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+            std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "1");
+        }
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+        ensure_live_root_bindings(&paths, &source).expect("bind source roots");
+
+        let pool = codex_rotate_core::pool::Pool {
+            active_index: 0,
+            accounts: vec![source.clone(), target.clone()],
+        };
+        codex_rotate_core::pool::save_pool(&pool).expect("save pool");
+
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: pool.clone(),
+            previous_index: 0,
+            target_index: 1,
+            previous: source.clone(),
+            target: target.clone(),
+            message: "rotating".to_string(),
+            persist_pool: false,
+        };
+
+        let progress_messages = Arc::new(Mutex::new(Vec::new()));
+        let progress_sink = Arc::clone(&progress_messages);
+        let progress: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |message| progress_sink.lock().expect("progress").push(message));
+
+        let error = activate_host_rotation(
+            &paths,
+            &prepared,
+            9333,
+            Some(&progress),
+            Vec::new(),
+            RotationCommandOptions {
+                force_managed_window: true,
+            },
+        )
+        .expect_err("host activation should fail before switching when -mw launch fails");
+        assert!(
+            format!("{:#}", error).contains("requested by -mw"),
+            "error should mention -mw launch failure: {error:#}"
+        );
+
+        let messages = progress_messages.lock().expect("progress messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("opening a managed window")),
+            "progress should mention auto-launch attempt: {:?}",
+            *messages
+        );
+
+        let pool_after = load_pool().expect("load pool");
+        assert_eq!(pool_after.active_index, 0);
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        assert!(is_symlink_to(&paths.codex_home, &source_paths.codex_home).unwrap());
+        assert!(is_symlink_to(&paths.debug_profile_dir, &source_paths.debug_profile_dir).unwrap());
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env(
+            "CODEX_ROTATE_DISABLE_MANAGED_LAUNCH",
+            previous_disable_launch,
+        );
     }
 
     #[test]
@@ -11709,7 +13016,13 @@ insert into threads (id, rollout_path, updated_at, archived) values
         // This bypasses rotate_next_impl's need for a correctly initialized pool
         // which is hard to test due to OnceLock caching of CorePaths.
         let backend = VmBackend { config: None };
-        let result = backend.activate(&prepared, 9333, None, Vec::new());
+        let result = backend.activate(
+            &prepared,
+            9333,
+            None,
+            Vec::new(),
+            RotationCommandOptions::default(),
+        );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
 
@@ -12039,7 +13352,13 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         let handoffs = backend
-            .activate(&prepared, 9333, None, Vec::new())
+            .activate(
+                &prepared,
+                9333,
+                None,
+                Vec::new(),
+                RotationCommandOptions::default(),
+            )
             .expect("activate vm");
         assert!(
             handoffs.is_empty(),
@@ -12346,7 +13665,13 @@ insert into threads (id, rollout_path, updated_at, archived) values
         };
 
         let error = backend
-            .activate(&prepared, 9333, None, Vec::new())
+            .activate(
+                &prepared,
+                9333,
+                None,
+                Vec::new(),
+                RotationCommandOptions::default(),
+            )
             .expect_err("activate should fail");
         let message = error.to_string();
         assert!(
@@ -12614,6 +13939,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             _port: u16,
             _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _source_thread_candidates: Vec<String>,
+            _options: RotationCommandOptions,
         ) -> Result<Vec<ThreadHandoff>> {
             panic!("activate should not run in rollback/retry helper tests");
         }
@@ -12633,6 +13959,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             &self,
             _port: u16,
             _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            _options: RotationCommandOptions,
         ) -> Result<NextResult> {
             panic!("rotate_next should not run in rollback/retry helper tests");
         }
@@ -12641,6 +13968,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
             &self,
             _port: u16,
             _progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+            _options: RotationCommandOptions,
         ) -> Result<String> {
             panic!("rotate_prev should not run in rollback/retry helper tests");
         }

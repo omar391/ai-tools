@@ -33,8 +33,11 @@ use codex_rotate_runtime::ipc::{
 };
 use codex_rotate_runtime::live_checks::{host_live_capability_report, vm_live_capability_report};
 use codex_rotate_runtime::rotation_hygiene::{
-    relogin as run_shared_relogin, repair_host_history, rotate_next as run_shared_next,
-    rotate_prev as run_shared_prev, rotate_set as run_shared_set, run_guest_bridge_server,
+    relogin as run_shared_relogin, repair_host_history,
+    rotate_next_with_options as run_shared_next_with_options,
+    rotate_prev_with_options as run_shared_prev_with_options,
+    rotate_set_with_options as run_shared_set_with_options, run_guest_bridge_server,
+    RotationCommandOptions,
 };
 use codex_rotate_runtime::vm_bootstrap::bootstrap_vm_base;
 use codex_rotate_runtime::watch::set_tray_enabled;
@@ -94,13 +97,25 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 )?,
             )?
         }
-        Some("next") => match parse_optional_next_selector(&args[1..])? {
-            Some(selector) => write_output(
+        Some("next") => match parse_next_options(&args[1..])? {
+            NextCommandOptions {
+                selector: Some(selector),
+                rotation_options,
+            } => write_output(
                 writer,
-                &run_shared_set(None, &selector, cli_progress_callback())?,
+                &run_shared_set_with_options(
+                    None,
+                    &selector,
+                    cli_progress_callback(),
+                    rotation_options,
+                )?,
             )?,
-            None => {
-                let result = run_shared_next(None, cli_progress_callback())?;
+            NextCommandOptions {
+                selector: None,
+                rotation_options,
+            } => {
+                let result =
+                    run_shared_next_with_options(None, cli_progress_callback(), rotation_options)?;
                 let output = match result {
                     NextResult::Rotated { message, .. }
                     | NextResult::Stayed { message, .. }
@@ -112,17 +127,24 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
             }
         },
         Some("prev") => {
-            parse_no_args("prev", &args[1..])?;
-            write_output(writer, &run_shared_prev(None, None)?)?
+            let rotation_options = parse_prev_options(&args[1..])?;
+            write_output(
+                writer,
+                &run_shared_prev_with_options(None, cli_progress_callback(), rotation_options)?,
+            )?
         }
-        Some("set") => write_output(
-            writer,
-            &run_shared_set(
-                None,
-                parse_set_selector(&args[1..])?,
-                cli_progress_callback(),
-            )?,
-        )?,
+        Some("set") => {
+            let options = parse_set_options(&args[1..])?;
+            write_output(
+                writer,
+                &run_shared_set_with_options(
+                    None,
+                    &options.selector,
+                    cli_progress_callback(),
+                    options.rotation_options,
+                )?,
+            )?
+        }
         Some("list") => cmd_list_stream(writer)?,
         Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
@@ -191,17 +213,47 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("create") => Some(InvokeAction::Create {
             options: parse_public_create_invocation(args)?,
         }),
-        Some("next") => match parse_optional_next_selector(args)? {
-            Some(selector) => Some(InvokeAction::Set { selector }),
-            None => Some(InvokeAction::Next),
+        Some("next") => match parse_next_options(args)? {
+            NextCommandOptions {
+                selector: Some(selector),
+                rotation_options:
+                    RotationCommandOptions {
+                        force_managed_window: true,
+                    },
+            } => Some(InvokeAction::SetManagedWindow { selector }),
+            NextCommandOptions {
+                selector: Some(selector),
+                ..
+            } => Some(InvokeAction::Set { selector }),
+            NextCommandOptions {
+                selector: None,
+                rotation_options:
+                    RotationCommandOptions {
+                        force_managed_window: true,
+                    },
+            } => Some(InvokeAction::NextManagedWindow),
+            NextCommandOptions { selector: None, .. } => Some(InvokeAction::Next),
         },
         Some("prev") => {
-            parse_no_args("prev", args)?;
-            Some(InvokeAction::Prev)
+            let options = parse_prev_options(args)?;
+            if options.force_managed_window {
+                Some(InvokeAction::PrevManagedWindow)
+            } else {
+                Some(InvokeAction::Prev)
+            }
         }
-        Some("set") => Some(InvokeAction::Set {
-            selector: parse_set_selector(args)?.to_string(),
-        }),
+        Some("set") => {
+            let options = parse_set_options(args)?;
+            if options.rotation_options.force_managed_window {
+                Some(InvokeAction::SetManagedWindow {
+                    selector: options.selector,
+                })
+            } else {
+                Some(InvokeAction::Set {
+                    selector: options.selector,
+                })
+            }
+        }
         Some("relogin") => Some(InvokeAction::Relogin {
             options: parse_public_relogin_invocation(args)?,
         }),
@@ -1101,34 +1153,70 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
-fn parse_no_args(command: &str, args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        return Ok(());
-    }
-    Err(anyhow!("Usage: codex-rotate {command}"))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NextCommandOptions {
+    selector: Option<String>,
+    rotation_options: RotationCommandOptions,
 }
 
-fn parse_optional_next_selector(args: &[String]) -> Result<Option<String>> {
-    if args.len() > 1
-        || args
-            .first()
-            .map(|arg| arg.starts_with('-'))
-            .unwrap_or(false)
-    {
-        return Err(anyhow!("Usage: codex-rotate next [selector]"));
-    }
-    Ok(args
-        .first()
-        .map(|arg| arg.trim())
-        .filter(|arg| !arg.is_empty())
-        .map(ToOwned::to_owned))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetCommandOptions {
+    selector: String,
+    rotation_options: RotationCommandOptions,
 }
 
-fn parse_set_selector(args: &[String]) -> Result<&str> {
-    if args.len() != 1 || args[0].starts_with('-') {
-        return Err(anyhow!("Usage: codex-rotate set <selector>"));
+fn parse_next_options(args: &[String]) -> Result<NextCommandOptions> {
+    let mut selector = None::<String>;
+    let mut rotation_options = RotationCommandOptions::default();
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed == "-mw" || trimmed == "--managed-window" {
+            rotation_options.force_managed_window = true;
+        } else if trimmed.starts_with('-') || selector.is_some() || trimmed.is_empty() {
+            return Err(anyhow!("Usage: codex-rotate next [-mw] [selector]"));
+        } else {
+            selector = Some(trimmed.to_string());
+        }
     }
-    Ok(args[0].as_str())
+    Ok(NextCommandOptions {
+        selector,
+        rotation_options,
+    })
+}
+
+fn parse_prev_options(args: &[String]) -> Result<RotationCommandOptions> {
+    let mut rotation_options = RotationCommandOptions::default();
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed == "-mw" || trimmed == "--managed-window" {
+            rotation_options.force_managed_window = true;
+        } else {
+            return Err(anyhow!("Usage: codex-rotate prev [-mw]"));
+        }
+    }
+    Ok(rotation_options)
+}
+
+fn parse_set_options(args: &[String]) -> Result<SetCommandOptions> {
+    let mut selector = None::<String>;
+    let mut rotation_options = RotationCommandOptions::default();
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed == "-mw" || trimmed == "--managed-window" {
+            rotation_options.force_managed_window = true;
+        } else if trimmed.starts_with('-') || selector.is_some() || trimmed.is_empty() {
+            return Err(anyhow!("Usage: codex-rotate set [-mw] <selector>"));
+        } else {
+            selector = Some(trimmed.to_string());
+        }
+    }
+    let Some(selector) = selector else {
+        return Err(anyhow!("Usage: codex-rotate set [-mw] <selector>"));
+    };
+    Ok(SetCommandOptions {
+        selector,
+        rotation_options,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1407,9 +1495,9 @@ fn help_text() -> String {
   {CYAN}add{RESET} [alias]      Snapshot current ~/.codex/auth.json into the pool
   {CYAN}create{RESET} [alias]   Reuse a healthy account, or create a new one when needed
   {CYAN}repair-host-history{RESET} --source <selector> [--target <selector> ...|--all] [--apply]
-  {CYAN}next{RESET} [selector]  Swap to the next account, or a selected target
-  {CYAN}prev{RESET}             Swap to the previous account
-  {CYAN}set{RESET} <selector>   Swap to the selected account (skip quota/health gating)
+  {CYAN}next{RESET} [-mw] [selector]  Swap to the next account, or a selected target
+  {CYAN}prev{RESET} [-mw]             Swap to the previous account
+  {CYAN}set{RESET} [-mw] <selector>   Swap to the selected account (skip quota/health gating)
   {CYAN}list{RESET}             Show all accounts with cached quota info
   {CYAN}status{RESET}           Show the current active account info and quota
   {CYAN}relogin{RESET} <selector> Repair that account in one step
@@ -1801,30 +1889,79 @@ mod tests {
     }
 
     #[test]
-    fn set_parser_requires_single_selector() {
+    fn set_parser_accepts_managed_window_flag_and_requires_selector() {
         assert_eq!(
-            parse_set_selector(&["acct-123".to_string()]).expect("set selector"),
-            "acct-123"
+            parse_set_options(&["acct-123".to_string()]).expect("set selector"),
+            SetCommandOptions {
+                selector: "acct-123".to_string(),
+                rotation_options: RotationCommandOptions::default(),
+            }
+        );
+        assert_eq!(
+            parse_set_options(&["-mw".to_string(), "acct-123".to_string()])
+                .expect("set selector with managed window"),
+            SetCommandOptions {
+                selector: "acct-123".to_string(),
+                rotation_options: RotationCommandOptions {
+                    force_managed_window: true,
+                },
+            }
         );
         let error =
-            parse_set_selector(&[]).expect_err("missing selector should fail for set command");
+            parse_set_options(&[]).expect_err("missing selector should fail for set command");
         assert!(error
             .to_string()
-            .contains("Usage: codex-rotate set <selector>"));
+            .contains("Usage: codex-rotate set [-mw] <selector>"));
     }
 
     #[test]
-    fn next_parser_accepts_optional_selector() {
-        assert_eq!(parse_optional_next_selector(&[]).expect("next"), None);
+    fn next_parser_accepts_optional_selector_and_managed_window_flag() {
         assert_eq!(
-            parse_optional_next_selector(&["acct-123".to_string()]).expect("next selector"),
-            Some("acct-123".to_string())
+            parse_next_options(&[]).expect("next"),
+            NextCommandOptions {
+                selector: None,
+                rotation_options: RotationCommandOptions::default(),
+            }
         );
-        let error = parse_optional_next_selector(&["acct-123".to_string(), "extra".to_string()])
+        assert_eq!(
+            parse_next_options(&["acct-123".to_string()]).expect("next selector"),
+            NextCommandOptions {
+                selector: Some("acct-123".to_string()),
+                rotation_options: RotationCommandOptions::default(),
+            }
+        );
+        assert_eq!(
+            parse_next_options(&["-mw".to_string(), "acct-123".to_string()])
+                .expect("next selector with managed window"),
+            NextCommandOptions {
+                selector: Some("acct-123".to_string()),
+                rotation_options: RotationCommandOptions {
+                    force_managed_window: true,
+                },
+            }
+        );
+        let error = parse_next_options(&["acct-123".to_string(), "extra".to_string()])
             .expect_err("next should reject extra args");
         assert!(error
             .to_string()
-            .contains("Usage: codex-rotate next [selector]"));
+            .contains("Usage: codex-rotate next [-mw] [selector]"));
+    }
+
+    #[test]
+    fn prev_parser_accepts_only_managed_window_flag() {
+        assert_eq!(
+            parse_prev_options(&[]).expect("prev"),
+            RotationCommandOptions::default()
+        );
+        assert_eq!(
+            parse_prev_options(&["-mw".to_string()]).expect("prev -mw"),
+            RotationCommandOptions {
+                force_managed_window: true,
+            }
+        );
+        let error = parse_prev_options(&["acct-123".to_string()])
+            .expect_err("prev should reject positional args");
+        assert!(error.to_string().contains("Usage: codex-rotate prev [-mw]"));
     }
 
     #[test]
@@ -2315,16 +2452,40 @@ mod tests {
             (Some("next"), Vec::new(), InvokeAction::Next),
             (
                 Some("next"),
+                vec!["-mw".to_string()],
+                InvokeAction::NextManagedWindow,
+            ),
+            (
+                Some("next"),
                 vec!["acct-456".to_string()],
                 InvokeAction::Set {
                     selector: "acct-456".to_string(),
                 },
             ),
+            (
+                Some("next"),
+                vec!["acct-456".to_string(), "-mw".to_string()],
+                InvokeAction::SetManagedWindow {
+                    selector: "acct-456".to_string(),
+                },
+            ),
             (Some("prev"), Vec::new(), InvokeAction::Prev),
+            (
+                Some("prev"),
+                vec!["-mw".to_string()],
+                InvokeAction::PrevManagedWindow,
+            ),
             (
                 Some("set"),
                 vec!["acct-456".to_string()],
                 InvokeAction::Set {
+                    selector: "acct-456".to_string(),
+                },
+            ),
+            (
+                Some("set"),
+                vec!["-mw".to_string(), "acct-456".to_string()],
+                InvokeAction::SetManagedWindow {
                     selector: "acct-456".to_string(),
                 },
             ),

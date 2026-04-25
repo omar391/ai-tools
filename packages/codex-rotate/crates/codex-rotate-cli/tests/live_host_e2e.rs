@@ -3337,10 +3337,109 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     "same-account persona session id marker",
                     "Continue this transferred conversation from its latest unfinished state",
                 )?;
+                ensure!(
+                    !path_tree_contains_file_name_fragment(&target_codex_home, &source_thread_id)?,
+                    "target persona still contains source-local thread id {source_thread_id}"
+                );
                 ensure_stale_source_thread_hidden_from_target_sidebar(
                     &target_codex_home,
                     &source_thread_id,
                 )?;
+
+                archive_thread_in_state_db(
+                    &latest_state_db_in_codex_home(&target_codex_home),
+                    &target_local_id,
+                )
+                .context("failed to archive imported target-local thread")?;
+                ensure!(
+                    thread_is_archived_in_state_db(
+                        &latest_state_db_in_codex_home(&target_codex_home),
+                        &target_local_id
+                    )?,
+                    "target-local thread {target_local_id} should be archived before rotating back"
+                );
+
+                match run_shared_prev(Some(target_port), None)? {
+                    output => ensure!(
+                        !output.trim().is_empty(),
+                        "expected prev rotation output to be non-empty"
+                    ),
+                }
+                ensure_debug_codex_instance(None, Some(target_port), None, Some(30_000))
+                    .context("failed to relaunch isolated managed Codex after rotating back")?;
+                complete_codex_onboarding_for_live_ui(target_port)
+                    .context("failed to prepare isolated source Codex UI after rotating back")?;
+
+                let source_codex_home = persona_codex_home(&paths, &source_entry)?;
+                let active_codex_home = std::fs::read_link(&paths.codex_home)
+                    .context("active Codex home is not a persona symlink after rotating back")?;
+                ensure!(
+                    active_codex_home == source_codex_home,
+                    "expected active Codex home to point back at {}, got {}",
+                    source_codex_home.display(),
+                    active_codex_home.display()
+                );
+                let source_local_id_after_reverse =
+                    ConversationSyncStore::new(&paths.conversation_sync_db_file)
+                        .context("failed to reopen conversation sync store after reverse sync")?
+                        .get_local_thread_id(&source_identity, &lineage)?
+                        .context("missing source local lineage binding after reverse sync")?;
+                ensure!(
+                    source_local_id_after_reverse == source_thread_id,
+                    "expected reverse sync to preserve source-local session id {source_thread_id}, got {source_local_id_after_reverse}"
+                );
+                ensure!(
+                    !path_tree_contains_file_name_fragment(&source_codex_home, &target_local_id)?,
+                    "source persona should not contain target-local thread id {target_local_id}"
+                );
+                ensure!(
+                    thread_is_archived_in_state_db(
+                        &latest_state_db_in_codex_home(&source_codex_home),
+                        &source_thread_id
+                    )?,
+                    "source-local thread {source_thread_id} should be archived after rotating back from target-local thread {target_local_id}"
+                );
+
+                match run_shared_next(Some(target_port), None)? {
+                    NextResult::Rotated { .. } => {}
+                    other => bail!(
+                        "expected same-account persona rotation back to target, got {other:?}"
+                    ),
+                }
+                ensure_debug_codex_instance(None, Some(target_port), None, Some(30_000)).context(
+                    "failed to relaunch isolated managed Codex after second target rotation",
+                )?;
+                complete_codex_onboarding_for_live_ui(target_port)
+                    .context("failed to prepare isolated target Codex UI after second rotation")?;
+
+                let repeated_rotated_pool =
+                    load_pool().context("failed to load pool after second target rotation")?;
+                let repeated_rotated_entry = repeated_rotated_pool
+                    .accounts
+                    .get(repeated_rotated_pool.active_index)
+                    .context("second rotated pool active account is missing")?
+                    .clone();
+                let repeated_target_identity = host_sync_identity(&repeated_rotated_entry);
+                ensure!(
+                    repeated_target_identity == target_identity,
+                    "expected second target rotation to return to {target_identity}, got {repeated_target_identity}"
+                );
+                let repeated_target_local_id =
+                    ConversationSyncStore::new(&paths.conversation_sync_db_file)
+                        .context("failed to reopen conversation sync store")?
+                        .get_local_thread_id(&target_identity, &lineage)?
+                        .context("missing target local lineage binding after second import")?;
+                ensure!(
+                    repeated_target_local_id == target_local_id,
+                    "expected repeated target sync to preserve target-local session id {target_local_id}, got {repeated_target_local_id}"
+                );
+                ensure!(
+                    thread_is_archived_in_state_db(
+                        &latest_state_db_in_codex_home(&target_codex_home),
+                        &target_local_id
+                    )?,
+                    "target-local thread {target_local_id} should remain archived after bidirectional sync"
+                );
 
                 Ok(())
             })();
@@ -5334,6 +5433,30 @@ fn archive_thread_in_state_db(state_db_path: &Path, thread_id: &str) -> Result<(
         state_db_path.display()
     );
     Ok(())
+}
+
+fn thread_is_archived_in_state_db(state_db_path: &Path, thread_id: &str) -> Result<bool> {
+    ensure!(
+        state_db_path.exists(),
+        "state DB {} did not exist before checking archived state for {}",
+        state_db_path.display(),
+        thread_id
+    );
+    let connection = Connection::open(state_db_path)
+        .with_context(|| format!("failed to open state DB {}", state_db_path.display()))?;
+    let archived: i64 = connection
+        .query_row(
+            "select archived from threads where id = ?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "failed to read archived state for thread {thread_id} in {}",
+                state_db_path.display()
+            )
+        })?;
+    Ok(archived != 0)
 }
 
 fn ensure_one_pending_recoverable_thread(

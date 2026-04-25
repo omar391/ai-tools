@@ -21,7 +21,9 @@ use crate::log_isolation::active_managed_codex_thread_ids;
 use crate::paths::{legacy_rotate_app_home, resolve_paths};
 use crate::rotation_hygiene::{
     recover_incomplete_rotation_state, relogin as run_shared_relogin,
-    rotate_next as run_shared_next, rotate_prev as run_shared_prev, rotate_set as run_shared_set,
+    rotate_next_with_options as run_shared_next_with_options,
+    rotate_prev_with_options as run_shared_prev_with_options,
+    rotate_set_with_options as run_shared_set_with_options, RotationCommandOptions,
 };
 use crate::runtime_log::{log_daemon_error, log_daemon_info};
 use crate::watch::{
@@ -902,14 +904,62 @@ fn run_invoke_action(daemon: &SharedDaemon, action: InvokeAction) -> Result<Stri
             let progress_daemon = daemon.clone();
             let progress: Arc<dyn Fn(String) + Send + Sync> =
                 Arc::new(move |message| progress_daemon.set_progress_message(message));
-            daemon.with_state_mut(|state| run_manual_next(state, Some(progress)))
+            daemon.with_state_mut(|state| {
+                run_manual_next(state, Some(progress), RotationCommandOptions::default())
+            })
         }
-        InvokeAction::Prev => daemon.with_state_mut(run_manual_prev),
+        InvokeAction::NextManagedWindow => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| {
+                run_manual_next(
+                    state,
+                    Some(progress),
+                    RotationCommandOptions {
+                        force_managed_window: true,
+                    },
+                )
+            })
+        }
+        InvokeAction::Prev => {
+            daemon.with_state_mut(|state| run_manual_prev(state, RotationCommandOptions::default()))
+        }
+        InvokeAction::PrevManagedWindow => daemon.with_state_mut(|state| {
+            run_manual_prev(
+                state,
+                RotationCommandOptions {
+                    force_managed_window: true,
+                },
+            )
+        }),
         InvokeAction::Set { selector } => {
             let progress_daemon = daemon.clone();
             let progress: Arc<dyn Fn(String) + Send + Sync> =
                 Arc::new(move |message| progress_daemon.set_progress_message(message));
-            daemon.with_state_mut(|state| run_manual_set(state, &selector, Some(progress)))
+            daemon.with_state_mut(|state| {
+                run_manual_set(
+                    state,
+                    &selector,
+                    Some(progress),
+                    RotationCommandOptions::default(),
+                )
+            })
+        }
+        InvokeAction::SetManagedWindow { selector } => {
+            let progress_daemon = daemon.clone();
+            let progress: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(move |message| progress_daemon.set_progress_message(message));
+            daemon.with_state_mut(|state| {
+                run_manual_set(
+                    state,
+                    &selector,
+                    Some(progress),
+                    RotationCommandOptions {
+                        force_managed_window: true,
+                    },
+                )
+            })
         }
         InvokeAction::Create { options } => {
             let progress_daemon = daemon.clone();
@@ -992,22 +1042,24 @@ fn run_watch_check(
 fn run_manual_next(
     state: &mut DaemonState,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
 ) -> Result<String> {
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = match run_shared_next(Some(managed_codex_port()), progress.clone()) {
-        Ok(result) => result,
-        Err(error) => {
-            refresh_static_snapshot(state);
-            refresh_quota_state(state, false);
-            state.snapshot.last_rotation_reason = Some("manual rotation failed".to_string());
-            set_snapshot_message(
-                &mut state.snapshot,
-                SnapshotMessageKind::Error,
-                manual_rotation_error_message(&error),
-            );
-            return Err(error);
-        }
-    };
+    let result =
+        match run_shared_next_with_options(Some(managed_codex_port()), progress.clone(), options) {
+            Ok(result) => result,
+            Err(error) => {
+                refresh_static_snapshot(state);
+                refresh_quota_state(state, false);
+                state.snapshot.last_rotation_reason = Some("manual rotation failed".to_string());
+                set_snapshot_message(
+                    &mut state.snapshot,
+                    SnapshotMessageKind::Error,
+                    manual_rotation_error_message(&error),
+                );
+                return Err(error);
+            }
+        };
     refresh_static_snapshot(state);
     let normalized = normalized_next_result(&result);
     apply_manual_next_result_to_snapshot(state, previous_displayed_email, &normalized);
@@ -1080,9 +1132,9 @@ fn apply_manual_next_result_to_snapshot(
     }
 }
 
-fn run_manual_prev(state: &mut DaemonState) -> Result<String> {
+fn run_manual_prev(state: &mut DaemonState, options: RotationCommandOptions) -> Result<String> {
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = run_shared_prev(Some(managed_codex_port()), None)?;
+    let result = run_shared_prev_with_options(Some(managed_codex_port()), None, options)?;
     refresh_static_snapshot(state);
     state.snapshot.last_rotation_from_email = previous_displayed_email;
     let summary = summarize_codex_auth(&load_codex_auth(&resolve_paths()?.codex_auth_file)?);
@@ -1103,9 +1155,11 @@ fn run_manual_set(
     state: &mut DaemonState,
     selector: &str,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    options: RotationCommandOptions,
 ) -> Result<String> {
     let previous_displayed_email = state.snapshot.current_email.clone();
-    let result = run_shared_set(Some(managed_codex_port()), selector, progress)?;
+    let result =
+        run_shared_set_with_options(Some(managed_codex_port()), selector, progress, options)?;
     refresh_static_snapshot(state);
     state.snapshot.last_rotation_from_email = previous_displayed_email;
     let summary = summarize_codex_auth(&load_codex_auth(&resolve_paths()?.codex_auth_file)?);
