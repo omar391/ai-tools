@@ -10,16 +10,21 @@ This file has one managed section per active spec, followed by one local section
 <!-- BEGIN rules:spec:common -->
 # Shared Rules
 
-- Start each new task from the repository's primary branch.
-- Unless already inside an appropriate task worktree, any task that will perform file edits must first create a dedicated repo-local task worktree under `<repo-root>/worktrees/<name>/` from the repository's primary branch when the repository uses worktree-based task isolation.
-- Keep mutable task work in the task worktree rather than in the primary checkout.
-- When the model determines the current worktree already contains one valid coherent change set that should be committed, auto-land that change before starting further unrelated code edits.
-- After landing and verifying a task, delete any temporary repo-local worktrees and branches created during the current conversation whose contents are already represented on `main`.
-- Use an isolated `bin/`, virtual environment, or equivalent tool environment per active worktree when the repository depends on local tooling.
-- Keep those per-worktree tool artifacts rooted inside the worktree root or repo-local task directory, for example `<worktree-root>/bin/`, `<worktree-root>/.venv/`, or `<worktree-root>/.codex-rotate/bin/`, rather than in shared home-level directories.
-- Do not run mutable tooling from a live shared environment when a repo-local isolated environment is expected.
-- Validate relevant tests, builds, and checks before landing completed changes.
-- Keep repo-specific constraints in the `rules:local` block instead of editing the shared baseline.
+- Start from the repo's primary branch. In worktree-isolated repos, edit only in a dedicated repo-local task worktree under `<repo>/worktrees/<name>/` unless already in the right one.
+- If a runtime skill defines worktree naming or reconcile flow, follow it within this isolation policy.
+- If the current worktree already holds one coherent committable change, land it before unrelated edits.
+- After verified landing, remove temporary worktrees/branches already represented on `main`.
+- Use per-worktree tool envs (`bin/`, `.venv/`, `.codex-rotate/bin/`); avoid mutable shared tool environments.
+- Run relevant tests/builds/checks before landing.
+- Put repo-specific constraints in `rules:local`, not shared specs.
+
+## Coding Baseline
+
+- Keep edits scoped and follow repo idioms.
+- Prefer TDD for behavior changes; apply SOLID only when it reduces churn.
+- Optimize for agentic locality: prefer cohesive production files ~150-500 lines; treat 700+ as a smell and 1,000+ as a split candidate unless generated, declarative, or inherently cohesive.
+- Split by semantic boundary, for example types, I/O, validation, domain logic, UI state/view, CLI parsing/execution, test helpers, or test scenarios.
+- Avoid splits where the pieces must always be read or changed together.
 <!-- END rules:spec:common -->
 
 <!-- BEGIN rules:local -->
