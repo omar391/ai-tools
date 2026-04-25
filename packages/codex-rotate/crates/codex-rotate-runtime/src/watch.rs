@@ -468,9 +468,12 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             recoverable_turn_failure_log_advanced,
         )
     {
-        let recovery_last_log_id = if bootstrap_thread_recovery {
+        let force_recovery_lookback = current_account_state.last_thread_recovery_log_id.is_none()
+            && (usage_limit_signal_seen || rotated || recoverable_turn_failure_log_advanced);
+        let recovery_last_log_id = if bootstrap_thread_recovery || force_recovery_lookback {
             current_account_state
                 .last_thread_recovery_log_id
+                .or(latest_recoverable_turn_failure_log_id)
                 .map(|id| id.saturating_sub(THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS))
         } else {
             current_account_state.last_thread_recovery_log_id
@@ -495,6 +498,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
             last_log_id: recovery_last_log_id,
             pending: current_account_state.thread_recovery_pending,
             pending_events: current_account_state.thread_recovery_pending_events.clone(),
+            detect_only: false,
         }) {
             Ok(recovery) => {
                 current_account_state.last_thread_recovery_log_id = recovery.last_log_id;

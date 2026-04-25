@@ -92,6 +92,7 @@ pub struct RecoveryIterationOptions {
     pub last_log_id: Option<i64>,
     pub pending: bool,
     pub pending_events: Vec<ThreadRecoveryEvent>,
+    pub detect_only: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -218,6 +219,34 @@ pub fn run_thread_recovery_iteration(
             dropped_thread_ids: Vec::new(),
         });
     }
+    let last_log_id = candidate_events
+        .iter()
+        .map(|event| event.source_log_id)
+        .filter(|log_id| *log_id > 0)
+        .max()
+        .or(seeded_last_log_id);
+
+    if options.detect_only {
+        let mut pending_events = Vec::new();
+        let mut dropped_thread_ids = Vec::new();
+        for event in candidate_events {
+            if thread_has_newer_user_turn(&connection, &event)? {
+                dropped_thread_ids.push(event.thread_id);
+            } else {
+                pending_events.push(event);
+            }
+        }
+
+        let detected = pending_events.len() + dropped_thread_ids.len();
+        return Ok(RecoveryIterationResult {
+            last_log_id,
+            pending: !pending_events.is_empty(),
+            pending_events,
+            detected,
+            continued_thread_ids: Vec::new(),
+            dropped_thread_ids,
+        });
+    }
 
     let current_live_email = match options.current_live_email.as_deref() {
         Some(email) => Some(normalize_email(email)),
@@ -240,12 +269,6 @@ pub fn run_thread_recovery_iteration(
             can_continue_without_email,
         )
     })?;
-    let last_log_id = candidate_events
-        .iter()
-        .map(|event| event.source_log_id)
-        .filter(|log_id| *log_id > 0)
-        .max()
-        .or(seeded_last_log_id);
 
     Ok(RecoveryIterationResult {
         last_log_id,
@@ -419,7 +442,10 @@ where id > ?1
   )
   and feedback_log_body like '%' || ?2 || '%'
   and feedback_log_body like '%submission_dispatch%'
-  and feedback_log_body like '%codex.op="user_input"%'
+  and (
+    feedback_log_body like '%codex.op="user_input"%'
+    or feedback_log_body like '%codex.op="user_input_with_turn_context"%'
+  )
 order by id asc
 limit 20
         "#,
@@ -447,7 +473,7 @@ from logs
 where id > ?1
   and (
     (
-      target = 'codex_core::codex'
+      target in ('codex_core::codex', 'codex_core::session::turn')
       and (
         feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
         or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
@@ -498,7 +524,7 @@ select id
 from logs
 where (
     (
-      target = 'codex_core::codex'
+      target in ('codex_core::codex', 'codex_core::session::turn')
       and (
         feedback_log_body like '%Turn error: You''ve hit your usage limit.%'
         or feedback_log_body like '%Turn error: Selected model is at capacity. Please try a different model.%'
@@ -1734,8 +1760,8 @@ insert into logs (id, ts, target, feedback_log_body) values
   (
     10,
     1775445612,
-    'codex_core::codex',
-    'session_loop{thread_id=thread-456}:submission_dispatch{otel.name="op.dispatch.user_input"}:turn{otel.name="session_task.turn" thread.id=thread-456 turn.id=turn-456 model=gpt-5.4}:run_turn: Turn error: You''ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Apr 13th, 2026 8:46 AM.'
+    'codex_core::session::turn',
+    'session_loop{thread_id=thread-456}:submission_dispatch{otel.name="op.dispatch.user_input_with_turn_context" submission.id="turn-456" codex.op="user_input_with_turn_context"}:turn{otel.name="session_task.turn" thread.id=thread-456 turn.id=turn-456 model=gpt-5.4}:run_turn: Turn error: You''ve hit your usage limit. To get more access now, send a request to your admin or try again at 2:20 PM.'
   );
                 "#,
             )
@@ -1884,7 +1910,7 @@ insert into logs (id, ts, target, feedback_log_body) values
     11,
     1775445613,
     'log',
-    'session_loop{thread_id=thread-123}:submission_dispatch{otel.name="op.dispatch.user_input" submission.id="submission-new" codex.op="user_input"}:turn{otel.name="session_task.turn" thread.id=thread-123 turn.id=turn-new model=gpt-5.4}:run_turn'
+    'session_loop{thread_id=thread-123}:submission_dispatch{otel.name="op.dispatch.user_input_with_turn_context" submission.id="submission-new" codex.op="user_input_with_turn_context"}:turn{otel.name="session_task.turn" thread.id=thread-123 turn.id=turn-new model=gpt-5.4}:run_turn'
   );
                 "#,
             )
@@ -1938,14 +1964,15 @@ insert into logs (id, ts, target, feedback_log_body) values
   (14, 1004, 'log', 'error.message=You''ve hit your usage limit. not authoritative'),
   (15, 1005, 'codex_core::codex', 'session_loop{thread_id=thread-d}:turn{thread.id=thread-d turn.id=turn-d}:run_turn: Turn error: Selected model is at capacity. Please try a different model.'),
   (16, 1006, 'codex_core::codex', 'session_loop{thread_id=thread-e}:turn{thread.id=thread-e turn.id=turn-e}:run_turn: Turn error: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)'),
-  (17, 1007, 'codex_core::compact_remote', 'session_loop{thread_id=thread-f}:turn{thread.id=thread-f turn.id=turn-f}:run_turn: remote compaction failed turn_id=turn-f compact_error=You''ve hit your usage limit. Upgrade to Plus to continue using Codex.');
+  (17, 1007, 'codex_core::compact_remote', 'session_loop{thread_id=thread-f}:turn{thread.id=thread-f turn.id=turn-f}:run_turn: remote compaction failed turn_id=turn-f compact_error=You''ve hit your usage limit. Upgrade to Plus to continue using Codex.'),
+  (18, 1008, 'codex_core::session::turn', 'session_loop{thread_id=thread-g}:turn{thread.id=thread-g turn.id=turn-g}:run_turn: Turn error: You''ve hit your usage limit. To get more access now, send a request to your admin or try again later.');
                 "#,
             )
             .unwrap();
 
         assert_eq!(
             read_latest_recoverable_turn_failure_log_id_from_connection(&connection).unwrap(),
-            Some(17)
+            Some(18)
         );
     }
 

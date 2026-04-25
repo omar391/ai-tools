@@ -36,8 +36,9 @@ use crate::log_isolation::{
 };
 use crate::paths::{resolve_paths, RuntimePaths};
 use crate::thread_recovery::{
-    read_active_thread_ids, run_thread_recovery_iteration, send_codex_app_request,
-    send_codex_host_fetch_request, RecoveryIterationOptions, ThreadRecoveryRehydration,
+    read_active_thread_ids, read_latest_recoverable_turn_failure_log_id,
+    run_thread_recovery_iteration, send_codex_app_request, send_codex_host_fetch_request,
+    RecoveryIterationOptions, ThreadRecoveryRehydration,
 };
 use crate::watch::read_watch_state;
 #[cfg(test)]
@@ -96,6 +97,7 @@ impl From<RotationCheckpointPhase> for RotationPhase {
 
 const DEFAULT_PORT: u16 = 9333;
 const MAX_HANDOFF_TEXT_CHARS: usize = 8_000;
+const ROTATION_THREAD_RECOVERY_LOOKBACK_LOGS: i64 = 2_000;
 const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
 const LINEAGE_CLAIM_STALE_AFTER_NANOS: u128 = 10 * 60 * 1_000_000_000;
 const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
@@ -1674,6 +1676,52 @@ fn finalize_rotation_after_import(
     Ok(())
 }
 
+fn capture_source_thread_recovery_events_before_rotation(
+    prepared: &PreparedRotation,
+    port: u16,
+) -> Result<()> {
+    use crate::watch::{read_watch_state, write_watch_state};
+
+    if prepared.action != PreparedRotationAction::Switch {
+        return Ok(());
+    }
+
+    let mut state = read_watch_state()?;
+    let source_account_id = &prepared.previous.account_id;
+    let source_state = state.account_state(source_account_id);
+    let latest_recoverable_log_id = read_latest_recoverable_turn_failure_log_id()?;
+    let recovery_last_log_id = source_state.last_thread_recovery_log_id.or_else(|| {
+        latest_recoverable_log_id
+            .map(|id| id.saturating_sub(ROTATION_THREAD_RECOVERY_LOOKBACK_LOGS))
+    });
+
+    let recovery = run_thread_recovery_iteration(RecoveryIterationOptions {
+        port: Some(port),
+        current_live_email: source_state
+            .last_live_email
+            .clone()
+            .or_else(|| Some(prepared.previous.email.clone())),
+        current_quota_usable: source_state.quota.as_ref().map(|quota| quota.usable),
+        current_primary_quota_left_percent: source_state
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.primary_quota_left_percent),
+        rotated: false,
+        last_log_id: recovery_last_log_id,
+        pending: source_state.thread_recovery_pending,
+        pending_events: source_state.thread_recovery_pending_events.clone(),
+        detect_only: true,
+    })?;
+
+    let mut updated_source_state = source_state;
+    updated_source_state.last_thread_recovery_log_id = recovery.last_log_id;
+    updated_source_state.thread_recovery_pending = recovery.pending;
+    updated_source_state.thread_recovery_pending_events = recovery.pending_events;
+    updated_source_state.thread_recovery_backfill_complete = true;
+    state.set_account_state(source_account_id.to_string(), updated_source_state);
+    write_watch_state(&state)
+}
+
 #[cfg(test)]
 pub(crate) fn translate_recovery_events_after_rotation(
     source_account_id: &str,
@@ -1830,6 +1878,7 @@ fn recover_translated_thread_events_after_rotation(
         last_log_id: target_state.last_thread_recovery_log_id,
         pending: target_state.thread_recovery_pending,
         pending_events: target_state.thread_recovery_pending_events.clone(),
+        detect_only: false,
     }) {
         Ok(recovery) => recovery,
         Err(error) => {
@@ -2124,6 +2173,7 @@ fn rotate_next_impl_with_retry(
             return Ok(result);
         }
     }
+    let _ = capture_source_thread_recovery_events_before_rotation(&prepared, port);
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend
@@ -2276,6 +2326,7 @@ fn rotate_prev_impl(
     }
 
     ensure_target_account_still_valid(&prepared)?;
+    let _ = capture_source_thread_recovery_events_before_rotation(&prepared, port);
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend.activate(
@@ -2355,6 +2406,7 @@ fn rotate_set_impl(
     }
 
     ensure_target_account_still_present(&prepared)?;
+    let _ = capture_source_thread_recovery_events_before_rotation(&prepared, port);
     save_rotation_checkpoint_for_prepared(&prepared, RotationCheckpointPhase::Activate)?;
 
     let handoffs = backend.activate(
@@ -3844,15 +3896,12 @@ fn localized_session_index_entry(snapshot: &HostThreadSnapshot) -> Option<Value>
         &snapshot.source_thread_id,
         &snapshot.target_thread_id,
     );
-    if entry
+    entry
         .get("thread_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        return None;
-    }
+        .map(|_| ())?;
     Some(entry)
 }
 
@@ -4223,12 +4272,10 @@ fn localize_thread_ids_in_json_value(
         Value::Object(object) => {
             let mut changed = false;
             for (key, value) in object.iter_mut() {
-                if thread_id_metadata_key(key) {
-                    if value.as_str() == Some(source_thread_id) {
-                        *value = Value::String(target_thread_id.to_string());
-                        changed = true;
-                        continue;
-                    }
+                if thread_id_metadata_key(key) && value.as_str() == Some(source_thread_id) {
+                    *value = Value::String(target_thread_id.to_string());
+                    changed = true;
+                    continue;
                 }
                 changed |=
                     localize_thread_ids_in_json_value(value, source_thread_id, target_thread_id);
@@ -4243,9 +4290,7 @@ fn localize_thread_ids_in_json_value(
 }
 
 fn thread_id_metadata_key(key: &str) -> bool {
-    THREAD_ID_METADATA_KEYS
-        .iter()
-        .any(|candidate| *candidate == key)
+    THREAD_ID_METADATA_KEYS.contains(&key)
 }
 
 #[cfg(test)]
@@ -4971,43 +5016,22 @@ fn import_thread_handoffs(
 
         let should_materialize = created_thread_id.is_some() || needs_update;
 
-        if should_materialize {
-            if !items_to_inject.is_empty() {
-                if let Err(error) =
-                    transport.inject_items(&target_thread_id, items_to_inject.clone())
-                {
-                    let error_message = format!("{:#}", error);
-                    if created_thread_id.is_none() && thread_not_found_message(&error_message) {
-                        match store.reclaim_lineage_binding(
-                            target_account_id,
-                            &handoff.lineage_id,
-                            &target_thread_id,
-                        )? {
-                            LineageBindingClaim::Claimed { claim_token } => {
-                                lineage_claim_token = Some(claim_token);
-                                let old_thread_id = target_thread_id.clone();
-                                let new_thread_id = match transport
-                                    .start_thread(handoff.cwd.as_deref())
-                                {
-                                    Ok(id) => id,
-                                    Err(start_error) => {
-                                        if let Some(claim_token) = lineage_claim_token.as_deref() {
-                                            let _ = store.release_lineage_claim(
-                                                target_account_id,
-                                                &handoff.lineage_id,
-                                                claim_token,
-                                            );
-                                        }
-                                        outcome.failures.push(ThreadHandoffImportFailure {
-                                            source_thread_id: handoff.source_thread_id.clone(),
-                                            created_thread_id: None,
-                                            stage: ThreadHandoffImportFailureStage::Start,
-                                            error: start_error.to_string(),
-                                        });
-                                        continue;
-                                    }
-                                };
-                                if new_thread_id == handoff.source_thread_id {
+        if should_materialize && !items_to_inject.is_empty() {
+            if let Err(error) = transport.inject_items(&target_thread_id, items_to_inject.clone()) {
+                let error_message = format!("{:#}", error);
+                if created_thread_id.is_none() && thread_not_found_message(&error_message) {
+                    match store.reclaim_lineage_binding(
+                        target_account_id,
+                        &handoff.lineage_id,
+                        &target_thread_id,
+                    )? {
+                        LineageBindingClaim::Claimed { claim_token } => {
+                            lineage_claim_token = Some(claim_token);
+                            let old_thread_id = target_thread_id.clone();
+                            let new_thread_id = match transport.start_thread(handoff.cwd.as_deref())
+                            {
+                                Ok(id) => id,
+                                Err(start_error) => {
                                     if let Some(claim_token) = lineage_claim_token.as_deref() {
                                         let _ = store.release_lineage_claim(
                                             target_account_id,
@@ -5019,34 +5043,51 @@ fn import_thread_handoffs(
                                         source_thread_id: handoff.source_thread_id.clone(),
                                         created_thread_id: None,
                                         stage: ThreadHandoffImportFailureStage::Start,
+                                        error: start_error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            };
+                            if new_thread_id == handoff.source_thread_id {
+                                if let Some(claim_token) = lineage_claim_token.as_deref() {
+                                    let _ = store.release_lineage_claim(
+                                        target_account_id,
+                                        &handoff.lineage_id,
+                                        claim_token,
+                                    );
+                                }
+                                outcome.failures.push(ThreadHandoffImportFailure {
+                                        source_thread_id: handoff.source_thread_id.clone(),
+                                        created_thread_id: None,
+                                        stage: ThreadHandoffImportFailureStage::Start,
                                         error: "Codex thread/start unexpectedly reused the source thread ID."
                                             .to_string(),
                                     });
-                                    continue;
-                                }
-                                target_thread_id = new_thread_id.clone();
-                                created_thread_id = Some(new_thread_id);
-                                replaced_thread_id = Some(old_thread_id);
-                                items_to_inject = handoff.items.clone();
-                                if let Err(retry_error) = transport
-                                    .inject_items(&target_thread_id, items_to_inject.clone())
-                                {
-                                    let _ = store.bind_local_thread_id(
-                                        target_account_id,
-                                        &handoff.lineage_id,
-                                        &target_thread_id,
-                                    );
-                                    outcome.failures.push(ThreadHandoffImportFailure {
-                                        source_thread_id: handoff.source_thread_id.clone(),
-                                        created_thread_id: created_thread_id.clone(),
-                                        stage: ThreadHandoffImportFailureStage::InjectItems,
-                                        error: retry_error.to_string(),
-                                    });
-                                    continue;
-                                }
+                                continue;
                             }
-                            LineageBindingClaim::Existing(repaired_local_id) => {
+                            target_thread_id = new_thread_id.clone();
+                            created_thread_id = Some(new_thread_id);
+                            replaced_thread_id = Some(old_thread_id);
+                            items_to_inject = handoff.items.clone();
+                            if let Err(retry_error) =
+                                transport.inject_items(&target_thread_id, items_to_inject.clone())
+                            {
+                                let _ = store.bind_local_thread_id(
+                                    target_account_id,
+                                    &handoff.lineage_id,
+                                    &target_thread_id,
+                                );
                                 outcome.failures.push(ThreadHandoffImportFailure {
+                                    source_thread_id: handoff.source_thread_id.clone(),
+                                    created_thread_id: created_thread_id.clone(),
+                                    stage: ThreadHandoffImportFailureStage::InjectItems,
+                                    error: retry_error.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                        LineageBindingClaim::Existing(repaired_local_id) => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
                                     source_thread_id: handoff.source_thread_id.clone(),
                                     created_thread_id: None,
                                     stage: ThreadHandoffImportFailureStage::InjectItems,
@@ -5055,10 +5096,10 @@ fn import_thread_handoffs(
                                         target_thread_id, repaired_local_id
                                     ),
                                 });
-                                continue;
-                            }
-                            LineageBindingClaim::Busy => {
-                                outcome.failures.push(ThreadHandoffImportFailure {
+                            continue;
+                        }
+                        LineageBindingClaim::Busy => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
                                     source_thread_id: handoff.source_thread_id.clone(),
                                     created_thread_id: None,
                                     stage: ThreadHandoffImportFailureStage::InjectItems,
@@ -5067,31 +5108,11 @@ fn import_thread_handoffs(
                                         handoff.lineage_id, target_account_id
                                     ),
                                 });
-                                continue;
-                            }
+                            continue;
                         }
-                    } else {
-                        if created_thread_id.is_some() {
-                            let _ = store.bind_local_thread_id(
-                                target_account_id,
-                                &handoff.lineage_id,
-                                &target_thread_id,
-                            );
-                        }
-                        outcome.failures.push(ThreadHandoffImportFailure {
-                            source_thread_id: handoff.source_thread_id.clone(),
-                            created_thread_id: created_thread_id.clone(),
-                            stage: ThreadHandoffImportFailureStage::InjectItems,
-                            error: error.to_string(),
-                        });
-                        continue;
                     }
-                }
-                wait_for_imported_thread_persistence();
-                if let Err(error) =
-                    transport.ensure_thread_user_message_event(&target_thread_id, handoff)
-                {
-                    if created_thread_id.is_some() || lineage_claim_token.is_some() {
+                } else {
+                    if created_thread_id.is_some() {
                         let _ = store.bind_local_thread_id(
                             target_account_id,
                             &handoff.lineage_id,
@@ -5101,11 +5122,30 @@ fn import_thread_handoffs(
                     outcome.failures.push(ThreadHandoffImportFailure {
                         source_thread_id: handoff.source_thread_id.clone(),
                         created_thread_id: created_thread_id.clone(),
-                        stage: ThreadHandoffImportFailureStage::Metadata,
+                        stage: ThreadHandoffImportFailureStage::InjectItems,
                         error: error.to_string(),
                     });
                     continue;
                 }
+            }
+            wait_for_imported_thread_persistence();
+            if let Err(error) =
+                transport.ensure_thread_user_message_event(&target_thread_id, handoff)
+            {
+                if created_thread_id.is_some() || lineage_claim_token.is_some() {
+                    let _ = store.bind_local_thread_id(
+                        target_account_id,
+                        &handoff.lineage_id,
+                        &target_thread_id,
+                    );
+                }
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: created_thread_id.clone(),
+                    stage: ThreadHandoffImportFailureStage::Metadata,
+                    error: error.to_string(),
+                });
+                continue;
             }
         }
 
@@ -9967,6 +10007,78 @@ create table threads (
         assert_eq!(
             next_target_state.thread_recovery_pending_events[0].thread_id,
             "target-thread-bound"
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn capture_source_recovery_before_rotation_records_session_turn_quota_event() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+        }
+        fs::create_dir_all(&paths.codex_home).expect("create codex home");
+        fs::create_dir_all(&paths.rotate_home).expect("create rotate home");
+
+        let logs =
+            rusqlite::Connection::open(paths.codex_home.join("logs_1.sqlite")).expect("open logs");
+        logs.execute_batch(
+            r#"
+create table logs (
+  id integer primary key,
+  ts integer,
+  target text,
+  feedback_log_body text,
+  thread_id text
+);
+insert into logs (id, ts, target, feedback_log_body, thread_id) values
+  (
+    100,
+    1775445612,
+    'codex_core::session::turn',
+    'session_loop{thread_id=source-thread}:submission_dispatch{otel.name="op.dispatch.user_input_with_turn_context" submission.id="turn-source" codex.op="user_input_with_turn_context"}:turn{otel.name="session_task.turn" thread.id=source-thread turn.id=turn-source model=gpt-5.5}:run_turn: Turn error: You''ve hit your usage limit. To get more access now, send a request to your admin or try again later.',
+    'source-thread'
+  );
+            "#,
+        )
+        .expect("seed logs");
+
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+        let prepared = PreparedRotation {
+            action: PreparedRotationAction::Switch,
+            pool: codex_rotate_core::pool::Pool {
+                active_index: 0,
+                accounts: vec![source.clone(), target.clone()],
+            },
+            previous_index: 0,
+            target_index: 1,
+            previous: source,
+            target,
+            message: "rotating".to_string(),
+            persist_pool: true,
+        };
+
+        write_watch_state(&crate::watch::WatchState::default()).expect("write watch state");
+        capture_source_thread_recovery_events_before_rotation(&prepared, 9333)
+            .expect("capture source recovery");
+
+        let state = crate::watch::read_watch_state().expect("read watch state");
+        let source_state = state.account_state("acct-source");
+        assert_eq!(source_state.last_thread_recovery_log_id, Some(100));
+        assert!(source_state.thread_recovery_pending);
+        assert_eq!(source_state.thread_recovery_pending_events.len(), 1);
+        assert_eq!(
+            source_state.thread_recovery_pending_events[0].thread_id,
+            "source-thread"
         );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
