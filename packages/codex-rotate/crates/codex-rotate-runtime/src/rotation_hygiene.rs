@@ -4677,13 +4677,21 @@ fn export_thread_handoffs_from_candidates(
                 handoffs.push(handoff);
             }
             Ok(None) => {}
-            Err(error) if is_terminal_thread_read_error(&error) => {
+            Err(error) if is_skippable_thread_handoff_read_error(&error) => {
                 continue;
             }
             Err(error) => return Err(error),
         }
     }
     Ok(handoffs)
+}
+
+fn is_skippable_thread_handoff_read_error(error: &anyhow::Error) -> bool {
+    if is_terminal_thread_read_error(error) {
+        return true;
+    }
+    let message = format!("{error:#}");
+    host_thread_not_ready_message(&message)
 }
 
 fn is_terminal_thread_read_error(error: &anyhow::Error) -> bool {
@@ -6835,7 +6843,8 @@ impl HostConversationTransport {
 }
 
 fn host_thread_not_ready_message(message: &str) -> bool {
-    message.contains("includeTurns is unavailable before first user message")
+    let message = message.to_lowercase();
+    message.contains("includeturns is unavailable before first user message")
         || message.contains("thread not loaded")
         || message.contains("is not materialized yet")
         || message.contains("no rollout found for thread id")
@@ -8326,6 +8335,114 @@ mod tests {
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
         restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn export_skips_stale_or_unmaterialized_handoff_candidates() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        struct ExportUnavailableTransport;
+        impl ConversationTransport for ExportUnavailableTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                match id {
+                    "thread-good" => Ok(json!({
+                        "thread": {
+                            "id": id,
+                            "cwd": "/tmp/project",
+                            "turns": [
+                                {
+                                    "id": "turn-1",
+                                    "items": [
+                                        {
+                                            "type": "userMessage",
+                                            "content": [{ "type": "text", "text": "hello" }]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    })),
+                    "thread-not-loaded" => Err(anyhow!(
+                        "Codex thread/read request failed: {{\"code\":-32600,\"message\":\"thread not loaded: thread-not-loaded\"}}"
+                    )),
+                    "thread-unmaterialized" => Err(anyhow!(
+                        "Codex thread/read request failed: {{\"code\":-32600,\"message\":\"thread thread-unmaterialized is not materialized yet; includeTurns is unavailable before first user message\"}}"
+                    )),
+                    other => Err(anyhow!("unexpected thread {other}")),
+                }
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("export should not start threads")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("export should not inject items")
+            }
+        }
+
+        let handoffs = export_thread_handoffs_from_candidates(
+            &ExportUnavailableTransport,
+            "source-sync",
+            vec![
+                "thread-good".to_string(),
+                "thread-not-loaded".to_string(),
+                "thread-unmaterialized".to_string(),
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("export should skip stale candidates");
+
+        assert_eq!(
+            handoffs
+                .iter()
+                .map(|handoff| handoff.source_thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-good"]
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn export_propagates_non_recoverable_handoff_read_errors() {
+        struct ExportTimeoutTransport;
+        impl ConversationTransport for ExportTimeoutTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Err(anyhow!(
+                    "Timed out waiting for thread/read response from Codex."
+                ))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("export should not start threads")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("export should not inject items")
+            }
+        }
+
+        let error = export_thread_handoffs_from_candidates(
+            &ExportTimeoutTransport,
+            "source-sync",
+            vec!["thread-timeout".to_string()],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("unexpected read errors should still fail export");
+
+        assert!(format!("{error:#}").contains("Timed out waiting for thread/read response"));
     }
 
     #[test]
