@@ -1825,24 +1825,41 @@ fn translate_recovery_events_after_rotation_with_identity(
     }
 
     if !translated_events.is_empty() {
-        let mut target_state = state.account_state(target_account_id);
-        target_state.thread_recovery_pending = true;
-        for translated in translated_events {
-            if !target_state
-                .thread_recovery_pending_events
-                .iter()
-                .any(|e| e.thread_id == translated.thread_id)
-            {
-                target_state.thread_recovery_pending_events.push(translated);
+        if source_account_id == target_account_id {
+            let mut shared_state = state.account_state(target_account_id);
+            shared_state.thread_recovery_pending_events = unresolved_events;
+            for translated in translated_events {
+                if !shared_state
+                    .thread_recovery_pending_events
+                    .iter()
+                    .any(|e| e.thread_id == translated.thread_id)
+                {
+                    shared_state.thread_recovery_pending_events.push(translated);
+                }
             }
-        }
-        state.set_account_state(target_account_id.to_string(), target_state);
+            shared_state.thread_recovery_pending =
+                !shared_state.thread_recovery_pending_events.is_empty();
+            state.set_account_state(target_account_id.to_string(), shared_state);
+        } else {
+            let mut target_state = state.account_state(target_account_id);
+            target_state.thread_recovery_pending = true;
+            for translated in translated_events {
+                if !target_state
+                    .thread_recovery_pending_events
+                    .iter()
+                    .any(|e| e.thread_id == translated.thread_id)
+                {
+                    target_state.thread_recovery_pending_events.push(translated);
+                }
+            }
+            state.set_account_state(target_account_id.to_string(), target_state);
 
-        let mut source_state = state.account_state(source_account_id);
-        source_state.thread_recovery_pending_events = unresolved_events;
-        source_state.thread_recovery_pending =
-            !source_state.thread_recovery_pending_events.is_empty();
-        state.set_account_state(source_account_id.to_string(), source_state);
+            let mut source_state = state.account_state(source_account_id);
+            source_state.thread_recovery_pending_events = unresolved_events;
+            source_state.thread_recovery_pending =
+                !source_state.thread_recovery_pending_events.is_empty();
+            state.set_account_state(source_account_id.to_string(), source_state);
+        }
 
         write_watch_state(&state)?;
     }
@@ -4625,10 +4642,7 @@ fn export_thread_handoffs_with_identity_and_candidates(
             }
         }
     }
-    let active_thread_ids = active_thread_ids
-        .into_iter()
-        .chain(initial_thread_ids)
-        .collect::<BTreeSet<_>>();
+    let active_thread_ids = active_thread_ids.into_iter().collect::<BTreeSet<_>>();
     let transport = HostConversationTransport::new(port);
     export_thread_handoffs_from_candidates(
         &transport,
@@ -4643,8 +4657,8 @@ fn export_thread_handoffs_from_candidates(
     transport: &dyn ConversationTransport,
     sync_identity: &str,
     thread_ids: Vec<String>,
-    _continue_thread_ids: &BTreeSet<String>,
-    _pending_recovery_thread_ids: &BTreeSet<String>,
+    continue_thread_ids: &BTreeSet<String>,
+    pending_recovery_thread_ids: &BTreeSet<String>,
 ) -> Result<Vec<ThreadHandoff>> {
     let mut unique = BTreeSet::new();
     let mut handoffs = Vec::new();
@@ -4653,7 +4667,15 @@ fn export_thread_handoffs_from_candidates(
             continue;
         }
         match export_single_thread_handoff_with_identity(transport, &thread_id, sync_identity) {
-            Ok(Some(handoff)) => handoffs.push(handoff),
+            Ok(Some(handoff)) => {
+                if handoff.metadata.archived == Some(true)
+                    && !continue_thread_ids.contains(&thread_id)
+                    && !pending_recovery_thread_ids.contains(&thread_id)
+                {
+                    continue;
+                }
+                handoffs.push(handoff);
+            }
             Ok(None) => {}
             Err(error) if is_terminal_thread_read_error(&error) => {
                 continue;
@@ -8175,11 +8197,12 @@ mod tests {
     }
 
     #[test]
-    fn state_backed_export_includes_historical_threads_without_auto_continue() {
+    fn state_backed_export_skips_archived_threads_without_pending_recovery() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
-        let state_db = temp.path().join("state_5.sqlite");
+        let state_db = paths.codex_home.join("state_5.sqlite");
+        fs::create_dir_all(&paths.codex_home).expect("create codex home");
         seed_threads_table(
             &state_db,
             &[
@@ -8200,8 +8223,10 @@ mod tests {
         );
 
         let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
         unsafe {
             std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
         }
 
         struct ExportMockTransport {
@@ -8277,7 +8302,7 @@ mod tests {
                 .iter()
                 .map(|handoff| handoff.source_thread_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["thread-new", "thread-old", "thread-archived"]
+            vec!["thread-new", "thread-old"]
         );
         let serialized = serde_json::to_value(&handoffs[0]).expect("serialize handoff");
         assert!(
@@ -8300,6 +8325,82 @@ mod tests {
         }
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn state_backed_export_keeps_archived_pending_recovery_threads() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        fs::create_dir_all(&paths.codex_home).expect("create codex home");
+        let state_db = paths.codex_home.join("state_5.sqlite");
+        seed_threads_table(&state_db, &[("thread-archived", "/tmp/archived.jsonl", 20)]);
+        update_thread_metadata(&state_db, "thread-archived", "/tmp/archived", true);
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+        }
+
+        struct ExportMockTransport;
+        impl ConversationTransport for ExportMockTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                Ok(json!({
+                    "thread": {
+                        "id": id,
+                        "cwd": "/tmp/project",
+                        "turns": [
+                            {
+                                "id": format!("turn-{id}"),
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "content": [
+                                            { "type": "text", "text": format!("hello {id}") }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("export should not start threads")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("export should not inject items")
+            }
+        }
+
+        let continue_thread_ids = BTreeSet::new();
+        let pending_thread_ids = BTreeSet::from(["thread-archived".to_string()]);
+        let handoffs = export_thread_handoffs_from_candidates(
+            &ExportMockTransport,
+            "source-sync",
+            vec!["thread-archived".to_string()],
+            &continue_thread_ids,
+            &pending_thread_ids,
+        )
+        .expect("export handoffs");
+
+        assert_eq!(
+            handoffs
+                .iter()
+                .map(|handoff| handoff.source_thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-archived"]
+        );
+        assert_eq!(handoffs[0].metadata.archived, Some(true));
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
     }
 
     #[test]
@@ -10007,6 +10108,96 @@ create table threads (
         assert_eq!(
             next_target_state.thread_recovery_pending_events[0].thread_id,
             "target-thread-bound"
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+        restore_env("CODEX_HOME", previous_codex_home);
+    }
+
+    #[test]
+    fn translate_recovery_events_keeps_translated_entries_for_same_account_personas() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+            std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+        }
+        fs::create_dir_all(&paths.rotate_home).expect("create rotate home");
+
+        let bound_source_event = crate::thread_recovery::ThreadRecoveryEvent {
+            source_log_id: 100,
+            source_ts: 1,
+            thread_id: "source-thread-bound".to_string(),
+            kind: crate::thread_recovery::ThreadRecoveryKind::QuotaExhausted,
+            exhausted_turn_id: Some("turn-1".to_string()),
+            exhausted_email: Some("shared-account@astronlab.com".to_string()),
+            exhausted_account_id: Some("acct-shared".to_string()),
+            message: "quota exhausted".to_string(),
+            rehydration: None,
+        };
+        let unresolved_source_event = crate::thread_recovery::ThreadRecoveryEvent {
+            source_log_id: 101,
+            source_ts: 2,
+            thread_id: "source-thread-unbound".to_string(),
+            kind: crate::thread_recovery::ThreadRecoveryKind::QuotaExhausted,
+            exhausted_turn_id: Some("turn-2".to_string()),
+            exhausted_email: Some("shared-account@astronlab.com".to_string()),
+            exhausted_account_id: Some("acct-shared".to_string()),
+            message: "quota exhausted".to_string(),
+            rehydration: None,
+        };
+
+        let mut initial_watch_state = crate::watch::WatchState::default();
+        let mut shared_state = initial_watch_state.account_state("acct-shared");
+        shared_state.thread_recovery_pending = true;
+        shared_state.thread_recovery_pending_events =
+            vec![bound_source_event.clone(), unresolved_source_event.clone()];
+        initial_watch_state.set_account_state("acct-shared", shared_state);
+        crate::watch::write_watch_state(&initial_watch_state).expect("write initial watch state");
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("store");
+        store
+            .bind_local_thread_id(
+                "host-persona:source",
+                "lineage-bound",
+                "source-thread-bound",
+            )
+            .expect("bind source lineage");
+        store
+            .bind_local_thread_id(
+                "host-persona:target",
+                "lineage-bound",
+                "target-thread-bound",
+            )
+            .expect("bind target lineage");
+
+        translate_recovery_events_after_rotation_with_identity(
+            "acct-shared",
+            "acct-shared",
+            "host-persona:source",
+            "host-persona:target",
+            9333,
+            &[],
+        )
+        .expect("translate recovery events");
+
+        let next_watch_state = crate::watch::read_watch_state().expect("read watch state");
+        let next_shared_state = next_watch_state.account_state("acct-shared");
+        let thread_ids = next_shared_state
+            .thread_recovery_pending_events
+            .iter()
+            .map(|event| event.thread_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(next_shared_state.thread_recovery_pending);
+        assert_eq!(
+            thread_ids,
+            vec!["source-thread-unbound", "target-thread-bound"]
         );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
