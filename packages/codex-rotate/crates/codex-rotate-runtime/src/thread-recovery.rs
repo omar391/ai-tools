@@ -1298,6 +1298,100 @@ where
     }
 }
 
+pub(crate) fn send_codex_host_fetch_request<T>(port: u16, method: &str, params: Value) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match send_codex_host_fetch_request_once(port, method, &params) {
+        Ok(value) => Ok(value),
+        Err(first_error) => {
+            invalidate_local_codex_connection(port, true);
+            ensure_debug_codex_instance(None, Some(port), None, None)?;
+            send_codex_host_fetch_request_once(port, method, &params).map_err(|retry_error| {
+                anyhow!(
+                    "{retry_error} (initial {method} host request failed before relaunch: {first_error})"
+                )
+            })
+        }
+    }
+}
+
+fn send_codex_host_fetch_request_once<T>(port: u16, method: &str, params: &Value) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let request_id = format!(
+        "codex-rotate-host-fetch-{method}-{}",
+        Utc::now().timestamp_millis()
+    );
+    let request = json!({
+        "type": "fetch",
+        "hostId": "local",
+        "requestId": request_id,
+        "method": "POST",
+        "url": format!("vscode://codex/{method}"),
+        "body": serde_json::to_string(params)?,
+    });
+    let request_json = serde_json::to_string(&request)?;
+    let expression = format!(
+        r#"new Promise(async (resolve) => {{
+const request = {request_json};
+const timeout = setTimeout(() => {{
+  window.removeEventListener("message", handler);
+  resolve({{ timeout: true }});
+}}, {MCP_RESPONSE_TIMEOUT_MS});
+const handler = (event) => {{
+  const data = event.data;
+  if (data && data.type === "fetch-response" && data.requestId === request.requestId) {{
+    clearTimeout(timeout);
+    window.removeEventListener("message", handler);
+    resolve({{
+      timeout: false,
+      responseType: data.responseType ?? null,
+      status: data.status ?? null,
+      bodyJsonString: data.bodyJsonString ?? null,
+      error: data.error ?? null
+    }});
+  }}
+}};
+window.addEventListener("message", handler);
+await window.electronBridge.sendMessageFromView(request);
+}})"#
+    );
+    let value: Value =
+        with_local_codex_connection(port, |connection| connection.evaluate(&expression))?;
+    if value.get("timeout").and_then(Value::as_bool) == Some(true) {
+        return Err(anyhow!(
+            "Timed out waiting for {method} host response from Codex."
+        ));
+    }
+    if value.get("responseType").and_then(Value::as_str) == Some("error") {
+        return Err(anyhow!(
+            "Codex {method} host request failed: {}",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+    let status = value.get("status").and_then(Value::as_i64).unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(anyhow!(
+            "Codex {method} host request returned status {status}: {}",
+            value
+                .get("bodyJsonString")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        ));
+    }
+    let body = value
+        .get("bodyJsonString")
+        .and_then(Value::as_str)
+        .unwrap_or("null");
+    serde_json::from_str(body)
+        .map_err(|error| anyhow!("Failed to decode {method} host response from Codex: {error}"))
+}
+
 fn send_codex_app_request_once<T>(port: u16, method: &str, params: &Value) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,

@@ -99,11 +99,19 @@ fn live_vm_full_lineage_sync_acceptance() -> Result<()> {
             .to_string();
 
         send_guest_request::<Value, Value>(
-            "start-turn",
+            "inject-items",
             json!({
                 "port": port,
                 "thread_id": source_thread_id,
-                "input": marker,
+                "items": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": marker }
+                        ]
+                    }
+                ],
             }),
         )?;
 
@@ -204,11 +212,19 @@ fn live_vm_recoverable_thread_continuity_acceptance() -> Result<()> {
             .to_string();
 
         send_guest_request::<Value, Value>(
-            "start-turn",
+            "inject-items",
             json!({
                 "port": port,
                 "thread_id": source_thread_id,
-                "input": marker,
+                "items": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": marker }
+                        ]
+                    }
+                ],
             }),
         )?;
 

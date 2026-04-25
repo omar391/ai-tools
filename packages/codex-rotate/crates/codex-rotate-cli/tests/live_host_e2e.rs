@@ -10,8 +10,10 @@ use codex_rotate_core::pool::{
 use codex_rotate_core::workflow::{cmd_relogin_with_progress, ReloginOptions};
 use codex_rotate_refresh::filesystem_tracking::{FilesystemTracker, TrackedPathKind};
 use codex_rotate_refresh::process_tracking::ProcessTracker;
-use codex_rotate_runtime::cdp::is_cdp_page_ready;
-use codex_rotate_runtime::cdp::with_local_codex_connection;
+use codex_rotate_runtime::cdp::{
+    invalidate_local_codex_connection, is_cdp_page_ready, list_cdp_targets,
+    with_local_codex_connection,
+};
 use codex_rotate_runtime::hook::switch_live_account_to_current_auth;
 use codex_rotate_runtime::launcher::ensure_debug_codex_instance;
 use codex_rotate_runtime::live_checks::{
@@ -1849,14 +1851,24 @@ fn live_host_recoverable_thread_continuity_acceptance() -> Result<()> {
         );
         let target_watch_state_after = watch_state.account_state(&target_summary.account_id);
         ensure!(
-            target_watch_state_after.thread_recovery_pending,
-            "expected target account {} to retain pending recovery state after rotation",
+            !target_watch_state_after.thread_recovery_pending,
+            "expected target account {} to complete pending recovery during rotation",
             target_summary.account_id
         );
-        ensure_one_pending_recoverable_thread(
-            &target_watch_state_after.thread_recovery_pending_events,
-            &target_thread_id,
-        )?;
+        ensure!(
+            target_watch_state_after
+                .thread_recovery_pending_events
+                .is_empty(),
+            "expected target account {} to clear pending recovery events during rotation",
+            target_summary.account_id
+        );
+        let _ = wait_for_thread_marker(port, &target_thread_id, "continue with skipped msgs")
+            .with_context(|| {
+                format!(
+                    "expected interrupted thread {} to receive recovery continuation input after rotation",
+                    target_thread_id
+                )
+            })?;
 
         Ok(())
     })();
@@ -2660,78 +2672,43 @@ fn live_host_watch_triggered_rotation_restart_sync_and_recovery_acceptance() -> 
                     );
                 }
                 ensure!(
-                    target_after_rotation.thread_recovery_pending,
-                    "expected target account {} to have pending interrupted-thread state after watch rotation",
+                    !target_after_rotation.thread_recovery_pending,
+                    "expected target account {} to recover interrupted-thread state during watch rotation",
                     target_summary.account_id
                 );
                 ensure!(
-                    target_after_rotation.thread_recovery_pending_events.len() == 1,
-                    "expected exactly one pending interrupted thread on target, got {}",
+                    target_after_rotation
+                        .thread_recovery_pending_events
+                        .is_empty(),
+                    "expected no pending interrupted threads on target after recovery, got {}",
                     target_after_rotation.thread_recovery_pending_events.len()
-                );
-                let pending_target_thread_id = target_after_rotation.thread_recovery_pending_events
-                    [0]
-                .thread_id
-                .clone();
-                if source_summary.account_id != target_summary.account_id {
-                    ensure!(
-                        pending_target_thread_id != source_recoverable_thread_id,
-                        "expected recoverable conversation to map to a target-local thread id distinct from source {}",
-                        source_recoverable_thread_id
-                    );
-                }
-                let _pending_thread = wait_for_thread_to_load(port, &pending_target_thread_id)
-                    .with_context(|| {
-                        format!(
-                            "failed to materialize pending target thread {pending_target_thread_id}"
-                        )
-                    })?;
-                std::thread::sleep(Duration::from_secs(5));
-
-                if managed_codex_is_running(&paths.debug_profile_dir)? {
-                    stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
-                }
-                ensure!(
-                    !managed_codex_is_running(&paths.debug_profile_dir)?,
-                    "expected managed Codex to be stopped before restart validation"
-                );
-                ensure_debug_codex_instance(None, Some(port), None, None)?;
-
-                let mut recovered = false;
-                for _ in 0..6 {
-                    let _ = run_watch_iteration(WatchIterationOptions {
-                        port: Some(port),
-                        after_signal_id: target_after_rotation.last_signal_id,
-                        cooldown_ms: Some(0),
-                        force_quota_refresh: false,
-                        progress: None,
-                    })?;
-                    let state_after_recovery_attempt = read_watch_state()?;
-                    let target_after_recovery =
-                        state_after_recovery_attempt.account_state(&target_summary.account_id);
-                    if !target_after_recovery.thread_recovery_pending
-                        && target_after_recovery
-                            .thread_recovery_pending_events
-                            .is_empty()
-                    {
-                        recovered = true;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                ensure!(
-                    recovered,
-                    "expected interrupted-thread recovery to auto-complete after restart for account {}",
-                    target_summary.account_id
                 );
 
                 let recovered_thread_id =
                     ConversationSyncStore::new(&paths.conversation_sync_db_file)?
                         .get_local_thread_id(
-                            &target_summary.account_id,
+                            &host_sync_identity(&target_entry),
                             &source_recoverable_thread_id,
                         )?
-                        .unwrap_or_else(|| pending_target_thread_id.clone());
+                        .with_context(|| {
+                            format!(
+                                "missing target-local binding for recovered source thread {}",
+                                source_recoverable_thread_id
+                            )
+                        })?;
+                if source_summary.account_id != target_summary.account_id {
+                    ensure!(
+                        recovered_thread_id != source_recoverable_thread_id,
+                        "expected recoverable conversation to map to a target-local thread id distinct from source {}",
+                        source_recoverable_thread_id
+                    );
+                }
+                let _recovered_thread = wait_for_thread_to_load(port, &recovered_thread_id)
+                    .with_context(|| {
+                        format!(
+                            "failed to materialize recovered target thread {recovered_thread_id}"
+                        )
+                    })?;
 
                 let _ = wait_for_thread_marker(
                     port,
@@ -3117,6 +3094,7 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                 &paths,
             )?;
             let port = allocate_test_port()?;
+            let mut managed_ports = vec![port];
             let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
             let mut stop_server = None;
             if managed_codex_is_running(&paths.debug_profile_dir)? {
@@ -3165,9 +3143,18 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     "test setup expected distinct host persona IDs"
                 );
                 source_entry.last_quota_usable = Some(true);
+                source_entry.last_quota_summary = None;
                 source_entry.last_quota_blocker = None;
+                source_entry.last_quota_checked_at = None;
+                source_entry.last_quota_primary_left_percent = Some(80);
+                source_entry.last_quota_next_refresh_at = None;
+                target_entry.auth = source_entry.auth.clone();
                 target_entry.last_quota_usable = Some(true);
+                target_entry.last_quota_summary = None;
                 target_entry.last_quota_blocker = None;
+                target_entry.last_quota_checked_at = None;
+                target_entry.last_quota_primary_left_percent = Some(80);
+                target_entry.last_quota_next_refresh_at = None;
                 save_pool(&Pool {
                     active_index: 0,
                     accounts: vec![source_entry.clone(), target_entry.clone()],
@@ -3218,6 +3205,8 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
 
                 ensure_debug_codex_instance(None, Some(port), None, Some(30_000))
                     .context("failed to launch isolated managed Codex for source persona")?;
+                complete_codex_onboarding_for_live_ui(port)
+                    .context("failed to prepare isolated source Codex UI")?;
                 ensure!(
                     managed_codex_is_running(&paths.debug_profile_dir)?,
                     "expected isolated managed Codex to be running before rotation"
@@ -3241,10 +3230,14 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     other => bail!("expected same-account persona rotation, got {other:?}"),
                 }
                 let rotated_pool = load_pool().context("failed to load pool after rotation")?;
-                let rotated_persona = rotated_pool
+                let rotated_entry = rotated_pool
                     .accounts
                     .get(rotated_pool.active_index)
-                    .and_then(|entry| entry.persona.as_ref())
+                    .context("rotated pool active account is missing")?
+                    .clone();
+                let rotated_persona = rotated_entry
+                    .persona
+                    .as_ref()
                     .context("rotated pool active account is missing persona")?;
                 ensure!(
                     Some(rotated_persona.persona_id.as_str())
@@ -3261,11 +3254,20 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     rotated_persona.persona_id
                 );
 
-                ensure_debug_codex_instance(None, Some(port), None, Some(30_000))
+                invalidate_local_codex_connection(port, true);
+                if managed_codex_is_running(&paths.debug_profile_dir)? {
+                    stop_managed_codex_instance(port, &paths.debug_profile_dir)
+                        .context("failed to stop managed Codex before target UI verification")?;
+                }
+                let target_port = allocate_test_port()?;
+                managed_ports.push(target_port);
+                ensure_debug_codex_instance(None, Some(target_port), None, Some(30_000))
                     .context("failed to launch isolated managed Codex for target persona")?;
+                complete_codex_onboarding_for_live_ui(target_port)
+                    .context("failed to prepare isolated target Codex UI")?;
 
                 let source_identity = host_sync_identity(&source_entry);
-                let target_identity = host_sync_identity(&target_entry);
+                let target_identity = host_sync_identity(&rotated_entry);
                 let store = ConversationSyncStore::new(&paths.conversation_sync_db_file)
                     .context("failed to open conversation sync store")?;
                 let lineage = store
@@ -3278,13 +3280,49 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     target_local_id != source_thread_id,
                     "conversation_sync.sqlite target binding reused source id {source_thread_id}"
                 );
-                let target_thread = wait_for_thread_marker(port, &target_local_id, &marker)?;
+                let target_codex_home = persona_codex_home(&paths, &rotated_entry)?;
+                let active_codex_home = std::fs::read_link(&paths.codex_home)
+                    .context("active Codex home is not a persona symlink after rotation")?;
+                ensure!(
+                    active_codex_home == target_codex_home,
+                    "expected active Codex home to point at {}, got {}",
+                    target_codex_home.display(),
+                    active_codex_home.display()
+                );
+                let target_thread = wait_for_thread_marker_in_codex_home(
+                    &target_codex_home,
+                    &target_local_id,
+                    &marker,
+                )?;
                 ensure!(
                     value_contains_text(&target_thread, &marker),
                     "target-local thread {target_local_id} did not preserve marker {marker}"
                 );
+                ensure!(
+                    !codex_home_thread_contains_text(
+                        &target_codex_home,
+                        &target_local_id,
+                        "Continue this transferred conversation from its latest unfinished state"
+                    )?,
+                    "target-local thread {target_local_id} should not receive a synthetic transfer continuation prompt"
+                );
 
-                let target_codex_home = persona_codex_home(&paths, &target_entry)?;
+                wait_for_thread_sidebar_metadata(&target_codex_home, &target_local_id, &marker)?;
+                wait_for_thread_sidebar_metadata(&paths.codex_home, &target_local_id, &marker)?;
+                wait_for_thread_marker(target_port, &target_local_id, &marker)
+                    .context("target app backend did not expose imported target-local thread")?;
+                wait_for_codex_projectless_ui_state(
+                    target_port,
+                    &target_local_id,
+                    &source_thread_id,
+                )
+                .context("target Codex UI state did not index imported target-local thread")?;
+                wait_for_codex_ui_thread_visible(
+                    target_port,
+                    &target_local_id,
+                    "same-account persona session id marker",
+                    "Continue this transferred conversation from its latest unfinished state",
+                )?;
                 ensure!(
                     !path_tree_contains_file_name_fragment(
                         &target_codex_home,
@@ -3307,8 +3345,10 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
                 },
             }
-            if managed_codex_is_running(&paths.debug_profile_dir)? {
-                stop_managed_codex_instance(port, &paths.debug_profile_dir)?;
+            for managed_port in managed_ports.into_iter().rev() {
+                if managed_codex_is_running(&paths.debug_profile_dir)? {
+                    let _ = stop_managed_codex_instance(managed_port, &paths.debug_profile_dir);
+                }
             }
 
             if outcome.is_ok() {
@@ -3558,7 +3598,7 @@ fn send_local_mcp_request(port: u16, method: &str, params: Value) -> Result<Valu
         }
     }))?;
     let expression = format!(
-        r#"new Promise(async (resolve) => {{
+        r#"new Promise((resolve) => {{
 const request = {request_json};
 const timeout = setTimeout(() => {{
     window.removeEventListener("message", handler);
@@ -3566,18 +3606,29 @@ const timeout = setTimeout(() => {{
 }}, 10000);
 const handler = (event) => {{
   const data = event.data;
-    if (data && data.type === "mcp-response" && data.message && data.message.id === request.request.id) {{
+  const message = data && data.type === "mcp-response" ? (data.message ?? data.response) : null;
+  if (message && message.id === request.request.id) {{
     clearTimeout(timeout);
     window.removeEventListener("message", handler);
     resolve({{
       timeout: false,
-      result: data.message.result ?? null,
-      error: data.message.error ?? null
+      result: message.result ?? null,
+      error: message.error ?? null
     }});
   }}
 }};
 window.addEventListener("message", handler);
-await window.electronBridge.sendMessageFromView(request);
+Promise.resolve(window.electronBridge.sendMessageFromView(request)).catch((error) => {{
+  clearTimeout(timeout);
+  window.removeEventListener("message", handler);
+  resolve({{
+    timeout: false,
+    result: null,
+    error: {{
+      message: error && error.message ? error.message : String(error),
+    }},
+  }});
+}});
 }})"#
     );
     let value: Value =
@@ -3589,6 +3640,78 @@ await window.electronBridge.sendMessageFromView(request);
         bail!("Codex {method} request failed: {error}");
     }
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn send_local_host_request(port: u16, method: &str, params: Value) -> Result<Value> {
+    let request_id = format!(
+        "live-host-fetch-{method}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before UNIX_EPOCH")?
+            .as_millis()
+    );
+    let request_json = serde_json::to_string(&json!({
+        "type": "fetch",
+        "hostId": "local",
+        "requestId": request_id,
+        "method": "POST",
+        "url": format!("vscode://codex/{method}"),
+        "body": serde_json::to_string(&params)?,
+    }))?;
+    let expression = format!(
+        r#"new Promise((resolve) => {{
+const request = {request_json};
+const timeout = setTimeout(() => {{
+  window.removeEventListener("message", handler);
+  resolve({{ timeout: true }});
+}}, 10000);
+const handler = (event) => {{
+  const data = event.data;
+  if (data && data.type === "fetch-response" && data.requestId === request.requestId) {{
+    clearTimeout(timeout);
+    window.removeEventListener("message", handler);
+    resolve({{
+      timeout: false,
+      responseType: data.responseType ?? null,
+      status: data.status ?? null,
+      bodyJsonString: data.bodyJsonString ?? null,
+      error: data.error ?? null
+    }});
+  }}
+}};
+window.addEventListener("message", handler);
+Promise.resolve(window.electronBridge.sendMessageFromView(request)).catch((error) => {{
+  clearTimeout(timeout);
+  window.removeEventListener("message", handler);
+  resolve({{
+    timeout: false,
+    responseType: "error",
+    status: 0,
+    bodyJsonString: null,
+    error: error && error.message ? error.message : String(error),
+  }});
+}});
+}})"#
+    );
+    let value: Value =
+        with_local_codex_connection(port, |connection| connection.evaluate(&expression))?;
+    if value.get("timeout").and_then(Value::as_bool) == Some(true) {
+        bail!("Timed out waiting for Codex host {method} response.");
+    }
+    if value.get("responseType").and_then(Value::as_str) == Some("error") {
+        bail!("Codex host {method} request failed: {value}");
+    }
+    let status = value.get("status").and_then(Value::as_i64).unwrap_or(0);
+    ensure!(
+        (200..300).contains(&status),
+        "Codex host {method} request returned status {status}: {value}"
+    );
+    let body = value
+        .get("bodyJsonString")
+        .and_then(Value::as_str)
+        .unwrap_or("null");
+    serde_json::from_str(body)
+        .with_context(|| format!("failed to parse Codex host {method} response body"))
 }
 
 fn inspect_codex_page_state(port: u16) -> Result<Value> {
@@ -3907,56 +4030,331 @@ fn prime_source_account_for_live_rotation(preferred_email: &str) -> Result<Strin
     }
 }
 
-fn start_thread_with_marker(port: u16, cwd: &str, marker: &str) -> Result<String> {
-    let thread = send_local_mcp_request(
-        port,
-        "thread/start",
-        json!({
-            "cwd": cwd,
-            "model": Value::Null,
-            "modelProvider": Value::Null,
-            "serviceTier": Value::Null,
-            "approvalPolicy": Value::Null,
-            "approvalsReviewer": "user",
-            "sandbox": Value::Null,
-            "personality": "pragmatic",
-        }),
-    )?;
-    let thread_id = thread
-        .get("thread")
-        .and_then(|value| value.get("id"))
-        .and_then(Value::as_str)
-        .context("thread/start did not return a thread id")?
-        .to_string();
+fn start_thread_with_marker(port: u16, _cwd: &str, marker: &str) -> Result<String> {
+    let marker_json = serde_json::to_string(marker)?;
+    complete_codex_onboarding_for_live_ui(port)
+        .context("failed to prepare Codex UI before starting marker thread")?;
+    let focus_result = focus_codex_composer_for_live_ui(port)?;
+    ensure!(
+        focus_result.get("ok").and_then(Value::as_bool) == Some(true),
+        "failed to focus Codex composer before live marker thread: {}",
+        serde_json::to_string_pretty(&focus_result)?
+    );
+    with_local_codex_connection(port, |connection| connection.insert_text(marker))
+        .context("failed to type marker into Codex composer through CDP")?;
+    let typed_snapshot: Value = with_local_codex_connection(port, |connection| {
+        connection.evaluate(&format!(
+            r#"(() => {{
+const marker = {marker_json};
+const active = document.activeElement;
+return {{
+  url: location.href,
+  activeTag: active ? active.tagName : null,
+  activeRole: active ? active.getAttribute("role") : null,
+  activeAriaLabel: active ? active.getAttribute("aria-label") : null,
+  activeText: active ? ((active.value ?? active.innerText ?? active.textContent ?? "") + "").slice(0, 500) : null,
+  markerInBody: document.body ? document.body.innerText.includes(marker) : false,
+}};
+}})()"#,
+        ))
+    })?;
+    ensure!(
+        typed_snapshot
+            .get("markerInBody")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || typed_snapshot
+                .get("activeText")
+                .and_then(Value::as_str)
+                .map(|text| text.contains(marker))
+                .unwrap_or(false),
+        "Codex composer did not contain typed live marker: {}",
+        serde_json::to_string_pretty(&typed_snapshot)?
+    );
 
-    send_local_mcp_request(
-        port,
-        "turn/start",
+    let mut submit_results = Vec::new();
+    let attempts = [
+        LiveComposerSubmitAttempt::Enter,
+        LiveComposerSubmitAttempt::MetaEnter,
+        LiveComposerSubmitAttempt::ClickButton,
+    ];
+    for attempt in attempts {
+        let submit_result = submit_codex_composer_for_live_ui(port, attempt)
+            .with_context(|| format!("failed to submit live Codex composer using {attempt:?}"))?;
+        submit_results.push(submit_result);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            if let Some(thread_id) = state_thread_with_marker(marker)? {
+                wait_for_thread_marker(port, &thread_id, marker)?;
+                return Ok(thread_id);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let _ = focus_codex_composer_for_live_ui(port);
+    }
+
+    let targets = list_cdp_targets(port).unwrap_or_default();
+    let page_state = inspect_codex_page_state(port).unwrap_or_else(|error| {
         json!({
-            "threadId": thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": marker,
-                    "text_elements": [],
-                }
-            ],
-            "cwd": cwd,
-            "approvalPolicy": Value::Null,
-            "approvalsReviewer": "user",
-            "sandboxPolicy": Value::Null,
-            "model": Value::Null,
-            "serviceTier": Value::Null,
-            "effort": Value::Null,
-            "summary": "none",
-            "personality": Value::Null,
-            "outputSchema": Value::Null,
-            "collaborationMode": Value::Null,
-            "attachments": [],
+            "error": format!("{:#}", error),
+        })
+    });
+    let composer_state = inspect_codex_composer_state(port)
+        .unwrap_or_else(|error| json!({ "error": format!("{:#}", error) }));
+    bail!(
+        "Codex UI did not create a live marker thread after composer submission: marker={marker:?}, focus={}, typed={}, submits={}, targets={}, composer={}, page={}",
+        serde_json::to_string_pretty(&focus_result)
+            .unwrap_or_else(|_| "<unprintable>".to_string()),
+        serde_json::to_string_pretty(&typed_snapshot)
+            .unwrap_or_else(|_| "<unprintable>".to_string()),
+        serde_json::to_string_pretty(&submit_results)
+            .unwrap_or_else(|_| "<unprintable>".to_string()),
+        serde_json::to_string_pretty(&targets)
+            .unwrap_or_else(|_| "<unprintable>".to_string()),
+        serde_json::to_string_pretty(&composer_state)
+            .unwrap_or_else(|_| "<unprintable>".to_string()),
+        serde_json::to_string_pretty(&page_state)
+            .unwrap_or_else(|_| "<unprintable>".to_string())
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LiveComposerSubmitAttempt {
+    Enter,
+    MetaEnter,
+    ClickButton,
+}
+
+fn focus_codex_composer_for_live_ui(port: u16) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let result = try_focus_codex_composer_for_live_ui(port)?;
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            return Ok(result);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn try_focus_codex_composer_for_live_ui(port: u16) -> Result<Value> {
+    with_local_codex_connection(port, |connection| {
+        connection.evaluate(
+            r#"(() => {
+const visible = (element) => {
+  if (!(element instanceof HTMLElement)) return false;
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+};
+const label = (element) => [
+  element.getAttribute("aria-label"),
+  element.getAttribute("placeholder"),
+  element.getAttribute("data-placeholder"),
+  element.getAttribute("title"),
+  element.innerText,
+  element.textContent,
+].filter(Boolean).join(" ");
+const candidates = Array.from(document.querySelectorAll(
+  'textarea, input[type="text"], [contenteditable="true"], [role="textbox"], .ProseMirror'
+)).filter((element) => {
+  if (!visible(element)) return false;
+  if (element.disabled || element.readOnly) return false;
+  if (element.getAttribute("aria-hidden") === "true") return false;
+  return true;
+}).map((element) => {
+  const rect = element.getBoundingClientRect();
+  const text = label(element);
+  const lower = text.toLowerCase();
+  let score = rect.width * rect.height;
+  if (lower.includes("what should we work on")) score += 100000;
+  if (lower.includes("message") || lower.includes("chat") || lower.includes("prompt")) score += 50000;
+  if (element.isContentEditable) score += 25000;
+  if (element.tagName === "TEXTAREA") score += 20000;
+  return { element, score, text, rect };
+}).sort((a, b) => b.score - a.score);
+const candidate = candidates[0];
+if (!candidate) {
+  return {
+    ok: false,
+    reason: "no visible composer candidate",
+    url: location.href,
+    bodyText: document.body ? document.body.innerText.slice(0, 2000) : null,
+  };
+}
+const element = candidate.element;
+element.scrollIntoView({ block: "center", inline: "center" });
+element.focus();
+if ("value" in element) {
+  const setter = Object.getOwnPropertyDescriptor(element.constructor.prototype, "value")?.set;
+  if (setter) setter.call(element, "");
+  else element.value = "";
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+} else if (element.isContentEditable) {
+  element.textContent = "";
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+}
+return {
+  ok: true,
+  url: location.href,
+  tag: element.tagName,
+  role: element.getAttribute("role"),
+  ariaLabel: element.getAttribute("aria-label"),
+  placeholder: element.getAttribute("placeholder") || element.getAttribute("data-placeholder"),
+  className: element.className,
+  text: candidate.text.slice(0, 500),
+  rect: {
+    x: Math.round(candidate.rect.x),
+    y: Math.round(candidate.rect.y),
+    width: Math.round(candidate.rect.width),
+    height: Math.round(candidate.rect.height),
+  },
+};
+})()"#,
+        )
+    })
+}
+
+fn submit_codex_composer_for_live_ui(
+    port: u16,
+    attempt: LiveComposerSubmitAttempt,
+) -> Result<Value> {
+    match attempt {
+        LiveComposerSubmitAttempt::Enter => {
+            with_local_codex_connection(port, |connection| {
+                connection.dispatch_key_event("keyDown", "Enter", "Enter", 13, 0)?;
+                connection.dispatch_key_event("keyUp", "Enter", "Enter", 13, 0)
+            })?;
+            Ok(json!({ "attempt": "enter", "ok": true }))
+        }
+        LiveComposerSubmitAttempt::MetaEnter => {
+            with_local_codex_connection(port, |connection| {
+                connection.dispatch_key_event("keyDown", "Enter", "Enter", 13, 4)?;
+                connection.dispatch_key_event("keyUp", "Enter", "Enter", 13, 4)
+            })?;
+            Ok(json!({ "attempt": "meta-enter", "ok": true }))
+        }
+        LiveComposerSubmitAttempt::ClickButton => with_local_codex_connection(port, |connection| {
+            connection.evaluate(
+                r#"(() => {
+const visible = (element) => {
+  if (!(element instanceof HTMLElement)) return false;
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+};
+const active = document.activeElement;
+const root = active?.closest("form") ||
+  active?.closest('[data-testid*="composer"], [class*="composer"], main') ||
+  document.body;
+const describe = (button) => [
+  button.getAttribute("aria-label"),
+  button.getAttribute("title"),
+  button.textContent,
+  button.innerText,
+].filter(Boolean).join(" ").trim();
+const activeRect = active instanceof HTMLElement ? active.getBoundingClientRect() : null;
+const buttons = Array.from(root.querySelectorAll("button"))
+  .filter((button) => !button.disabled && visible(button))
+  .map((button) => {
+    const rect = button.getBoundingClientRect();
+    const text = describe(button);
+    const lower = text.toLowerCase();
+    let score = 0;
+    if (/\b(send|submit|start|run)\b/.test(lower)) score += 1000;
+    if (/(feedback|update|new chat|search|settings|plugins|automations)/.test(lower)) score -= 1000;
+    if (activeRect) {
+      score -= Math.abs(rect.top - activeRect.top);
+      if (rect.left >= activeRect.left) score += 100;
+    }
+    return { button, text, score, rect };
+  })
+  .sort((a, b) => b.score - a.score);
+const selected = buttons[0];
+if (!selected || selected.score < 0) {
+  return {
+    ok: false,
+    reason: "no submit button",
+    activeTag: active ? active.tagName : null,
+    buttons: buttons.slice(0, 10).map(({ text, score, rect }) => ({
+      text,
+      score,
+      rect: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+    })),
+  };
+}
+selected.button.click();
+return {
+  ok: true,
+  attempt: "click-button",
+  buttonText: selected.text,
+  score: selected.score,
+};
+})()"#,
+            )
         }),
-    )?;
-    wait_for_thread_marker(port, &thread_id, marker)?;
-    Ok(thread_id)
+    }
+}
+
+fn inspect_codex_composer_state(port: u16) -> Result<Value> {
+    with_local_codex_connection(port, |connection| {
+        connection.evaluate(
+            r#"(() => {
+const visible = (element) => {
+  if (!(element instanceof HTMLElement)) return false;
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+};
+return {
+  url: location.href,
+  active: document.activeElement ? {
+    tag: document.activeElement.tagName,
+    role: document.activeElement.getAttribute("role"),
+    ariaLabel: document.activeElement.getAttribute("aria-label"),
+    text: ((document.activeElement.value ?? document.activeElement.innerText ?? document.activeElement.textContent ?? "") + "").slice(0, 1000),
+  } : null,
+  editableCandidates: Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"], .ProseMirror'))
+    .filter(visible)
+    .slice(0, 20)
+    .map((element) => ({
+      tag: element.tagName,
+      role: element.getAttribute("role"),
+      ariaLabel: element.getAttribute("aria-label"),
+      placeholder: element.getAttribute("placeholder") || element.getAttribute("data-placeholder"),
+      className: element.className,
+      text: ((element.value ?? element.innerText ?? element.textContent ?? "") + "").slice(0, 500),
+    })),
+  buttons: Array.from(document.querySelectorAll("button"))
+    .filter(visible)
+    .slice(0, 50)
+    .map((button) => ({
+      disabled: button.disabled,
+      ariaLabel: button.getAttribute("aria-label"),
+      title: button.getAttribute("title"),
+      text: (button.innerText || button.textContent || "").trim().slice(0, 200),
+    })),
+  bodyText: document.body ? document.body.innerText.slice(0, 3000) : null,
+};
+})()"#,
+        )
+    })
 }
 
 fn wait_for_thread_marker(port: u16, thread_id: &str, marker: &str) -> Result<Value> {
@@ -3967,11 +4365,182 @@ fn wait_for_thread_marker(port: u16, thread_id: &str, marker: &str) -> Result<Va
                 return Ok(thread);
             }
         }
+        if let Some(thread) = state_thread_record_with_marker(thread_id, marker)? {
+            return Ok(thread);
+        }
         if Instant::now() >= deadline {
             bail!("Timed out waiting for source thread {thread_id} to include marker {marker}");
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn wait_for_thread_marker_in_codex_home(
+    codex_home: &Path,
+    thread_id: &str,
+    marker: &str,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(thread) =
+            state_thread_record_with_marker_in_codex_home(codex_home, thread_id, marker)?
+        {
+            return Ok(thread);
+        }
+        if codex_home_thread_contains_text(codex_home, thread_id, marker)? {
+            return Ok(json!({
+                "thread": {
+                    "id": thread_id,
+                    "rollout_contains_marker": true,
+                    "marker": marker,
+                }
+            }));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for thread {thread_id} in {} to include marker {marker}",
+                codex_home.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn state_thread_with_marker(marker: &str) -> Result<Option<String>> {
+    let paths = resolve_paths()?;
+    let state_db_path = paths.codex_state_db_file;
+    if !state_db_path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open(&state_db_path)
+        .with_context(|| format!("failed to open {}", state_db_path.display()))?;
+    let has_threads_table: i64 = connection.query_row(
+        "select count(*) from sqlite_master where type = 'table' and name = 'threads'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_threads_table == 0 {
+        return Ok(None);
+    }
+    let like_marker = format!("%{marker}%");
+    let mut statement = connection.prepare(
+        "select id from threads
+         where archived = 0
+           and (coalesce(first_user_message, '') like ?1 or coalesce(title, '') like ?1)
+         order by rowid desc
+         limit 1",
+    )?;
+    let mut rows = statement.query([like_marker])?;
+    Ok(rows
+        .next()?
+        .map(|row| row.get::<_, String>(0))
+        .transpose()?)
+}
+
+fn state_thread_record_with_marker(thread_id: &str, marker: &str) -> Result<Option<Value>> {
+    let paths = resolve_paths()?;
+    state_thread_record_with_marker_in_state_db(&paths.codex_state_db_file, thread_id, marker)
+}
+
+fn state_thread_record_with_marker_in_codex_home(
+    codex_home: &Path,
+    thread_id: &str,
+    marker: &str,
+) -> Result<Option<Value>> {
+    state_thread_record_with_marker_in_state_db(
+        &codex_home.join("state_5.sqlite"),
+        thread_id,
+        marker,
+    )
+}
+
+fn state_thread_record_with_marker_in_state_db(
+    state_db_path: &Path,
+    thread_id: &str,
+    marker: &str,
+) -> Result<Option<Value>> {
+    if !state_db_path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open(&state_db_path)
+        .with_context(|| format!("failed to open {}", state_db_path.display()))?;
+    let has_threads_table: i64 = connection.query_row(
+        "select count(*) from sqlite_master where type = 'table' and name = 'threads'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_threads_table == 0 {
+        return Ok(None);
+    }
+    let row = connection
+        .query_row(
+            "select id, title, first_user_message, has_user_event from threads where id = ?1",
+            [thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((id, title, first_user_message, has_user_event)) = row else {
+        return Ok(None);
+    };
+    if !title.contains(marker) && !first_user_message.contains(marker) {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "thread": {
+            "id": id,
+            "title": title,
+            "first_user_message": first_user_message,
+            "has_user_event": has_user_event,
+        }
+    })))
+}
+
+fn codex_home_thread_contains_text(
+    codex_home: &Path,
+    thread_id: &str,
+    needle: &str,
+) -> Result<bool> {
+    if !codex_home.exists() {
+        return Ok(false);
+    }
+    let mut stack = vec![codex_home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let file_name_matches = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(thread_id))
+                .unwrap_or(false);
+            if !file_name_matches {
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+            if contents.contains(needle) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn active_threads_with_marker(port: u16, marker: &str) -> Result<Vec<(String, Value)>> {
@@ -4013,6 +4582,485 @@ fn wait_for_imported_thread(port: u16, marker: &str) -> Result<(String, Value)> 
         if Instant::now() >= deadline {
             bail!(
                 "Timed out waiting for target persona to import a thread containing marker {marker}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_thread_sidebar_metadata(
+    codex_home: &Path,
+    thread_id: &str,
+    first_user_fragment: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let session_index_path = codex_home.join("session_index.jsonl");
+    let mut last_debug: String;
+    loop {
+        let state_db_path = latest_state_db_in_codex_home(codex_home);
+        let row = if state_db_path.exists() {
+            let connection = Connection::open(&state_db_path)
+                .with_context(|| format!("failed to open {}", state_db_path.display()))?;
+            let has_threads_table: i64 = connection.query_row(
+                "select count(*) from sqlite_master where type = 'table' and name = 'threads'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_threads_table > 0 {
+                let row = connection
+                    .query_row(
+                        "select title, first_user_message, has_user_event, archived, source, cwd from threads where id = ?1",
+                        [thread_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )
+                    .ok();
+                last_debug = format!("state_db={}, row={row:?}", state_db_path.display());
+                row
+            } else {
+                last_debug = format!(
+                    "state_db={}, missing threads table",
+                    state_db_path.display()
+                );
+                None
+            }
+        } else {
+            last_debug = format!("state_db={} missing", state_db_path.display());
+            None
+        };
+        let session_index_has_thread = std::fs::read_to_string(&session_index_path)
+            .map(|contents| contents.contains(thread_id))
+            .unwrap_or(false);
+        if let Some((title, first_user_message, has_user_event, archived, source, cwd)) = row {
+            if !title.trim().is_empty()
+                && first_user_message.contains(first_user_fragment)
+                && has_user_event == 1
+                && archived == 0
+                && session_index_has_thread
+            {
+                return Ok(());
+            }
+            last_debug = format!(
+                "{}, title={title:?}, first_user_message={first_user_message:?}, has_user_event={has_user_event}, archived={archived}, source={source:?}, cwd={cwd:?}, session_index_has_thread={session_index_has_thread}",
+                last_debug
+            );
+            if title.trim().is_empty() && first_user_message.trim().is_empty() {
+                last_debug = format!(
+                    "{}, rollout_preview={:?}",
+                    last_debug,
+                    rollout_preview_for_thread(codex_home, thread_id, first_user_fragment)?
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for target-local thread {thread_id} to have visible sidebar metadata in {} ({last_debug})",
+                codex_home.display(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn rollout_preview_for_thread(
+    codex_home: &Path,
+    thread_id: &str,
+    first_user_fragment: &str,
+) -> Result<Option<String>> {
+    let mut stack = vec![codex_home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(thread_id))
+                .unwrap_or(false)
+            {
+                let contents = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let interesting = contents
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        line.contains(first_user_fragment)
+                            || line.contains("\"role\":\"user\"")
+                            || line.contains("\"user_message\"")
+                            || line.contains("\"input_text\"")
+                    })
+                    .take(10)
+                    .map(|(index, line)| {
+                        let snippet: String = line.chars().take(1000).collect();
+                        format!("{}:{snippet}", index + 1)
+                    })
+                    .collect::<Vec<_>>();
+                if !interesting.is_empty() {
+                    return Ok(Some(interesting.join("\n")));
+                }
+                return Ok(Some(
+                    contents
+                        .lines()
+                        .take(5)
+                        .enumerate()
+                        .map(|(index, line)| {
+                            let snippet: String = line.chars().take(500).collect();
+                            format!("{}:{snippet}", index + 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn latest_state_db_in_codex_home(codex_home: &Path) -> PathBuf {
+    let mut best_versioned = None::<(u32, PathBuf)>;
+    if let Ok(entries) = std::fs::read_dir(codex_home) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if let Some(version) = name
+                .strip_prefix("state_")
+                .and_then(|value| value.strip_suffix(".sqlite"))
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                if best_versioned
+                    .as_ref()
+                    .map(|(current, _)| version > *current)
+                    .unwrap_or(true)
+                {
+                    best_versioned = Some((version, path));
+                }
+            }
+        }
+    }
+    best_versioned
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| codex_home.join("state_5.sqlite"))
+}
+
+fn complete_codex_onboarding_for_live_ui(port: u16) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match try_complete_codex_onboarding_for_live_ui(port) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                invalidate_local_codex_connection(port, true);
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn try_complete_codex_onboarding_for_live_ui(port: u16) -> Result<()> {
+    let prepare_result: Value = with_local_codex_connection(port, |connection| {
+        connection.evaluate(
+            r#"(() => {
+const bridge = window.electronBridge;
+if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+  return { ok: false, reason: "missing electron bridge" };
+}
+const updates = [
+  ["electron:onboarding-override", "auto"],
+  ["electron:onboarding-welcome-pending", false],
+  ["electron:onboarding-projectless-completed", true],
+  ["electron:onboarding-hide-first-new-thread-promos", true],
+  ["electron:onboarding-welcome-v2-state", {
+    intents: ["build_software"],
+    personalizedSuggestionsEnabled: false,
+    workMode: "coding",
+  }],
+];
+for (const [key, value] of updates) {
+  bridge.sendMessageFromView({
+    type: "persisted-atom-update",
+    key,
+    value,
+    deleted: false,
+  });
+}
+if (location.pathname !== "/") {
+  history.pushState({}, "", "/");
+  window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+}
+return { ok: true, path: location.pathname, href: location.href };
+})()"#,
+        )
+    })?;
+    ensure!(
+        prepare_result.get("ok").and_then(Value::as_bool) == Some(true),
+        "failed to complete Codex onboarding for live UI: {}",
+        serde_json::to_string_pretty(&prepare_result)?
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    dismiss_codex_model_prompt_for_live_ui(port)?;
+    Ok(())
+}
+
+fn dismiss_codex_model_prompt_for_live_ui(port: u16) -> Result<()> {
+    let _: Value = with_local_codex_connection(port, |connection| {
+        connection.evaluate(
+            r#"(() => {
+const buttons = Array.from(document.querySelectorAll("button"));
+const button = buttons.find((candidate) =>
+  (candidate.innerText || candidate.textContent || "").trim() === "Continue with current model"
+);
+if (button) {
+  button.click();
+  return { clicked: true };
+}
+return { clicked: false };
+})()"#,
+        )
+    })?;
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(())
+}
+
+fn wait_for_codex_projectless_ui_state(
+    port: u16,
+    target_thread_id: &str,
+    source_thread_id: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let projectless_response = send_local_host_request(
+            port,
+            "get-global-state",
+            json!({ "key": "projectless-thread-ids" }),
+        )?;
+        let hints_response = send_local_host_request(
+            port,
+            "get-global-state",
+            json!({ "key": "thread-workspace-root-hints" }),
+        )?;
+        let ids = projectless_response
+            .get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let contains_target = ids
+            .iter()
+            .any(|value| value.as_str() == Some(target_thread_id));
+        let contains_source = ids
+            .iter()
+            .any(|value| value.as_str() == Some(source_thread_id));
+        let snapshot = json!({
+            "projectlessThreadIds": ids,
+            "threadWorkspaceRootHints": hints_response.get("value").cloned().unwrap_or(Value::Null),
+            "containsTarget": contains_target,
+            "containsSource": contains_source,
+        });
+        if contains_target && !contains_source {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for Codex UI projectless state to contain target-local thread {target_thread_id} and exclude source thread {source_thread_id}: {}",
+                serde_json::to_string_pretty(&snapshot)?
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_codex_ui_thread_visible(
+    port: u16,
+    thread_id: &str,
+    visible_fragment: &str,
+    forbidden_fragment: &str,
+) -> Result<()> {
+    let visible_fragment_json = serde_json::to_string(visible_fragment)?;
+    let forbidden_fragment_json = serde_json::to_string(forbidden_fragment)?;
+    let thread_id_json = serde_json::to_string(thread_id)?;
+    let prepare_expression = format!(
+        r#"(() => {{
+const targetThreadId = {thread_id_json};
+const bridge = window.electronBridge;
+if (!bridge || typeof bridge.sendMessageFromView !== "function") {{
+  return {{ ok: false, reason: "missing electron bridge" }};
+}}
+const updates = [
+  ["electron:onboarding-override", "auto"],
+  ["electron:onboarding-welcome-pending", false],
+  ["electron:onboarding-projectless-completed", true],
+  ["electron:onboarding-hide-first-new-thread-promos", true],
+  ["electron:onboarding-welcome-v2-state", {{
+    intents: ["build_software"],
+    personalizedSuggestionsEnabled: false,
+    workMode: "coding",
+  }}],
+];
+for (const [key, value] of updates) {{
+  bridge.sendMessageFromView({{
+    type: "persisted-atom-update",
+    key,
+    value,
+    deleted: false,
+  }});
+}}
+const targetPath = `/local/${{targetThreadId}}`;
+if (location.pathname !== targetPath) {{
+  history.pushState({{}}, "", targetPath);
+  window.dispatchEvent(new PopStateEvent("popstate", {{ state: history.state }}));
+}}
+return {{ ok: true, path: location.pathname, href: location.href }};
+}})()"#
+    );
+    let prepare_result: Value =
+        with_local_codex_connection(port, |connection| connection.evaluate(&prepare_expression))
+            .context("failed to seed Codex onboarding completion through renderer bridge")?;
+    ensure!(
+        prepare_result.get("ok").and_then(Value::as_bool) == Some(true),
+        "failed to prepare Codex UI thread route for {thread_id}: {}",
+        serde_json::to_string_pretty(&prepare_result)?
+    );
+    invalidate_local_codex_connection(port, true);
+    std::thread::sleep(Duration::from_secs(2));
+    dismiss_codex_model_prompt_for_live_ui(port)?;
+    let snapshot_expression = format!(
+        r#"(() => {{
+const visibleFragment = {visible_fragment_json};
+const forbiddenFragment = {forbidden_fragment_json};
+const bodyText = document.body ? document.body.innerText : "";
+const onboardingVisible =
+  bodyText.includes("What can Codex help with?") ||
+  bodyText.includes("Choose what you want to work on first") ||
+  bodyText.includes("How technical should Codex feel?") ||
+  bodyText.includes("Choose how much detail Codex shows");
+const localStorageDump = {{}};
+let storageError = null;
+try {{
+  for (let index = 0; index < localStorage.length; index += 1) {{
+    const key = localStorage.key(index);
+    if (key !== null) {{
+      const value = localStorage.getItem(key);
+      localStorageDump[key] = typeof value === "string" ? value.slice(0, 500) : value;
+    }}
+  }}
+}} catch (error) {{
+  storageError = error && error.message ? error.message : String(error);
+}}
+const sessionStorageDump = {{}};
+try {{
+  for (let index = 0; index < sessionStorage.length; index += 1) {{
+    const key = sessionStorage.key(index);
+    if (key !== null) {{
+      const value = sessionStorage.getItem(key);
+      sessionStorageDump[key] = typeof value === "string" ? value.slice(0, 500) : value;
+    }}
+  }}
+}} catch (error) {{
+  storageError = storageError || (error && error.message ? error.message : String(error));
+}}
+const matchingElements = Array.from(document.querySelectorAll("body *"))
+  .filter((element) => {{
+    const style = window.getComputedStyle(element);
+    return style.visibility !== "hidden" && style.display !== "none";
+  }})
+  .filter((element) => (element.innerText || "").includes(visibleFragment))
+  .slice(0, 8)
+  .map((element) => ({{
+    tag: element.tagName,
+    role: element.getAttribute("role"),
+    ariaLabel: element.getAttribute("aria-label"),
+    dataTestid: element.getAttribute("data-testid"),
+    text: (element.innerText || "").trim().slice(0, 500),
+  }}));
+return {{
+  url: location.href,
+  title: document.title,
+  readyState: document.readyState,
+  onboardingVisible,
+  visible: bodyText.includes(visibleFragment),
+  forbiddenVisible: bodyText.includes(forbiddenFragment),
+  bodyText: bodyText.slice(0, 4000),
+  html: document.documentElement ? document.documentElement.outerHTML.slice(0, 4000) : null,
+  rootHtml: document.getElementById("root") ? document.getElementById("root").innerHTML.slice(0, 4000) : null,
+  storageError,
+  debug: window.__codexLiveUiDebug ? {{
+    errors: window.__codexLiveUiDebug.errors.slice(-20),
+    messages: window.__codexLiveUiDebug.messages.slice(-80),
+    workerMessages: window.__codexLiveUiDebug.workerMessages.slice(-80),
+    inboundMessages: window.__codexLiveUiDebug.inboundMessages.slice(-80),
+  }} : null,
+  resources: performance.getEntriesByType("resource")
+    .slice(-40)
+    .map((entry) => ({{
+      name: entry.name,
+      initiatorType: entry.initiatorType,
+      duration: Math.round(entry.duration),
+    }})),
+  localStorage: localStorageDump,
+  sessionStorage: sessionStorageDump,
+  electronBridgeKeys:
+    typeof window.electronBridge === "object" && window.electronBridge !== null
+      ? Object.keys(window.electronBridge).sort()
+      : [],
+  windowKeys: Object.keys(window)
+    .filter((key) => /onboard|thread|conversation|sidebar|store|router|codex|workspace/i.test(key))
+    .sort()
+    .slice(0, 200),
+  matchingElements,
+}};
+}})()"#
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_snapshot;
+    loop {
+        let snapshot: Value = with_local_codex_connection(port, |connection| {
+            connection.evaluate(&snapshot_expression)
+        })?;
+        if snapshot
+            .get("forbiddenVisible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!(
+                "Codex UI for target-local thread {thread_id} visibly contains forbidden transfer prompt: {}",
+                serde_json::to_string_pretty(&snapshot)?
+            );
+        }
+        if snapshot
+            .get("visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        last_snapshot = snapshot;
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for Codex UI to show target-local thread {thread_id} fragment {visible_fragment:?}. Last UI snapshot: {}",
+                serde_json::to_string_pretty(&last_snapshot)?
             );
         }
         std::thread::sleep(Duration::from_millis(500));

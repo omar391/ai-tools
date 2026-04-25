@@ -4,9 +4,10 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{SecondsFormat, TimeZone, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::bridge::{
     AutomationProgressCallback, GuestBridgeRequest, GuestBridgeResponse,
@@ -26,6 +27,7 @@ use codex_rotate_core::workflow::{
     CreateCommandOptions, CreateCommandSource, ReloginOptions,
 };
 use fs2::available_space;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::launcher::ensure_debug_codex_instance;
@@ -34,7 +36,8 @@ use crate::log_isolation::{
 };
 use crate::paths::{resolve_paths, RuntimePaths};
 use crate::thread_recovery::{
-    read_active_thread_ids, send_codex_app_request, ThreadRecoveryRehydration,
+    read_active_thread_ids, run_thread_recovery_iteration, send_codex_app_request,
+    send_codex_host_fetch_request, RecoveryIterationOptions, ThreadRecoveryRehydration,
 };
 use crate::watch::read_watch_state;
 #[cfg(test)]
@@ -114,6 +117,8 @@ const PROJECT_ORDER_KEY: &str = "project-order";
 const SESSION_INDEX_FILE_NAME: &str = concat!("session_", "index.jsonl");
 const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot be activated";
 const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
+const PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
+const THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
 
 #[cfg(test)]
 const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
@@ -738,49 +743,6 @@ fn handle_guest_bridge_command(command: &str, payload: Value) -> Result<Value> {
                 json!({
                     "threadId": thread_id,
                     "items": items,
-                }),
-            )?;
-            Ok(json!({}))
-        }
-        "start-turn" => {
-            let port = payload
-                .get("port")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(DEFAULT_PORT);
-            let thread_id = payload
-                .get("thread_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("start-turn requires thread_id"))?;
-            let input = payload
-                .get("input")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let cwd = payload.get("cwd").and_then(Value::as_str);
-            send_codex_app_request::<Value>(
-                port,
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": input,
-                            "text_elements": [],
-                        }
-                    ],
-                    "cwd": cwd,
-                    "approvalPolicy": Value::Null,
-                    "approvalsReviewer": "user",
-                    "sandboxPolicy": Value::Null,
-                    "model": Value::Null,
-                    "serviceTier": Value::Null,
-                    "effort": Value::Null,
-                    "summary": "none",
-                    "personality": "pragmatic",
-                    "outputSchema": Value::Null,
-                    "collaborationMode": Value::Null,
-                    "attachments": [],
                 }),
             )?;
             Ok(json!({}))
@@ -1789,6 +1751,92 @@ fn translate_recovery_events_after_rotation_with_identity(
     Ok(())
 }
 
+fn recover_translated_thread_events_after_rotation(
+    target_account_id: &str,
+    target_email: &str,
+    port: u16,
+    progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<()> {
+    use crate::watch::{read_watch_state, write_watch_state};
+
+    let mut state = read_watch_state()?;
+    let mut target_state = state.account_state(target_account_id);
+    if !target_state.thread_recovery_pending
+        && target_state.thread_recovery_pending_events.is_empty()
+    {
+        return Ok(());
+    }
+
+    let recovery = match run_thread_recovery_iteration(RecoveryIterationOptions {
+        port: Some(port),
+        current_live_email: Some(target_email.to_string()),
+        current_quota_usable: target_state.quota.as_ref().map(|quota| quota.usable),
+        current_primary_quota_left_percent: target_state
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.primary_quota_left_percent),
+        rotated: true,
+        last_log_id: target_state.last_thread_recovery_log_id,
+        pending: target_state.thread_recovery_pending,
+        pending_events: target_state.thread_recovery_pending_events.clone(),
+    }) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            target_state.thread_recovery_pending = target_state.thread_recovery_pending
+                || !target_state.thread_recovery_pending_events.is_empty();
+            state.set_account_state(target_account_id.to_string(), target_state);
+            let _ = write_watch_state(&state);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to recover pending interrupted threads for rotated account {}.",
+                    target_account_id
+                )
+            });
+        }
+    };
+
+    if let Some(progress) = progress {
+        if !recovery.continued_thread_ids.is_empty() {
+            progress(format!(
+                "Recovered {} interrupted thread(s) after rotation.",
+                recovery.continued_thread_ids.len()
+            ));
+        }
+    }
+
+    target_state.last_thread_recovery_log_id = recovery.last_log_id;
+    target_state.thread_recovery_pending = recovery.pending;
+    target_state.thread_recovery_pending_events = recovery.pending_events;
+    target_state.thread_recovery_backfill_complete = true;
+    state.set_account_state(target_account_id.to_string(), target_state);
+    write_watch_state(&state)?;
+    Ok(())
+}
+
+fn translate_and_recover_thread_events_after_rotation(
+    prepared: &PreparedRotation,
+    port: u16,
+    handoffs: &[ThreadHandoff],
+    progress: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<()> {
+    let previous_sync_identity = conversation_sync_identity(&prepared.previous);
+    let target_sync_identity = conversation_sync_identity(&prepared.target);
+    translate_recovery_events_after_rotation_with_identity(
+        &prepared.previous.account_id,
+        &prepared.target.account_id,
+        &previous_sync_identity,
+        &target_sync_identity,
+        port,
+        handoffs,
+    )?;
+    recover_translated_thread_events_after_rotation(
+        &prepared.target.account_id,
+        &prepared.target.email,
+        port,
+        progress,
+    )
+}
+
 fn maybe_complete_non_switch_next_result(
     backend: &dyn RotationBackend,
     prepared: &PreparedRotation,
@@ -2091,15 +2139,11 @@ fn rotate_next_impl_with_retry(
         ensure_target_account_still_valid(&prepared)?;
         sync_host_archive_state_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
-        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
-        let target_sync_identity = conversation_sync_identity(&prepared.target);
-        let _ = translate_recovery_events_after_rotation_with_identity(
-            &prepared.previous.account_id,
-            &prepared.target.account_id,
-            &previous_sync_identity,
-            &target_sync_identity,
+        let _ = translate_and_recover_thread_events_after_rotation(
+            &prepared,
             port,
             &handoffs,
+            progress.as_ref(),
         );
         Ok(())
     })();
@@ -2191,15 +2235,11 @@ fn rotate_prev_impl(
         }
         sync_host_archive_state_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
-        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
-        let target_sync_identity = conversation_sync_identity(&prepared.target);
-        let _ = translate_recovery_events_after_rotation_with_identity(
-            &prepared.previous.account_id,
-            &prepared.target.account_id,
-            &previous_sync_identity,
-            &target_sync_identity,
+        let _ = translate_and_recover_thread_events_after_rotation(
+            &prepared,
             port,
             &handoffs,
+            progress.as_ref(),
         );
         Ok(())
     })();
@@ -2268,15 +2308,11 @@ fn rotate_set_impl(
         ensure_target_account_still_present(&prepared)?;
         sync_host_archive_state_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
-        let previous_sync_identity = conversation_sync_identity(&prepared.previous);
-        let target_sync_identity = conversation_sync_identity(&prepared.target);
-        let _ = translate_recovery_events_after_rotation_with_identity(
-            &prepared.previous.account_id,
-            &prepared.target.account_id,
-            &previous_sync_identity,
-            &target_sync_identity,
+        let _ = translate_and_recover_thread_events_after_rotation(
+            &prepared,
             port,
             &handoffs,
+            progress.as_ref(),
         );
         Ok(())
     })();
@@ -3330,8 +3366,8 @@ fn export_thread_handoffs_from_candidates(
     transport: &dyn ConversationTransport,
     sync_identity: &str,
     thread_ids: Vec<String>,
-    continue_thread_ids: &BTreeSet<String>,
-    pending_recovery_thread_ids: &BTreeSet<String>,
+    _continue_thread_ids: &BTreeSet<String>,
+    _pending_recovery_thread_ids: &BTreeSet<String>,
 ) -> Result<Vec<ThreadHandoff>> {
     let mut unique = BTreeSet::new();
     let mut handoffs = Vec::new();
@@ -3340,14 +3376,7 @@ fn export_thread_handoffs_from_candidates(
             continue;
         }
         match export_single_thread_handoff_with_identity(transport, &thread_id, sync_identity) {
-            Ok(Some(mut handoff)) => {
-                if pending_recovery_thread_ids.contains(&thread_id)
-                    || !continue_thread_ids.contains(&thread_id)
-                {
-                    handoff.continue_prompt = None;
-                }
-                handoffs.push(handoff);
-            }
+            Ok(Some(handoff)) => handoffs.push(handoff),
             Ok(None) => {}
             Err(error) if is_terminal_thread_read_error(&error) => {
                 continue;
@@ -3373,7 +3402,15 @@ fn export_single_thread_handoff_with_identity(
     sync_identity: &str,
 ) -> Result<Option<ThreadHandoff>> {
     let response = transport.read_thread(thread_id)?;
-    export_single_thread_handoff_from_response(response, thread_id, sync_identity)
+    let mut handoff =
+        export_single_thread_handoff_from_response(response, thread_id, sync_identity)?;
+    if let Some(handoff) = handoff.as_mut() {
+        merge_thread_sidebar_metadata(
+            &mut handoff.metadata,
+            transport.read_thread_ui_metadata(thread_id)?,
+        );
+    }
+    Ok(handoff)
 }
 
 fn export_single_thread_handoff_from_response(
@@ -3388,11 +3425,6 @@ fn export_single_thread_handoff_from_response(
         .get("cwd")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let preview = thread
-        .get("preview")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     let mut items = Vec::new();
     for turn in thread
         .get("turns")
@@ -3414,6 +3446,7 @@ fn export_single_thread_handoff_from_response(
     if items.len() > MAX_HANDOFF_ITEMS {
         items = items.split_off(items.len().saturating_sub(MAX_HANDOFF_ITEMS));
     }
+    let metadata = thread_handoff_metadata_from_thread(thread_id, thread, &items);
 
     let paths = crate::paths::resolve_paths()?;
     let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
@@ -3441,10 +3474,7 @@ fn export_single_thread_handoff_from_response(
         watermark,
         cwd,
         items,
-        continue_prompt: Some(format!(
-            "Continue this transferred conversation from its latest unfinished state. The prior history came from another isolated persona of the same operator. Do not restate the transfer process; continue the actual work. Latest visible preview: {}",
-            truncate_handoff_text(&preview)
-        )),
+        metadata,
     }))
 }
 
@@ -3468,38 +3498,55 @@ fn import_thread_handoffs(
 
         let mut created_thread_id = None;
         let mut lineage_claim_token = None;
-        let existing_local_id =
-            match store.claim_lineage_binding(target_account_id, &handoff.lineage_id)? {
-                LineageBindingClaim::Existing(local_id) => {
-                    if local_id == handoff.source_thread_id {
-                        outcome.failures.push(ThreadHandoffImportFailure {
-                            source_thread_id: handoff.source_thread_id.clone(),
-                            created_thread_id: None,
-                            stage: ThreadHandoffImportFailureStage::Start,
-                            error: "Existing target lineage binding reuses the source thread ID."
-                                .to_string(),
-                        });
-                        continue;
+        let existing_local_id = match store
+            .claim_lineage_binding(target_account_id, &handoff.lineage_id)?
+        {
+            LineageBindingClaim::Existing(local_id) => {
+                if local_id == handoff.source_thread_id {
+                    match store.reclaim_lineage_binding(
+                        target_account_id,
+                        &handoff.lineage_id,
+                        &local_id,
+                    )? {
+                        LineageBindingClaim::Claimed { claim_token } => {
+                            lineage_claim_token = Some(claim_token);
+                            None
+                        }
+                        LineageBindingClaim::Existing(repaired_local_id) => Some(repaired_local_id),
+                        LineageBindingClaim::Busy => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
+                                source_thread_id: handoff.source_thread_id.clone(),
+                                created_thread_id: None,
+                                stage: ThreadHandoffImportFailureStage::Start,
+                                error: format!(
+                                    "Lineage {} is already being synchronized for account {}; retry.",
+                                    handoff.lineage_id, target_account_id
+                                ),
+                            });
+                            continue;
+                        }
                     }
+                } else {
                     Some(local_id)
                 }
-                LineageBindingClaim::Claimed { claim_token } => {
-                    lineage_claim_token = Some(claim_token);
-                    None
-                }
-                LineageBindingClaim::Busy => {
-                    outcome.failures.push(ThreadHandoffImportFailure {
-                        source_thread_id: handoff.source_thread_id.clone(),
-                        created_thread_id: None,
-                        stage: ThreadHandoffImportFailureStage::Start,
-                        error: format!(
-                            "Lineage {} is already being synchronized for account {}; retry.",
-                            handoff.lineage_id, target_account_id
-                        ),
-                    });
-                    continue;
-                }
-            };
+            }
+            LineageBindingClaim::Claimed { claim_token } => {
+                lineage_claim_token = Some(claim_token);
+                None
+            }
+            LineageBindingClaim::Busy => {
+                outcome.failures.push(ThreadHandoffImportFailure {
+                    source_thread_id: handoff.source_thread_id.clone(),
+                    created_thread_id: None,
+                    stage: ThreadHandoffImportFailureStage::Start,
+                    error: format!(
+                        "Lineage {} is already being synchronized for account {}; retry.",
+                        handoff.lineage_id, target_account_id
+                    ),
+                });
+                continue;
+            }
+        };
 
         let target_thread_id = match existing_local_id {
             Some(local_id) => {
@@ -3574,27 +3621,29 @@ fn import_thread_handoffs(
                     });
                     continue;
                 }
-            }
-            if let Some(prompt) = handoff.continue_prompt.as_deref() {
+                wait_for_imported_thread_persistence();
                 if let Err(error) =
-                    transport.start_turn(&target_thread_id, prompt, handoff.cwd.as_deref())
+                    transport.ensure_thread_user_message_event(&target_thread_id, handoff)
                 {
-                    if created_thread_id.is_some() {
-                        let _ = store.bind_local_thread_id(
-                            target_account_id,
-                            &handoff.lineage_id,
-                            &target_thread_id,
-                        );
-                    }
                     outcome.failures.push(ThreadHandoffImportFailure {
                         source_thread_id: handoff.source_thread_id.clone(),
                         created_thread_id: created_thread_id.clone(),
-                        stage: ThreadHandoffImportFailureStage::TurnStart,
+                        stage: ThreadHandoffImportFailureStage::Metadata,
                         error: error.to_string(),
                     });
                     continue;
                 }
             }
+        }
+
+        if let Err(error) = transport.publish_thread_handoff_metadata(&target_thread_id, handoff) {
+            outcome.failures.push(ThreadHandoffImportFailure {
+                source_thread_id: handoff.source_thread_id.clone(),
+                created_thread_id: created_thread_id.clone(),
+                stage: ThreadHandoffImportFailureStage::Metadata,
+                error: error.to_string(),
+            });
+            continue;
         }
 
         // Update binding and watermark transactionally after materialization.
@@ -3620,7 +3669,7 @@ fn import_thread_handoffs(
             outcome.failures.push(ThreadHandoffImportFailure {
                 source_thread_id: handoff.source_thread_id.clone(),
                 created_thread_id,
-                stage: ThreadHandoffImportFailureStage::TurnStart,
+                stage: ThreadHandoffImportFailureStage::Persist,
                 error: format!("Failed to update binding and watermark: {}", error),
             });
             continue;
@@ -3633,10 +3682,941 @@ fn import_thread_handoffs(
     Ok(outcome)
 }
 
+fn wait_for_imported_thread_persistence() {
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+fn thread_handoff_metadata_from_thread(
+    thread_id: &str,
+    thread: &Value,
+    mapped_items: &[Value],
+) -> ThreadHandoffMetadata {
+    let mut metadata = read_thread_sidebar_metadata_from_active_home(thread_id)
+        .unwrap_or_else(|_| ThreadHandoffMetadata::default());
+    fill_if_missing(
+        &mut metadata.title,
+        first_non_empty_thread_string(thread, &["title", "thread_name", "name"]),
+    );
+    fill_if_missing(
+        &mut metadata.first_user_message,
+        first_non_empty_thread_string(thread, &["first_user_message", "firstUserMessage"])
+            .or_else(|| first_user_message_from_thread_turns(thread))
+            .or_else(|| first_user_message_from_response_items(mapped_items)),
+    );
+    fill_if_missing_i64(
+        &mut metadata.updated_at,
+        first_thread_i64(thread, &["updated_at", "updatedAt"]),
+    );
+    fill_if_missing_i64(
+        &mut metadata.updated_at_ms,
+        first_thread_i64(thread, &["updated_at_ms", "updatedAtMs"]),
+    );
+    if let Some(cwd) = first_non_empty_thread_string(thread, &["cwd"]) {
+        metadata.cwd = Some(cwd);
+    }
+    metadata
+}
+
+fn first_non_empty_thread_string(thread: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        thread
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn first_thread_i64(thread: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        thread.get(*key).and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<i64>().ok())
+            })
+        })
+    })
+}
+
+fn fill_if_missing(target: &mut Option<String>, candidate: Option<String>) {
+    if target.as_deref().unwrap_or_default().trim().is_empty() {
+        *target = candidate.filter(|value| !value.trim().is_empty());
+    }
+}
+
+fn fill_if_missing_i64(target: &mut Option<i64>, candidate: Option<i64>) {
+    if target.is_none() {
+        *target = candidate;
+    }
+}
+
+fn fill_if_missing_bool(target: &mut Option<bool>, candidate: Option<bool>) {
+    if target.is_none() {
+        *target = candidate;
+    }
+}
+
+fn first_user_message_from_response_items(items: &[Value]) -> Option<String> {
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("message")
+            || item.get("role").and_then(Value::as_str) != Some("user")
+        {
+            continue;
+        }
+        let text = item
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|entry| {
+                        let content_type = entry.get("type").and_then(Value::as_str)?;
+                        if content_type == "input_text" || content_type == "text" {
+                            entry.get("text").and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if !text.trim().is_empty() && !is_handoff_context_user_text(&text) {
+            return Some(truncate_handoff_text(&text));
+        }
+    }
+    None
+}
+
+fn first_user_message_from_thread_turns(thread: &Value) -> Option<String> {
+    for item in thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+    {
+        if let Some(text) = user_text_from_thread_item(item) {
+            if is_handoff_context_user_text(&text) {
+                continue;
+            }
+            return Some(truncate_handoff_text(&text));
+        }
+    }
+    None
+}
+
+fn user_text_from_thread_item(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "message" if item.get("role").and_then(Value::as_str) == Some("user") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|content| text_from_content_array(content))
+            .filter(|text| !text.trim().is_empty()),
+        "userMessage" | "user_message" => item
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|content| text_from_content_array(content))
+            .or_else(|| {
+                item.get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .filter(|text| !text.trim().is_empty()),
+        _ => None,
+    }
+}
+
+fn text_from_content_array(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter_map(|entry| {
+            let content_type = entry.get("type").and_then(Value::as_str)?;
+            if matches!(content_type, "input_text" | "text") {
+                entry.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_handoff_context_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<environment_context>")
+}
+
+fn read_thread_sidebar_metadata_from_active_home(thread_id: &str) -> Result<ThreadHandoffMetadata> {
+    let paths = crate::paths::resolve_paths()?;
+    read_thread_sidebar_metadata(&paths.codex_home, thread_id)
+}
+
+fn read_thread_sidebar_metadata(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<ThreadHandoffMetadata> {
+    let mut metadata = ThreadHandoffMetadata::default();
+    if let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) {
+        if state_db_path.exists() {
+            merge_thread_sidebar_metadata(
+                &mut metadata,
+                read_thread_sidebar_metadata_from_state_db(&state_db_path, thread_id)?,
+            );
+        }
+    }
+    merge_thread_sidebar_metadata(
+        &mut metadata,
+        read_thread_sidebar_metadata_from_session_index(codex_home, thread_id)?,
+    );
+    Ok(metadata)
+}
+
+fn merge_thread_sidebar_metadata(
+    target: &mut ThreadHandoffMetadata,
+    source: ThreadHandoffMetadata,
+) {
+    fill_if_missing(&mut target.title, source.title);
+    fill_if_missing(&mut target.first_user_message, source.first_user_message);
+    fill_if_missing_i64(&mut target.updated_at, source.updated_at);
+    fill_if_missing_i64(&mut target.updated_at_ms, source.updated_at_ms);
+    fill_if_missing(
+        &mut target.session_index_updated_at,
+        source.session_index_updated_at,
+    );
+    fill_if_missing(&mut target.source, source.source);
+    fill_if_missing(&mut target.model_provider, source.model_provider);
+    fill_if_missing(&mut target.cwd, source.cwd);
+    fill_if_missing(&mut target.sandbox_policy, source.sandbox_policy);
+    fill_if_missing(&mut target.approval_mode, source.approval_mode);
+    fill_if_missing_bool(&mut target.projectless, source.projectless);
+    fill_if_missing(&mut target.workspace_root_hint, source.workspace_root_hint);
+}
+
+fn read_thread_sidebar_metadata_from_state_db(
+    state_db_path: &Path,
+    thread_id: &str,
+) -> Result<ThreadHandoffMetadata> {
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(ThreadHandoffMetadata::default());
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(ThreadHandoffMetadata::default());
+    }
+    let mut metadata = ThreadHandoffMetadata::default();
+    if columns.iter().any(|column| column == "title") {
+        metadata.title = query_thread_optional_string(&connection, "title", thread_id)?
+            .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "first_user_message") {
+        metadata.first_user_message =
+            query_thread_optional_string(&connection, "first_user_message", thread_id)?
+                .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "updated_at") {
+        metadata.updated_at = query_thread_optional_i64(&connection, "updated_at", thread_id)?;
+    }
+    if columns.iter().any(|column| column == "updated_at_ms") {
+        metadata.updated_at_ms =
+            query_thread_optional_i64(&connection, "updated_at_ms", thread_id)?;
+    }
+    if columns.iter().any(|column| column == "source") {
+        metadata.source = query_thread_optional_string(&connection, "source", thread_id)?
+            .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "model_provider") {
+        metadata.model_provider =
+            query_thread_optional_string(&connection, "model_provider", thread_id)?
+                .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "cwd") {
+        metadata.cwd = query_thread_optional_string(&connection, "cwd", thread_id)?
+            .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "sandbox_policy") {
+        metadata.sandbox_policy =
+            query_thread_optional_string(&connection, "sandbox_policy", thread_id)?
+                .filter(|value| !value.trim().is_empty());
+    }
+    if columns.iter().any(|column| column == "approval_mode") {
+        metadata.approval_mode =
+            query_thread_optional_string(&connection, "approval_mode", thread_id)?
+                .filter(|value| !value.trim().is_empty());
+    }
+    Ok(metadata)
+}
+
+fn query_thread_optional_string(
+    connection: &rusqlite::Connection,
+    column: &str,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let sql = format!(
+        "select {} from threads where id = ?1",
+        quote_sql_identifier(column)
+    );
+    connection
+        .query_row(&sql, [thread_id], |row| row.get::<_, Option<String>>(0))
+        .optional()
+        .map(|value| value.flatten())
+        .with_context(|| format!("Failed to query thread {thread_id} metadata column {column}."))
+}
+
+fn query_thread_optional_i64(
+    connection: &rusqlite::Connection,
+    column: &str,
+    thread_id: &str,
+) -> Result<Option<i64>> {
+    let sql = format!(
+        "select {} from threads where id = ?1",
+        quote_sql_identifier(column)
+    );
+    connection
+        .query_row(&sql, [thread_id], |row| row.get::<_, Option<i64>>(0))
+        .optional()
+        .map(|value| value.flatten())
+        .with_context(|| format!("Failed to query thread {thread_id} metadata column {column}."))
+}
+
+fn read_thread_sidebar_metadata_from_session_index(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<ThreadHandoffMetadata> {
+    let path = codex_home.join("session_index.jsonl");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return Ok(ThreadHandoffMetadata::default());
+    };
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_str) != Some(thread_id) {
+            continue;
+        }
+        return Ok(ThreadHandoffMetadata {
+            title: value
+                .get("thread_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            first_user_message: None,
+            updated_at: None,
+            updated_at_ms: None,
+            session_index_updated_at: value
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            ..ThreadHandoffMetadata::default()
+        });
+    }
+    Ok(ThreadHandoffMetadata::default())
+}
+
+#[cfg(test)]
+fn publish_thread_sidebar_metadata(
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<()> {
+    let Some(metadata) = prepared_thread_sidebar_metadata(codex_home, thread_id, metadata)? else {
+        return Ok(());
+    };
+    publish_prepared_thread_sidebar_metadata(codex_home, thread_id, &metadata)
+}
+
+fn publish_thread_sidebar_metadata_until_visible(
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+    timeout: Duration,
+) -> Result<()> {
+    let Some(metadata) = prepared_thread_sidebar_metadata(codex_home, thread_id, metadata)? else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None::<anyhow::Error>;
+    loop {
+        match publish_prepared_thread_sidebar_metadata(codex_home, thread_id, &metadata)
+            .and_then(|_| thread_sidebar_metadata_visible(codex_home, thread_id, &metadata))
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => last_error = Some(error),
+        }
+        if Instant::now() >= deadline {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+            return Err(anyhow!(
+                "Timed out waiting for thread {thread_id} sidebar metadata to become visible."
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn prepared_thread_sidebar_metadata(
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<Option<ThreadHandoffMetadata>> {
+    let mut metadata = metadata.clone();
+    if metadata
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        metadata.title = metadata
+            .first_user_message
+            .as_deref()
+            .map(truncate_handoff_text)
+            .filter(|value| !value.trim().is_empty());
+    }
+    if metadata
+        .first_user_message
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        metadata.first_user_message =
+            first_user_message_from_thread_rollout(codex_home, thread_id)?;
+    }
+    if metadata
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        metadata.title = metadata
+            .first_user_message
+            .as_deref()
+            .map(truncate_handoff_text)
+            .filter(|value| !value.trim().is_empty());
+    }
+    if metadata
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        && metadata
+            .first_user_message
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(metadata))
+}
+
+fn publish_prepared_thread_sidebar_metadata(
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<()> {
+    if let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) {
+        if state_db_path.exists() {
+            publish_thread_sidebar_metadata_to_state_db(
+                codex_home,
+                &state_db_path,
+                thread_id,
+                metadata,
+            )?;
+        }
+    }
+    publish_thread_sidebar_metadata_to_session_index(codex_home, thread_id, metadata)?;
+    Ok(())
+}
+
+fn thread_sidebar_metadata_visible(
+    codex_home: &Path,
+    thread_id: &str,
+    expected: &ThreadHandoffMetadata,
+) -> Result<bool> {
+    let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) else {
+        return Ok(true);
+    };
+    if !state_db_path.exists() {
+        return Ok(true);
+    }
+    let actual = read_thread_sidebar_metadata_from_state_db(&state_db_path, thread_id)?;
+    let title_visible = actual
+        .title
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let first_user_visible = match expected
+        .first_user_message
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(expected) => actual
+            .first_user_message
+            .as_deref()
+            .map(|value| value.contains(expected))
+            .unwrap_or(false),
+        None => true,
+    };
+    Ok(title_visible && first_user_visible)
+}
+
+fn publish_thread_sidebar_metadata_to_state_db(
+    codex_home: &Path,
+    state_db_path: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<()> {
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .with_context(|| format!("Failed to configure {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(());
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(());
+    }
+    let has_row: Option<i64> = connection
+        .query_row(
+            "select 1 from threads where id = ?1 limit 1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("Failed to query thread row {thread_id}."))?;
+    if has_row.is_none() {
+        insert_thread_sidebar_metadata_row_if_missing(
+            &connection,
+            codex_home,
+            thread_id,
+            metadata,
+            &columns,
+        )?;
+    }
+
+    if columns.iter().any(|column| column == "title") {
+        if let Some(title) = metadata
+            .title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            connection.execute(
+                "update threads set title = ?1 where id = ?2 and trim(coalesce(title, '')) = ''",
+                rusqlite::params![title, thread_id],
+            )?;
+        }
+    }
+    if columns.iter().any(|column| column == "first_user_message") {
+        if let Some(message) = metadata
+            .first_user_message
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            connection.execute(
+                "update threads set first_user_message = ?1 where id = ?2 and trim(coalesce(first_user_message, '')) = ''",
+                rusqlite::params![message, thread_id],
+            )?;
+        }
+    }
+    if columns.iter().any(|column| column == "has_user_event")
+        && metadata
+            .first_user_message
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        connection.execute(
+            "update threads set has_user_event = 1 where id = ?1",
+            [thread_id],
+        )?;
+    }
+    if columns.iter().any(|column| column == "updated_at") {
+        if let Some(updated_at) = metadata.updated_at {
+            connection.execute(
+                "update threads set updated_at = ?1 where id = ?2",
+                rusqlite::params![updated_at, thread_id],
+            )?;
+        }
+    }
+    if columns.iter().any(|column| column == "updated_at_ms") {
+        let updated_at_ms = metadata.updated_at_ms.or_else(|| {
+            metadata
+                .updated_at
+                .and_then(|value| value.checked_mul(1000))
+        });
+        if let Some(updated_at_ms) = updated_at_ms {
+            connection.execute(
+                "update threads set updated_at_ms = ?1 where id = ?2",
+                rusqlite::params![updated_at_ms, thread_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_thread_sidebar_metadata_row_if_missing(
+    connection: &rusqlite::Connection,
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+    columns: &[String],
+) -> Result<()> {
+    let now = current_unix_timestamp_secs();
+    let updated_at = metadata.updated_at.unwrap_or(now);
+    let updated_at_ms = metadata
+        .updated_at_ms
+        .unwrap_or_else(|| updated_at.saturating_mul(1000));
+    let title = metadata
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or(metadata.first_user_message.as_deref())
+        .map(truncate_handoff_text)
+        .unwrap_or_else(|| thread_id.to_string());
+    let first_user_message = metadata
+        .first_user_message
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let rollout_path = find_thread_rollout_path(codex_home, thread_id)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+
+    let mut insert_columns = Vec::new();
+    let mut values = Vec::<rusqlite::types::Value>::new();
+    let mut push = |column: &str, value: rusqlite::types::Value| {
+        if columns.iter().any(|candidate| candidate == column) {
+            insert_columns.push(column.to_string());
+            values.push(value);
+        }
+    };
+    push("id", thread_id.to_string().into());
+    push("rollout_path", rollout_path.into());
+    push("created_at", updated_at.into());
+    push("updated_at", updated_at.into());
+    push("updated_at_ms", updated_at_ms.into());
+    push(
+        "source",
+        metadata
+            .source
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("vscode")
+            .to_string()
+            .into(),
+    );
+    push(
+        "model_provider",
+        metadata
+            .model_provider
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("openai")
+            .to_string()
+            .into(),
+    );
+    push(
+        "cwd",
+        metadata
+            .cwd
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("/")
+            .to_string()
+            .into(),
+    );
+    push("title", title.into());
+    push("first_user_message", first_user_message.into());
+    push(
+        "sandbox_policy",
+        metadata
+            .sandbox_policy
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("workspace-write")
+            .to_string()
+            .into(),
+    );
+    push(
+        "approval_mode",
+        metadata
+            .approval_mode
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("never")
+            .to_string()
+            .into(),
+    );
+    push("tokens_used", 0_i64.into());
+    push("has_user_event", 1_i64.into());
+    push("archived", 0_i64.into());
+
+    if !insert_columns.iter().any(|column| column == "id") {
+        return Ok(());
+    }
+    let placeholders = (1..=insert_columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>();
+    let sql = format!(
+        "insert or ignore into threads ({}) values ({})",
+        insert_columns.join(", "),
+        placeholders.join(", ")
+    );
+    connection
+        .execute(&sql, rusqlite::params_from_iter(values))
+        .with_context(|| format!("Failed to insert target thread metadata row {thread_id}."))?;
+    Ok(())
+}
+
+fn find_thread_rollout_path(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    if !codex_home.exists() {
+        return None;
+    }
+    let mut stack = vec![codex_home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let file_name_matches = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(thread_id))
+                .unwrap_or(false);
+            if file_name_matches {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn ensure_thread_rollout_user_message_event(
+    codex_home: &Path,
+    thread_id: &str,
+    handoff: &ThreadHandoff,
+) -> Result<()> {
+    let message = handoff
+        .metadata
+        .first_user_message
+        .clone()
+        .or_else(|| first_user_message_from_response_items(&handoff.items))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(message) = message else {
+        return Ok(());
+    };
+    let Some(path) = find_thread_rollout_path(codex_home, thread_id) else {
+        return Ok(());
+    };
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}.", path.display()))?;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = value.get("payload").unwrap_or(&value);
+        if payload.get("type").and_then(Value::as_str) == Some("user_message")
+            && payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                == Some(message.as_str())
+        {
+            return Ok(());
+        }
+    }
+    let event = json!({
+        "timestamp": current_rfc3339_timestamp(),
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": message,
+            "images": [],
+            "local_images": [],
+            "text_elements": [],
+        }
+    });
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open {} for append.", path.display()))?;
+    if !contents.ends_with('\n') {
+        writeln!(file)
+            .with_context(|| format!("Failed to append newline to {}.", path.display()))?;
+    }
+    writeln!(file, "{}", serde_json::to_string(&event)?)
+        .with_context(|| format!("Failed to append user message event to {}.", path.display()))
+}
+
+fn first_user_message_from_thread_rollout(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(path) = find_thread_rollout_path(codex_home, thread_id) else {
+        return Ok(None);
+    };
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}.", path.display()))?;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(text) = first_user_message_from_rollout_event(&value) {
+            return Ok(Some(truncate_handoff_text(&text)));
+        }
+    }
+    Ok(None)
+}
+
+fn first_user_message_from_rollout_event(value: &Value) -> Option<String> {
+    let payload = value.get("payload").unwrap_or(value);
+    if payload.get("type").and_then(Value::as_str) == Some("user_message") {
+        return payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .filter(|text| !is_handoff_context_user_text(text))
+            .map(ToOwned::to_owned);
+    }
+    if payload.get("type").and_then(Value::as_str) == Some("message")
+        && payload.get("role").and_then(Value::as_str) == Some("user")
+    {
+        return payload
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|entry| {
+                        let entry_type = entry.get("type").and_then(Value::as_str)?;
+                        if matches!(entry_type, "input_text" | "text") {
+                            entry.get("text").and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty() && !is_handoff_context_user_text(text));
+    }
+    None
+}
+
+fn current_unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn publish_thread_sidebar_metadata_to_session_index(
+    codex_home: &Path,
+    thread_id: &str,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<()> {
+    let Some(title) = metadata
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let path = codex_home.join("session_index.jsonl");
+    let updated_at = metadata
+        .session_index_updated_at
+        .clone()
+        .or_else(|| metadata.updated_at_ms.and_then(timestamp_millis_to_rfc3339))
+        .or_else(|| metadata.updated_at.and_then(timestamp_secs_to_rfc3339))
+        .unwrap_or_else(current_rfc3339_timestamp);
+    let replacement = json!({
+        "id": thread_id,
+        "thread_name": title,
+        "updated_at": updated_at,
+    });
+    let replacement_line = serde_json::to_string(&replacement)?;
+    let contents = fs::read_to_string(&path).unwrap_or_default();
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let should_replace = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+            .map(|id| id == thread_id)
+            .unwrap_or(false);
+        if should_replace {
+            if !replaced {
+                lines.push(replacement_line.clone());
+                replaced = true;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(replacement_line);
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    fs::write(&path, output).with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn timestamp_millis_to_rfc3339(value: i64) -> Option<String> {
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+fn timestamp_secs_to_rfc3339(value: i64) -> Option<String> {
+    Utc.timestamp_opt(value, 0)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+fn current_rfc3339_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
 fn map_thread_item_to_response_item(item: &Value) -> Option<Value> {
     let item_type = item.get("type").and_then(Value::as_str)?;
     match item_type {
-        "userMessage" => {
+        "message" => message_item_to_response_item(item),
+        "userMessage" | "user_message" => {
             let text = item
                 .get("content")
                 .and_then(Value::as_array)
@@ -3646,6 +4626,16 @@ fn map_thread_item_to_response_item(item: &Value) -> Option<Value> {
                         .filter_map(user_input_to_text)
                         .collect::<Vec<_>>()
                         .join("\n")
+                })
+                .or_else(|| {
+                    item.get("message")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .or_else(|| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
                 })
                 .unwrap_or_default();
             (!text.trim().is_empty()).then(|| {
@@ -3699,6 +4689,37 @@ fn map_thread_item_to_response_item(item: &Value) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+fn message_item_to_response_item(item: &Value) -> Option<Value> {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return None;
+    }
+    if role == "user" {
+        return Some(json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": truncate_handoff_text(&text),
+                }
+            ]
+        }));
+    }
+    Some(assistant_message_item(&text))
 }
 
 fn assistant_message_item(text: &str) -> Value {
@@ -3992,7 +5013,30 @@ pub trait ConversationTransport {
     fn read_thread(&self, thread_id: &str) -> Result<Value>;
     fn start_thread(&self, cwd: Option<&str>) -> Result<String>;
     fn inject_items(&self, thread_id: &str, items: Vec<Value>) -> Result<()>;
-    fn start_turn(&self, thread_id: &str, input: &str, cwd: Option<&str>) -> Result<()>;
+    fn read_thread_ui_metadata(&self, _thread_id: &str) -> Result<ThreadHandoffMetadata> {
+        Ok(ThreadHandoffMetadata::default())
+    }
+    fn ensure_thread_user_message_event(
+        &self,
+        _thread_id: &str,
+        _handoff: &ThreadHandoff,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn publish_thread_metadata(
+        &self,
+        _thread_id: &str,
+        _metadata: &ThreadHandoffMetadata,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn publish_thread_handoff_metadata(
+        &self,
+        thread_id: &str,
+        handoff: &ThreadHandoff,
+    ) -> Result<()> {
+        self.publish_thread_metadata(thread_id, &handoff.metadata)
+    }
 }
 
 pub struct HostConversationTransport {
@@ -4035,23 +5079,96 @@ fn wait_for_host_thread_materialization(port: u16, thread_id: &str) -> Result<()
     }
 }
 
-fn wait_for_host_thread_listing(port: u16, thread_id: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if read_active_thread_ids(Some(port))
-            .unwrap_or_default()
-            .iter()
-            .any(|candidate| candidate == thread_id)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "Timed out waiting for imported thread {thread_id} to appear in Codex active thread listings."
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(250));
+fn read_host_global_state_value(port: u16, key: &str) -> Result<Value> {
+    let response: Value =
+        send_codex_host_fetch_request(port, "get-global-state", json!({ "key": key }))?;
+    Ok(response.get("value").cloned().unwrap_or(Value::Null))
+}
+
+fn write_host_global_state_value(port: u16, key: &str, value: Value) -> Result<()> {
+    let _: Value = send_codex_host_fetch_request(
+        port,
+        "set-global-state",
+        json!({ "key": key, "value": value }),
+    )?;
+    Ok(())
+}
+
+fn host_projectless_thread_ids(port: u16) -> Result<BTreeSet<String>> {
+    Ok(
+        read_host_global_state_value(port, PROJECTLESS_THREAD_IDS_KEY)?
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+fn host_thread_workspace_root_hints(port: u16) -> Result<BTreeMap<String, String>> {
+    Ok(
+        read_host_global_state_value(port, THREAD_WORKSPACE_ROOT_HINTS_KEY)?
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+            .collect(),
+    )
+}
+
+fn publish_projectless_thread_ui_metadata(
+    port: u16,
+    thread_id: &str,
+    source_thread_id: Option<&str>,
+    metadata: &ThreadHandoffMetadata,
+) -> Result<()> {
+    if metadata.projectless != Some(true) {
+        return Ok(());
     }
+
+    let mut ids = host_projectless_thread_ids(port)?;
+    let mut ids_changed = false;
+    if let Some(source_thread_id) = source_thread_id.filter(|source| *source != thread_id) {
+        ids_changed |= ids.remove(source_thread_id);
+    }
+    ids_changed |= ids.insert(thread_id.to_string());
+    if ids_changed {
+        write_host_global_state_value(
+            port,
+            PROJECTLESS_THREAD_IDS_KEY,
+            Value::Array(ids.into_iter().map(Value::String).collect()),
+        )?;
+    }
+
+    let root_hint = metadata
+        .workspace_root_hint
+        .as_deref()
+        .or(metadata.cwd.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(root_hint) = root_hint {
+        let mut hints = host_thread_workspace_root_hints(port)?;
+        let mut hints_changed = false;
+        if let Some(source_thread_id) = source_thread_id.filter(|source| *source != thread_id) {
+            hints_changed |= hints.remove(source_thread_id).is_some();
+        }
+        if hints.get(thread_id).map(String::as_str) != Some(root_hint) {
+            hints.insert(thread_id.to_string(), root_hint.to_string());
+            hints_changed = true;
+        }
+        if hints_changed {
+            let value = Value::Object(
+                hints
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            );
+            write_host_global_state_value(port, THREAD_WORKSPACE_ROOT_HINTS_KEY, value)?;
+        }
+    }
+
+    Ok(())
 }
 
 impl ConversationTransport for HostConversationTransport {
@@ -4104,36 +5221,61 @@ impl ConversationTransport for HostConversationTransport {
         .map(|_| ())
     }
 
-    fn start_turn(&self, thread_id: &str, input: &str, cwd: Option<&str>) -> Result<()> {
-        send_codex_app_request::<Value>(
+    fn read_thread_ui_metadata(&self, thread_id: &str) -> Result<ThreadHandoffMetadata> {
+        let projectless_ids = host_projectless_thread_ids(self.port)?;
+        let mut workspace_root_hints = host_thread_workspace_root_hints(self.port)?;
+        let workspace_root_hint = workspace_root_hints
+            .remove(thread_id)
+            .filter(|value| !value.trim().is_empty());
+        Ok(ThreadHandoffMetadata {
+            projectless: Some(projectless_ids.contains(thread_id)),
+            workspace_root_hint,
+            ..ThreadHandoffMetadata::default()
+        })
+    }
+
+    fn ensure_thread_user_message_event(
+        &self,
+        thread_id: &str,
+        handoff: &ThreadHandoff,
+    ) -> Result<()> {
+        let paths = crate::paths::resolve_paths()?;
+        ensure_thread_rollout_user_message_event(&paths.codex_home, thread_id, handoff)
+    }
+
+    fn publish_thread_metadata(
+        &self,
+        thread_id: &str,
+        metadata: &ThreadHandoffMetadata,
+    ) -> Result<()> {
+        let paths = crate::paths::resolve_paths()?;
+        publish_thread_sidebar_metadata_until_visible(
+            &paths.codex_home,
+            thread_id,
+            metadata,
+            Duration::from_secs(10),
+        )?;
+        publish_projectless_thread_ui_metadata(self.port, thread_id, None, metadata)
+    }
+
+    fn publish_thread_handoff_metadata(
+        &self,
+        thread_id: &str,
+        handoff: &ThreadHandoff,
+    ) -> Result<()> {
+        let paths = crate::paths::resolve_paths()?;
+        publish_thread_sidebar_metadata_until_visible(
+            &paths.codex_home,
+            thread_id,
+            &handoff.metadata,
+            Duration::from_secs(10),
+        )?;
+        publish_projectless_thread_ui_metadata(
             self.port,
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": input,
-                        "text_elements": [],
-                    }
-                ],
-                "cwd": cwd,
-                "approvalPolicy": Value::Null,
-                "approvalsReviewer": "user",
-                "sandboxPolicy": Value::Null,
-                "model": Value::Null,
-                "serviceTier": Value::Null,
-                "effort": Value::Null,
-                "summary": "none",
-                "personality": "pragmatic",
-                "outputSchema": Value::Null,
-                "collaborationMode": Value::Null,
-                "attachments": [],
-            }),
+            thread_id,
+            Some(&handoff.source_thread_id),
+            &handoff.metadata,
         )
-        .map(|_| ())?;
-        wait_for_host_thread_materialization(self.port, thread_id)?;
-        wait_for_host_thread_listing(self.port, thread_id)
     }
 }
 
@@ -4190,14 +5332,6 @@ impl ConversationTransport for VmConversationTransport {
         )?;
         Ok(())
     }
-
-    fn start_turn(&self, thread_id: &str, input: &str, cwd: Option<&str>) -> Result<()> {
-        let _res: Value = crate::rotation_hygiene::send_guest_request(
-            "start-turn",
-            json!({ "port": self.port, "thread_id": thread_id, "input": input, "cwd": cwd }),
-        )?;
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -4207,7 +5341,36 @@ pub struct ThreadHandoff {
     pub watermark: Option<String>,
     pub cwd: Option<String>,
     pub items: Vec<Value>,
-    pub continue_prompt: Option<String>,
+    #[serde(default)]
+    pub metadata: ThreadHandoffMetadata,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ThreadHandoffMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_user_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_index_updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projectless: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4229,7 +5392,8 @@ struct ThreadHandoffImportFailure {
 enum ThreadHandoffImportFailureStage {
     Start,
     InjectItems,
-    TurnStart,
+    Metadata,
+    Persist,
 }
 
 impl ThreadHandoffImportOutcome {
@@ -4265,7 +5429,8 @@ fn thread_handoff_import_stage_label(stage: ThreadHandoffImportFailureStage) -> 
     match stage {
         ThreadHandoffImportFailureStage::Start => "thread/start",
         ThreadHandoffImportFailureStage::InjectItems => "thread/inject_items",
-        ThreadHandoffImportFailureStage::TurnStart => "turn/start",
+        ThreadHandoffImportFailureStage::Metadata => "metadata",
+        ThreadHandoffImportFailureStage::Persist => "persist",
     }
 }
 
@@ -4696,6 +5861,54 @@ impl ConversationSyncStore {
         Ok(claim)
     }
 
+    fn reclaim_lineage_binding(
+        &mut self,
+        account_id: &str,
+        lineage_id: &str,
+        expected_local_thread_id: &str,
+    ) -> Result<LineageBindingClaim> {
+        let tx = self.db.transaction()?;
+        let claim_token = make_lineage_claim_token();
+        let changed = tx.execute(
+            "UPDATE conversation_bindings
+             SET local_thread_id = ?3
+             WHERE account_id = ?1 AND lineage_id = ?2 AND local_thread_id = ?4",
+            [
+                account_id,
+                lineage_id,
+                claim_token.as_str(),
+                expected_local_thread_id,
+            ],
+        )?;
+        let claim = if changed == 1 {
+            LineageBindingClaim::Claimed { claim_token }
+        } else {
+            let mut stmt = tx.prepare(
+                "SELECT local_thread_id FROM conversation_bindings WHERE account_id = ?1 AND lineage_id = ?2",
+            )?;
+            let mut rows = stmt.query([account_id, lineage_id])?;
+            let claim = if let Some(row) = rows.next()? {
+                let local_thread_id: String = row.get(0)?;
+                if is_pending_lineage_claim(&local_thread_id) {
+                    LineageBindingClaim::Busy
+                } else {
+                    LineageBindingClaim::Existing(local_thread_id)
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO conversation_bindings (account_id, lineage_id, local_thread_id) VALUES (?1, ?2, ?3)",
+                    [account_id, lineage_id, claim_token.as_str()],
+                )?;
+                LineageBindingClaim::Claimed { claim_token }
+            };
+            drop(rows);
+            drop(stmt);
+            claim
+        };
+        tx.commit()?;
+        Ok(claim)
+    }
+
     fn release_lineage_claim(
         &mut self,
         account_id: &str,
@@ -4845,6 +6058,7 @@ mod tests {
                 if line.trim().starts_with("//")
                     || line.contains("guardrail_no_direct_conversation_file_writes")
                     || line.contains("line.contains(")
+                    || line.contains("codex_home.join(\"session_index.jsonl\")")
                 {
                     return false;
                 }
@@ -4876,7 +6090,7 @@ mod tests {
             watermark: Some("turn-1".to_string()),
             cwd: None,
             items: vec![json!({"type": "text", "text": "hello"})],
-            continue_prompt: Some("continue".to_string()),
+            metadata: ThreadHandoffMetadata::default(),
         };
 
         let target_thread_id = "target-thread-1";
@@ -4896,9 +6110,6 @@ mod tests {
                 Ok(self.thread_id.clone())
             }
             fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
-                Ok(())
-            }
-            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
                 Ok(())
             }
         }
@@ -4982,9 +6193,6 @@ mod tests {
             fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
                 Ok(())
             }
-            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
-                Ok(())
-            }
         }
 
         let handoff = ThreadHandoff {
@@ -4993,7 +6201,7 @@ mod tests {
             watermark: Some("turn-1".to_string()),
             cwd: None,
             items: vec![],
-            continue_prompt: None,
+            metadata: ThreadHandoffMetadata::default(),
         };
         let outcome = import_thread_handoffs(
             &MockConversationTransport,
@@ -5078,9 +6286,6 @@ mod tests {
             fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
                 unreachable!("export should not inject items")
             }
-            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
-                unreachable!("export should not start turns")
-            }
         }
         fn thread_response(id: &str) -> Value {
             json!({
@@ -5137,10 +6342,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["thread-new", "thread-old", "thread-archived"]
         );
-        assert!(handoffs[0].continue_prompt.is_some());
-        assert!(handoffs[1].continue_prompt.is_none());
-        assert!(handoffs[2].continue_prompt.is_none());
-
+        let serialized = serde_json::to_value(&handoffs[0]).expect("serialize handoff");
+        assert!(
+            serialized.get("continue_prompt").is_none(),
+            "conversation sync must not carry an invented continuation prompt"
+        );
+        assert!(
+            serialized.get("continuePrompt").is_none(),
+            "conversation sync must not carry an invented continuation prompt"
+        );
         let store =
             ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
         for thread_id in ["thread-new", "thread-old", "thread-archived"] {
@@ -5156,7 +6366,97 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_poisoned_same_id_target_binding() {
+    fn export_handoff_captures_projectless_ui_metadata() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        struct ProjectlessExportTransport;
+        impl ConversationTransport for ProjectlessExportTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, id: &str) -> Result<Value> {
+                Ok(json!({
+                    "thread": {
+                        "id": id,
+                        "cwd": "/tmp/source-projectless-root",
+                        "turns": [
+                            {
+                                "id": "turn-1",
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "content": [
+                                            { "type": "text", "text": "hi" }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("export should not start threads")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("export should not inject items")
+            }
+            fn read_thread_ui_metadata(&self, thread_id: &str) -> Result<ThreadHandoffMetadata> {
+                assert_eq!(thread_id, "source-thread");
+                Ok(ThreadHandoffMetadata {
+                    projectless: Some(true),
+                    workspace_root_hint: Some("/tmp/source-projectless-root".to_string()),
+                    ..ThreadHandoffMetadata::default()
+                })
+            }
+        }
+
+        let handoff = export_single_thread_handoff_with_identity(
+            &ProjectlessExportTransport,
+            "source-thread",
+            "source-sync",
+        )
+        .expect("export")
+        .expect("handoff");
+
+        assert_eq!(handoff.metadata.projectless, Some(true));
+        assert_eq!(
+            handoff.metadata.workspace_root_hint.as_deref(),
+            Some("/tmp/source-projectless-root")
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn thread_handoff_ignores_legacy_continue_prompt_field() {
+        let handoff: ThreadHandoff = serde_json::from_value(json!({
+            "source_thread_id": "source-thread",
+            "lineage_id": "lineage",
+            "watermark": "turn-1",
+            "cwd": "/tmp/project",
+            "items": [],
+            "metadata": {},
+            "continue_prompt": "Continue this transferred conversation from its latest unfinished state.",
+            "continuePrompt": "Continue this transferred conversation from its latest unfinished state."
+        }))
+        .expect("legacy handoff should deserialize without continuation behavior");
+
+        assert_eq!(handoff.source_thread_id, "source-thread");
+        let serialized = serde_json::to_value(handoff).expect("serialize handoff");
+        assert!(serialized.get("continue_prompt").is_none());
+        assert!(serialized.get("continuePrompt").is_none());
+    }
+
+    #[test]
+    fn import_repairs_poisoned_same_id_target_binding() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let paths = test_runtime_paths(temp.path());
@@ -5172,8 +6472,8 @@ mod tests {
             .bind_local_thread_id("target-sync", "lineage-1", "source-thread")
             .expect("seed poisoned binding");
 
-        struct NoStartTransport;
-        impl ConversationTransport for NoStartTransport {
+        struct RepairTransport;
+        impl ConversationTransport for RepairTransport {
             fn list_threads(&self) -> Result<Vec<String>> {
                 Ok(vec![])
             }
@@ -5181,12 +6481,9 @@ mod tests {
                 Ok(json!({}))
             }
             fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
-                panic!("poisoned existing binding must fail before thread/start");
+                Ok("target-thread".to_string())
             }
             fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
-                Ok(())
-            }
-            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
                 Ok(())
             }
         }
@@ -5197,17 +6494,345 @@ mod tests {
             watermark: Some("turn-1".to_string()),
             cwd: None,
             items: vec![],
-            continue_prompt: None,
+            metadata: ThreadHandoffMetadata::default(),
         };
-        let outcome = import_thread_handoffs(&NoStartTransport, "target-sync", &[handoff], None)
+        let outcome = import_thread_handoffs(&RepairTransport, "target-sync", &[handoff], None)
             .expect("import returns outcome");
-        assert!(!outcome.is_complete());
-        assert_eq!(outcome.failures.len(), 1);
-        assert!(outcome.failures[0]
-            .error
-            .contains("reuses the source thread ID"));
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.failures.len(), 0);
+        assert_eq!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding"),
+            Some("target-thread".to_string())
+        );
+        assert_ne!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding")
+                .unwrap(),
+            "source-thread"
+        );
+        assert_eq!(
+            store
+                .get_watermark("target-sync", "lineage-1")
+                .expect("watermark"),
+            Some("turn-1".to_string())
+        );
 
         restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_publishes_sidebar_metadata_for_existing_current_binding() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id("target-sync", "lineage-1", "target-thread")
+            .expect("seed binding");
+        store
+            .set_watermark("target-sync", "lineage-1", Some("turn-1"))
+            .expect("seed watermark");
+
+        struct MetadataTransport {
+            calls: Arc<Mutex<Vec<(String, Option<String>, Option<bool>)>>>,
+        }
+        impl ConversationTransport for MetadataTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                unreachable!("existing current binding should not create a duplicate thread")
+            }
+            fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
+                unreachable!("same watermark should not reinject items")
+            }
+            fn publish_thread_metadata(
+                &self,
+                thread_id: &str,
+                metadata: &ThreadHandoffMetadata,
+            ) -> Result<()> {
+                self.calls.lock().expect("metadata calls lock").push((
+                    thread_id.to_string(),
+                    metadata.title.clone(),
+                    metadata.projectless,
+                ));
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = MetadataTransport {
+            calls: calls.clone(),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some("turn-1".to_string()),
+            cwd: None,
+            items: vec![],
+            metadata: ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("hi".to_string()),
+                updated_at: Some(1_777_038_485),
+                updated_at_ms: None,
+                session_index_updated_at: Some("2026-04-24T13:48:05.018117Z".to_string()),
+                projectless: Some(true),
+                workspace_root_hint: Some("/tmp/projectless-root".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        };
+
+        let outcome = import_thread_handoffs(&transport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            calls.lock().expect("metadata calls").as_slice(),
+            &[(
+                "target-thread".to_string(),
+                Some("Greet user".to_string()),
+                Some(true)
+            )]
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn publish_thread_sidebar_metadata_updates_state_db_and_session_index() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    title text not null default '',
+    first_user_message text not null default '',
+    updated_at integer not null default 0,
+    updated_at_ms integer,
+    has_user_event integer not null default 0
+);
+insert into threads (id) values ('target-thread');
+"#,
+            )
+            .expect("seed state db");
+        drop(connection);
+
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            "target-thread",
+            &ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("hi".to_string()),
+                updated_at: Some(1_777_038_485),
+                updated_at_ms: None,
+                session_index_updated_at: Some("2026-04-24T13:48:05.018117Z".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let row = connection
+            .query_row(
+                "select title, first_user_message, has_user_event, updated_at from threads where id = 'target-thread'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("query target row");
+        assert_eq!(
+            row,
+            ("Greet user".to_string(), "hi".to_string(), 1, 1_777_038_485)
+        );
+
+        let index =
+            fs::read_to_string(codex_home.join("session_index.jsonl")).expect("read session index");
+        assert!(index.contains("\"id\":\"target-thread\""));
+        assert!(index.contains("\"thread_name\":\"Greet user\""));
+        assert!(index.contains("\"updated_at\":\"2026-04-24T13:48:05.018117Z\""));
+    }
+
+    #[test]
+    fn publish_thread_sidebar_metadata_inserts_missing_state_row_for_imported_thread() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        let target_thread_id = "target-thread-local";
+        let rollout_path = sessions.join(format!("rollout-{target_thread_id}.jsonl"));
+        fs::write(&rollout_path, "{}\n").expect("write rollout");
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    updated_at_ms integer,
+    source text not null,
+    model_provider text not null,
+    cwd text not null,
+    title text not null,
+    first_user_message text not null default '',
+    sandbox_policy text not null,
+    approval_mode text not null,
+    tokens_used integer not null default 0,
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        drop(connection);
+
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            target_thread_id,
+            &ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("hi".to_string()),
+                updated_at: Some(1_777_038_485),
+                updated_at_ms: None,
+                session_index_updated_at: Some("2026-04-24T13:48:05.018117Z".to_string()),
+                source: Some("vscode".to_string()),
+                model_provider: Some("openai".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                sandbox_policy: Some("workspace-write".to_string()),
+                approval_mode: Some("on-request".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let row = connection
+            .query_row(
+                "select title, first_user_message, has_user_event, archived, rollout_path, source, cwd, approval_mode from threads where id = ?1",
+                [target_thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .expect("query inserted target row");
+        assert_eq!(row.0, "Greet user");
+        assert_eq!(row.1, "hi");
+        assert_eq!(row.2, 1);
+        assert_eq!(row.3, 0);
+        assert_eq!(row.4, rollout_path.display().to_string());
+        assert_eq!(row.5, "vscode");
+        assert_eq!(row.6, "/tmp/project");
+        assert_eq!(row.7, "on-request");
+    }
+
+    #[test]
+    fn publish_thread_sidebar_metadata_derives_user_preview_from_rollout() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        let target_thread_id = "target-thread-local";
+        let rollout_path = sessions.join(format!("rollout-{target_thread_id}.jsonl"));
+        fs::write(
+            &rollout_path,
+            serde_json::to_string(&json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi from rollout"}],
+                }
+            }))
+            .expect("serialize rollout")
+                + "\n",
+        )
+        .expect("write rollout");
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    source text not null,
+    model_provider text not null,
+    cwd text not null,
+    title text not null,
+    first_user_message text not null default '',
+    sandbox_policy text not null,
+    approval_mode text not null,
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        drop(connection);
+
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            target_thread_id,
+            &ThreadHandoffMetadata {
+                updated_at: Some(1_777_038_485),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let row = connection
+            .query_row(
+                "select title, first_user_message, has_user_event from threads where id = ?1",
+                [target_thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("query inserted target row");
+        assert_eq!(row.0, "hi from rollout");
+        assert_eq!(row.1, "hi from rollout");
+        assert_eq!(row.2, 1);
     }
 
     #[test]
@@ -5258,7 +6883,7 @@ mod tests {
                 watermark: Some("w1".to_string()),
                 cwd: None,
                 items: vec![],
-                continue_prompt: None,
+                metadata: ThreadHandoffMetadata::default(),
             },
             ThreadHandoff {
                 source_thread_id: "s2".to_string(),
@@ -5266,7 +6891,7 @@ mod tests {
                 watermark: Some("w2".to_string()),
                 cwd: None,
                 items: vec![],
-                continue_prompt: None,
+                metadata: ThreadHandoffMetadata::default(),
             },
         ];
 
@@ -5282,9 +6907,6 @@ mod tests {
                 Err(anyhow!("Failed to start thread"))
             }
             fn inject_items(&self, _id: &str, _items: Vec<Value>) -> Result<()> {
-                Ok(())
-            }
-            fn start_turn(&self, _id: &str, _input: &str, _cwd: Option<&str>) -> Result<()> {
                 Ok(())
             }
         }
@@ -9584,6 +11206,45 @@ insert into threads (id, rollout_path, updated_at, archived) values
 
     #[test]
     fn map_thread_item_to_response_item_converts_user_and_agent_messages() {
+        let message_user_item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "hello message"
+                }
+            ]
+        });
+        let mapped_message_user = map_thread_item_to_response_item(&message_user_item).unwrap();
+        assert_eq!(mapped_message_user["type"], "message");
+        assert_eq!(mapped_message_user["role"], "user");
+        assert_eq!(mapped_message_user["content"][0]["text"], "hello message");
+        assert_eq!(mapped_message_user["content"][0]["type"], "input_text");
+
+        let message_assistant_item = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hello assistant"
+                }
+            ]
+        });
+        let mapped_message_assistant =
+            map_thread_item_to_response_item(&message_assistant_item).unwrap();
+        assert_eq!(mapped_message_assistant["type"], "message");
+        assert_eq!(mapped_message_assistant["role"], "assistant");
+        assert_eq!(
+            mapped_message_assistant["content"][0]["text"],
+            "hello assistant"
+        );
+        assert_eq!(
+            mapped_message_assistant["content"][0]["type"],
+            "output_text"
+        );
+
         let user_item = json!({
             "type": "userMessage",
             "content": [
@@ -9694,8 +11355,7 @@ insert into threads (id, rollout_path, updated_at, archived) values
                                 "source_thread_id": "thread-source-1",
                                 "lineage_id": "lineage-source-1",
                                 "cwd": null,
-                                "items": [],
-                                "continue_prompt": "continue"
+                                "items": []
                             }
                         ]
                     }

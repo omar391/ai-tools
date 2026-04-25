@@ -94,18 +94,27 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 )?,
             )?
         }
-        Some("next") => {
-            let result = run_shared_next(None, cli_progress_callback())?;
-            let output = match result {
-                NextResult::Rotated { message, .. }
-                | NextResult::Stayed { message, .. }
-                | NextResult::Created {
-                    output: message, ..
-                } => message,
-            };
-            write_output(writer, &output)?
+        Some("next") => match parse_optional_next_selector(&args[1..])? {
+            Some(selector) => write_output(
+                writer,
+                &run_shared_set(None, &selector, cli_progress_callback())?,
+            )?,
+            None => {
+                let result = run_shared_next(None, cli_progress_callback())?;
+                let output = match result {
+                    NextResult::Rotated { message, .. }
+                    | NextResult::Stayed { message, .. }
+                    | NextResult::Created {
+                        output: message, ..
+                    } => message,
+                };
+                write_output(writer, &output)?
+            }
+        },
+        Some("prev") => {
+            parse_no_args("prev", &args[1..])?;
+            write_output(writer, &run_shared_prev(None, None)?)?
         }
-        Some("prev") => write_output(writer, &run_shared_prev(None, None)?)?,
         Some("set") => write_output(
             writer,
             &run_shared_set(
@@ -182,8 +191,14 @@ fn try_run_via_daemon(command: Option<&str>, args: &[String]) -> Result<Option<S
         Some("create") => Some(InvokeAction::Create {
             options: parse_public_create_invocation(args)?,
         }),
-        Some("next") => Some(InvokeAction::Next),
-        Some("prev") => Some(InvokeAction::Prev),
+        Some("next") => match parse_optional_next_selector(args)? {
+            Some(selector) => Some(InvokeAction::Set { selector }),
+            None => Some(InvokeAction::Next),
+        },
+        Some("prev") => {
+            parse_no_args("prev", args)?;
+            Some(InvokeAction::Prev)
+        }
         Some("set") => Some(InvokeAction::Set {
             selector: parse_set_selector(args)?.to_string(),
         }),
@@ -1086,6 +1101,29 @@ fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
+fn parse_no_args(command: &str, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!("Usage: codex-rotate {command}"))
+}
+
+fn parse_optional_next_selector(args: &[String]) -> Result<Option<String>> {
+    if args.len() > 1
+        || args
+            .first()
+            .map(|arg| arg.starts_with('-'))
+            .unwrap_or(false)
+    {
+        return Err(anyhow!("Usage: codex-rotate next [selector]"));
+    }
+    Ok(args
+        .first()
+        .map(|arg| arg.trim())
+        .filter(|arg| !arg.is_empty())
+        .map(ToOwned::to_owned))
+}
+
 fn parse_set_selector(args: &[String]) -> Result<&str> {
     if args.len() != 1 || args[0].starts_with('-') {
         return Err(anyhow!("Usage: codex-rotate set <selector>"));
@@ -1369,7 +1407,7 @@ fn help_text() -> String {
   {CYAN}add{RESET} [alias]      Snapshot current ~/.codex/auth.json into the pool
   {CYAN}create{RESET} [alias]   Reuse a healthy account, or create a new one when needed
   {CYAN}repair-host-history{RESET} --source <selector> [--target <selector> ...|--all] [--apply]
-  {CYAN}next{RESET}             Swap to the next account with usable quota
+  {CYAN}next{RESET} [selector]  Swap to the next account, or a selected target
   {CYAN}prev{RESET}             Swap to the previous account
   {CYAN}set{RESET} <selector>   Swap to the selected account (skip quota/health gating)
   {CYAN}list{RESET}             Show all accounts with cached quota info
@@ -1773,6 +1811,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Usage: codex-rotate set <selector>"));
+    }
+
+    #[test]
+    fn next_parser_accepts_optional_selector() {
+        assert_eq!(parse_optional_next_selector(&[]).expect("next"), None);
+        assert_eq!(
+            parse_optional_next_selector(&["acct-123".to_string()]).expect("next selector"),
+            Some("acct-123".to_string())
+        );
+        let error = parse_optional_next_selector(&["acct-123".to_string(), "extra".to_string()])
+            .expect_err("next should reject extra args");
+        assert!(error
+            .to_string()
+            .contains("Usage: codex-rotate next [selector]"));
     }
 
     #[test]
@@ -2261,6 +2313,13 @@ mod tests {
                 },
             ),
             (Some("next"), Vec::new(), InvokeAction::Next),
+            (
+                Some("next"),
+                vec!["acct-456".to_string()],
+                InvokeAction::Set {
+                    selector: "acct-456".to_string(),
+                },
+            ),
             (Some("prev"), Vec::new(), InvokeAction::Prev),
             (
                 Some("set"),

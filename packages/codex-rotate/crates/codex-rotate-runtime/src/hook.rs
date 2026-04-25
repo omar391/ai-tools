@@ -177,10 +177,11 @@ const timeout = setTimeout(() => {{
 }}, 8000);
 const handler = (event) => {{
   const data = event.data;
-  if (data && data.type === "mcp-response" && data.message && data.message.id === request.request.id) {{
+  const message = data && data.type === "mcp-response" ? (data.message ?? data.response) : null;
+  if (message && message.id === request.request.id) {{
     clearTimeout(timeout);
     window.removeEventListener("message", handler);
-    resolve({{ timeout: false, result: data.message.result }});
+    resolve({{ timeout: false, result: message.result }});
   }}
 }};
 window.addEventListener("message", handler);

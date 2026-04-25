@@ -2513,7 +2513,11 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
 fn normalized_persona(entry: &AccountEntry) -> PersonaEntry {
     let mut hasher = DefaultHasher::new();
     entry.account_id.hash(&mut hasher);
-    entry.label.hash(&mut hasher);
+    entry
+        .alias
+        .as_deref()
+        .unwrap_or(entry.label.as_str())
+        .hash(&mut hasher);
     let persona_hash = hasher.finish();
     let persona_id = format!(
         "persona-{}-{:08x}",

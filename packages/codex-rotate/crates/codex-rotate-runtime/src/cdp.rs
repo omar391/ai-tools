@@ -3,7 +3,9 @@ use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
@@ -80,9 +82,17 @@ pub fn invalidate_local_codex_connection(port: u16, clear_target_url: bool) {
 }
 
 fn connect_to_debugger_url(websocket_debugger_url: &str) -> Result<CdpConnection> {
-    let (socket, _) = connect(websocket_debugger_url).with_context(|| {
+    let (mut socket, _) = connect(websocket_debugger_url).with_context(|| {
         format!("Failed to connect to Codex renderer at {websocket_debugger_url}.")
     })?;
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .context("Failed to configure CDP socket read timeout.")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .context("Failed to configure CDP socket write timeout.")?;
+    }
 
     let mut connection = CdpConnection { socket, next_id: 0 };
     let _: Value = connection.send_command("Runtime.enable", json!({}))?;
@@ -92,7 +102,7 @@ fn connect_to_debugger_url(websocket_debugger_url: &str) -> Result<CdpConnection
 fn local_codex_page_websocket_url(port: u16) -> Result<String> {
     let page = list_cdp_targets(port)?
         .into_iter()
-        .find(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
+        .find(|target| target.target_type == "page" && is_codex_app_page_url(&target.url))
         .ok_or_else(|| anyhow!("No Codex page target is available on port {port}."))?;
     Ok(page.websocket_debugger_url)
 }
@@ -100,7 +110,11 @@ fn local_codex_page_websocket_url(port: u16) -> Result<String> {
 fn has_codex_page_target(targets: &[CdpTargetInfo]) -> bool {
     targets
         .iter()
-        .any(|target| target.target_type == "page" && target.url.starts_with("app://-/index.html"))
+        .any(|target| target.target_type == "page" && is_codex_app_page_url(&target.url))
+}
+
+fn is_codex_app_page_url(url: &str) -> bool {
+    url.starts_with("app://-/")
 }
 
 fn ensure_shared_connection(
@@ -160,6 +174,9 @@ impl CdpConnection {
                 "awaitPromise": true,
             }),
         )?;
+        if let Some(exception) = result.get("exceptionDetails") {
+            return Err(anyhow!("CDP evaluation failed: {}", exception));
+        }
         let value = result
             .get("result")
             .and_then(|result| result.get("value"))
@@ -173,6 +190,48 @@ impl CdpConnection {
             "Page.reload",
             json!({
                 "ignoreCache": ignore_cache,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub fn navigate_page(&mut self, url: &str) -> Result<()> {
+        let _: Value = self.send_command(
+            "Page.navigate",
+            json!({
+                "url": url,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_text(&mut self, text: &str) -> Result<()> {
+        let _: Value = self.send_command(
+            "Input.insertText",
+            json!({
+                "text": text,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub fn dispatch_key_event(
+        &mut self,
+        event_type: &str,
+        key: &str,
+        code: &str,
+        windows_virtual_key_code: i64,
+        modifiers: i64,
+    ) -> Result<()> {
+        let _: Value = self.send_command(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": event_type,
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": windows_virtual_key_code,
+                "nativeVirtualKeyCode": windows_virtual_key_code,
+                "modifiers": modifiers,
             }),
         )?;
         Ok(())
@@ -194,8 +253,19 @@ impl CdpConnection {
             .send(Message::Text(payload.to_string()))
             .context("Failed to send CDP request.")?;
 
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let message = self.socket.read().context("Failed to read CDP response.")?;
+            let message = match self.socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(error) => return Err(error).context("Failed to read CDP response."),
+            };
             let text = match message {
                 Message::Text(text) => text,
                 Message::Binary(bytes) => String::from_utf8(bytes)
@@ -272,6 +342,10 @@ mod tests {
         assert!(has_codex_page_target(&[
             target("page", "https://example.com"),
             target("page", "app://-/index.html#/threads/abc"),
+        ]));
+        assert!(has_codex_page_target(&[
+            target("page", "https://example.com"),
+            target("page", "app://-/local/thread-123"),
         ]));
     }
 }
