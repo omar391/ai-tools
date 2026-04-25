@@ -367,6 +367,21 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
             Ok(false) => {}
             Err(error) => daemon.set_error_message(format!("daemon refresh failed: {error}")),
         }
+        match should_defer_background_watch_tick(&daemon) {
+            Ok(Some(reason)) => {
+                if reason.should_publish_message() {
+                    daemon.set_progress_message(reason.message());
+                }
+                sleep_until_next_watch_tick(&daemon);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                daemon.set_error_message(format!("watch activity guard failed: {error}"));
+                sleep_until_next_watch_tick(&daemon);
+                continue;
+            }
+        }
         let progress_daemon = daemon.clone();
         let progress: Arc<dyn Fn(String) + Send + Sync> =
             Arc::new(move |message| progress_daemon.set_progress_message(message));
@@ -381,6 +396,63 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
         daemon.set_next_tick(next_tick_label(interval));
         thread::sleep(interval);
     });
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackgroundWatchDeferReason {
+    InvokeInFlight,
+    ActiveCodexThreads(usize),
+}
+
+impl BackgroundWatchDeferReason {
+    fn should_publish_message(&self) -> bool {
+        matches!(self, Self::ActiveCodexThreads(_))
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::InvokeInFlight => {
+                "Auto rotation deferred while a Codex Rotate command is running.".to_string()
+            }
+            Self::ActiveCodexThreads(1) => {
+                "Auto rotation deferred until the active Codex conversation goes idle.".to_string()
+            }
+            Self::ActiveCodexThreads(count) => {
+                format!("Auto rotation deferred until {count} active Codex conversations go idle.")
+            }
+        }
+    }
+}
+
+fn should_defer_background_watch_tick(
+    daemon: &SharedDaemon,
+) -> Result<Option<BackgroundWatchDeferReason>> {
+    if daemon.has_in_flight_invocations() {
+        return Ok(Some(BackgroundWatchDeferReason::InvokeInFlight));
+    }
+    let active_thread_count = active_managed_codex_thread_ids(Some(managed_codex_port()))?.len();
+    Ok(background_watch_defer_reason(false, active_thread_count))
+}
+
+fn background_watch_defer_reason(
+    has_in_flight_invocation: bool,
+    active_thread_count: usize,
+) -> Option<BackgroundWatchDeferReason> {
+    if has_in_flight_invocation {
+        return Some(BackgroundWatchDeferReason::InvokeInFlight);
+    }
+    if active_thread_count > 0 {
+        return Some(BackgroundWatchDeferReason::ActiveCodexThreads(
+            active_thread_count,
+        ));
+    }
+    None
+}
+
+fn sleep_until_next_watch_tick(daemon: &SharedDaemon) {
+    let interval = next_watch_interval(daemon.snapshot().current_quota_percent);
+    daemon.set_next_tick(next_tick_label(interval));
+    thread::sleep(interval);
 }
 
 fn spawn_local_source_refresh_loop(daemon: SharedDaemon) {
@@ -1813,6 +1885,38 @@ mod tests {
             maybe_refresh_local_daemon_process(Some(&daemon), false).expect("refresh result");
 
         assert!(!result);
+    }
+
+    #[test]
+    fn background_watch_defer_reason_prioritizes_in_flight_invocation() {
+        assert_eq!(
+            background_watch_defer_reason(true, 2),
+            Some(BackgroundWatchDeferReason::InvokeInFlight)
+        );
+    }
+
+    #[test]
+    fn background_watch_defer_reason_blocks_active_codex_threads() {
+        assert_eq!(
+            background_watch_defer_reason(false, 2),
+            Some(BackgroundWatchDeferReason::ActiveCodexThreads(2))
+        );
+    }
+
+    #[test]
+    fn background_watch_defer_reason_allows_idle_watch_tick() {
+        assert_eq!(background_watch_defer_reason(false, 0), None);
+    }
+
+    #[test]
+    fn background_watch_defer_check_skips_thread_probe_for_active_invoke() {
+        let daemon = SharedDaemon::new();
+        let _guard = InvocationGuard::new(daemon.in_flight_invocations.clone());
+
+        let reason = should_defer_background_watch_tick(&daemon)
+            .expect("active invoke should not require thread probe");
+
+        assert_eq!(reason, Some(BackgroundWatchDeferReason::InvokeInFlight));
     }
 
     #[test]
