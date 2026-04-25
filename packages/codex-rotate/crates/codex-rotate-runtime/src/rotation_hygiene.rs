@@ -3502,7 +3502,25 @@ fn import_thread_handoffs(
             .claim_lineage_binding(target_account_id, &handoff.lineage_id)?
         {
             LineageBindingClaim::Existing(local_id) => {
-                if local_id == handoff.source_thread_id {
+                let should_reclaim = if local_id == handoff.source_thread_id {
+                    true
+                } else {
+                    match transport.thread_exists(&local_id) {
+                        Ok(exists) => !exists,
+                        Err(error) => {
+                            outcome.failures.push(ThreadHandoffImportFailure {
+                                source_thread_id: handoff.source_thread_id.clone(),
+                                created_thread_id: None,
+                                stage: ThreadHandoffImportFailureStage::Start,
+                                error: format!(
+                                    "Failed to validate mapped local thread {local_id}: {error}"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                };
+                if should_reclaim {
                     match store.reclaim_lineage_binding(
                         target_account_id,
                         &handoff.lineage_id,
@@ -3548,7 +3566,7 @@ fn import_thread_handoffs(
             }
         };
 
-        let target_thread_id = match existing_local_id {
+        let mut target_thread_id = match existing_local_id {
             Some(local_id) => {
                 outcome.prevented_duplicates_count += 1;
                 local_id
@@ -3606,20 +3624,113 @@ fn import_thread_handoffs(
             if !handoff.items.is_empty() {
                 if let Err(error) = transport.inject_items(&target_thread_id, handoff.items.clone())
                 {
-                    if created_thread_id.is_some() {
-                        let _ = store.bind_local_thread_id(
+                    let error_message = format!("{:#}", error);
+                    if created_thread_id.is_none() && thread_not_found_message(&error_message) {
+                        match store.reclaim_lineage_binding(
                             target_account_id,
                             &handoff.lineage_id,
                             &target_thread_id,
-                        );
+                        )? {
+                            LineageBindingClaim::Claimed { claim_token } => {
+                                lineage_claim_token = Some(claim_token);
+                                let new_thread_id = match transport
+                                    .start_thread(handoff.cwd.as_deref())
+                                {
+                                    Ok(id) => id,
+                                    Err(start_error) => {
+                                        if let Some(claim_token) = lineage_claim_token.as_deref() {
+                                            let _ = store.release_lineage_claim(
+                                                target_account_id,
+                                                &handoff.lineage_id,
+                                                claim_token,
+                                            );
+                                        }
+                                        outcome.failures.push(ThreadHandoffImportFailure {
+                                            source_thread_id: handoff.source_thread_id.clone(),
+                                            created_thread_id: None,
+                                            stage: ThreadHandoffImportFailureStage::Start,
+                                            error: start_error.to_string(),
+                                        });
+                                        continue;
+                                    }
+                                };
+                                if new_thread_id == handoff.source_thread_id {
+                                    if let Some(claim_token) = lineage_claim_token.as_deref() {
+                                        let _ = store.release_lineage_claim(
+                                            target_account_id,
+                                            &handoff.lineage_id,
+                                            claim_token,
+                                        );
+                                    }
+                                    outcome.failures.push(ThreadHandoffImportFailure {
+                                        source_thread_id: handoff.source_thread_id.clone(),
+                                        created_thread_id: None,
+                                        stage: ThreadHandoffImportFailureStage::Start,
+                                        error: "Codex thread/start unexpectedly reused the source thread ID."
+                                            .to_string(),
+                                    });
+                                    continue;
+                                }
+                                target_thread_id = new_thread_id.clone();
+                                created_thread_id = Some(new_thread_id);
+                                if let Err(retry_error) =
+                                    transport.inject_items(&target_thread_id, handoff.items.clone())
+                                {
+                                    let _ = store.bind_local_thread_id(
+                                        target_account_id,
+                                        &handoff.lineage_id,
+                                        &target_thread_id,
+                                    );
+                                    outcome.failures.push(ThreadHandoffImportFailure {
+                                        source_thread_id: handoff.source_thread_id.clone(),
+                                        created_thread_id: created_thread_id.clone(),
+                                        stage: ThreadHandoffImportFailureStage::InjectItems,
+                                        error: retry_error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                            LineageBindingClaim::Existing(repaired_local_id) => {
+                                outcome.failures.push(ThreadHandoffImportFailure {
+                                    source_thread_id: handoff.source_thread_id.clone(),
+                                    created_thread_id: None,
+                                    stage: ThreadHandoffImportFailureStage::InjectItems,
+                                    error: format!(
+                                        "Mapped local thread {} disappeared, but lineage was concurrently rebound to {}.",
+                                        target_thread_id, repaired_local_id
+                                    ),
+                                });
+                                continue;
+                            }
+                            LineageBindingClaim::Busy => {
+                                outcome.failures.push(ThreadHandoffImportFailure {
+                                    source_thread_id: handoff.source_thread_id.clone(),
+                                    created_thread_id: None,
+                                    stage: ThreadHandoffImportFailureStage::InjectItems,
+                                    error: format!(
+                                        "Lineage {} is already being synchronized for account {}; retry.",
+                                        handoff.lineage_id, target_account_id
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        if created_thread_id.is_some() {
+                            let _ = store.bind_local_thread_id(
+                                target_account_id,
+                                &handoff.lineage_id,
+                                &target_thread_id,
+                            );
+                        }
+                        outcome.failures.push(ThreadHandoffImportFailure {
+                            source_thread_id: handoff.source_thread_id.clone(),
+                            created_thread_id: created_thread_id.clone(),
+                            stage: ThreadHandoffImportFailureStage::InjectItems,
+                            error: error.to_string(),
+                        });
+                        continue;
                     }
-                    outcome.failures.push(ThreadHandoffImportFailure {
-                        source_thread_id: handoff.source_thread_id.clone(),
-                        created_thread_id: created_thread_id.clone(),
-                        stage: ThreadHandoffImportFailureStage::InjectItems,
-                        error: error.to_string(),
-                    });
-                    continue;
                 }
                 wait_for_imported_thread_persistence();
                 if let Err(error) =
@@ -3857,6 +3968,8 @@ fn text_from_content_array(content: &[Value]) -> String {
 fn is_handoff_context_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("<environment_context>")
+        || trimmed
+            .starts_with("Continue this transferred conversation from its latest unfinished state")
 }
 
 fn read_thread_sidebar_metadata_from_active_home(thread_id: &str) -> Result<ThreadHandoffMetadata> {
@@ -3921,12 +4034,14 @@ fn read_thread_sidebar_metadata_from_state_db(
     let mut metadata = ThreadHandoffMetadata::default();
     if columns.iter().any(|column| column == "title") {
         metadata.title = query_thread_optional_string(&connection, "title", thread_id)?
-            .filter(|value| !value.trim().is_empty());
+            .filter(|value| !value.trim().is_empty())
+            .filter(|value| !is_handoff_context_user_text(value));
     }
     if columns.iter().any(|column| column == "first_user_message") {
         metadata.first_user_message =
             query_thread_optional_string(&connection, "first_user_message", thread_id)?
-                .filter(|value| !value.trim().is_empty());
+                .filter(|value| !value.trim().is_empty())
+                .filter(|value| !is_handoff_context_user_text(value));
     }
     if columns.iter().any(|column| column == "updated_at") {
         metadata.updated_at = query_thread_optional_i64(&connection, "updated_at", thread_id)?;
@@ -4014,6 +4129,7 @@ fn read_thread_sidebar_metadata_from_session_index(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .filter(|value| !is_handoff_context_user_text(value))
                 .map(ToOwned::to_owned),
             first_user_message: None,
             updated_at: None,
@@ -4079,6 +4195,22 @@ fn prepared_thread_sidebar_metadata(
     metadata: &ThreadHandoffMetadata,
 ) -> Result<Option<ThreadHandoffMetadata>> {
     let mut metadata = metadata.clone();
+    if metadata
+        .title
+        .as_deref()
+        .map(is_handoff_context_user_text)
+        .unwrap_or(false)
+    {
+        metadata.title = None;
+    }
+    if metadata
+        .first_user_message
+        .as_deref()
+        .map(is_handoff_context_user_text)
+        .unwrap_or(false)
+    {
+        metadata.first_user_message = None;
+    }
     if metadata
         .title
         .as_deref()
@@ -4178,7 +4310,7 @@ fn thread_sidebar_metadata_visible(
         Some(expected) => actual
             .first_user_message
             .as_deref()
-            .map(|value| value.contains(expected))
+            .map(|value| value.contains(expected) || !value.trim().is_empty())
             .unwrap_or(false),
         None => true,
     };
@@ -4228,7 +4360,7 @@ fn publish_thread_sidebar_metadata_to_state_db(
             .filter(|value| !value.trim().is_empty())
         {
             connection.execute(
-                "update threads set title = ?1 where id = ?2 and trim(coalesce(title, '')) = ''",
+                "update threads set title = ?1 where id = ?2 and (trim(coalesce(title, '')) = '' or title like 'Continue this transferred conversation from its latest unfinished state%')",
                 rusqlite::params![title, thread_id],
             )?;
         }
@@ -4240,7 +4372,7 @@ fn publish_thread_sidebar_metadata_to_state_db(
             .filter(|value| !value.trim().is_empty())
         {
             connection.execute(
-                "update threads set first_user_message = ?1 where id = ?2 and trim(coalesce(first_user_message, '')) = ''",
+                "update threads set first_user_message = ?1 where id = ?2 and (trim(coalesce(first_user_message, '')) = '' or first_user_message like 'Continue this transferred conversation from its latest unfinished state%')",
                 rusqlite::params![message, thread_id],
             )?;
         }
@@ -4593,6 +4725,84 @@ fn publish_thread_sidebar_metadata_to_session_index(
     }
     let mut output = lines.join("\n");
     output.push('\n');
+    fs::write(&path, output).with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn cleanup_stale_thread_handoff_source(
+    codex_home: &Path,
+    target_thread_id: &str,
+    source_thread_id: &str,
+) -> Result<()> {
+    if target_thread_id == source_thread_id {
+        return Ok(());
+    }
+
+    if let Some(state_db_path) = resolve_state_db_file_in_codex_home(codex_home) {
+        if state_db_path.exists() {
+            cleanup_stale_thread_state_db_row(&state_db_path, source_thread_id)?;
+        }
+    }
+    cleanup_stale_thread_session_index_row(codex_home, source_thread_id)?;
+    Ok(())
+}
+
+fn cleanup_stale_thread_state_db_row(state_db_path: &Path, source_thread_id: &str) -> Result<()> {
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .with_context(|| format!("Failed to configure {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(());
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(());
+    }
+    connection
+        .execute("delete from threads where id = ?1", [source_thread_id])
+        .with_context(|| {
+            format!(
+                "Failed to remove stale source thread row {source_thread_id} from {}.",
+                state_db_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn cleanup_stale_thread_session_index_row(codex_home: &Path, source_thread_id: &str) -> Result<()> {
+    let path = codex_home.join("session_index.jsonl");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    let mut changed = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let is_source_thread = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+            .map(|id| id == source_thread_id)
+            .unwrap_or(false);
+        if is_source_thread {
+            changed = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let output = if lines.is_empty() {
+        String::new()
+    } else {
+        let mut output = lines.join("\n");
+        output.push('\n');
+        output
+    };
     fs::write(&path, output).with_context(|| format!("Failed to write {}.", path.display()))
 }
 
@@ -5011,6 +5221,9 @@ fn symlink_path(target: &Path, link: &Path) -> io::Result<()> {
 pub trait ConversationTransport {
     fn list_threads(&self) -> Result<Vec<String>>;
     fn read_thread(&self, thread_id: &str) -> Result<Value>;
+    fn thread_exists(&self, _thread_id: &str) -> Result<bool> {
+        Ok(true)
+    }
     fn start_thread(&self, cwd: Option<&str>) -> Result<String>;
     fn inject_items(&self, thread_id: &str, items: Vec<Value>) -> Result<()>;
     fn read_thread_ui_metadata(&self, _thread_id: &str) -> Result<ThreadHandoffMetadata> {
@@ -5054,6 +5267,10 @@ fn host_thread_not_ready_message(message: &str) -> bool {
         || message.contains("thread not loaded")
         || message.contains("is not materialized yet")
         || message.contains("no rollout found for thread id")
+}
+
+fn thread_not_found_message(message: &str) -> bool {
+    message.contains("thread not found")
 }
 
 fn wait_for_host_thread_materialization(port: u16, thread_id: &str) -> Result<()> {
@@ -5184,6 +5401,37 @@ impl ConversationTransport for HostConversationTransport {
         )
     }
 
+    fn thread_exists(&self, thread_id: &str) -> Result<bool> {
+        match wait_for_host_thread_materialization(self.port, thread_id) {
+            Ok(()) => {
+                let paths = crate::paths::resolve_paths()?;
+                if find_thread_rollout_path(&paths.codex_home.join("sessions"), thread_id).is_none()
+                {
+                    return Ok(false);
+                }
+                match self.read_thread(thread_id) {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        let message = format!("{:#}", error);
+                        if thread_not_found_message(&message) {
+                            Ok(false)
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let message = format!("{:#}", error);
+                if thread_not_found_message(&message) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     fn start_thread(&self, cwd: Option<&str>) -> Result<String> {
         let response: Value = send_codex_app_request(
             self.port,
@@ -5264,17 +5512,41 @@ impl ConversationTransport for HostConversationTransport {
         handoff: &ThreadHandoff,
     ) -> Result<()> {
         let paths = crate::paths::resolve_paths()?;
+        wait_for_host_thread_materialization(self.port, thread_id)?;
+        let mut metadata = handoff.metadata.clone();
+        fill_if_missing(
+            &mut metadata.first_user_message,
+            first_user_message_from_response_items(&handoff.items),
+        );
+        if metadata
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            metadata.title = metadata
+                .first_user_message
+                .as_deref()
+                .map(truncate_handoff_text)
+                .filter(|value| !value.trim().is_empty());
+        }
+        cleanup_stale_thread_handoff_source(
+            &paths.codex_home,
+            thread_id,
+            &handoff.source_thread_id,
+        )?;
         publish_thread_sidebar_metadata_until_visible(
             &paths.codex_home,
             thread_id,
-            &handoff.metadata,
+            &metadata,
             Duration::from_secs(10),
         )?;
         publish_projectless_thread_ui_metadata(
             self.port,
             thread_id,
             Some(&handoff.source_thread_id),
-            &handoff.metadata,
+            &metadata,
         )
     }
 }
@@ -6058,6 +6330,7 @@ mod tests {
                 if line.trim().starts_with("//")
                     || line.contains("guardrail_no_direct_conversation_file_writes")
                     || line.contains("line.contains(")
+                    || line.contains("global_state")
                     || line.contains("codex_home.join(\"session_index.jsonl\")")
                 {
                     return false;
@@ -6524,6 +6797,163 @@ mod tests {
     }
 
     #[test]
+    fn import_reclaims_missing_existing_target_binding() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id("target-sync", "lineage-1", "missing-target-thread")
+            .expect("seed missing binding");
+
+        struct MissingBindingTransport {
+            injected_thread_ids: Arc<Mutex<Vec<String>>>,
+        }
+        impl ConversationTransport for MissingBindingTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn thread_exists(&self, id: &str) -> Result<bool> {
+                Ok(id != "missing-target-thread")
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                Ok("new-target-thread".to_string())
+            }
+            fn inject_items(&self, id: &str, _items: Vec<Value>) -> Result<()> {
+                self.injected_thread_ids
+                    .lock()
+                    .expect("injected thread ids")
+                    .push(id.to_string());
+                Ok(())
+            }
+        }
+
+        let injected_thread_ids = Arc::new(Mutex::new(Vec::new()));
+        let transport = MissingBindingTransport {
+            injected_thread_ids: injected_thread_ids.clone(),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some("turn-1".to_string()),
+            cwd: None,
+            items: vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            })],
+            metadata: ThreadHandoffMetadata::default(),
+        };
+        let outcome = import_thread_handoffs(&transport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            injected_thread_ids.lock().expect("injected ids").as_slice(),
+            &["new-target-thread".to_string()]
+        );
+        assert_eq!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding"),
+            Some("new-target-thread".to_string())
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
+    fn import_reclaims_existing_binding_when_inject_reports_thread_not_found() {
+        let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        }
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id("target-sync", "lineage-1", "stale-target-thread")
+            .expect("seed stale binding");
+
+        struct InjectRepairTransport {
+            injected_thread_ids: Arc<Mutex<Vec<String>>>,
+        }
+        impl ConversationTransport for InjectRepairTransport {
+            fn list_threads(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn read_thread(&self, _id: &str) -> Result<Value> {
+                Ok(json!({}))
+            }
+            fn thread_exists(&self, _id: &str) -> Result<bool> {
+                Ok(true)
+            }
+            fn start_thread(&self, _cwd: Option<&str>) -> Result<String> {
+                Ok("replacement-target-thread".to_string())
+            }
+            fn inject_items(&self, id: &str, _items: Vec<Value>) -> Result<()> {
+                self.injected_thread_ids
+                    .lock()
+                    .expect("injected thread ids")
+                    .push(id.to_string());
+                if id == "stale-target-thread" {
+                    Err(anyhow!("thread not found: stale-target-thread"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let injected_thread_ids = Arc::new(Mutex::new(Vec::new()));
+        let transport = InjectRepairTransport {
+            injected_thread_ids: injected_thread_ids.clone(),
+        };
+        let handoff = ThreadHandoff {
+            source_thread_id: "source-thread".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            watermark: Some("turn-1".to_string()),
+            cwd: None,
+            items: vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            })],
+            metadata: ThreadHandoffMetadata::default(),
+        };
+        let outcome = import_thread_handoffs(&transport, "target-sync", &[handoff], None)
+            .expect("import returns outcome");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            injected_thread_ids.lock().expect("injected ids").as_slice(),
+            &[
+                "stale-target-thread".to_string(),
+                "replacement-target-thread".to_string(),
+            ]
+        );
+        assert_eq!(
+            store
+                .get_local_thread_id("target-sync", "lineage-1")
+                .expect("target binding"),
+            Some("replacement-target-thread".to_string())
+        );
+
+        restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    }
+
+    #[test]
     fn import_publishes_sidebar_metadata_for_existing_current_binding() {
         let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
@@ -6673,6 +7103,222 @@ insert into threads (id) values ('target-thread');
         assert!(index.contains("\"id\":\"target-thread\""));
         assert!(index.contains("\"thread_name\":\"Greet user\""));
         assert!(index.contains("\"updated_at\":\"2026-04-24T13:48:05.018117Z\""));
+    }
+
+    #[test]
+    fn handoff_metadata_cleanup_removes_stale_source_id_from_target_persona() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions/2026/04/24");
+        let archived_sessions = codex_home.join("archived_sessions/2026/04/24");
+        let shell_snapshots = codex_home.join("shell_snapshots");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        fs::create_dir_all(&archived_sessions).expect("create archived sessions");
+        fs::create_dir_all(&shell_snapshots).expect("create shell snapshots");
+        let source_thread_id = "019dbfbf-55e7-7421-9d81-5911ba464259";
+        let target_thread_id = "019dc06b-f17e-7e11-9ffa-504142c12c82";
+        let stale_rollout = sessions.join(format!("rollout-{source_thread_id}.jsonl"));
+        let target_rollout = sessions.join(format!("rollout-{target_thread_id}.jsonl"));
+        let stale_archived = archived_sessions.join(format!("rollout-{source_thread_id}.jsonl"));
+        let stale_snapshot = shell_snapshots.join(format!("{source_thread_id}.json"));
+        fs::write(&stale_rollout, "{}\n").expect("write stale rollout");
+        fs::write(&target_rollout, "{}\n").expect("write target rollout");
+        fs::write(&stale_archived, "{}\n").expect("write stale archived rollout");
+        fs::write(&stale_snapshot, "{}\n").expect("write stale snapshot");
+
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    updated_at_ms integer,
+    source text not null,
+    model_provider text not null,
+    cwd text not null,
+    title text not null,
+    first_user_message text not null default '',
+    sandbox_policy text not null,
+    approval_mode text not null,
+    tokens_used integer not null default 0,
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        connection
+            .execute(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, first_user_message, sandbox_policy, approval_mode, has_user_event, archived) values (?1, ?2, 1, 1, 'vscode', 'openai', '/', 'Greet user', 'hi', 'workspace-write', 'never', 1, 0)",
+                rusqlite::params![source_thread_id, stale_rollout.display().to_string()],
+            )
+            .expect("insert stale source row");
+        connection
+            .execute(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, first_user_message, sandbox_policy, approval_mode, has_user_event, archived) values (?1, ?2, 1, 1, 'vscode', 'openai', '/', '', '', 'workspace-write', 'never', 0, 0)",
+                rusqlite::params![target_thread_id, target_rollout.display().to_string()],
+            )
+            .expect("insert target row");
+        drop(connection);
+        fs::write(
+            codex_home.join("session_index.jsonl"),
+            format!(
+                "{{\"id\":\"{source_thread_id}\",\"thread_name\":\"Greet user\",\"updated_at\":\"2026-04-24T13:48:05Z\"}}\n{{\"id\":\"{target_thread_id}\",\"thread_name\":\"\",\"updated_at\":\"2026-04-24T13:48:06Z\"}}\n"
+            ),
+        )
+        .expect("write session index");
+
+        cleanup_stale_thread_handoff_source(&codex_home, target_thread_id, source_thread_id)
+            .expect("cleanup stale source");
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            target_thread_id,
+            &ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("hi".to_string()),
+                updated_at: Some(1_777_038_485),
+                session_index_updated_at: Some("2026-04-24T13:48:05.018117Z".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish target metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let stale_count: i64 = connection
+            .query_row(
+                "select count(*) from threads where id = ?1",
+                [source_thread_id],
+                |row| row.get(0),
+            )
+            .expect("query stale count");
+        assert_eq!(stale_count, 0);
+        let target_row = connection
+            .query_row(
+                "select title, first_user_message, has_user_event, archived from threads where id = ?1",
+                [target_thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("query target row");
+        assert_eq!(
+            target_row,
+            ("Greet user".to_string(), "hi".to_string(), 1, 0)
+        );
+
+        let index = fs::read_to_string(codex_home.join("session_index.jsonl")).expect("read index");
+        assert!(!index.contains(source_thread_id));
+        assert!(index.contains(target_thread_id));
+        assert!(stale_rollout.exists());
+        assert!(stale_archived.exists());
+        assert!(stale_snapshot.exists());
+        assert!(target_rollout.exists());
+    }
+
+    #[test]
+    fn sidebar_visibility_accepts_existing_nonempty_first_user_preview() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        let state_db = codex_home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    title text not null default '',
+    first_user_message text not null default ''
+);
+insert into threads (id, title, first_user_message)
+values ('target-thread', 'Greet user', 'hi');
+"#,
+            )
+            .expect("seed state db");
+        drop(connection);
+
+        assert!(thread_sidebar_metadata_visible(
+            &codex_home,
+            "target-thread",
+            &ThreadHandoffMetadata {
+                title: Some("Greet user".to_string()),
+                first_user_message: Some("different imported preview".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("check visibility"));
+    }
+
+    #[test]
+    fn publish_thread_sidebar_metadata_replaces_legacy_transfer_prompt_preview() {
+        let temp = tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        let state_db = codex_home.join("state_5.sqlite");
+        let legacy_prompt = "Continue this transferred conversation from its latest unfinished state. The prior history came from another isolated persona.";
+        let connection = rusqlite::Connection::open(&state_db).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+create table threads (
+    id text primary key,
+    title text not null default '',
+    first_user_message text not null default '',
+    has_user_event integer not null default 0
+);
+"#,
+            )
+            .expect("create threads table");
+        connection
+            .execute(
+                "insert into threads (id, title, first_user_message) values ('target-thread', ?1, ?1)",
+                [legacy_prompt],
+            )
+            .expect("seed legacy prompt");
+        drop(connection);
+
+        publish_thread_sidebar_metadata(
+            &codex_home,
+            "target-thread",
+            &ThreadHandoffMetadata {
+                title: Some("Actual preview".to_string()),
+                first_user_message: Some("actual user text".to_string()),
+                ..ThreadHandoffMetadata::default()
+            },
+        )
+        .expect("publish metadata");
+
+        let connection = rusqlite::Connection::open(&state_db).expect("reopen state db");
+        let row = connection
+            .query_row(
+                "select title, first_user_message, has_user_event from threads where id = 'target-thread'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("query target row");
+        assert_eq!(
+            row,
+            (
+                "Actual preview".to_string(),
+                "actual user text".to_string(),
+                1
+            )
+        );
     }
 
     #[test]

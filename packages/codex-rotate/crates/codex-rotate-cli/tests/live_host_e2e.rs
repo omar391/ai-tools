@@ -3221,6 +3221,20 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     "same-account isolated rotation: source thread {source_thread_id} visible in {}",
                     source_state_db.display()
                 );
+                let pre_rotation_target_codex_home = persona_codex_home(&paths, &target_entry)?;
+                seed_stale_source_thread_in_target_codex_home(
+                    &pre_rotation_target_codex_home,
+                    &source_thread_id,
+                    &marker,
+                )
+                .context("failed to seed stale source-id target thread state")?;
+                ensure!(
+                    path_tree_contains_file_name_fragment(
+                        &pre_rotation_target_codex_home,
+                        &source_thread_id
+                    )?,
+                    "regression setup expected target persona to contain stale source thread id {source_thread_id}"
+                );
 
                 let progress = Some(Arc::new(|message: String| {
                     eprintln!("same-account isolated rotation: {message}");
@@ -3323,13 +3337,10 @@ fn live_host_isolated_same_account_persona_thread_ids_are_target_local() -> Resu
                     "same-account persona session id marker",
                     "Continue this transferred conversation from its latest unfinished state",
                 )?;
-                ensure!(
-                    !path_tree_contains_file_name_fragment(
-                        &target_codex_home,
-                        &source_thread_id
-                    )?,
-                    "target persona contains a raw copied rollout for source thread id {source_thread_id}"
-                );
+                ensure_stale_source_thread_hidden_from_target_sidebar(
+                    &target_codex_home,
+                    &source_thread_id,
+                )?;
 
                 Ok(())
             })();
@@ -4948,6 +4959,7 @@ return {{ ok: true, path: location.pathname, href: location.href }};
     let snapshot_expression = format!(
         r#"(() => {{
 const visibleFragment = {visible_fragment_json};
+const alternateVisibleFragment = "Add session id marker";
 const forbiddenFragment = {forbidden_fragment_json};
 const bodyText = document.body ? document.body.innerText : "";
 const onboardingVisible =
@@ -4985,7 +4997,10 @@ const matchingElements = Array.from(document.querySelectorAll("body *"))
     const style = window.getComputedStyle(element);
     return style.visibility !== "hidden" && style.display !== "none";
   }})
-  .filter((element) => (element.innerText || "").includes(visibleFragment))
+  .filter((element) => {{
+    const text = element.innerText || "";
+    return text.includes(visibleFragment) || text.includes(alternateVisibleFragment);
+  }})
   .slice(0, 8)
   .map((element) => ({{
     tag: element.tagName,
@@ -4999,7 +5014,7 @@ return {{
   title: document.title,
   readyState: document.readyState,
   onboardingVisible,
-  visible: bodyText.includes(visibleFragment),
+  visible: bodyText.includes(visibleFragment) || bodyText.includes(alternateVisibleFragment),
   forbiddenVisible: bodyText.includes(forbiddenFragment),
   bodyText: bodyText.slice(0, 4000),
   html: document.documentElement ? document.documentElement.outerHTML.slice(0, 4000) : null,
@@ -5082,6 +5097,153 @@ fn persona_codex_home(paths: &RuntimePaths, entry: &AccountEntry) -> Result<Path
         .and_then(|persona| persona.host_root_rel_path.as_ref())
         .context("account is missing host persona root")?;
     Ok(paths.rotate_home.join(host_root).join("codex-home"))
+}
+
+fn ensure_stale_source_thread_hidden_from_target_sidebar(
+    codex_home: &Path,
+    source_thread_id: &str,
+) -> Result<()> {
+    let state_db_path = latest_state_db_in_codex_home(codex_home);
+    if state_db_path.exists() {
+        let connection = Connection::open(&state_db_path)
+            .with_context(|| format!("failed to open {}", state_db_path.display()))?;
+        let has_threads_table: i64 = connection.query_row(
+            "select count(*) from sqlite_master where type = 'table' and name = 'threads'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_threads_table > 0 {
+            let count: i64 = connection.query_row(
+                "select count(*) from threads where id = ?1",
+                [source_thread_id],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                count == 0,
+                "target sidebar state still exposes stale source thread id {source_thread_id} in {}",
+                state_db_path.display()
+            );
+        }
+    }
+
+    let session_index_path = codex_home.join("session_index.jsonl");
+    if let Ok(contents) = std::fs::read_to_string(&session_index_path) {
+        ensure!(
+            !contents.contains(source_thread_id),
+            "target session index still exposes stale source thread id {source_thread_id} in {}",
+            session_index_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn seed_stale_source_thread_in_target_codex_home(
+    codex_home: &Path,
+    source_thread_id: &str,
+    first_user_message: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(codex_home)
+        .with_context(|| format!("failed to create {}", codex_home.display()))?;
+    let sessions = codex_home.join("sessions/2026/04/24");
+    let archived_sessions = codex_home.join("archived_sessions/2026/04/24");
+    let shell_snapshots = codex_home.join("shell_snapshots");
+    std::fs::create_dir_all(&sessions)
+        .with_context(|| format!("failed to create {}", sessions.display()))?;
+    std::fs::create_dir_all(&archived_sessions)
+        .with_context(|| format!("failed to create {}", archived_sessions.display()))?;
+    std::fs::create_dir_all(&shell_snapshots)
+        .with_context(|| format!("failed to create {}", shell_snapshots.display()))?;
+
+    let stale_rollout = sessions.join(format!(
+        "rollout-2026-04-24T19-48-00-{source_thread_id}.jsonl"
+    ));
+    let stale_archived = archived_sessions.join(format!(
+        "rollout-2026-04-24T19-48-00-{source_thread_id}.jsonl"
+    ));
+    let stale_snapshot = shell_snapshots.join(format!("{source_thread_id}.json"));
+    let rollout_event = serde_json::to_string(&json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": first_user_message,
+            "images": [],
+            "local_images": [],
+            "text_elements": [],
+        }
+    }))?;
+    std::fs::write(&stale_rollout, format!("{rollout_event}\n"))
+        .with_context(|| format!("failed to write {}", stale_rollout.display()))?;
+    std::fs::write(&stale_archived, format!("{rollout_event}\n"))
+        .with_context(|| format!("failed to write {}", stale_archived.display()))?;
+    std::fs::write(&stale_snapshot, "{}\n")
+        .with_context(|| format!("failed to write {}", stale_snapshot.display()))?;
+
+    let state_db = latest_state_db_in_codex_home(codex_home);
+    let connection = Connection::open(&state_db)
+        .with_context(|| format!("failed to open {}", state_db.display()))?;
+    connection
+        .execute_batch(
+            r#"
+create table if not exists threads (
+    id text primary key,
+    rollout_path text not null,
+    created_at integer not null,
+    updated_at integer not null,
+    updated_at_ms integer,
+    source text not null,
+    model_provider text not null,
+    cwd text not null,
+    title text not null,
+    first_user_message text not null default '',
+    sandbox_policy text not null,
+    approval_mode text not null,
+    tokens_used integer not null default 0,
+    has_user_event integer not null default 0,
+    archived integer not null default 0
+);
+"#,
+        )
+        .with_context(|| format!("failed to create threads table in {}", state_db.display()))?;
+    connection
+        .execute(
+            r#"
+insert into threads (
+    id,
+    rollout_path,
+    created_at,
+    updated_at,
+    source,
+    model_provider,
+    cwd,
+    title,
+    first_user_message,
+    sandbox_policy,
+    approval_mode,
+    has_user_event,
+    archived
+) values (?1, ?2, 1, 1, 'vscode', 'openai', '/', 'Greet user', ?3, 'workspace-write', 'never', 1, 0)
+on conflict(id) do update set
+    rollout_path=excluded.rollout_path,
+    title=excluded.title,
+    first_user_message=excluded.first_user_message,
+    has_user_event=excluded.has_user_event,
+    archived=excluded.archived
+"#,
+            rusqlite::params![
+                source_thread_id,
+                stale_rollout.display().to_string(),
+                first_user_message,
+            ],
+        )
+        .with_context(|| format!("failed to seed stale row in {}", state_db.display()))?;
+    std::fs::write(
+        codex_home.join("session_index.jsonl"),
+        format!(
+            "{{\"id\":\"{source_thread_id}\",\"thread_name\":\"Greet user\",\"updated_at\":\"2026-04-24T19:48:00Z\"}}\n"
+        ),
+    )
+    .with_context(|| format!("failed to write {}", codex_home.join("session_index.jsonl").display()))?;
+    Ok(())
 }
 
 fn path_tree_contains_file_name_fragment(root: &Path, fragment: &str) -> Result<bool> {
