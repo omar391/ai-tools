@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -119,6 +119,16 @@ const DISABLED_TARGET_ERROR_SNIPPET: &str = "is in a disabled domain and cannot 
 const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
 const PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
 const THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
+const THREAD_ID_METADATA_KEYS: &[&str] = &[
+    "id",
+    "thread_id",
+    "threadId",
+    "threadID",
+    "conversation_id",
+    "conversationId",
+    "local_thread_id",
+    "localThreadId",
+];
 
 #[cfg(test)]
 const LINEAGE_SYNC_CONTRACT: &str = r#"Lineage-sync contract:
@@ -2191,7 +2201,7 @@ fn rotate_next_impl_with_retry(
         }
         debug_pool_drift_state("before_finalize");
         ensure_target_account_still_valid(&prepared)?;
-        sync_host_archive_state_after_import(&prepared)?;
+        sync_host_conversation_snapshot_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
         let _ = translate_and_recover_thread_events_after_rotation(
             &prepared,
@@ -2295,7 +2305,7 @@ fn rotate_prev_impl(
         if let Some(progress) = progress.as_ref() {
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
-        sync_host_archive_state_after_import(&prepared)?;
+        sync_host_conversation_snapshot_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
         let _ = translate_and_recover_thread_events_after_rotation(
             &prepared,
@@ -2375,7 +2385,7 @@ fn rotate_set_impl(
             progress(format!("Activated persona for {}.", prepared.target.label));
         }
         ensure_target_account_still_present(&prepared)?;
-        sync_host_archive_state_after_import(&prepared)?;
+        sync_host_conversation_snapshot_after_import(&prepared)?;
         finalize_rotation_after_import(&prepared, &import_outcome)?;
         let _ = translate_and_recover_thread_events_after_rotation(
             &prepared,
@@ -2574,7 +2584,7 @@ fn activate_host_rotation(
     }
 }
 
-fn sync_host_archive_state_after_import(prepared: &PreparedRotation) -> Result<()> {
+fn sync_host_conversation_snapshot_after_import(prepared: &PreparedRotation) -> Result<()> {
     if current_environment()? != RotationEnvironment::Host {
         return Ok(());
     }
@@ -2595,7 +2605,7 @@ fn sync_host_archive_state_after_import(prepared: &PreparedRotation) -> Result<(
             .as_ref()
             .ok_or_else(|| anyhow!("Target account is missing persona metadata."))?,
     )?;
-    sync_host_persona_thread_archive_state(
+    sync_host_persona_conversation_snapshot(
         &source.codex_home,
         &conversation_sync_identity(&prepared.previous),
         &target.codex_home,
@@ -3103,6 +3113,1139 @@ fn sync_host_persona_thread_archive_state(
         .commit()
         .with_context(|| format!("Failed to commit {}.", target_state_db.display()))?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct HostThreadSnapshot {
+    source_thread_id: String,
+    target_thread_id: String,
+    archived: bool,
+    source_rollout_path: Option<PathBuf>,
+    target_rollout_path: Option<PathBuf>,
+    metadata: ThreadHandoffMetadata,
+    state_row: Option<ThreadStateDbRow>,
+    session_index_entry: Option<Value>,
+}
+
+#[derive(Clone)]
+struct ThreadStateDbSnapshot {
+    db_path: PathBuf,
+    create_sql: Option<String>,
+    rows: BTreeMap<String, ThreadStateDbRow>,
+}
+
+#[derive(Clone)]
+struct ThreadStateDbRow {
+    values: BTreeMap<String, rusqlite::types::Value>,
+}
+
+fn sync_host_persona_conversation_snapshot(
+    source_codex_home: &Path,
+    source_account_id: &str,
+    target_codex_home: &Path,
+    target_account_id: &str,
+    conversation_sync_db_file: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+    if !source_codex_home.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(target_codex_home)
+        .with_context(|| format!("Failed to create {}.", target_codex_home.display()))?;
+
+    let state_snapshot = read_thread_state_db_snapshot(source_codex_home)?;
+    let session_index_entries = read_session_index_entries(source_codex_home)?;
+    let mut source_thread_ids = BTreeSet::new();
+    if let Some(state_snapshot) = state_snapshot.as_ref() {
+        source_thread_ids.extend(state_snapshot.rows.keys().cloned());
+    }
+    source_thread_ids.extend(session_index_entries.keys().cloned());
+
+    if source_thread_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut store = ConversationSyncStore::new(conversation_sync_db_file)?;
+    let mut used_target_thread_ids = BTreeSet::new();
+    if let Some(target_state_db) = resolve_state_db_file_in_codex_home(target_codex_home) {
+        used_target_thread_ids.extend(read_thread_ids_from_state_db(&target_state_db)?);
+    }
+    let mut snapshots = Vec::new();
+
+    for source_thread_id in source_thread_ids {
+        let lineage_id = match store.get_lineage_id(source_account_id, &source_thread_id)? {
+            Some(lineage_id) => lineage_id,
+            None => {
+                store.bind_local_thread_id(
+                    source_account_id,
+                    &source_thread_id,
+                    &source_thread_id,
+                )?;
+                source_thread_id.clone()
+            }
+        };
+        let target_thread_id = match store.get_local_thread_id(target_account_id, &lineage_id)? {
+            Some(local_thread_id) if !is_pending_lineage_claim(&local_thread_id) => {
+                used_target_thread_ids.insert(local_thread_id.clone());
+                local_thread_id
+            }
+            _ => {
+                let local_thread_id = allocate_snapshot_thread_id(
+                    &source_thread_id,
+                    target_account_id,
+                    &lineage_id,
+                    &used_target_thread_ids,
+                );
+                store.bind_local_thread_id(target_account_id, &lineage_id, &local_thread_id)?;
+                used_target_thread_ids.insert(local_thread_id.clone());
+                local_thread_id
+            }
+        };
+
+        let state_row = state_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.rows.get(&source_thread_id).cloned());
+        let mut metadata = state_row
+            .as_ref()
+            .map(thread_metadata_from_state_row)
+            .unwrap_or_default();
+        let session_index_entry = session_index_entries.get(&source_thread_id).cloned();
+        if let Some(entry) = session_index_entry.as_ref() {
+            merge_thread_sidebar_metadata(
+                &mut metadata,
+                thread_metadata_from_session_index_entry(entry),
+            );
+        }
+        let archived = metadata.archived.unwrap_or(false);
+        let source_rollout_path = resolve_source_thread_rollout_path(
+            source_codex_home,
+            &source_thread_id,
+            state_row.as_ref(),
+            archived,
+        );
+        let target_rollout_path = source_rollout_path.as_ref().map(|source_rollout_path| {
+            target_thread_rollout_path(
+                source_codex_home,
+                target_codex_home,
+                source_rollout_path,
+                &source_thread_id,
+                &target_thread_id,
+                archived,
+            )
+        });
+        snapshots.push(HostThreadSnapshot {
+            source_thread_id,
+            target_thread_id,
+            archived,
+            source_rollout_path,
+            target_rollout_path,
+            metadata,
+            state_row,
+            session_index_entry,
+        });
+    }
+
+    sync_host_snapshot_rollout_files(target_codex_home, &snapshots)?;
+    sync_host_snapshot_state_db(target_codex_home, state_snapshot.as_ref(), &snapshots)?;
+    sync_host_snapshot_session_index(target_codex_home, &snapshots)?;
+    Ok(())
+}
+
+fn read_thread_state_db_snapshot(codex_home: &Path) -> Result<Option<ThreadStateDbSnapshot>> {
+    let Some(db_path) = resolve_state_db_file_in_codex_home(codex_home) else {
+        return Ok(None);
+    };
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let connection = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("Failed to open {}.", db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(None);
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(None);
+    }
+    let create_sql = connection
+        .query_row(
+            "select sql from sqlite_master where type = 'table' and name = 'threads'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let sql = format!(
+        "select {} from threads",
+        columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .with_context(|| format!("Failed to query {}.", db_path.display()))?;
+    let mut rows = statement.query([])?;
+    let mut snapshots = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let mut values = BTreeMap::new();
+        for (index, column) in columns.iter().enumerate() {
+            values.insert(column.clone(), row.get::<_, rusqlite::types::Value>(index)?);
+        }
+        let Some(source_thread_id) = sql_value_string(values.get("id"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        snapshots.insert(source_thread_id, ThreadStateDbRow { values });
+    }
+    Ok(Some(ThreadStateDbSnapshot {
+        db_path,
+        create_sql,
+        rows: snapshots,
+    }))
+}
+
+fn read_session_index_entries(codex_home: &Path) -> Result<BTreeMap<String, Value>> {
+    let path = codex_home.join("session_index.jsonl");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", path.display()))
+        }
+    };
+    let mut entries = BTreeMap::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(thread_id) = value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        entries.insert(thread_id, value);
+    }
+    Ok(entries)
+}
+
+fn read_thread_ids_from_state_db(state_db_path: &Path) -> Result<Vec<String>> {
+    if !state_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection = rusqlite::Connection::open(state_db_path)
+        .with_context(|| format!("Failed to open {}.", state_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(Vec::new());
+    }
+    let columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !columns.iter().any(|column| column == "id") {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare("select id from threads")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
+fn thread_metadata_from_state_row(row: &ThreadStateDbRow) -> ThreadHandoffMetadata {
+    ThreadHandoffMetadata {
+        title: row_string(row, "title"),
+        first_user_message: row_string(row, "first_user_message"),
+        updated_at: row_i64(row, "updated_at"),
+        updated_at_ms: row_i64(row, "updated_at_ms"),
+        session_index_updated_at: None,
+        source: row_string(row, "source"),
+        model_provider: row_string(row, "model_provider"),
+        cwd: row_string(row, "cwd"),
+        sandbox_policy: row_string(row, "sandbox_policy"),
+        approval_mode: row_string(row, "approval_mode"),
+        projectless: None,
+        workspace_root_hint: None,
+        archived: row_i64(row, "archived").map(|value| value != 0),
+    }
+}
+
+fn thread_metadata_from_session_index_entry(entry: &Value) -> ThreadHandoffMetadata {
+    ThreadHandoffMetadata {
+        title: entry
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        session_index_updated_at: entry
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        ..ThreadHandoffMetadata::default()
+    }
+}
+
+fn row_string(row: &ThreadStateDbRow, column: &str) -> Option<String> {
+    sql_value_string(row.values.get(column))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn row_i64(row: &ThreadStateDbRow, column: &str) -> Option<i64> {
+    match row.values.get(column) {
+        Some(rusqlite::types::Value::Integer(value)) => Some(*value),
+        Some(rusqlite::types::Value::Real(value)) => Some(*value as i64),
+        Some(rusqlite::types::Value::Text(value)) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn sql_value_string(value: Option<&rusqlite::types::Value>) -> Option<&str> {
+    match value {
+        Some(rusqlite::types::Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn allocate_snapshot_thread_id(
+    source_thread_id: &str,
+    target_account_id: &str,
+    lineage_id: &str,
+    used_target_thread_ids: &BTreeSet<String>,
+) -> String {
+    let mut salt = 0_u64;
+    loop {
+        let seed = format!("{target_account_id}\n{lineage_id}\n{source_thread_id}\n{salt}");
+        let mut candidate = stable_local_thread_id_like(source_thread_id, &seed);
+        if candidate == source_thread_id {
+            flip_first_thread_id_char(&mut candidate);
+        }
+        if !used_target_thread_ids.contains(&candidate) {
+            return candidate;
+        }
+        salt = salt.saturating_add(1);
+    }
+}
+
+fn stable_local_thread_id_like(source_thread_id: &str, seed: &str) -> String {
+    if source_thread_id.is_empty() {
+        return format!("thread-{}", fnv1a64_hex(seed.as_bytes()));
+    }
+    let digest = repeated_hex_digest(seed, source_thread_id.len());
+    let mut digest_chars = digest.chars();
+    source_thread_id
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '-' | '_') {
+                ch
+            } else if ch.is_ascii_alphanumeric() {
+                digest_chars.next().unwrap_or('0')
+            } else {
+                'x'
+            }
+        })
+        .collect()
+}
+
+fn repeated_hex_digest(seed: &str, len: usize) -> String {
+    let mut output = String::with_capacity(len);
+    let mut counter = 0_u64;
+    while output.len() < len {
+        let chunk = format!("{seed}\n{counter}");
+        output.push_str(&fnv1a64_hex(chunk.as_bytes()));
+        counter = counter.saturating_add(1);
+    }
+    output.truncate(len);
+    output
+}
+
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn flip_first_thread_id_char(value: &mut String) {
+    let mut chars = value.chars().collect::<Vec<_>>();
+    if let Some(ch) = chars.iter_mut().find(|ch| ch.is_ascii_alphanumeric()) {
+        *ch = if *ch == '0' { '1' } else { '0' };
+    }
+    *value = chars.into_iter().collect();
+}
+
+fn resolve_source_thread_rollout_path(
+    source_codex_home: &Path,
+    source_thread_id: &str,
+    state_row: Option<&ThreadStateDbRow>,
+    archived: bool,
+) -> Option<PathBuf> {
+    if let Some(path) = state_row
+        .and_then(|row| row_string(row, "rollout_path"))
+        .map(PathBuf::from)
+    {
+        if path.exists() {
+            return Some(path);
+        }
+        if let Some((_, relative_path)) = thread_artifact_relative_path(source_codex_home, &path) {
+            let candidate = source_codex_home.join(relative_path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let preferred_root = if archived {
+        source_codex_home.join("archived_sessions")
+    } else {
+        source_codex_home.join("sessions")
+    };
+    find_thread_rollout_path(&preferred_root, source_thread_id)
+        .or_else(|| find_thread_rollout_path(source_codex_home, source_thread_id))
+}
+
+fn target_thread_rollout_path(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+    source_rollout_path: &Path,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    archived: bool,
+) -> PathBuf {
+    let relative_path = thread_artifact_relative_path(source_codex_home, source_rollout_path)
+        .map(|(_, relative_path)| relative_path)
+        .unwrap_or_else(|| {
+            source_rollout_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("{target_thread_id}.jsonl")))
+        });
+    let localized = localize_path_thread_id(&relative_path, source_thread_id, target_thread_id);
+    target_codex_home
+        .join(if archived {
+            "archived_sessions"
+        } else {
+            "sessions"
+        })
+        .join(localized)
+}
+
+fn thread_artifact_relative_path(
+    codex_home: &Path,
+    path: &Path,
+) -> Option<(&'static str, PathBuf)> {
+    if let Ok(relative) = path.strip_prefix(codex_home) {
+        return split_thread_artifact_relative_path(relative);
+    }
+    split_thread_artifact_relative_path(path)
+}
+
+fn split_thread_artifact_relative_path(path: &Path) -> Option<(&'static str, PathBuf)> {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let name = component.to_string_lossy();
+        if name == "sessions" || name == "archived_sessions" {
+            let mut relative = PathBuf::new();
+            for component in components.iter().skip(index + 1) {
+                relative.push(component);
+            }
+            if !relative.as_os_str().is_empty() {
+                return Some((
+                    if name == "sessions" {
+                        "sessions"
+                    } else {
+                        "archived_sessions"
+                    },
+                    relative,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn localize_path_thread_id(path: &Path, source_thread_id: &str, target_thread_id: &str) -> PathBuf {
+    let mut localized = PathBuf::new();
+    for component in path.components() {
+        let value = component.as_os_str().to_string_lossy();
+        localized.push(value.replace(source_thread_id, target_thread_id));
+    }
+    localized
+}
+
+fn sync_host_snapshot_rollout_files(
+    target_codex_home: &Path,
+    snapshots: &[HostThreadSnapshot],
+) -> Result<()> {
+    for snapshot in snapshots {
+        remove_thread_artifact_files_with_id(
+            &target_codex_home.join("sessions"),
+            &snapshot.target_thread_id,
+        )?;
+        remove_thread_artifact_files_with_id(
+            &target_codex_home.join("archived_sessions"),
+            &snapshot.target_thread_id,
+        )?;
+        if snapshot.target_thread_id != snapshot.source_thread_id {
+            remove_thread_artifact_files_with_id(
+                &target_codex_home.join("sessions"),
+                &snapshot.source_thread_id,
+            )?;
+            remove_thread_artifact_files_with_id(
+                &target_codex_home.join("archived_sessions"),
+                &snapshot.source_thread_id,
+            )?;
+        }
+        let (Some(source), Some(target)) = (
+            snapshot.source_rollout_path.as_ref(),
+            snapshot.target_rollout_path.as_ref(),
+        ) else {
+            continue;
+        };
+        copy_thread_jsonl_with_cow_and_localization(
+            source,
+            target,
+            &snapshot.source_thread_id,
+            &snapshot.target_thread_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_host_snapshot_state_db(
+    target_codex_home: &Path,
+    state_snapshot: Option<&ThreadStateDbSnapshot>,
+    snapshots: &[HostThreadSnapshot],
+) -> Result<()> {
+    let Some(state_snapshot) = state_snapshot else {
+        return Ok(());
+    };
+    if state_snapshot.rows.is_empty() {
+        return Ok(());
+    }
+    let target_db_path = resolve_state_db_file_in_codex_home(target_codex_home)
+        .or_else(|| {
+            state_snapshot
+                .db_path
+                .file_name()
+                .map(|name| target_codex_home.join(name))
+        })
+        .unwrap_or_else(|| target_codex_home.join("state_5.sqlite"));
+    if let Some(parent) = target_db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    let connection = rusqlite::Connection::open(&target_db_path)
+        .with_context(|| format!("Failed to open {}.", target_db_path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .with_context(|| format!("Failed to configure {}.", target_db_path.display()))?;
+    if !sqlite_table_exists(&connection, "threads")? {
+        if let Some(create_sql) = state_snapshot.create_sql.as_deref() {
+            connection.execute_batch(create_sql).with_context(|| {
+                format!(
+                    "Failed to create threads table in {}.",
+                    target_db_path.display()
+                )
+            })?;
+        }
+    }
+    if !sqlite_table_exists(&connection, "threads")? {
+        return Ok(());
+    }
+    let target_columns = sqlite_table_columns(&connection, "main", "threads")?;
+    if !target_columns.iter().any(|column| column == "id") {
+        return Ok(());
+    }
+
+    for snapshot in snapshots {
+        if snapshot.target_thread_id != snapshot.source_thread_id {
+            connection
+                .execute(
+                    "delete from threads where id = ?1",
+                    [&snapshot.source_thread_id],
+                )
+                .with_context(|| {
+                    format!(
+                        "Failed to remove stale source thread row {} from {}.",
+                        snapshot.source_thread_id,
+                        target_db_path.display()
+                    )
+                })?;
+        }
+        let Some(state_row) = snapshot.state_row.as_ref() else {
+            publish_thread_sidebar_metadata_to_state_db(
+                target_codex_home,
+                &target_db_path,
+                &snapshot.target_thread_id,
+                &snapshot.metadata,
+            )?;
+            continue;
+        };
+        let mut insert_columns = Vec::new();
+        let mut values = Vec::new();
+        for column in &target_columns {
+            if let Some(value) = state_row.values.get(column) {
+                insert_columns.push(column.clone());
+                values.push(localized_state_db_value(column, value, snapshot));
+            }
+        }
+        if !insert_columns.iter().any(|column| column == "id") {
+            continue;
+        }
+        let placeholders = (1..=insert_columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "insert or replace into threads ({}) values ({})",
+            insert_columns
+                .iter()
+                .map(|column| quote_sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", "),
+            placeholders.join(", ")
+        );
+        connection
+            .execute(&sql, rusqlite::params_from_iter(values))
+            .with_context(|| {
+                format!(
+                    "Failed to upsert synced thread {} into {}.",
+                    snapshot.target_thread_id,
+                    target_db_path.display()
+                )
+            })?;
+        publish_thread_sidebar_metadata_to_state_db(
+            target_codex_home,
+            &target_db_path,
+            &snapshot.target_thread_id,
+            &snapshot.metadata,
+        )?;
+    }
+    Ok(())
+}
+
+fn localized_state_db_value(
+    column: &str,
+    value: &rusqlite::types::Value,
+    snapshot: &HostThreadSnapshot,
+) -> rusqlite::types::Value {
+    if column == "id" {
+        return rusqlite::types::Value::Text(snapshot.target_thread_id.clone());
+    }
+    if column == "rollout_path" {
+        return rusqlite::types::Value::Text(
+            snapshot
+                .target_rollout_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+    }
+    if column == "archived" {
+        return rusqlite::types::Value::Integer(snapshot.archived as i64);
+    }
+    match value {
+        rusqlite::types::Value::Text(text)
+            if thread_id_metadata_key(column) && text == &snapshot.source_thread_id =>
+        {
+            rusqlite::types::Value::Text(snapshot.target_thread_id.clone())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sync_host_snapshot_session_index(
+    target_codex_home: &Path,
+    snapshots: &[HostThreadSnapshot],
+) -> Result<()> {
+    let path = target_codex_home.join("session_index.jsonl");
+    let contents = fs::read_to_string(&path).unwrap_or_default();
+    let synced_source_ids = snapshots
+        .iter()
+        .map(|snapshot| snapshot.source_thread_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let synced_target_ids = snapshots
+        .iter()
+        .map(|snapshot| snapshot.target_thread_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let should_replace = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+            .map(|id| {
+                synced_source_ids.contains(id.as_str()) || synced_target_ids.contains(id.as_str())
+            })
+            .unwrap_or(false);
+        if !should_replace {
+            lines.push(line.to_string());
+        }
+    }
+    for snapshot in snapshots {
+        if let Some(entry) = localized_session_index_entry(snapshot) {
+            lines.push(serde_json::to_string(&entry)?);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    let output = if lines.is_empty() {
+        String::new()
+    } else {
+        let mut output = lines.join("\n");
+        output.push('\n');
+        output
+    };
+    fs::write(&path, output).with_context(|| format!("Failed to write {}.", path.display()))
+}
+
+fn localized_session_index_entry(snapshot: &HostThreadSnapshot) -> Option<Value> {
+    let mut entry = snapshot.session_index_entry.clone().unwrap_or_else(|| {
+        json!({
+            "id": snapshot.source_thread_id,
+            "thread_name": snapshot
+                .metadata
+                .title
+                .as_deref()
+                .or(snapshot.metadata.first_user_message.as_deref())
+                .map(truncate_handoff_text)
+                .unwrap_or_else(|| snapshot.source_thread_id.clone()),
+            "updated_at": snapshot
+                .metadata
+                .session_index_updated_at
+                .clone()
+                .or_else(|| snapshot.metadata.updated_at_ms.and_then(timestamp_millis_to_rfc3339))
+                .or_else(|| snapshot.metadata.updated_at.and_then(timestamp_secs_to_rfc3339))
+                .unwrap_or_else(current_rfc3339_timestamp),
+        })
+    });
+    localize_thread_ids_in_json_value(
+        &mut entry,
+        &snapshot.source_thread_id,
+        &snapshot.target_thread_id,
+    );
+    if entry
+        .get("thread_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+fn copy_thread_jsonl_with_cow_and_localization(
+    source: &Path,
+    target: &Path,
+    source_thread_id: &str,
+    target_thread_id: &str,
+) -> Result<()> {
+    copy_file_best_effort_cow(source, target)?;
+    localize_thread_jsonl_file(target, source_thread_id, target_thread_id)
+}
+
+fn copy_file_best_effort_cow(source: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    let temp_path = temporary_copy_path(target);
+    remove_path_if_exists(&temp_path)?;
+    let copy_result = copy_file_cow(source, &temp_path).or_else(|_| {
+        fs::copy(source, &temp_path).map(|_| ()).with_context(|| {
+            format!(
+                "Failed to copy {} to {}.",
+                source.display(),
+                temp_path.display()
+            )
+        })
+    });
+    if let Err(error) = copy_result {
+        remove_path_if_exists(&temp_path).ok();
+        return Err(error);
+    }
+    remove_path_if_exists(target)?;
+    fs::rename(&temp_path, target).with_context(|| {
+        format!(
+            "Failed to move {} to {}.",
+            temp_path.display(),
+            target.display()
+        )
+    })
+}
+
+fn temporary_copy_path(target: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("thread.jsonl");
+    target.with_file_name(format!(
+        ".{file_name}.codex-rotate-copy-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn copy_file_cow(source: &Path, target: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(
+            src: *const std::os::raw::c_char,
+            dst: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .context("Source path contained an interior NUL byte.")?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .context("Target path contained an interior NUL byte.")?;
+    let result = unsafe { clonefile(source.as_ptr(), target.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()).context("clonefile failed")
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_os = "macos")))]
+fn copy_file_cow(source: &Path, target: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const FICLONE: u64 = 0x4004_9409;
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+
+    let source_file =
+        fs::File::open(source).with_context(|| format!("Failed to open {}.", source.display()))?;
+    let target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("Failed to create {}.", target.display()))?;
+    let result = unsafe { ioctl(target_file.as_raw_fd(), FICLONE, source_file.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()).context("FICLONE failed")
+    }
+}
+
+#[cfg(windows)]
+fn copy_file_cow(source: &Path, target: &Path) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
+
+    #[repr(C)]
+    struct DuplicateExtentsData {
+        file_handle: *mut c_void,
+        source_file_offset: i64,
+        target_file_offset: i64,
+        byte_count: i64,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            hDevice: *mut c_void,
+            dwIoControlCode: u32,
+            lpInBuffer: *mut c_void,
+            nInBufferSize: u32,
+            lpOutBuffer: *mut c_void,
+            nOutBufferSize: u32,
+            lpBytesReturned: *mut u32,
+            lpOverlapped: *mut c_void,
+        ) -> i32;
+    }
+
+    let source_file =
+        fs::File::open(source).with_context(|| format!("Failed to open {}.", source.display()))?;
+    let target_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("Failed to create {}.", target.display()))?;
+    let size = source_file.metadata()?.len();
+    target_file.set_len(size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let mut data = DuplicateExtentsData {
+        file_handle: source_file.as_raw_handle() as *mut c_void,
+        source_file_offset: 0,
+        target_file_offset: 0,
+        byte_count: size as i64,
+    };
+    let mut bytes_returned = 0_u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            target_file.as_raw_handle() as *mut c_void,
+            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            (&mut data as *mut DuplicateExtentsData).cast(),
+            std::mem::size_of::<DuplicateExtentsData>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()).context("FSCTL_DUPLICATE_EXTENTS_TO_FILE failed")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn copy_file_cow(_source: &Path, _target: &Path) -> Result<()> {
+    Err(anyhow!(
+        "copy-on-write clone is unsupported on this platform"
+    ))
+}
+
+fn localize_thread_jsonl_file(
+    path: &Path,
+    source_thread_id: &str,
+    target_thread_id: &str,
+) -> Result<()> {
+    if source_thread_id == target_thread_id {
+        return Ok(());
+    }
+    if source_thread_id.len() == target_thread_id.len() {
+        let bytes =
+            fs::read(path).with_context(|| format!("Failed to read {}.", path.display()))?;
+        let replacements =
+            json_thread_id_string_replacements(&bytes, source_thread_id, target_thread_id);
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "Failed to open {} for thread ID localization.",
+                    path.display()
+                )
+            })?;
+        for (offset, replacement) in replacements {
+            file.seek(SeekFrom::Start(offset as u64))?;
+            file.write_all(replacement.as_bytes())?;
+        }
+        return Ok(());
+    }
+
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}.", path.display()))?;
+    let mut changed = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(mut value) => {
+                if localize_thread_ids_in_json_value(&mut value, source_thread_id, target_thread_id)
+                {
+                    changed = true;
+                    lines.push(serde_json::to_string(&value)?);
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            Err(_) => lines.push(line.to_string()),
+        }
+    }
+    if changed {
+        let mut output = lines.join("\n");
+        if contents.ends_with('\n') {
+            output.push('\n');
+        }
+        fs::write(path, output).with_context(|| format!("Failed to write {}.", path.display()))?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+enum JsonObjectScanMode {
+    KeyOrEnd,
+    Colon { key: String },
+    Value { key: String },
+    CommaOrEnd,
+}
+
+#[derive(Clone, Debug)]
+enum JsonScanFrame {
+    Object(JsonObjectScanMode),
+    Array,
+}
+
+fn json_thread_id_string_replacements(
+    bytes: &[u8],
+    source_thread_id: &str,
+    target_thread_id: &str,
+) -> Vec<(usize, String)> {
+    let source_bytes = source_thread_id.as_bytes();
+    let mut replacements = Vec::new();
+    let mut stack = Vec::<JsonScanFrame>::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => {
+                mark_json_container_value_started(&mut stack);
+                stack.push(JsonScanFrame::Object(JsonObjectScanMode::KeyOrEnd));
+                index += 1;
+            }
+            b'[' => {
+                mark_json_container_value_started(&mut stack);
+                stack.push(JsonScanFrame::Array);
+                index += 1;
+            }
+            b'}' | b']' => {
+                stack.pop();
+                mark_json_scalar_value_consumed(&mut stack);
+                index += 1;
+            }
+            b':' => {
+                if let Some(JsonScanFrame::Object(mode)) = stack.last_mut() {
+                    if let JsonObjectScanMode::Colon { key } = mode {
+                        let key = std::mem::take(key);
+                        *mode = JsonObjectScanMode::Value { key };
+                    }
+                }
+                index += 1;
+            }
+            b',' => {
+                if let Some(JsonScanFrame::Object(mode)) = stack.last_mut() {
+                    *mode = JsonObjectScanMode::KeyOrEnd;
+                }
+                index += 1;
+            }
+            b'"' => {
+                let Some((content_start, content_end, next_index)) =
+                    json_string_token_bounds(bytes, index)
+                else {
+                    break;
+                };
+                let string_value = serde_json::from_slice::<String>(&bytes[index..next_index]).ok();
+                if let Some(JsonScanFrame::Object(mode)) = stack.last_mut() {
+                    match mode.clone() {
+                        JsonObjectScanMode::KeyOrEnd => {
+                            *mode = JsonObjectScanMode::Colon {
+                                key: string_value.unwrap_or_default(),
+                            };
+                        }
+                        JsonObjectScanMode::Value { key } => {
+                            if thread_id_metadata_key(&key)
+                                && &bytes[content_start..content_end] == source_bytes
+                            {
+                                replacements.push((content_start, target_thread_id.to_string()));
+                            }
+                            *mode = JsonObjectScanMode::CommaOrEnd;
+                        }
+                        _ => {}
+                    }
+                }
+                index = next_index;
+            }
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                mark_json_scalar_value_consumed(&mut stack);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    replacements
+}
+
+fn json_string_token_bounds(bytes: &[u8], start: usize) -> Option<(usize, usize, usize)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = index.saturating_add(2),
+            b'"' => return Some((start + 1, index, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn mark_json_container_value_started(stack: &mut [JsonScanFrame]) {
+    if let Some(JsonScanFrame::Object(mode @ JsonObjectScanMode::Value { .. })) = stack.last_mut() {
+        *mode = JsonObjectScanMode::CommaOrEnd;
+    }
+}
+
+fn mark_json_scalar_value_consumed(stack: &mut [JsonScanFrame]) {
+    if let Some(JsonScanFrame::Object(mode @ JsonObjectScanMode::Value { .. })) = stack.last_mut() {
+        *mode = JsonObjectScanMode::CommaOrEnd;
+    }
+}
+
+fn localize_thread_ids_in_json_value(
+    value: &mut Value,
+    source_thread_id: &str,
+    target_thread_id: &str,
+) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, value) in object.iter_mut() {
+                if thread_id_metadata_key(key) {
+                    if value.as_str() == Some(source_thread_id) {
+                        *value = Value::String(target_thread_id.to_string());
+                        changed = true;
+                        continue;
+                    }
+                }
+                changed |=
+                    localize_thread_ids_in_json_value(value, source_thread_id, target_thread_id);
+            }
+            changed
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |changed, value| {
+            localize_thread_ids_in_json_value(value, source_thread_id, target_thread_id) || changed
+        }),
+        _ => false,
+    }
+}
+
+fn thread_id_metadata_key(key: &str) -> bool {
+    THREAD_ID_METADATA_KEYS
+        .iter()
+        .any(|candidate| *candidate == key)
 }
 
 #[cfg(test)]
@@ -6818,34 +7961,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn guardrail_no_direct_conversation_file_writes() {
+    fn guardrail_snapshot_sync_uses_cow_without_hard_links() {
         let code = include_str!("rotation_hygiene.rs");
         let production_code = code
             .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(before, _)| before)
             .unwrap_or(code);
-        let occurrences = production_code
-            .lines()
-            .filter(|line| {
-                if line.trim().starts_with("//")
-                    || line.contains("guardrail_no_direct_conversation_file_writes")
-                    || line.contains("line.contains(")
-                    || line.contains("global_state")
-                    || line.contains("codex_home.join(\"session_index.jsonl\")")
-                    || line.contains("codex_home.join(\"archived_sessions\")")
-                {
-                    return false;
-                }
-                line.contains("state_v")
-                    || line.contains("sessions/")
-                    || line.contains("archived_sessions")
-                    || line.contains("session_index.jsonl")
-            })
-            .count();
-        assert_eq!(
-            occurrences, 0,
-            "No direct conversation storage paths should be manipulated in sync paths."
-        );
+        assert!(production_code.contains("copy_file_best_effort_cow"));
+        assert!(!production_code.contains("hard_link"));
     }
 
     #[test]
@@ -10717,6 +11840,291 @@ exit 91
             &target_paths.codex_home.join("state_5.sqlite"),
             "thread-target",
         ));
+    }
+
+    #[test]
+    fn host_conversation_snapshot_syncs_active_and_archived_jsonl_one_way() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        let source_db = source_paths.codex_home.join("state_5.sqlite");
+        let target_db = target_paths.codex_home.join("state_5.sqlite");
+
+        let source_threads = [
+            ("active-thread-1", false, 500_i64),
+            ("active-thread-2", false, 490_i64),
+            ("archived-thread-1", true, 480_i64),
+            ("archived-thread-2", true, 470_i64),
+            ("archived-thread-3", true, 460_i64),
+        ];
+        let mut source_rollout_paths = BTreeMap::new();
+        for (thread_id, archived, updated_at) in source_threads {
+            let root = if archived {
+                source_paths.codex_home.join("archived_sessions")
+            } else {
+                source_paths.codex_home.join("sessions")
+            };
+            let rollout_path = root
+                .join("2026")
+                .join("04")
+                .join("25")
+                .join(format!("rollout-2026-04-25T00-00-00-{thread_id}.jsonl"));
+            fs::create_dir_all(rollout_path.parent().unwrap()).expect("create rollout parent");
+            fs::write(
+                &rollout_path,
+                format!(
+                    "{{\"id\":\"{thread_id}\",\"thread_id\":\"{thread_id}\",\"payload\":{{\"type\":\"user_message\",\"message\":\"literal {thread_id} text must stay\"}}}}\n"
+                ),
+            )
+            .expect("write source rollout");
+            source_rollout_paths.insert(
+                thread_id,
+                (rollout_path.display().to_string(), archived, updated_at),
+            );
+        }
+
+        let source_rows = source_rollout_paths
+            .iter()
+            .map(|(thread_id, (path, _, updated_at))| (*thread_id, path.as_str(), *updated_at))
+            .collect::<Vec<_>>();
+        seed_threads_table(&source_db, &source_rows);
+        for (thread_id, (_, archived, _)) in &source_rollout_paths {
+            update_thread_metadata(
+                &source_db,
+                thread_id,
+                "/workspace/source-project",
+                *archived,
+            );
+        }
+        fs::write(
+            source_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            source_rollout_paths
+                .iter()
+                .map(|(thread_id, (_, _, updated_at))| {
+                    format!(
+                        "{{\"id\":\"{thread_id}\",\"thread_name\":\"title {thread_id}\",\"updated_at\":\"2026-04-25T00:00:{:02}Z\"}}",
+                        updated_at % 60
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write source session index");
+
+        let target_only_rollout = target_paths
+            .codex_home
+            .join("sessions/2026/04/24/rollout-target-only.jsonl");
+        fs::create_dir_all(target_only_rollout.parent().unwrap())
+            .expect("create target-only parent");
+        fs::write(&target_only_rollout, "{\"id\":\"target-only\"}\n")
+            .expect("write target-only rollout");
+        let target_only_rollout_string = target_only_rollout.display().to_string();
+        seed_threads_table(
+            &target_db,
+            &[("target-only", target_only_rollout_string.as_str(), 100)],
+        );
+        fs::write(
+            target_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            "{\"id\":\"target-only\",\"thread_name\":\"target only\",\"updated_at\":\"2026-04-24T00:00:00Z\"}\n",
+        )
+        .expect("write target session index");
+
+        sync_host_persona_conversation_snapshot(
+            &source_paths.codex_home,
+            &conversation_sync_identity(&source),
+            &target_paths.codex_home,
+            &conversation_sync_identity(&target),
+            &paths.conversation_sync_db_file,
+        )
+        .expect("sync snapshot");
+
+        let store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        let target_state_ids = read_thread_ids(&target_db);
+        assert!(target_state_ids.contains(&"target-only".to_string()));
+        assert!(target_only_rollout.exists());
+        let target_index =
+            fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME))
+                .expect("read target index");
+        assert!(target_index.contains("\"target-only\""));
+
+        for (source_thread_id, (_, archived, _)) in &source_rollout_paths {
+            let lineage_id = store
+                .get_lineage_id(&conversation_sync_identity(&source), source_thread_id)
+                .expect("source lineage")
+                .expect("source lineage exists");
+            let target_thread_id = store
+                .get_local_thread_id(&conversation_sync_identity(&target), &lineage_id)
+                .expect("target binding")
+                .expect("target binding exists");
+            assert_ne!(&target_thread_id, source_thread_id);
+            assert_eq!(target_thread_id.len(), source_thread_id.len());
+            let target_root = if *archived {
+                target_paths.codex_home.join("archived_sessions")
+            } else {
+                target_paths.codex_home.join("sessions")
+            };
+            let target_rollout = find_thread_rollout_path(&target_root, &target_thread_id)
+                .unwrap_or_else(|| {
+                    panic!("missing target rollout for {source_thread_id} as {target_thread_id}")
+                });
+            assert!(
+                target_rollout.starts_with(&target_root),
+                "rollout should be in the expected archive root: {}",
+                target_rollout.display()
+            );
+            let contents = fs::read_to_string(&target_rollout).expect("read target rollout");
+            assert!(contents.contains(&format!("\"id\":\"{target_thread_id}\"")));
+            assert!(contents.contains(&format!("\"thread_id\":\"{target_thread_id}\"")));
+            assert!(contents.contains(&format!(
+                "\"message\":\"literal {source_thread_id} text must stay\""
+            )));
+            assert!(!contents.contains(&format!("\"thread_id\":\"{source_thread_id}\"")));
+            assert!(target_state_ids.contains(&target_thread_id));
+            assert!(!target_state_ids.contains(&source_thread_id.to_string()));
+            assert_eq!(
+                thread_is_archived(&target_db, &target_thread_id),
+                *archived,
+                "archive state should sync for {source_thread_id}"
+            );
+            assert!(target_index.contains(&format!("\"id\":\"{target_thread_id}\"")));
+            assert!(!target_index.contains(&format!("\"id\":\"{source_thread_id}\"")));
+        }
+    }
+
+    #[test]
+    fn host_conversation_snapshot_moves_thread_between_active_and_archive_roots() {
+        let temp = tempdir().expect("tempdir");
+        let paths = test_runtime_paths(temp.path());
+        let source = test_account("acct-source", "persona-source");
+        let target = test_account("acct-target", "persona-target");
+
+        provision_host_persona(&paths, &source, None).expect("provision source");
+        provision_host_persona(&paths, &target, None).expect("provision target");
+
+        let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+        let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+        let source_db = source_paths.codex_home.join("state_5.sqlite");
+        let target_db = target_paths.codex_home.join("state_5.sqlite");
+        let source_thread_id = "thread-move";
+        let target_thread_id = "target-move";
+
+        let active_source_rollout = source_paths
+            .codex_home
+            .join("sessions/2026/04/25/rollout-thread-move.jsonl");
+        fs::create_dir_all(active_source_rollout.parent().unwrap())
+            .expect("create active source parent");
+        fs::write(
+            &active_source_rollout,
+            "{\"id\":\"thread-move\",\"thread_id\":\"thread-move\"}\n",
+        )
+        .expect("write active source rollout");
+        let active_source_rollout_string = active_source_rollout.display().to_string();
+        seed_threads_table(
+            &source_db,
+            &[(source_thread_id, active_source_rollout_string.as_str(), 100)],
+        );
+        seed_threads_table(&target_db, &[]);
+        fs::write(
+            source_paths.codex_home.join(SESSION_INDEX_FILE_NAME),
+            "{\"id\":\"thread-move\",\"thread_name\":\"move me\",\"updated_at\":\"2026-04-25T00:00:00Z\"}\n",
+        )
+        .expect("write source index");
+
+        let mut store =
+            ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+        store
+            .bind_local_thread_id(
+                &conversation_sync_identity(&source),
+                source_thread_id,
+                source_thread_id,
+            )
+            .expect("bind source");
+        store
+            .bind_local_thread_id(
+                &conversation_sync_identity(&target),
+                source_thread_id,
+                target_thread_id,
+            )
+            .expect("bind target");
+
+        sync_host_persona_conversation_snapshot(
+            &source_paths.codex_home,
+            &conversation_sync_identity(&source),
+            &target_paths.codex_home,
+            &conversation_sync_identity(&target),
+            &paths.conversation_sync_db_file,
+        )
+        .expect("sync active");
+
+        let active_target =
+            find_thread_rollout_path(&target_paths.codex_home.join("sessions"), target_thread_id)
+                .expect("active target rollout");
+        assert!(active_target.exists());
+        assert!(find_thread_rollout_path(
+            &target_paths.codex_home.join("archived_sessions"),
+            target_thread_id,
+        )
+        .is_none());
+
+        let archived_source_rollout = source_paths
+            .codex_home
+            .join("archived_sessions/2026/04/25/rollout-thread-move.jsonl");
+        fs::create_dir_all(archived_source_rollout.parent().unwrap())
+            .expect("create archived source parent");
+        fs::rename(&active_source_rollout, &archived_source_rollout)
+            .expect("archive source rollout");
+        let archived_source_rollout_string = archived_source_rollout.display().to_string();
+        let connection = rusqlite::Connection::open(&source_db).expect("open source db");
+        connection
+            .execute(
+                "update threads set rollout_path = ?1, archived = 1 where id = ?2",
+                rusqlite::params![archived_source_rollout_string, source_thread_id],
+            )
+            .expect("update source archive state");
+
+        sync_host_persona_conversation_snapshot(
+            &source_paths.codex_home,
+            &conversation_sync_identity(&source),
+            &target_paths.codex_home,
+            &conversation_sync_identity(&target),
+            &paths.conversation_sync_db_file,
+        )
+        .expect("sync archived");
+
+        assert!(
+            find_thread_rollout_path(&target_paths.codex_home.join("sessions"), target_thread_id)
+                .is_none(),
+            "active target rollout should be removed after archive sync"
+        );
+        let archived_target = find_thread_rollout_path(
+            &target_paths.codex_home.join("archived_sessions"),
+            target_thread_id,
+        )
+        .expect("archived target rollout");
+        assert!(archived_target.exists());
+        assert!(thread_is_archived(&target_db, target_thread_id));
+
+        sync_host_persona_conversation_snapshot(
+            &source_paths.codex_home,
+            &conversation_sync_identity(&source),
+            &target_paths.codex_home,
+            &conversation_sync_identity(&target),
+            &paths.conversation_sync_db_file,
+        )
+        .expect("sync archived idempotently");
+        let target_index =
+            fs::read_to_string(target_paths.codex_home.join(SESSION_INDEX_FILE_NAME))
+                .expect("read target index");
+        assert_eq!(target_index.matches(target_thread_id).count(), 1);
     }
 
     #[test]
