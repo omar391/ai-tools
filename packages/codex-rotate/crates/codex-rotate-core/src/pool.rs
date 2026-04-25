@@ -21,6 +21,7 @@ use crate::persona::get_persona_profile;
 use crate::quota::{
     describe_quota_blocker, format_compact_quota, get_quota_left, has_usable_quota,
     quota_next_refresh_at, UsageCredits, UsageResponse, UsageWindow,
+    MIN_HEALTHY_QUOTA_LEFT_PERCENT,
 };
 #[cfg(test)]
 use crate::state::write_rotate_state_json;
@@ -38,6 +39,8 @@ const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
+const LIST_QUOTA_REFRESH_LIMIT_ENV: &str = "CODEX_ROTATE_LIST_QUOTA_REFRESH_LIMIT";
+const DEFAULT_LIST_QUOTA_REFRESH_LIMIT: usize = 4;
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -79,8 +82,7 @@ fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> 
 
 fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
     !account_requires_terminal_cleanup(entry)
-        && (account_rotation_enabled(disabled_domains, &entry.email)
-            || entry.last_quota_usable != Some(true))
+        && account_rotation_enabled(disabled_domains, &entry.email)
 }
 
 fn normalize_cached_quota_usability(entry: &mut AccountEntry) -> bool {
@@ -96,6 +98,13 @@ fn normalize_cached_quota_usability(entry: &mut AccountEntry) -> bool {
 
 fn cached_quota_indicates_unusable(entry: &AccountEntry) -> Option<bool> {
     if entry.last_quota_blocker.is_some() {
+        return Some(true);
+    }
+    if entry
+        .last_quota_primary_left_percent
+        .map(|value| (value as f64) < MIN_HEALTHY_QUOTA_LEFT_PERCENT)
+        .unwrap_or(false)
+    {
         return Some(true);
     }
     let summary = entry.last_quota_summary.as_deref()?;
@@ -120,9 +129,9 @@ fn cached_summary_has_exhausted_window(summary: &str) -> bool {
                 .trim_end_matches('%')
                 .parse::<f64>()
                 .ok()
-                .map(|value| value <= 0.0)
+                .map(|value| value < MIN_HEALTHY_QUOTA_LEFT_PERCENT)
         })
-        .any(|is_zero| is_zero)
+        .any(|is_below_threshold| is_below_threshold)
 }
 
 fn is_terminal_refresh_error(message: &str) -> bool {
@@ -150,7 +159,7 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     if deleted && should_disable_domain {
         auto_disable_domain_for_account(&entry.email)?;
     }
-    Ok(deleted)
+    Ok(true)
 }
 
 fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
@@ -1309,7 +1318,10 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
     }
     let disabled_domains = load_disabled_rotation_domains()?;
     let refresh_order = build_list_quota_refresh_order(&pool, listed_at);
-    let refresh_indices = refresh_order.into_iter().collect::<HashSet<_>>();
+    let refresh_indices = refresh_order
+        .into_iter()
+        .take(list_quota_refresh_limit())
+        .collect::<HashSet<_>>();
     let display_order = build_list_account_display_order(&pool);
 
     let mut usable_count = 0;
@@ -1534,6 +1546,13 @@ fn build_list_quota_refresh_order(pool: &Pool, now: DateTime<Utc>) -> Vec<usize>
     refreshes.extend(candidates.into_iter().map(|(index, _, _)| index));
 
     refreshes
+}
+
+fn list_quota_refresh_limit() -> usize {
+    std::env::var(LIST_QUOTA_REFRESH_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LIST_QUOTA_REFRESH_LIMIT)
 }
 
 fn cached_quota_state_is_stale(entry: &AccountEntry, now: DateTime<Utc>) -> bool {
@@ -4038,6 +4057,24 @@ mod tests {
     }
 
     #[test]
+    fn list_quota_refresh_limit_uses_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_limit = std::env::var_os(LIST_QUOTA_REFRESH_LIMIT_ENV);
+
+        unsafe {
+            std::env::set_var(LIST_QUOTA_REFRESH_LIMIT_ENV, "2");
+        }
+        assert_eq!(list_quota_refresh_limit(), 2);
+
+        unsafe {
+            std::env::set_var(LIST_QUOTA_REFRESH_LIMIT_ENV, "invalid");
+        }
+        assert_eq!(list_quota_refresh_limit(), DEFAULT_LIST_QUOTA_REFRESH_LIMIT);
+
+        restore_env_var(LIST_QUOTA_REFRESH_LIMIT_ENV, previous_limit);
+    }
+
+    #[test]
     fn list_account_display_order_sorts_by_next_quota_refresh_eta() {
         let mut later = stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z"));
         later.label = "later".to_string();
@@ -4276,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_list_hides_healthy_accounts_from_disabled_domains() {
+    fn cmd_list_hides_all_accounts_from_disabled_domains() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let codex_home = tempdir.path().join("codex-home");
@@ -4319,18 +4356,18 @@ mod tests {
             let output = strip_ansi(&cmd_list()?);
 
             assert!(
-                output.contains("Codex OAuth Account Pool (1 account(s))"),
+                output.contains("Codex OAuth Account Pool (0 account(s))"),
                 "{output}"
             );
             assert!(!output.contains("dev.hidden@astronlab.com_free"));
-            assert!(output.contains("dev.visible@astronlab.com_free"));
+            assert!(!output.contains("dev.visible@astronlab.com_free"));
             assert!(output.contains("Healthy Accounts (0 account(s))"));
             Ok(())
         })();
 
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
-        result.expect("list should hide healthy disabled-domain accounts");
+        result.expect("list should hide disabled-domain accounts");
     }
 
     #[test]
@@ -5125,6 +5162,34 @@ mod tests {
     }
 
     #[test]
+    fn normalize_pool_entries_marks_sub_two_percent_cached_accounts_unusable() {
+        let mut pool = Pool {
+            active_index: 0,
+            accounts: vec![AccountEntry {
+                label: "dev.5@hotspotprime.com_team".to_string(),
+                alias: None,
+                email: "dev.5@hotspotprime.com".to_string(),
+                account_id: "acct-5".to_string(),
+                plan_type: "team".to_string(),
+                auth: make_auth("dev.5@hotspotprime.com", "acct-5", "team"),
+                added_at: "2026-04-18T00:00:00.000Z".to_string(),
+                last_quota_usable: Some(true),
+                last_quota_summary: Some("5h 1.9% left, 8m | week 94% left, 6d 11h".to_string()),
+                last_quota_blocker: None,
+                last_quota_checked_at: Some("2026-04-18T02:01:57.804Z".to_string()),
+                last_quota_primary_left_percent: Some(1),
+                last_quota_next_refresh_at: Some("2026-04-18T02:02:57.804Z".to_string()),
+                persona: None,
+            }],
+        };
+
+        let changed = normalize_pool_entries(&mut pool);
+
+        assert!(changed);
+        assert_eq!(pool.accounts[0].last_quota_usable, Some(false));
+    }
+
+    #[test]
     fn cmd_add_expected_email_preserves_target_email_against_provider_gmail_auth() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -5255,7 +5320,7 @@ mod tests {
     }
 
     #[test]
-    fn current_pool_overview_hides_healthy_accounts_from_disabled_domains() {
+    fn current_pool_overview_hides_all_accounts_from_disabled_domains() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let tempdir = tempfile::tempdir().expect("tempdir");
         let codex_home = tempdir.path().join("codex-home");
@@ -5301,7 +5366,7 @@ mod tests {
             assert!(load_disabled_rotation_domains()?.contains("astronlab.com"));
 
             let overview = current_pool_overview()?;
-            assert_eq!(overview.inventory_count, 2);
+            assert_eq!(overview.inventory_count, 1);
             assert_eq!(overview.inventory_active_slot, None);
             assert_eq!(overview.inventory_healthy_count, 1);
             Ok(())
@@ -5309,7 +5374,7 @@ mod tests {
 
         restore_env_var("CODEX_HOME", previous_codex_home);
         restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
-        result.expect("overview should hide healthy disabled-domain accounts");
+        result.expect("overview should hide disabled-domain accounts");
     }
 
     #[test]

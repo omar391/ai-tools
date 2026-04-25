@@ -8,6 +8,7 @@ use crate::auth::{summarize_codex_auth, CodexAuth};
 
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
+pub const MIN_HEALTHY_QUOTA_LEFT_PERCENT: f64 = 2.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UsageWindow {
@@ -147,7 +148,9 @@ pub fn has_usable_quota(usage: &UsageResponse) -> bool {
         .as_ref()
         .map(|limits| limits.allowed)
         .unwrap_or(false)
-        && effective_left.map(|value| value > 0.0).unwrap_or(false)
+        && effective_left
+            .map(|value| value >= MIN_HEALTHY_QUOTA_LEFT_PERCENT)
+            .unwrap_or(false)
     {
         return true;
     }
@@ -544,6 +547,14 @@ mod tests {
     #[test]
     fn usable_when_primary_window_has_remaining_quota() {
         assert!(has_usable_quota(&make_usage(10.0)));
+    }
+
+    #[test]
+    fn less_than_two_percent_remaining_is_not_usable() {
+        let usage = make_usage(98.1);
+        let remaining = get_effective_quota_left(&usage).expect("effective quota left");
+        assert!((remaining - 1.9).abs() < 1e-9);
+        assert!(!has_usable_quota(&usage));
     }
 
     #[test]
