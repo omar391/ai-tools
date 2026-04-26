@@ -30,4 +30,4 @@
 <!-- BEGIN rules:local -->
 <!-- END rules:local -->
 
-Load on-demand specs: [`code-review`](../ai-rules/skills/agent-md/assets/specs/code-review.md), [`ts`](../ai-rules/skills/agent-md/assets/specs/ts.md)
+Load on-demand specs: [`code-review`](../ai-rules/skills/loopo/assets/specs/code-review.md), [`ts`](../ai-rules/skills/loopo/assets/specs/ts.md)
