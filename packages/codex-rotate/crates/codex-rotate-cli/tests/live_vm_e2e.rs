@@ -2,13 +2,12 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use codex_rotate_core::pool::{load_pool, NextResult};
-use codex_rotate_runtime::live_checks::{
-    load_live_staging_accounts, require_vm_live_capabilities, LiveStagingAccount,
-};
+use codex_rotate_runtime::live_checks::{load_live_staging_accounts, LiveStagingAccount};
 use codex_rotate_runtime::log_isolation::{managed_codex_is_running, stop_managed_codex_instance};
 use codex_rotate_runtime::paths::resolve_paths;
-use codex_rotate_runtime::rotation_hygiene::{rotate_next as run_shared_next, send_guest_request};
+use codex_rotate_runtime::rotation_hygiene::rotate_next as run_shared_next;
 use codex_rotate_test_support::{FailureArtifactBundle, FailureArtifactCapture};
+use codex_rotate_vm::{require_vm_live_capabilities, send_guest_request};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

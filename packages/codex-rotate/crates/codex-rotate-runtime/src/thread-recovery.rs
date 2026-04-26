@@ -1306,7 +1306,7 @@ fn send_continue_turn(port: u16, thread_id: &str, cwd: Option<String>) -> Result
     Ok(())
 }
 
-pub(crate) fn send_codex_app_request<T>(port: u16, method: &str, params: Value) -> Result<T>
+pub fn send_codex_app_request<T>(port: u16, method: &str, params: Value) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {

@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 
-use crate::paths::resolve_paths;
+use codex_rotate_runtime::paths::resolve_paths;
 
 const VM_BRIDGE_ROOT_ENV: &str = "CODEX_ROTATE_VM_BRIDGE_ROOT";
 const UTMCTL_BIN_ENV: &str = "CODEX_ROTATE_UTMCTL_BIN";
@@ -270,9 +270,14 @@ fn render_guest_bridge_launch_agent(node_path: &Path, bridge_root: &Path) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env_mutex;
     use codex_rotate_refresh::FilesystemTracker;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
         match value {

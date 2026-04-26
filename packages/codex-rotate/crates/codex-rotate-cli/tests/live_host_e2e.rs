@@ -48,7 +48,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DIRECT_MANAGED_LAUNCH_ENV: &str = "CODEX_ROTATE_MANAGED_LAUNCH_DIRECT";
 const DEBUG_POOL_DRIFT_ENV: &str = "CODEX_ROTATE_DEBUG_POOL_DRIFT";
-const LIVE_ALIAS_ROOT_ENV: &str = "CODEX_ROTATE_LIVE_ALIAS_ROOT";
+const LIVE_ISOLATED_ENV: &str = "CODEX_ROTATE_LIVE_ISOLATED";
+const LIVE_ISOLATED_ROOT_ENV: &str = "CODEX_ROTATE_LIVE_ISOLATED_ROOT";
 const STAGING_ACCOUNTS_JSON_ENV: &str = "CODEX_ROTATE_STAGING_ACCOUNTS_JSON";
 
 struct LiveHostFailureArtifacts {
@@ -478,7 +479,12 @@ fn with_cloned_live_host_environment<T>(
     operation: impl FnOnce(RuntimePaths, Vec<LiveStagingAccount>) -> Result<T>,
 ) -> Result<T> {
     let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let live_paths = resolve_paths()?;
+    require_host_live_capabilities().with_context(|| {
+        format!(
+            "{scenario} must be seeded from an existing isolated live root; set {LIVE_ISOLATED_ENV}=1, {LIVE_ISOLATED_ROOT_ENV}, and runtime homes under that root"
+        )
+    })?;
+    let source_paths = resolve_paths()?;
 
     let temp = tempfile::tempdir().context("create isolated live host tempdir")?;
     let home = temp.path().join("home");
@@ -499,10 +505,10 @@ fn with_cloned_live_host_environment<T>(
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     copy_file_if_exists(
-        &live_paths.rotate_home.join("accounts.json"),
+        &source_paths.rotate_home.join("accounts.json"),
         &rotate_home.join("accounts.json"),
     )?;
-    copy_file_if_exists(&live_paths.codex_auth_file, &codex_home.join("auth.json"))?;
+    copy_file_if_exists(&source_paths.codex_auth_file, &codex_home.join("auth.json"))?;
     enable_rotation_for_cloned_pool_domains(&rotate_home.join("accounts.json"))?;
     let cloned_auth_email = read_cloned_auth_email(&codex_home.join("auth.json"))?;
     align_pool_file_active_index_to_email(
@@ -534,19 +540,21 @@ fn with_cloned_live_host_environment<T>(
     let previous_fast_browser_home = std::env::var_os("FAST_BROWSER_HOME");
     let previous_codex_app_support = std::env::var_os("CODEX_ROTATE_CODEX_APP_SUPPORT");
     let previous_environment = std::env::var_os("CODEX_ROTATE_ENVIRONMENT");
-    let previous_live_alias_root = std::env::var_os(LIVE_ALIAS_ROOT_ENV);
+    let previous_live_isolated = std::env::var_os(LIVE_ISOLATED_ENV);
+    let previous_live_isolated_root = std::env::var_os(LIVE_ISOLATED_ROOT_ENV);
     let previous_staging_accounts = std::env::var_os(STAGING_ACCOUNTS_JSON_ENV);
     let previous_disable_launch = std::env::var_os("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH");
     let previous_direct_launch = std::env::var_os(DIRECT_MANAGED_LAUNCH_ENV);
 
     unsafe {
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CODEX_ROTATE_HOME");
-        std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("FAST_BROWSER_HOME");
-        std::env::remove_var("CODEX_ROTATE_CODEX_APP_SUPPORT");
+        std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("FAST_BROWSER_HOME", &fast_browser_home);
+        std::env::set_var("CODEX_ROTATE_CODEX_APP_SUPPORT", &codex_app_support);
         std::env::set_var("CODEX_ROTATE_ENVIRONMENT", "host");
-        std::env::set_var(LIVE_ALIAS_ROOT_ENV, temp.path().join("live-aliases"));
+        std::env::set_var(LIVE_ISOLATED_ENV, "1");
+        std::env::set_var(LIVE_ISOLATED_ROOT_ENV, temp.path());
         std::env::set_var(STAGING_ACCOUNTS_JSON_ENV, &staging_accounts_json);
         std::env::set_var("CODEX_ROTATE_DISABLE_MANAGED_LAUNCH", "0");
         std::env::set_var(DIRECT_MANAGED_LAUNCH_ENV, "1");
@@ -565,7 +573,8 @@ fn with_cloned_live_host_environment<T>(
         previous_disable_launch,
     );
     restore_env(STAGING_ACCOUNTS_JSON_ENV, previous_staging_accounts);
-    restore_env(LIVE_ALIAS_ROOT_ENV, previous_live_alias_root);
+    restore_env(LIVE_ISOLATED_ROOT_ENV, previous_live_isolated_root);
+    restore_env(LIVE_ISOLATED_ENV, previous_live_isolated);
     restore_env("CODEX_ROTATE_ENVIRONMENT", previous_environment);
     restore_env("CODEX_ROTATE_CODEX_APP_SUPPORT", previous_codex_app_support);
     restore_env("FAST_BROWSER_HOME", previous_fast_browser_home);

@@ -343,6 +343,7 @@ dependencies = [
  "codex-rotate-refresh",
  "codex-rotate-runtime",
  "codex-rotate-test-support",
+ "codex-rotate-vm",
  "rusqlite",
  "serde",
  "serde_json",
@@ -386,7 +387,6 @@ dependencies = [
  "codex-rotate-core",
  "codex-rotate-refresh",
  "dirs",
- "fs2",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -421,6 +421,23 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "codex-rotate-vm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codex-rotate-core",
+ "codex-rotate-refresh",
+ "codex-rotate-runtime",
+ "dirs",
+ "fs2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

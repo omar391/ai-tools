@@ -14,6 +14,7 @@ chrono.workspace = true
 codex-rotate-core = { path = "../codex-rotate-core" }
 codex-rotate-refresh = { path = "../codex-rotate-refresh" }
 codex-rotate-runtime = { path = "../codex-rotate-runtime" }
+codex-rotate-vm = { path = "../codex-rotate-vm" }
 serde.workspace = true
 serde_json.workspace = true
 url = "2.5.7"

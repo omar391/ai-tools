@@ -1,0 +1,31 @@
+use super::*;
+use crate::test_support::env_mutex;
+use codex_rotate_core::pool::{AccountEntry, PersonaEntry};
+use codex_rotate_refresh::FilesystemTracker;
+use codex_rotate_refresh::ProcessTracker;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tempfile::tempdir;
+
+mod host_activation;
+mod host_environment;
+mod host_persona_live_roots;
+mod host_persona_shared_state;
+mod host_snapshot_sync;
+mod locks_and_managed;
+mod repair_history;
+mod sandbox_rotation;
+mod sync_export;
+mod sync_import;
+mod sync_metadata;
+mod sync_store;
+mod test_support;
+mod workspace_visibility;
+
+use self::test_support::*;

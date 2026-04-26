@@ -5,6 +5,7 @@ members = [
   "packages/codex-rotate/crates/codex-rotate-test-support",
   "packages/codex-rotate/crates/codex-rotate-refresh",
   "packages/codex-rotate/crates/codex-rotate-runtime",
+  "packages/codex-rotate/crates/codex-rotate-vm",
   "packages/codex-rotate-app/src-tauri",
 ]
 resolver = "2"
