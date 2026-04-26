@@ -68,15 +68,6 @@ pub fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
         .collect())
 }
 
-pub fn load_relogin_account_emails() -> Result<HashSet<String>> {
-    Ok(load_pool()?
-        .accounts
-        .into_iter()
-        .filter(|entry| entry.relogin)
-        .map(|entry| normalize_email_key(&entry.email))
-        .collect())
-}
-
 pub(super) fn save_credential_store(store: &CredentialStore) -> Result<()> {
     let credential_state = serialize_credential_store(store);
     let mut dropped_non_dev_pending = Vec::new();
@@ -516,13 +507,6 @@ pub(super) fn normalize_stored_credential_map(
 pub(super) fn normalize_credential_family(raw: &Value) -> Option<CredentialFamily> {
     let mut record = serde_json::from_value::<CredentialFamily>(raw.clone()).ok()?;
     record.template = migrate_legacy_template_value(&record.template).ok()?;
-    record.relogin = record
-        .relogin
-        .iter()
-        .map(|email| normalize_email_key(email))
-        .collect::<Vec<_>>();
-    record.relogin.sort();
-    record.relogin.dedup();
     record.suspend_domain_on_terminal_refresh_failure = raw
         .as_object()
         .is_some_and(|family| family.contains_key("deleted"))
@@ -560,9 +544,6 @@ pub(super) fn merge_normalized_family(
         Some(existing) => {
             existing.next_suffix = existing.next_suffix.max(family.next_suffix);
             existing.max_skipped_slots = existing.max_skipped_slots.max(family.max_skipped_slots);
-            existing.relogin.extend(family.relogin.iter().cloned());
-            existing.relogin.sort();
-            existing.relogin.dedup();
             existing.suspend_domain_on_terminal_refresh_failure |=
                 family.suspend_domain_on_terminal_refresh_failure;
             if parse_sortable_timestamp(Some(family.created_at.as_str()))
@@ -737,27 +718,11 @@ pub(crate) fn record_terminal_refresh_failures(emails: &[String]) -> Result<bool
         let removed_skipped = store.skipped.remove(&normalized_email);
         dirty |= removed_pending || removed_skipped;
 
-        let Some(family_match) = family_match else {
-            continue;
-        };
-
-        if let Some(family) = store.families.get_mut(&family_match.key) {
-            if !family
-                .relogin
-                .iter()
-                .any(|entry| normalize_email_key(entry) == normalized_email)
-            {
-                family.relogin.push(normalized_email.clone());
-                family.relogin.sort();
-                family.relogin.dedup();
-                dirty = true;
-            }
-        }
-
-        if family_match
-            .family
-            .suspend_domain_on_terminal_refresh_failure
-        {
+        if family_match.is_some_and(|family_match| {
+            family_match
+                .family
+                .suspend_domain_on_terminal_refresh_failure
+        }) {
             let Some(domain) = extract_email_domain(email) else {
                 continue;
             };

@@ -20,42 +20,6 @@ fn load_codex_mode_config_from_state(state: &Value) -> Result<CodexModeConfig> {
     Ok(CodexModeConfig::with_defaults(config))
 }
 
-fn collect_legacy_family_relogin_emails(state: &Value) -> HashSet<String> {
-    state
-        .get("families")
-        .and_then(Value::as_object)
-        .map(|families| {
-            families
-                .values()
-                .filter_map(Value::as_object)
-                .flat_map(|family| {
-                    family
-                        .get("relogin")
-                        .or_else(|| family.get("deleted"))
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .filter_map(Value::as_str)
-                .map(normalize_email_for_label)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn apply_legacy_family_relogin_flags(state: &Value, pool: &mut Pool) {
-    let legacy_relogin = collect_legacy_family_relogin_emails(state);
-    if legacy_relogin.is_empty() {
-        return;
-    }
-
-    for entry in &mut pool.accounts {
-        if legacy_relogin.contains(&normalize_email_for_label(&entry.email)) {
-            entry.relogin = true;
-        }
-    }
-}
-
 pub fn load_pool() -> Result<Pool> {
     let state = load_rotate_state_json()?;
     let object = state.as_object().cloned().unwrap_or_default();
@@ -65,7 +29,6 @@ pub fn load_pool() -> Result<Pool> {
     }))
     .context("Invalid pool data in rotate state.")?;
     normalize_pool_entries(&mut pool);
-    apply_legacy_family_relogin_flags(&state, &mut pool);
     Ok(pool)
 }
 

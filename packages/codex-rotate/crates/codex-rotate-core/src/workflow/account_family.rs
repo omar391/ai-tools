@@ -932,9 +932,6 @@ pub(super) fn upsert_family_for_account(
         Some(existing) => {
             let previous = existing.clone();
             existing.next_suffix = existing.next_suffix.max(next_suffix);
-            existing
-                .relogin
-                .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if parse_sortable_timestamp(Some(next_created_at.as_str()))
                 < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
@@ -960,7 +957,6 @@ pub(super) fn upsert_family_for_account(
                     created_at: next_created_at,
                     updated_at: next_updated_at,
                     last_created_email: next_last_created_email,
-                    relogin: Vec::new(),
                     suspend_domain_on_terminal_refresh_failure: false,
                 },
             );
@@ -982,9 +978,6 @@ pub(super) fn merge_legacy_account_into_families(
     match families.get_mut(&family_key) {
         Some(existing) => {
             existing.next_suffix = existing.next_suffix.max(account.suffix.saturating_add(1));
-            existing
-                .relogin
-                .retain(|email| normalize_email_key(email) != normalize_email_key(&account.email));
             if created_at < parse_sortable_timestamp(Some(existing.created_at.as_str()))
                 || existing.created_at.trim().is_empty()
             {
@@ -1006,7 +999,6 @@ pub(super) fn merge_legacy_account_into_families(
                     created_at: account.created_at.clone(),
                     updated_at: account.updated_at.clone(),
                     last_created_email: Some(account.email.clone()),
-                    relogin: Vec::new(),
                     suspend_domain_on_terminal_refresh_failure: false,
                 },
             );

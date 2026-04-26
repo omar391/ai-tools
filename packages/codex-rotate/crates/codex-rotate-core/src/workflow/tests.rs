@@ -1091,7 +1091,6 @@ fn compute_fresh_account_family_suffix_respects_family_frontier_when_skips_exist
         created_at: "2026-04-13T05:00:00.000Z".to_string(),
         updated_at: "2026-04-13T05:00:00.000Z".to_string(),
         last_created_email: None,
-        relogin: Vec::new(),
         suspend_domain_on_terminal_refresh_failure: false,
     };
 
@@ -1121,7 +1120,6 @@ fn compute_fresh_account_family_suffix_preserves_gap_fill_without_skips() {
         created_at: "2026-04-13T05:00:00.000Z".to_string(),
         updated_at: "2026-04-13T05:00:00.000Z".to_string(),
         last_created_email: None,
-        relogin: Vec::new(),
         suspend_domain_on_terminal_refresh_failure: false,
     };
 
@@ -1149,7 +1147,6 @@ fn compute_fresh_account_family_suffix_ignores_frontier_when_skips_are_not_reser
         created_at: "2026-04-13T05:00:00.000Z".to_string(),
         updated_at: "2026-04-14T06:11:25.913Z".to_string(),
         last_created_email: Some("dev3astronlab+1@gmail.com".to_string()),
-        relogin: Vec::new(),
         suspend_domain_on_terminal_refresh_failure: false,
     };
 
@@ -1180,7 +1177,6 @@ fn collect_known_account_emails_includes_relogin_marked_pool_entries() {
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: Some("dev.9@astronlab.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -1234,7 +1230,6 @@ fn prepare_next_auto_create_attempt_preserves_current_skip_when_budget_is_full()
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-13T05:00:00.000Z".to_string(),
                 last_created_email: None,
-                relogin: Vec::new(),
                 suspend_domain_on_terminal_refresh_failure: false,
             },
         );
@@ -1297,7 +1292,6 @@ fn skip_pending_account_and_advance_family_unblocks_next_gmail_suffix() {
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T19:56:10.036Z".to_string(),
                 last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-                relogin: Vec::new(),
                 suspend_domain_on_terminal_refresh_failure: false,
             },
         );
@@ -1371,7 +1365,6 @@ fn skip_pending_account_and_advance_family_keeps_existing_runtime_gmail_skips_re
                 created_at: "2026-04-13T05:00:00.000Z".to_string(),
                 updated_at: "2026-04-14T21:40:53.532Z".to_string(),
                 last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-                relogin: Vec::new(),
                 suspend_domain_on_terminal_refresh_failure: false,
             },
         );
@@ -1428,7 +1421,6 @@ fn compute_create_attempt_family_suffix_advances_past_current_retry_reserved_gma
         created_at: "2026-04-13T05:00:00.000Z".to_string(),
         updated_at: "2026-04-15T04:22:55.044Z".to_string(),
         last_created_email: Some("dev3astronlab+1@gmail.com".to_string()),
-        relogin: Vec::new(),
         suspend_domain_on_terminal_refresh_failure: false,
     };
 
@@ -1944,7 +1936,6 @@ fn save_credential_store_preserves_pool_sections() {
                 created_at: "2026-04-05T00:00:00.000Z".to_string(),
                 updated_at: "2026-04-05T00:00:00.000Z".to_string(),
                 last_created_email: Some("dev.2@astronlab.com".to_string()),
-                relogin: Vec::new(),
                 suspend_domain_on_terminal_refresh_failure: false,
             },
         );
@@ -1982,8 +1973,7 @@ fn concurrent_pool_and_credential_store_writes_preserve_valid_rotate_state() {
                     "max_skipped_slots": 0,
                     "created_at": "2026-04-05T00:00:00.000Z",
                     "updated_at": "2026-04-05T00:00:00.000Z",
-                    "last_created_email": "dev.1@astronlab.com",
-                    "relogin": []
+                    "last_created_email": "dev.1@astronlab.com"
                 }
             }
         }))
@@ -2082,34 +2072,6 @@ fn normalize_credential_store_defaults_family_skip_cap() {
 }
 
 #[test]
-fn normalize_credential_store_reads_family_relogin_emails() {
-    let store = normalize_credential_store(json!({
-        "families": {
-            "dev-1::dev.{n}@astronlab.com": {
-                "profile_name": "dev-1",
-                "template": "dev.{n}@astronlab.com",
-                "next_suffix": 23,
-                "created_at": "2026-04-05T00:00:00.000Z",
-                "updated_at": "2026-04-05T00:00:00.000Z",
-                "last_created_email": "dev.22@astronlab.com",
-                "relogin": ["DEV.2@astronlab.com", "dev.3@astronlab.com"]
-            }
-        }
-    }));
-
-    assert_eq!(
-        store
-            .families
-            .get("dev-1::dev.{n}@astronlab.com")
-            .map(|family| family.relogin.clone()),
-        Some(vec![
-            "dev.2@astronlab.com".to_string(),
-            "dev.3@astronlab.com".to_string()
-        ])
-    );
-}
-
-#[test]
 fn normalize_credential_store_migrates_legacy_deleted_into_current_suspend_flag() {
     let store = normalize_credential_store(json!({
         "families": {
@@ -2129,13 +2091,6 @@ fn normalize_credential_store_migrates_legacy_deleted_into_current_suspend_flag(
         .families
         .get("dev-1::dev.{n}@astronlab.com")
         .expect("family");
-    assert_eq!(
-        family.relogin,
-        vec![
-            "dev.2@astronlab.com".to_string(),
-            "dev.3@astronlab.com".to_string()
-        ]
-    );
     assert!(family.suspend_domain_on_terminal_refresh_failure);
 }
 
@@ -2322,7 +2277,6 @@ fn select_stored_template_hint_prefers_common_and_high_frontier_template() {
             created_at: "2026-04-06T16:00:00.000Z".to_string(),
             updated_at: "2026-04-06T16:00:00.000Z".to_string(),
             last_created_email: Some("qa.299@astronlab.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -2442,7 +2396,6 @@ fn resolve_create_template_for_profile_prefers_store_default_before_existing_fam
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-14T06:11:25.913Z".to_string(),
             last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -2483,7 +2436,6 @@ fn resolve_create_template_for_profile_returns_store_default_even_when_hints_are
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-14T06:11:25.913Z".to_string(),
             last_created_email: Some("dev.106@astronlab.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -2497,7 +2449,6 @@ fn resolve_create_template_for_profile_returns_store_default_even_when_hints_are
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-14T06:11:25.913Z".to_string(),
             last_created_email: Some("dev3astronlab+2@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -2661,7 +2612,6 @@ fn relogin_selector_accepts_exact_family_email_without_pool_or_pending() {
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-14T16:01:04.952Z".to_string(),
             last_created_email: Some("dev3astronlab+4@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -2884,8 +2834,7 @@ fn normalize_credential_store_keeps_current_default_gmail_template_pending() {
                 "max_skipped_slots": 0,
                 "created_at": "2026-04-13T05:00:00.000Z",
                 "updated_at": "2026-04-14T15:12:25.003Z",
-                "last_created_email": "dev3astronlab+4@gmail.com",
-                "relogin": []
+                "last_created_email": "dev3astronlab+4@gmail.com"
             }
         },
         "pending": {
@@ -3215,7 +3164,6 @@ fn relogin_family_match_prefers_exact_last_created_email() {
             created_at: "2026-03-20T00:00:00.000Z".to_string(),
             updated_at: "2026-03-20T01:00:00.000Z".to_string(),
             last_created_email: Some("dev.user+3@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -3229,7 +3177,6 @@ fn relogin_family_match_prefers_exact_last_created_email() {
             created_at: "2026-03-20T00:00:00.000Z".to_string(),
             updated_at: "2026-03-20T02:00:00.000Z".to_string(),
             last_created_email: Some("dev.user+2@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -3253,7 +3200,6 @@ fn relogin_family_match_refuses_ambiguous_non_exact_matches() {
             created_at: "2026-03-20T00:00:00.000Z".to_string(),
             updated_at: "2026-03-20T01:00:00.000Z".to_string(),
             last_created_email: Some("dev.user+3@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -3267,7 +3213,6 @@ fn relogin_family_match_refuses_ambiguous_non_exact_matches() {
             created_at: "2026-03-20T00:00:00.000Z".to_string(),
             updated_at: "2026-03-20T02:00:00.000Z".to_string(),
             last_created_email: Some("dev.user+4@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -3288,7 +3233,6 @@ fn relogin_family_match_supports_bare_gmail_template() {
             created_at: "2026-03-20T00:00:00.000Z".to_string(),
             updated_at: "2026-03-20T01:00:00.000Z".to_string(),
             last_created_email: Some("dev.user+3@gmail.com".to_string()),
-            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
@@ -3389,7 +3333,6 @@ fn add_reconciliation_updates_matching_bare_gmail_family_state() {
                 created_at: "2026-04-05T05:51:09.049Z".to_string(),
                 updated_at: "2026-04-05T05:51:09.049Z".to_string(),
                 last_created_email: Some("supplyprima1+2@gmail.com".to_string()),
-                relogin: Vec::new(),
                 suspend_domain_on_terminal_refresh_failure: false,
             },
         );

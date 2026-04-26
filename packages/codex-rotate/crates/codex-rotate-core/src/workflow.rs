@@ -62,7 +62,7 @@ pub use self::create_flow::{
 };
 pub use self::credential_store::{
     auto_disable_domain_for_account, extract_email_domain, load_disabled_rotation_domains,
-    load_relogin_account_emails, record_removed_account,
+    record_removed_account,
 };
 pub(crate) use self::credential_store::{
     migrate_rotate_state_credential_sections, record_terminal_refresh_failures,
@@ -215,8 +215,6 @@ pub struct CredentialFamily {
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
-    #[serde(default, alias = "deleted", skip_serializing)]
-    pub relogin: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub suspend_domain_on_terminal_refresh_failure: bool,
 }

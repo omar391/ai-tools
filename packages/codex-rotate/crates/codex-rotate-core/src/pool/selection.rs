@@ -70,7 +70,6 @@ pub(crate) fn find_next_usable_account(
     dirty: bool,
     skip_indices: &HashSet<usize>,
     disabled_domains: &HashSet<String>,
-    relogin_accounts: &HashSet<String>,
 ) -> Result<(Option<RotationCandidate>, bool)> {
     let mut next_dirty = dirty;
     next_dirty |= prune_terminal_accounts_from_pool(pool)?;
@@ -89,7 +88,7 @@ pub(crate) fn find_next_usable_account(
         if skip_indices.contains(&index) {
             continue;
         }
-        if account_entry_marked_for_relogin(relogin_accounts, &pool.accounts[index]) {
+        if account_entry_marked_for_relogin(&pool.accounts[index]) {
             reasons.push(format!(
                 "{}: scheduled for relogin",
                 pool.accounts[index].label

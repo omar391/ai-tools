@@ -1,5 +1,48 @@
 use super::*;
 
+fn relogin_rotation_target_error(entry: &AccountEntry) -> anyhow::Error {
+    anyhow!(
+        "Account \"{}\" is marked for relogin and cannot be selected for rotation. Run: codex-rotate relogin {}",
+        entry.label,
+        entry.label
+    )
+}
+
+fn relogin_rotation_unavailable_error() -> anyhow::Error {
+    anyhow!(
+        "No rotation target is available because the remaining accounts are marked for relogin. Run: codex-rotate relogin <selector>"
+    )
+}
+
+fn previous_rotation_target_index(
+    pool: &Pool,
+    disabled_domains: &HashSet<String>,
+) -> Result<usize> {
+    let previous_index = pool.active_index;
+    let candidate_indices = (1..pool.accounts.len())
+        .map(|offset| (pool.active_index + pool.accounts.len() - offset) % pool.accounts.len())
+        .collect::<Vec<_>>();
+
+    if let Some(target_index) = candidate_indices.iter().copied().find(|index| {
+        account_rotation_enabled(disabled_domains, &pool.accounts[*index].email)
+            && !account_entry_marked_for_relogin(&pool.accounts[*index])
+    }) {
+        return Ok(target_index);
+    }
+
+    if candidate_indices.iter().copied().any(|index| {
+        index != previous_index
+            && account_rotation_enabled(disabled_domains, &pool.accounts[index].email)
+            && account_entry_marked_for_relogin(&pool.accounts[index])
+    }) {
+        return Err(relogin_rotation_unavailable_error());
+    }
+
+    Err(disabled_rotation_target_error(
+        &disabled_rotation_domains_for_pool(pool, disabled_domains, Some(previous_index)),
+    ))
+}
+
 pub fn cmd_next() -> Result<String> {
     cmd_next_with_progress(None)
 }
@@ -23,7 +66,6 @@ pub fn prepare_next_rotation_with_progress(
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     let disabled_domains = load_disabled_rotation_domains()?;
-    let relogin_accounts = load_relogin_account_emails()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -38,7 +80,7 @@ pub fn prepare_next_rotation_with_progress(
             break;
         };
         round_robin_steps += 1;
-        if account_entry_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index]) {
+        if account_entry_marked_for_relogin(&pool.accounts[candidate_index]) {
             cursor_index = candidate_index;
             continue;
         }
@@ -127,7 +169,6 @@ pub fn prepare_next_rotation_with_progress(
         dirty,
         &inspected_later_indices,
         &disabled_domains,
-        &relogin_accounts,
     )?;
     dirty = result.1;
 
@@ -232,7 +273,11 @@ pub fn prepare_prev_rotation() -> Result<PreparedRotation> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     if pool.accounts.len() == 1 {
@@ -245,13 +290,14 @@ pub fn prepare_prev_rotation() -> Result<PreparedRotation> {
     }
 
     let previous_index = pool.active_index;
-    let Some(target_index) = (1..pool.accounts.len())
-        .map(|offset| (pool.active_index + pool.accounts.len() - offset) % pool.accounts.len())
-        .find(|index| account_rotation_enabled(&disabled_domains, &pool.accounts[*index].email))
-    else {
-        return Err(disabled_rotation_target_error(
-            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
-        ));
+    let target_index = match previous_rotation_target_index(&pool, &disabled_domains) {
+        Ok(target_index) => target_index,
+        Err(error) => {
+            if dirty {
+                save_pool(&pool)?;
+            }
+            return Err(error);
+        }
     };
     let previous = pool.accounts[previous_index].clone();
     let target = pool.accounts[target_index].clone();
@@ -287,7 +333,11 @@ pub fn prepare_set_rotation(selector: &str) -> Result<PreparedRotation> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
 
@@ -296,6 +346,13 @@ pub fn prepare_set_rotation(selector: &str) -> Result<PreparedRotation> {
     let selection = resolve_account_selector(&pool, selector)?;
     let target_index = selection.index;
     let target = selection.entry;
+
+    if account_entry_marked_for_relogin(&target) {
+        if dirty {
+            save_pool(&pool)?;
+        }
+        return Err(relogin_rotation_target_error(&target));
+    }
 
     let previous_label = previous.label.clone();
     let previous_email = previous.email.clone();
@@ -401,7 +458,6 @@ pub fn rotate_next_internal_with_progress(
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     let disabled_domains = load_disabled_rotation_domains()?;
-    let relogin_accounts = load_relogin_account_emails()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -416,7 +472,7 @@ pub fn rotate_next_internal_with_progress(
             break;
         };
         round_robin_steps += 1;
-        if account_entry_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index]) {
+        if account_entry_marked_for_relogin(&pool.accounts[candidate_index]) {
             cursor_index = candidate_index;
             continue;
         }
@@ -486,7 +542,6 @@ pub fn rotate_next_internal_with_progress(
         dirty,
         &inspected_later_indices,
         &disabled_domains,
-        &relogin_accounts,
     )?;
     dirty = result.1;
 
@@ -577,7 +632,11 @@ pub fn cmd_prev() -> Result<String> {
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
+    dirty |= prune_terminal_accounts_from_pool(&mut pool)?;
     if pool.accounts.is_empty() {
+        if dirty {
+            save_pool(&pool)?;
+        }
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     if pool.accounts.len() == 1 {
@@ -590,13 +649,14 @@ pub fn cmd_prev() -> Result<String> {
     }
 
     let previous_index = pool.active_index;
-    let Some(next_index) = (1..pool.accounts.len())
-        .map(|offset| (pool.active_index + pool.accounts.len() - offset) % pool.accounts.len())
-        .find(|index| account_rotation_enabled(&disabled_domains, &pool.accounts[*index].email))
-    else {
-        return Err(disabled_rotation_target_error(
-            &disabled_rotation_domains_for_pool(&pool, &disabled_domains, Some(previous_index)),
-        ));
+    let next_index = match previous_rotation_target_index(&pool, &disabled_domains) {
+        Ok(next_index) => next_index,
+        Err(error) => {
+            if dirty {
+                save_pool(&pool)?;
+            }
+            return Err(error);
+        }
     };
     pool.active_index = next_index;
     let next = pool.accounts[pool.active_index].clone();
