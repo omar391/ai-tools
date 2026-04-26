@@ -2,6 +2,13 @@ use super::*;
 
 pub(super) const LIST_QUOTA_REFRESH_LIMIT_ENV: &str = "CODEX_ROTATE_LIST_QUOTA_REFRESH_LIMIT";
 pub(super) const DEFAULT_LIST_QUOTA_REFRESH_LIMIT: usize = 8;
+pub(super) const LIST_FORCE_REFRESH_DELAY_MS_ENV: &str = "CODEX_ROTATE_LIST_FORCE_REFRESH_DELAY_MS";
+pub(super) const DEFAULT_LIST_FORCE_REFRESH_DELAY_MS: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListOptions {
+    pub force_refresh: bool,
+}
 
 struct LineEmitter<'a> {
     writer: Option<&'a mut dyn Write>,
@@ -41,19 +48,27 @@ impl<'a> LineEmitter<'a> {
 }
 
 pub fn cmd_list() -> Result<String> {
+    cmd_list_with_options(ListOptions::default())
+}
+
+pub fn cmd_list_with_options(options: ListOptions) -> Result<String> {
     let mut emitter = LineEmitter::buffered();
-    cmd_list_impl(&mut emitter)?;
+    cmd_list_impl(&mut emitter, options)?;
     Ok(emitter.finish())
 }
 
 // TODO: expose a structured healthy-account list so callers can use this logic directly
 // instead of scraping the rendered account-pool text.
 pub fn cmd_list_stream(writer: &mut dyn Write) -> Result<()> {
-    let mut emitter = LineEmitter::streaming(writer);
-    cmd_list_impl(&mut emitter)
+    cmd_list_stream_with_options(writer, ListOptions::default())
 }
 
-fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
+pub fn cmd_list_stream_with_options(writer: &mut dyn Write, options: ListOptions) -> Result<()> {
+    let mut emitter = LineEmitter::streaming(writer);
+    cmd_list_impl(&mut emitter, options)
+}
+
+fn cmd_list_impl(output: &mut LineEmitter<'_>, options: ListOptions) -> Result<()> {
     let paths = resolve_paths()?;
     let mut pool = load_pool()?;
     let listed_at = Utc::now();
@@ -70,12 +85,14 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         return Ok(());
     }
     let disabled_domains = load_disabled_rotation_domains()?;
-    let refresh_order = build_list_quota_refresh_order(&pool, listed_at);
-    let refresh_indices = refresh_order
-        .into_iter()
-        .take(list_quota_refresh_limit())
-        .collect::<HashSet<_>>();
+    let refresh_indices = build_list_quota_refresh_indices(&pool, listed_at, options);
     let display_order = build_list_account_display_order(&pool);
+    let force_refresh_delay_ms = if options.force_refresh {
+        list_force_refresh_delay_ms()
+    } else {
+        0
+    };
+    let mut forced_refresh_count = 0usize;
 
     let mut usable_count = 0;
     let mut exhausted_count = 0;
@@ -106,9 +123,19 @@ fn cmd_list_impl(output: &mut LineEmitter<'_>) -> Result<()> {
         let account_header_line = build_list_account_header_line(&pool.accounts[index], is_active);
         output.push_line(account_header_line.clone())?;
 
-        if refresh_indices.contains(&index)
-            && account_quota_refresh_due_for_list(&pool.accounts[index], listed_at)
-        {
+        let should_refresh = if options.force_refresh {
+            refresh_indices.contains(&index)
+        } else {
+            refresh_indices.contains(&index)
+                && account_quota_refresh_due_for_list(&pool.accounts[index], listed_at)
+        };
+        if should_refresh {
+            if options.force_refresh {
+                if forced_refresh_count > 0 && force_refresh_delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(force_refresh_delay_ms));
+                }
+                forced_refresh_count += 1;
+            }
             let inspection =
                 inspect_account(&mut pool.accounts[index], &paths.codex_auth_file, is_active)?;
             dirty |= inspection.updated;
@@ -258,6 +285,21 @@ pub(super) fn build_list_account_display_order(pool: &Pool) -> Vec<usize> {
     indices
 }
 
+pub(super) fn build_list_quota_refresh_indices(
+    pool: &Pool,
+    now: DateTime<Utc>,
+    options: ListOptions,
+) -> HashSet<usize> {
+    let mut refresh_indices = build_list_quota_refresh_order(pool, now)
+        .into_iter()
+        .take(list_quota_refresh_limit())
+        .collect::<HashSet<_>>();
+    if options.force_refresh {
+        refresh_indices.extend(build_list_force_refresh_order(pool));
+    }
+    refresh_indices
+}
+
 pub(super) fn build_list_quota_refresh_order(pool: &Pool, now: DateTime<Utc>) -> Vec<usize> {
     let mut refreshes = pool
         .accounts
@@ -279,7 +321,7 @@ pub(super) fn build_list_quota_refresh_order(pool: &Pool, now: DateTime<Utc>) ->
         .iter()
         .enumerate()
         .filter(|(_, entry)| entry.last_quota_checked_at.is_some())
-        .filter(|(_, entry)| cached_quota_state_is_stale(entry, now))
+        .filter(|(_, entry)| should_refresh_cached_account_for_list(entry, now))
         .map(|(index, entry)| {
             let priority = if index == pool.active_index {
                 0
@@ -302,6 +344,45 @@ pub(super) fn build_list_quota_refresh_order(pool: &Pool, now: DateTime<Utc>) ->
     refreshes.extend(candidates.into_iter().map(|(index, _, _)| index));
 
     refreshes
+}
+
+pub(super) fn build_list_force_refresh_order(pool: &Pool) -> Vec<usize> {
+    pool.accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| force_refresh_candidate_for_list(entry).then_some(index))
+        .collect()
+}
+
+pub(super) fn should_refresh_cached_account_for_list(
+    entry: &AccountEntry,
+    now: DateTime<Utc>,
+) -> bool {
+    if cached_quota_is_healthy_for_list(entry) {
+        return false;
+    }
+    cached_quota_state_is_stale(entry, now)
+}
+
+pub(super) fn force_refresh_candidate_for_list(entry: &AccountEntry) -> bool {
+    !account_requires_terminal_cleanup(entry) && cached_quota_is_healthy_for_list(entry)
+}
+
+pub(super) fn cached_quota_is_healthy_for_list(entry: &AccountEntry) -> bool {
+    if entry.last_quota_usable != Some(true) {
+        return false;
+    }
+    entry
+        .last_quota_primary_left_percent
+        .map(|value| (value as f64) >= MIN_HEALTHY_QUOTA_LEFT_PERCENT)
+        .unwrap_or(false)
+}
+
+pub(super) fn list_force_refresh_delay_ms() -> u64 {
+    std::env::var(LIST_FORCE_REFRESH_DELAY_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LIST_FORCE_REFRESH_DELAY_MS)
 }
 
 pub(super) fn list_quota_refresh_limit() -> usize {

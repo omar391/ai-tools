@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use codex_rotate_core::pool::{
-    cmd_add, cmd_list_stream, cmd_remove, cmd_status_stream, NextResult,
+    cmd_add, cmd_list_stream_with_options, cmd_remove, cmd_status_stream, ListOptions, NextResult,
 };
 use codex_rotate_core::workflow::{
     cmd_create_with_progress, CreateCommandOptions, CreateCommandSource, ReloginOptions,
@@ -151,7 +151,7 @@ fn run_with_args(args: &[String], writer: &mut dyn Write) -> Result<()> {
                 )?,
             )?
         }
-        Some("list") => cmd_list_stream(writer)?,
+        Some("list") => cmd_list_stream_with_options(writer, parse_list_options(&args[1..])?)?,
         Some("status") => cmd_status_stream(writer)?,
         Some("relogin") => {
             let (selector, options) = parse_public_relogin_options(&args[1..])?;
@@ -394,7 +394,8 @@ fn help_text() -> String {
   {CYAN}next{RESET} [-mw] [selector]  Swap to the next account, or a selected target
   {CYAN}prev{RESET} [-mw]             Swap to the previous account
   {CYAN}set{RESET} [-mw] <selector>   Swap to the selected account (skip quota/health gating)
-  {CYAN}list{RESET}             Show all accounts with cached quota info
+  {CYAN}list{RESET} [-f|--force-refresh]
+                   Show cached quota info; force refreshes healthy accounts serially
   {CYAN}status{RESET}           Show the current active account info and quota
   {CYAN}relogin{RESET} <selector> Repair that account in one step
   {CYAN}report-duplicates{RESET}   Show potential historical duplicates in the current persona

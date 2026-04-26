@@ -803,8 +803,8 @@ fn list_account_refresh_due_only_when_refresh_time_elapsed_or_missing() {
     fresh.last_quota_next_refresh_at = Some("2026-04-08T12:10:00.000Z".to_string());
     assert!(!account_quota_refresh_due_for_list(&fresh, now));
 
-    let mut stale = stored_entry(Some(true), Some("2026-04-08T12:03:30.000Z"));
-    stale.last_quota_primary_left_percent = Some(40);
+    let mut stale = stored_entry(Some(false), Some("2026-04-08T12:03:30.000Z"));
+    stale.last_quota_primary_left_percent = Some(2);
     stale.last_quota_next_refresh_at = Some("2026-04-08T12:04:59.000Z".to_string());
     assert!(account_quota_refresh_due_for_list(&stale, now));
 
@@ -813,7 +813,7 @@ fn list_account_refresh_due_only_when_refresh_time_elapsed_or_missing() {
 }
 
 #[test]
-fn list_quota_refresh_order_prioritizes_active_then_oldest_stale_usable() {
+fn list_quota_refresh_order_prioritizes_active_then_oldest_stale_unhealthy() {
     let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
         .expect("parse now")
         .with_timezone(&Utc);
@@ -821,11 +821,11 @@ fn list_quota_refresh_order_prioritizes_active_then_oldest_stale_usable() {
     let mut active = stored_entry(Some(false), Some("2026-04-08T12:04:00.000Z"));
     active.last_quota_blocker = Some("rate limited".to_string());
 
-    let mut oldest_stale_usable = stored_entry(Some(true), Some("2026-04-08T12:03:30.000Z"));
-    oldest_stale_usable.last_quota_primary_left_percent = Some(40);
+    let mut oldest_stale_unhealthy = stored_entry(Some(false), Some("2026-04-08T12:03:30.000Z"));
+    oldest_stale_unhealthy.last_quota_primary_left_percent = Some(2);
 
-    let mut fresher_stale_usable = stored_entry(Some(true), Some("2026-04-08T12:04:10.000Z"));
-    fresher_stale_usable.last_quota_primary_left_percent = Some(40);
+    let mut fresher_stale_unhealthy = stored_entry(Some(false), Some("2026-04-08T12:04:10.000Z"));
+    fresher_stale_unhealthy.last_quota_primary_left_percent = Some(2);
 
     let mut fresh_usable = stored_entry(Some(true), Some("2026-04-08T12:04:45.000Z"));
     fresh_usable.last_quota_primary_left_percent = Some(40);
@@ -834,17 +834,17 @@ fn list_quota_refresh_order_prioritizes_active_then_oldest_stale_usable() {
         active_index: 0,
         accounts: vec![
             active,
-            fresher_stale_usable,
+            fresher_stale_unhealthy,
             fresh_usable,
-            oldest_stale_usable,
+            oldest_stale_unhealthy,
         ],
     };
 
-    assert_eq!(build_list_quota_refresh_order(&pool, now), vec![0, 3]);
+    assert_eq!(build_list_quota_refresh_order(&pool, now), vec![0, 3, 1]);
 }
 
 #[test]
-fn list_quota_refresh_order_includes_unknown_and_all_stale_entries() {
+fn list_quota_refresh_order_includes_unknown_and_stale_unhealthy_entries() {
     let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
         .expect("parse now")
         .with_timezone(&Utc);
@@ -865,7 +865,114 @@ fn list_quota_refresh_order_includes_unknown_and_all_stale_entries() {
         accounts: vec![stale_active, unknown, stale_usable],
     };
 
-    assert_eq!(build_list_quota_refresh_order(&pool, now), vec![1, 0, 2]);
+    assert_eq!(build_list_quota_refresh_order(&pool, now), vec![1, 0]);
+}
+
+#[test]
+fn list_default_refresh_skips_cached_healthy_accounts_even_when_stale() {
+    let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+        .expect("parse now")
+        .with_timezone(&Utc);
+    let mut healthy = stored_entry(Some(true), Some("2026-04-08T11:55:00.000Z"));
+    healthy.last_quota_primary_left_percent = Some(MIN_HEALTHY_QUOTA_LEFT_PERCENT as u8);
+    healthy.last_quota_next_refresh_at = Some("2026-04-08T11:56:00.000Z".to_string());
+
+    assert!(account_quota_refresh_due_for_list(&healthy, now));
+    assert!(!should_refresh_cached_account_for_list(&healthy, now));
+}
+
+#[test]
+fn list_force_refresh_order_includes_all_cached_healthy_accounts() {
+    let mut healthy_stale = stored_entry(Some(true), Some("2026-04-08T11:55:00.000Z"));
+    healthy_stale.last_quota_primary_left_percent = Some(80);
+    healthy_stale.last_quota_next_refresh_at = Some("2026-04-08T11:56:00.000Z".to_string());
+
+    let mut healthy_fresh = stored_entry(Some(true), Some("2026-04-08T12:04:30.000Z"));
+    healthy_fresh.last_quota_primary_left_percent = Some(40);
+    healthy_fresh.last_quota_next_refresh_at = Some("2026-04-08T12:10:00.000Z".to_string());
+
+    let mut below_threshold = stored_entry(Some(false), Some("2026-04-08T11:55:00.000Z"));
+    below_threshold.last_quota_primary_left_percent =
+        Some((MIN_HEALTHY_QUOTA_LEFT_PERCENT as u8).saturating_sub(1));
+    below_threshold.last_quota_next_refresh_at = Some("2026-04-08T11:56:00.000Z".to_string());
+
+    let mut terminal = stored_entry(Some(true), Some("2026-04-08T11:55:00.000Z"));
+    terminal.last_quota_primary_left_percent = Some(80);
+    terminal.last_quota_blocker = Some(
+        "Token refresh failed (401): refresh token already rotated; sign in again".to_string(),
+    );
+
+    let pool = Pool {
+        active_index: 0,
+        accounts: vec![healthy_stale, healthy_fresh, below_threshold, terminal],
+    };
+
+    assert_eq!(build_list_force_refresh_order(&pool), vec![0, 1]);
+}
+
+#[test]
+fn list_force_refresh_indices_are_not_capped_by_default_limit() {
+    let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+        .expect("parse now")
+        .with_timezone(&Utc);
+    let accounts = (0..(DEFAULT_LIST_QUOTA_REFRESH_LIMIT + 2))
+        .map(|index| {
+            let mut account = stored_entry(Some(true), Some("2026-04-08T11:55:00.000Z"));
+            account.label = format!("healthy-{index}");
+            account.email = format!("healthy-{index}@example.com");
+            account.account_id = format!("acct-healthy-{index}");
+            account.last_quota_primary_left_percent = Some(80);
+            account
+        })
+        .collect::<Vec<_>>();
+    let pool = Pool {
+        active_index: 0,
+        accounts,
+    };
+
+    assert_eq!(
+        build_list_quota_refresh_indices(
+            &pool,
+            now,
+            ListOptions {
+                force_refresh: true
+            },
+        )
+        .len(),
+        DEFAULT_LIST_QUOTA_REFRESH_LIMIT + 2
+    );
+}
+
+#[test]
+fn list_force_refresh_indices_include_default_due_accounts() {
+    let now = DateTime::parse_from_rfc3339("2026-04-08T12:05:00.000Z")
+        .expect("parse now")
+        .with_timezone(&Utc);
+    let unknown = stored_entry(None, None);
+
+    let mut stale_unhealthy = stored_entry(Some(false), Some("2026-04-08T11:55:00.000Z"));
+    stale_unhealthy.last_quota_primary_left_percent = Some(2);
+    stale_unhealthy.last_quota_next_refresh_at = Some("2026-04-08T11:56:00.000Z".to_string());
+
+    let mut healthy_cached = stored_entry(Some(true), Some("2026-04-08T12:04:30.000Z"));
+    healthy_cached.last_quota_primary_left_percent = Some(80);
+    healthy_cached.last_quota_next_refresh_at = Some("2026-04-08T12:10:00.000Z".to_string());
+
+    let mut refresh_indices = build_list_quota_refresh_indices(
+        &Pool {
+            active_index: 0,
+            accounts: vec![unknown, stale_unhealthy, healthy_cached],
+        },
+        now,
+        ListOptions {
+            force_refresh: true,
+        },
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    refresh_indices.sort_unstable();
+
+    assert_eq!(refresh_indices, vec![0, 1, 2]);
 }
 
 #[test]
@@ -893,6 +1000,35 @@ fn list_quota_refresh_limit_uses_env_override() {
 }
 
 #[test]
+fn list_force_refresh_delay_uses_env_override() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+    let previous_delay = std::env::var_os(LIST_FORCE_REFRESH_DELAY_MS_ENV);
+
+    unsafe {
+        std::env::remove_var(LIST_FORCE_REFRESH_DELAY_MS_ENV);
+    }
+    assert_eq!(
+        list_force_refresh_delay_ms(),
+        DEFAULT_LIST_FORCE_REFRESH_DELAY_MS
+    );
+
+    unsafe {
+        std::env::set_var(LIST_FORCE_REFRESH_DELAY_MS_ENV, "250");
+    }
+    assert_eq!(list_force_refresh_delay_ms(), 250);
+
+    unsafe {
+        std::env::set_var(LIST_FORCE_REFRESH_DELAY_MS_ENV, "invalid");
+    }
+    assert_eq!(
+        list_force_refresh_delay_ms(),
+        DEFAULT_LIST_FORCE_REFRESH_DELAY_MS
+    );
+
+    restore_env_var(LIST_FORCE_REFRESH_DELAY_MS_ENV, previous_delay);
+}
+
+#[test]
 fn list_account_display_order_sorts_by_next_quota_refresh_eta() {
     let mut later = stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z"));
     later.label = "later".to_string();
@@ -915,7 +1051,7 @@ fn list_account_display_order_sorts_by_next_quota_refresh_eta() {
 }
 
 #[test]
-fn cmd_list_refreshes_stale_cached_usable_quota() {
+fn cmd_list_uses_cached_healthy_quota_without_refresh() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
     let codex_home = tempdir.path().join("codex-home");
@@ -939,10 +1075,72 @@ fn cmd_list_refreshes_stale_cached_usable_quota() {
         stale.auth.tokens.account_id = "acct-60".to_string();
         stale.last_quota_summary = Some("5h 99% left".to_string());
         stale.last_quota_primary_left_percent = Some(99);
+        stale.last_quota_next_refresh_at = Some("2026-04-07T12:01:00.000Z".to_string());
 
         save_pool(&Pool {
             active_index: 0,
             accounts: vec![stale],
+        })?;
+
+        unsafe {
+            std::env::set_var(
+                "CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE",
+                "http://127.0.0.1:9/usage",
+            );
+        }
+
+        let output = cmd_list()?;
+
+        assert!(output.contains("5h 99% left"));
+
+        let cached = load_pool()?;
+        assert_eq!(cached.accounts[0].last_quota_primary_left_percent, Some(99));
+        assert!(cached.accounts[0]
+            .last_quota_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("5h 99% left"));
+        Ok(())
+    })();
+
+    restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+    restore_env_var("CODEX_HOME", previous_codex_home);
+    restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+    result.expect("list should use cached healthy quota without refresh");
+}
+
+#[test]
+fn cmd_list_force_refreshes_cached_healthy_quota() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempdir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+    let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+    let previous_force_delay = std::env::var_os(LIST_FORCE_REFRESH_DELAY_MS_ENV);
+
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var(LIST_FORCE_REFRESH_DELAY_MS_ENV, "0");
+    }
+
+    let result = (|| -> Result<()> {
+        let mut cached = stored_entry(Some(true), Some("2026-04-07T12:00:00.000Z"));
+        cached.email = "dev.60@astronlab.com".to_string();
+        cached.account_id = "acct-60".to_string();
+        cached.label = "dev.60@astronlab.com_free".to_string();
+        cached.auth = make_auth("dev.60@astronlab.com", "acct-60", "free");
+        cached.auth.tokens.account_id = "acct-60".to_string();
+        cached.last_quota_summary = Some("5h 99% left".to_string());
+        cached.last_quota_primary_left_percent = Some(99);
+        cached.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+        save_pool(&Pool {
+            active_index: 0,
+            accounts: vec![cached],
         })?;
 
         let (usage_url, handle) = spawn_usage_server(
@@ -973,7 +1171,9 @@ fn cmd_list_refreshes_stale_cached_usable_quota() {
             std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &usage_url);
         }
 
-        let output = cmd_list()?;
+        let output = cmd_list_with_options(ListOptions {
+            force_refresh: true,
+        })?;
         handle.join().expect("usage server should finish");
 
         assert!(output.contains("5h 40% left"));
@@ -992,9 +1192,10 @@ fn cmd_list_refreshes_stale_cached_usable_quota() {
     })();
 
     restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+    restore_env_var(LIST_FORCE_REFRESH_DELAY_MS_ENV, previous_force_delay);
     restore_env_var("CODEX_HOME", previous_codex_home);
     restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
-    result.expect("list should refresh stale cached quota");
+    result.expect("list -f should refresh cached healthy quota");
 }
 
 #[test]
@@ -1643,7 +1844,12 @@ fn cmd_list_stream_emits_account_lines_before_slow_quota_refresh_finishes() {
         let probe_writer = writer.clone();
         let join = thread::spawn(move || {
             let mut writer = writer;
-            cmd_list_stream(&mut writer)
+            cmd_list_stream_with_options(
+                &mut writer,
+                ListOptions {
+                    force_refresh: true,
+                },
+            )
         });
 
         let mut partial = String::new();

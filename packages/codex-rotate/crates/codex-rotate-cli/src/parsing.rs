@@ -26,6 +26,19 @@ pub(super) fn parse_remove_selector(args: &[String]) -> Result<&str> {
     Ok(args[0].as_str())
 }
 
+pub(super) fn parse_list_options(args: &[String]) -> Result<ListOptions> {
+    let mut options = ListOptions::default();
+    for arg in args {
+        match arg.trim() {
+            "-f" | "--force-refresh" => options.force_refresh = true,
+            _ => {
+                return Err(anyhow!("Usage: codex-rotate list [-f|--force-refresh]"));
+            }
+        }
+    }
+    Ok(options)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NextCommandOptions {
     pub(super) selector: Option<String>,

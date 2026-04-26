@@ -58,8 +58,9 @@ pub(crate) use self::identity::{
     format_account_summary_for_display,
 };
 pub use self::list_status::{
-    cmd_list, cmd_list_stream, cmd_status, cmd_status_stream, current_pool_overview,
-    current_pool_overview_without_activation,
+    cmd_list, cmd_list_stream, cmd_list_stream_with_options, cmd_list_with_options, cmd_status,
+    cmd_status_stream, current_pool_overview, current_pool_overview_without_activation,
+    ListOptions,
 };
 pub use self::models::*;
 pub(crate) use self::normalization::normalize_pool_entries;

@@ -305,6 +305,37 @@ fn add_alias_parser_accepts_trimmed_optional_alias() {
 }
 
 #[test]
+fn list_parser_accepts_force_refresh_flags() {
+    assert_eq!(
+        parse_list_options(&[]).expect("default list"),
+        ListOptions {
+            force_refresh: false
+        }
+    );
+    assert_eq!(
+        parse_list_options(&["-f".to_string()]).expect("list -f"),
+        ListOptions {
+            force_refresh: true
+        }
+    );
+    assert_eq!(
+        parse_list_options(&["--force-refresh".to_string()]).expect("list --force-refresh"),
+        ListOptions {
+            force_refresh: true
+        }
+    );
+}
+
+#[test]
+fn list_parser_rejects_unknown_args() {
+    let error =
+        parse_list_options(&["--wat".to_string()]).expect_err("list should reject unknown args");
+    assert!(error
+        .to_string()
+        .contains("Usage: codex-rotate list [-f|--force-refresh]"));
+}
+
+#[test]
 fn run_with_timeout_returns_none_when_operation_blocks_past_deadline() {
     let result = run_with_timeout(Duration::from_millis(10), || {
         thread::sleep(Duration::from_millis(50));
