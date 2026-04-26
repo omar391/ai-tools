@@ -1,5 +1,25 @@
 use super::*;
 
+pub fn load_codex_mode_config() -> Result<CodexModeConfig> {
+    let state = load_rotate_state_json()?;
+    load_codex_mode_config_from_state(&state)
+}
+
+pub fn load_codex_mode_config_from_path(path: &Path) -> Result<CodexModeConfig> {
+    let state = crate::state::load_rotate_state_json_from_path(path)?;
+    load_codex_mode_config_from_state(&state)
+}
+
+fn load_codex_mode_config_from_state(state: &Value) -> Result<CodexModeConfig> {
+    let config = state
+        .get("codex-mode")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("Invalid codex-mode config in rotate state.")?;
+    Ok(CodexModeConfig::with_defaults(config))
+}
+
 pub fn load_pool() -> Result<Pool> {
     let state = load_rotate_state_json()?;
     let object = state.as_object().cloned().unwrap_or_default();
@@ -26,6 +46,7 @@ pub fn save_pool(pool: &Pool) -> Result<()> {
     let active_index = pool.active_index;
     let accounts = serde_json::to_value(&pool.accounts)?;
     update_rotate_state_json(RotateStateOwner::Pool, move |state| {
+        let codex_mode = load_codex_mode_config_from_state(state)?;
         if !state.is_object() {
             *state = Value::Object(Map::new());
         }
@@ -37,6 +58,7 @@ pub fn save_pool(pool: &Pool) -> Result<()> {
             Value::Number(active_index.into()),
         );
         object.insert("accounts".to_string(), accounts.clone());
+        object.insert("codex-mode".to_string(), serde_json::to_value(&codex_mode)?);
         Ok(())
     })
 }

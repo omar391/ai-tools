@@ -1,4 +1,66 @@
 use super::*;
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexModeProfile {
+    pub model: String,
+    pub model_reasoning_effort: String,
+}
+
+impl CodexModeProfile {
+    fn new(model: &str, model_reasoning_effort: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            model_reasoning_effort: model_reasoning_effort.to_string(),
+        }
+    }
+
+    fn merge_defaults(&mut self, default: &Self) {
+        if self.model.trim().is_empty() {
+            self.model = default.model.clone();
+        }
+        if self.model_reasoning_effort.trim().is_empty() {
+            self.model_reasoning_effort = default.model_reasoning_effort.clone();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexModeConfig {
+    #[serde(flatten)]
+    pub plans: BTreeMap<String, CodexModeProfile>,
+}
+
+impl CodexModeConfig {
+    pub fn with_defaults(config: Option<Self>) -> Self {
+        let mut config = config.unwrap_or_default();
+        for plan_type in ["free", "team"] {
+            let Some(default_profile) = Self::default_profile(plan_type) else {
+                continue;
+            };
+            config
+                .plans
+                .entry(plan_type.to_string())
+                .and_modify(|profile| profile.merge_defaults(&default_profile))
+                .or_insert(default_profile);
+        }
+        config
+    }
+
+    pub fn profile_for_plan_type(&self, plan_type: &str) -> Option<&CodexModeProfile> {
+        self.plans.get(plan_type)
+    }
+
+    fn default_profile(plan_type: &str) -> Option<CodexModeProfile> {
+        match plan_type {
+            "free" => Some(CodexModeProfile::new("gpt-5.4", "xhigh")),
+            "team" => Some(CodexModeProfile::new("gpt-5.5", "xhigh")),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Pool {

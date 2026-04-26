@@ -64,8 +64,9 @@ pub use self::list_status::{
 pub use self::models::*;
 pub(crate) use self::normalization::normalize_pool_entries;
 pub use self::persistence::{
-    load_pool, load_rotation_checkpoint, load_rotation_environment_settings, save_pool,
-    save_rotation_checkpoint, write_selected_account_auth,
+    load_codex_mode_config, load_codex_mode_config_from_path, load_pool, load_rotation_checkpoint,
+    load_rotation_environment_settings, save_pool, save_rotation_checkpoint,
+    write_selected_account_auth,
 };
 pub(crate) use self::quota_refresh::inspect_account;
 pub use self::rotation::{

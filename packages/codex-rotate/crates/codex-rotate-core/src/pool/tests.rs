@@ -251,6 +251,11 @@ fn save_pool_preserves_credential_store_sections() {
     write_rotate_state_json(&json!({
         "accounts": [configured_entry("dev.1@astronlab.com", "acct-1", "free", Some(true), None)],
         "active_index": 0,
+        "codex-mode": {
+            "free": {
+                "model": "gpt-custom-free"
+            }
+        },
         "version": 7,
         "default_create_template": "dev.{n}@astronlab.com",
         "families": {
@@ -308,8 +313,70 @@ fn save_pool_preserves_credential_store_sections() {
         state["domain"]["astronlab.com"]["rotation_enabled"],
         json!(false)
     );
+    assert_eq!(
+        state["codex-mode"]["free"]["model"],
+        json!("gpt-custom-free")
+    );
+    assert_eq!(
+        state["codex-mode"]["free"]["model_reasoning_effort"],
+        json!("xhigh")
+    );
+    assert_eq!(state["codex-mode"]["team"]["model"], json!("gpt-5.5"));
+    assert_eq!(
+        state["codex-mode"]["team"]["model_reasoning_effort"],
+        json!("xhigh")
+    );
     assert_eq!(state["active_index"], json!(1));
     assert_eq!(state["accounts"][1]["email"], json!("dev.2@astronlab.com"));
+}
+
+#[test]
+fn load_codex_mode_config_merges_defaults_with_custom_profiles() {
+    let _guard = RotateHomeGuard::enter("codex-rotate-codex-mode-load");
+    write_rotate_state_json(&json!({
+        "accounts": [],
+        "active_index": 0,
+        "codex-mode": {
+            "free": {
+                "model": "gpt-custom-free"
+            },
+            "enterprise": {
+                "model": "gpt-enterprise",
+                "model_reasoning_effort": "medium"
+            }
+        }
+    }))
+    .expect("write initial state");
+
+    let config = load_codex_mode_config().expect("load codex-mode config");
+    assert_eq!(
+        config
+            .profile_for_plan_type("free")
+            .expect("free profile")
+            .model,
+        "gpt-custom-free"
+    );
+    assert_eq!(
+        config
+            .profile_for_plan_type("free")
+            .expect("free profile")
+            .model_reasoning_effort,
+        "xhigh"
+    );
+    assert_eq!(
+        config
+            .profile_for_plan_type("team")
+            .expect("team profile")
+            .model,
+        "gpt-5.5"
+    );
+    assert_eq!(
+        config
+            .profile_for_plan_type("enterprise")
+            .expect("enterprise profile")
+            .model_reasoning_effort,
+        "medium"
+    );
 }
 
 #[test]

@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::fs_security::write_private_string;
 use crate::paths::{resolve_paths, CorePaths};
-use crate::pool::{AccountEntry, RotationEnvironment, VmEnvironmentConfig};
+use crate::pool::{AccountEntry, CodexModeConfig, RotationEnvironment, VmEnvironmentConfig};
 use crate::workflow::{
     migrate_rotate_state_credential_sections, CredentialFamily, DomainConfig, PendingCredential,
 };
@@ -39,7 +39,7 @@ impl RotateStateOwner {
 
     fn owned_top_level_keys(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Pool => Some(&["accounts", "active_index"]),
+            Self::Pool => Some(&["accounts", "active_index", "codex-mode"]),
             Self::CredentialStore => Some(&[
                 "version",
                 "default_create_template",
@@ -76,6 +76,8 @@ struct RotateStateSchema {
     environment: Option<RotationEnvironment>,
     #[serde(default)]
     vm: Option<VmEnvironmentConfig>,
+    #[serde(default, rename = "codex-mode")]
+    codex_mode: Option<CodexModeConfig>,
     #[serde(default)]
     version: Option<u8>,
     #[serde(default)]
@@ -236,7 +238,7 @@ fn empty_rotate_state() -> Value {
     Value::Object(Map::new())
 }
 
-fn load_rotate_state_json_from_path(path: &Path) -> Result<Value> {
+pub(crate) fn load_rotate_state_json_from_path(path: &Path) -> Result<Value> {
     let raw = read_rotate_state_raw(path)?;
     match raw {
         Some(raw) => parse_rotate_state_json(path, &raw),

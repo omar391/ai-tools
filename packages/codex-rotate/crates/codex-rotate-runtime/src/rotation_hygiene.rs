@@ -10,13 +10,14 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth};
 use codex_rotate_core::bridge::AutomationProgressCallback;
 use codex_rotate_core::pool::{
-    load_pool, load_rotation_checkpoint, load_rotation_environment_settings,
-    persist_prepared_rotation_pool, prepare_next_rotation_with_progress, prepare_prev_rotation,
-    prepare_set_rotation, resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
+    load_codex_mode_config_from_path, load_pool, load_rotation_checkpoint,
+    load_rotation_environment_settings, persist_prepared_rotation_pool,
+    prepare_next_rotation_with_progress, prepare_prev_rotation, prepare_set_rotation,
+    resolve_persona_profile, resolve_pool_account, restore_pool_active_index,
     rollback_prepared_rotation, save_pool, save_rotation_checkpoint,
     sync_pool_active_account_from_current_auth, write_selected_account_auth, AccountEntry,
-    NextResult, PreparedRotation, PreparedRotationAction, RotationCheckpoint,
-    RotationCheckpointPhase, RotationEnvironment,
+    CodexModeConfig, CodexModeProfile, NextResult, PreparedRotation, PreparedRotationAction,
+    RotationCheckpoint, RotationCheckpointPhase, RotationEnvironment,
 };
 use codex_rotate_core::state::RotationLock;
 use codex_rotate_core::workflow::{

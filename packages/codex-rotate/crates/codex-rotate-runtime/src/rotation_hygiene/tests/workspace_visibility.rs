@@ -255,9 +255,11 @@ fn switch_host_persona_syncs_config_projects_from_source_only() {
             .is_symlink()
     );
 
-    assert!(source_config.contains("model = \"gpt-5.3-codex\""));
+    assert!(source_config.contains("model = \"gpt-5.4\""));
+    assert!(source_config.contains("model_reasoning_effort = \"xhigh\""));
     assert!(!source_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
-    assert!(target_config.contains("model = \"gpt-5.3-codex\""));
+    assert!(target_config.contains("model = \"gpt-5.4\""));
+    assert!(target_config.contains("model_reasoning_effort = \"xhigh\""));
     assert!(!target_config.contains("[plugins.\"computer-use@openai-bundled\"]"));
 
     assert!(source_config.contains(&project_table_heading(&source_project)));

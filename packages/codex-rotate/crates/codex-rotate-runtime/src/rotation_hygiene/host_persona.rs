@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Component;
+use toml_edit::{value, DocumentMut};
 
 pub(super) fn ensure_host_personas_ready(
     paths: &RuntimePaths,
@@ -32,6 +33,9 @@ pub(super) fn provision_host_persona(
     }
     ensure_host_persona_shared_codex_home_links(paths, &target)?;
     ensure_host_persona_local_codex_home_entries(paths, &target)?;
+    let codex_mode_config =
+        load_codex_mode_config_from_path(&paths.rotate_home.join("accounts.json"))?;
+    apply_account_codex_mode_config(entry, &target.codex_home, &codex_mode_config)?;
 
     // Materialize BrowserForge-backed browser persona defaults if missing
     if entry
@@ -122,6 +126,10 @@ pub(super) fn switch_host_persona(
     ensure_host_persona_local_codex_home_entries(paths, &source)?;
     ensure_host_persona_local_codex_home_entries(paths, &target)?;
     sync_host_persona_local_codex_home_entries(&source.codex_home, &target.codex_home)?;
+    let codex_mode_config =
+        load_codex_mode_config_from_path(&paths.rotate_home.join("accounts.json"))?;
+    apply_account_codex_mode_config(source_entry, &source.codex_home, &codex_mode_config)?;
+    apply_account_codex_mode_config(target_entry, &target.codex_home, &codex_mode_config)?;
     fs::create_dir_all(&target.codex_app_support_dir).with_context(|| {
         format!(
             "Failed to create {}.",
@@ -236,6 +244,41 @@ fn sync_host_persona_local_codex_home_entry(
         materialize_persona_local_codex_home_default(entry, target_path)?;
     }
     ensure_persona_local_codex_home_entry_shape(entry, target_path)
+}
+
+fn apply_account_codex_mode_config(
+    entry: &AccountEntry,
+    codex_home: &Path,
+    codex_mode_config: &CodexModeConfig,
+) -> Result<()> {
+    let Some(profile) = codex_mode_config.profile_for_plan_type(&entry.plan_type) else {
+        return Ok(());
+    };
+    update_persona_codex_config_mode(&codex_home.join("config.toml"), profile)
+}
+
+fn update_persona_codex_config_mode(config_path: &Path, profile: &CodexModeProfile) -> Result<()> {
+    let raw = match fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}.", config_path.display()))
+        }
+    };
+    let mut document = if raw.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        raw.parse::<DocumentMut>()
+            .with_context(|| format!("Failed to parse {}.", config_path.display()))?
+    };
+    document["model"] = value(profile.model.as_str());
+    document["model_reasoning_effort"] = value(profile.model_reasoning_effort.as_str());
+    let mut rendered = document.to_string();
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    fs::write(config_path, rendered)
+        .with_context(|| format!("Failed to write {}.", config_path.display()))
 }
 
 pub(super) fn read_thread_handoff_candidate_ids_from_state_db(

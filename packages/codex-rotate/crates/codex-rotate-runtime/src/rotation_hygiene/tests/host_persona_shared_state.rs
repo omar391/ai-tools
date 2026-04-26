@@ -179,7 +179,8 @@ fn switch_host_persona_links_shared_settings_and_copies_local_codex_state() {
             .file_type()
             .is_symlink()
     );
-    assert!(target_config.contains("model = \"gpt-5.3-codex\""));
+    assert!(target_config.contains("model = \"gpt-5.4\""));
+    assert!(target_config.contains("model_reasoning_effort = \"xhigh\""));
     assert!(target_config.contains("approval_policy = \"never\""));
     assert!(!target_config.contains("personality = \"target-only\""));
     assert!(target_config.contains(&project_table_heading(&source_project)));
@@ -341,10 +342,9 @@ fn shared_codex_home_migrates_entries_linked_to_legacy_host_shared_data() {
         .unwrap(),
         "# Legacy Skill\n"
     );
-    assert_eq!(
-        fs::read_to_string(source_paths.codex_home.join("config.toml")).unwrap(),
-        "model = \"gpt-5.5\"\n"
-    );
+    let source_config = fs::read_to_string(source_paths.codex_home.join("config.toml")).unwrap();
+    assert!(source_config.contains("model = \"gpt-5.4\""));
+    assert!(source_config.contains("model_reasoning_effort = \"xhigh\""));
     assert!(
         !fs::symlink_metadata(source_paths.codex_home.join("config.toml"))
             .unwrap()
@@ -355,6 +355,44 @@ fn shared_codex_home_migrates_entries_linked_to_legacy_host_shared_data() {
         fs::read_link(source_paths.codex_home.join("skills")).unwrap(),
         shared_codex_home.join("skills")
     );
+}
+
+#[test]
+fn switch_host_persona_applies_codex_mode_for_each_account_plan() {
+    let temp = tempdir().expect("tempdir");
+    let paths = test_runtime_paths(temp.path());
+    let source = test_account("acct-source", "persona-source");
+    let mut target = test_account("acct-target", "persona-target");
+    target.plan_type = "team".to_string();
+    target.label = "acct-target_team".to_string();
+
+    provision_host_persona(&paths, &source, None).expect("provision source");
+    provision_host_persona(&paths, &target, None).expect("provision target");
+
+    let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+    let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+    fs::write(
+        source_paths.codex_home.join("config.toml"),
+        "model = \"source-model\"\napproval_policy = \"never\"\n",
+    )
+    .expect("write source config");
+    fs::write(
+        target_paths.codex_home.join("config.toml"),
+        "model = \"target-model\"\n",
+    )
+    .expect("write target config");
+
+    switch_host_persona(&paths, &source, &target, false).expect("switch");
+
+    let source_config =
+        fs::read_to_string(source_paths.codex_home.join("config.toml")).expect("source config");
+    let target_config =
+        fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
+    assert!(source_config.contains("model = \"gpt-5.4\""));
+    assert!(source_config.contains("model_reasoning_effort = \"xhigh\""));
+    assert!(target_config.contains("model = \"gpt-5.5\""));
+    assert!(target_config.contains("model_reasoning_effort = \"xhigh\""));
+    assert!(target_config.contains("approval_policy = \"never\""));
 }
 
 #[test]
