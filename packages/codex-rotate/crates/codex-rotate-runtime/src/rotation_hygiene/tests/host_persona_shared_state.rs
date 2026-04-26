@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn switch_host_persona_links_shared_settings_and_local_skills() {
+fn switch_host_persona_links_shared_settings_and_copies_local_codex_state() {
     let temp = tempfile::Builder::new()
         .prefix("codex-rotate-shared-state-")
         .tempdir_in(std::env::current_dir().expect("current dir"))
@@ -134,6 +134,18 @@ fn switch_host_persona_links_shared_settings_and_local_skills() {
         "{}\n",
     )
     .expect("write stale imports");
+    fs::create_dir_all(source_paths.codex_home.join("memory")).expect("create source memory");
+    fs::write(
+        source_paths.codex_home.join("memory").join("notes.json"),
+        "{\"source\":true}\n",
+    )
+    .expect("write source memory");
+    fs::create_dir_all(target_paths.codex_home.join("memory")).expect("create target memory");
+    fs::write(
+        target_paths.codex_home.join("memory").join("stale.json"),
+        "{\"stale\":true}\n",
+    )
+    .expect("write stale memory");
 
     ensure_live_root_bindings(&paths, &source).expect("bind source");
     switch_host_persona(&paths, &source, &target, false).expect("switch");
@@ -150,8 +162,23 @@ fn switch_host_persona_links_shared_settings_and_local_skills() {
         );
     }
 
+    let source_config =
+        fs::read_to_string(source_paths.codex_home.join("config.toml")).expect("source config");
     let target_config =
         fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
+    assert_eq!(source_config, target_config);
+    assert!(
+        !fs::symlink_metadata(source_paths.codex_home.join("config.toml"))
+            .expect("source config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !fs::symlink_metadata(target_paths.codex_home.join("config.toml"))
+            .expect("target config metadata")
+            .file_type()
+            .is_symlink()
+    );
     assert!(target_config.contains("model = \"gpt-5.3-codex\""));
     assert!(target_config.contains("approval_policy = \"never\""));
     assert!(!target_config.contains("personality = \"target-only\""));
@@ -218,6 +245,15 @@ fn switch_host_persona_links_shared_settings_and_local_skills() {
     assert!(!target_paths
         .codex_home
         .join("vendor_imports")
+        .join("stale.json")
+        .exists());
+    assert_eq!(
+        fs::read_to_string(target_paths.codex_home.join("memory").join("notes.json")).unwrap(),
+        "{\"source\":true}\n"
+    );
+    assert!(!target_paths
+        .codex_home
+        .join("memory")
         .join("stale.json")
         .exists());
 
@@ -287,18 +323,14 @@ fn shared_codex_home_migrates_entries_linked_to_legacy_host_shared_data() {
     )
     .expect("link legacy skills");
 
-    ensure_host_persona_shared_codex_home_links(&paths, &source_paths)
-        .expect("migrate shared links");
+    provision_host_persona(&paths, &source, None).expect("migrate persona roots");
 
     let shared_codex_home = host_shared_codex_home_root(&paths);
     assert_eq!(
         shared_codex_home,
         paths.rotate_home.join("personas/shared-data/codex-home")
     );
-    assert_eq!(
-        fs::read_to_string(shared_codex_home.join("config.toml")).unwrap(),
-        "model = \"gpt-5.5\"\n"
-    );
+    assert!(!shared_codex_home.join("config.toml").exists());
     assert_eq!(
         fs::read_to_string(
             shared_codex_home
@@ -310,8 +342,14 @@ fn shared_codex_home_migrates_entries_linked_to_legacy_host_shared_data() {
         "# Legacy Skill\n"
     );
     assert_eq!(
-        fs::read_link(source_paths.codex_home.join("config.toml")).unwrap(),
-        shared_codex_home.join("config.toml")
+        fs::read_to_string(source_paths.codex_home.join("config.toml")).unwrap(),
+        "model = \"gpt-5.5\"\n"
+    );
+    assert!(
+        !fs::symlink_metadata(source_paths.codex_home.join("config.toml"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
     assert_eq!(
         fs::read_link(source_paths.codex_home.join("skills")).unwrap(),
