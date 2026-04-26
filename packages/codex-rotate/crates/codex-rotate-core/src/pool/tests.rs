@@ -14,6 +14,7 @@ fn stored_entry(usable: Option<bool>, checked_at: Option<&str>) -> AccountEntry 
         label: "a_free".to_string(),
         alias: None,
         email: "a@example.com".to_string(),
+        relogin: false,
         account_id: "acct-a".to_string(),
         plan_type: "free".to_string(),
         auth: CodexAuth {
@@ -173,6 +174,7 @@ fn configured_entry(
         label: format!("{email}_{plan_type}"),
         alias: None,
         email: email.to_string(),
+        relogin: false,
         account_id: account_id.to_string(),
         plan_type: plan_type.to_string(),
         auth: make_auth(email, account_id, plan_type),
@@ -392,6 +394,7 @@ fn prune_terminal_accounts_does_not_disable_domain_for_relogin_only_families() {
 
     let changed = prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
     assert!(changed);
+    assert!(pool.accounts[0].relogin);
 
     let state = load_rotate_state_json().expect("load rotate state");
     assert_eq!(
@@ -412,6 +415,7 @@ fn prune_terminal_accounts_disables_domain_for_suspend_flagged_families() {
 
     let changed = prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
     assert!(changed);
+    assert!(pool.accounts[0].relogin);
 
     let state = load_rotate_state_json().expect("load rotate state");
     assert_eq!(
@@ -1483,11 +1487,10 @@ fn cmd_list_prunes_invalidated_refresh_token_accounts_and_suspends_domain() {
             .with_timezone(&Utc);
         let delta_days = (parsed - Utc::now()).num_days();
         assert!((8..=9).contains(&delta_days), "{reactivate_at}");
+        assert_eq!(accounts[0]["relogin"], Value::Bool(true));
         assert_eq!(
-            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
-                .as_array()
-                .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
-            Some(vec!["devbench.9@astronlab.com"])
+            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"],
+            Value::Null
         );
         assert_eq!(
             state["families"]["dev-1::devbench.{n}@astronlab.com"]
@@ -1550,11 +1553,10 @@ fn cmd_list_prunes_token_expired_refresh_token_accounts_for_relogin() {
         assert!(!output.contains("devbench.15@astronlab.com_free"));
 
         let state = load_rotate_state_json()?;
+        assert_eq!(state["accounts"][0]["relogin"], Value::Bool(true));
         assert_eq!(
-            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
-                .as_array()
-                .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
-            Some(vec!["devbench.15@astronlab.com"])
+            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"],
+            Value::Null
         );
         Ok(())
     })();
@@ -1626,11 +1628,10 @@ fn cmd_list_prunes_reused_refresh_token_accounts() {
             state["domain"]["astronlab.com"]["rotation_enabled"],
             Value::Bool(false)
         );
+        assert_eq!(accounts[0]["relogin"], Value::Bool(true));
         assert_eq!(
-            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
-                .as_array()
-                .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
-            Some(vec!["devbench.10@astronlab.com"])
+            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"],
+            Value::Null
         );
         assert_eq!(
             state["families"]["dev-1::devbench.{n}@astronlab.com"]
@@ -1646,7 +1647,7 @@ fn cmd_list_prunes_reused_refresh_token_accounts() {
 }
 
 #[test]
-fn record_removed_account_uses_current_relogin_shape() {
+fn load_pool_migrates_legacy_family_relogin_entries_into_account_flags() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
     let codex_home = tempdir.path().join("codex-home");
@@ -1661,7 +1662,10 @@ fn record_removed_account_uses_current_relogin_shape() {
     }
 
     let result = (|| -> Result<()> {
+        let account = configured_entry("devbench.9@astronlab.com", "acct-9", "free", None, None);
         write_rotate_state_json(&json!({
+            "accounts": [account],
+            "active_index": 0,
             "families": {
                 "dev-1::devbench.{n}@astronlab.com": {
                     "profile_name": "dev-1",
@@ -1675,28 +1679,20 @@ fn record_removed_account_uses_current_relogin_shape() {
                 }
             }
         }))?;
+        let mut state = load_rotate_state_json()?;
+        state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"] =
+            json!(["devbench.9@astronlab.com"]);
+        write_rotate_state_json(&state)?;
 
-        assert!(!family_suspends_domain_on_terminal_refresh_failure(
-            "devbench.9@astronlab.com"
-        )?);
-        assert!(record_removed_account("devbench.9@astronlab.com")?);
-
-        let state = load_rotate_state_json()?;
-        assert_eq!(
-            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"],
-            json!(["devbench.9@astronlab.com"])
-        );
-        assert_eq!(
-            state["families"]["dev-1::devbench.{n}@astronlab.com"]
-                ["suspend_domain_on_terminal_refresh_failure"],
-            Value::Null
-        );
+        let pool = load_pool()?;
+        assert_eq!(pool.accounts.len(), 1);
+        assert!(pool.accounts[0].relogin);
         Ok(())
     })();
 
     restore_env_var("CODEX_HOME", previous_codex_home);
     restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
-    result.expect("record_removed_account should keep current relogin shape");
+    result.expect("load_pool should migrate legacy family relogin state");
 }
 
 #[test]
@@ -2125,39 +2121,25 @@ fn sync_pool_current_auth_into_pool_without_activation_clears_family_relogin_ema
             &make_auth("dev.36@astronlab.com", "acct-36", "free"),
         )?;
 
-        let existing = configured_entry("dev.36@astronlab.com", "acct-36", "free", None, None);
+        let mut existing = configured_entry("dev.36@astronlab.com", "acct-36", "free", None, None);
+        existing.relogin = true;
         write_rotate_state_json(&json!({
             "accounts": [existing],
             "active_index": 0,
             "version": 9,
-            "default_create_template": "dev.{n}@astronlab.com",
-            "families": {
-                "dev-1::dev.{n}@astronlab.com": {
-                    "profile_name": "dev-1",
-                    "template": "dev.{n}@astronlab.com",
-                    "next_suffix": 37,
-                    "max_skipped_slots": 0,
-                    "relogin": ["dev.36@astronlab.com"],
-                    "last_created_email": "dev.36@astronlab.com",
-                    "created_at": "2026-04-05T00:00:00.000Z",
-                    "updated_at": "2026-04-05T00:00:00.000Z"
-                }
-            }
+            "default_create_template": "dev.{n}@astronlab.com"
         }))?;
 
         let _ = sync_pool_current_auth_into_pool_without_activation()?;
         let state = load_rotate_state_json()?;
 
-        assert_eq!(
-            state["families"]["dev-1::dev.{n}@astronlab.com"]["relogin"],
-            json!([])
-        );
+        assert_eq!(state["accounts"][0]["relogin"], Value::Bool(false));
         Ok(())
     })();
 
     restore_env_var("CODEX_HOME", previous_codex_home);
     restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
-    result.expect("passive current auth sync should clear matching family relogin entries");
+    result.expect("passive current auth sync should clear matching account relogin flags");
 }
 
 #[test]
@@ -2182,6 +2164,7 @@ fn restore_codex_auth_from_active_pool_restores_missing_auth_file() {
                 label: "dev.restore@astronlab.com_free".to_string(),
                 alias: None,
                 email: "dev.restore@astronlab.com".to_string(),
+                relogin: false,
                 account_id: "acct-restore".to_string(),
                 plan_type: "free".to_string(),
                 auth: make_auth("dev.restore@astronlab.com", "acct-restore", "free"),
@@ -2221,6 +2204,7 @@ fn normalize_pool_entries_preserves_non_gmail_target_when_auth_is_gmail() {
             label: "devbench.12@astronlab.com_free".to_string(),
             alias: None,
             email: "devbench.12@astronlab.com".to_string(),
+            relogin: false,
             account_id: "acct-12".to_string(),
             plan_type: "free".to_string(),
             auth: make_auth("1.dev.astronlab@gmail.com", "acct-12", "free"),
@@ -2251,6 +2235,7 @@ fn normalize_pool_entries_marks_weekly_exhausted_cached_accounts_unusable() {
             label: "dev.4@hotspotprime.com_team".to_string(),
             alias: None,
             email: "dev.4@hotspotprime.com".to_string(),
+            relogin: false,
             account_id: "acct-4".to_string(),
             plan_type: "team".to_string(),
             auth: make_auth("dev.4@hotspotprime.com", "acct-4", "team"),
@@ -2279,6 +2264,7 @@ fn normalize_pool_entries_marks_sub_three_percent_cached_accounts_unusable() {
             label: "dev.5@hotspotprime.com_team".to_string(),
             alias: None,
             email: "dev.5@hotspotprime.com".to_string(),
+            relogin: false,
             account_id: "acct-5".to_string(),
             plan_type: "team".to_string(),
             auth: make_auth("dev.5@hotspotprime.com", "acct-5", "team"),
@@ -2600,30 +2586,30 @@ fn rotate_next_skips_relogin_marked_accounts_and_keeps_them_in_pool() {
             &make_auth("dev.10@astronlab.com", "acct-10", "free"),
         )?;
 
+        let first = configured_entry(
+            "dev.10@astronlab.com",
+            "acct-10",
+            "free",
+            Some(true),
+            Some("2026-04-07T00:00:00.000Z"),
+        );
+        let mut second = configured_entry(
+            "dev.11@astronlab.com",
+            "acct-11",
+            "free",
+            Some(true),
+            Some("2026-04-07T00:00:00.000Z"),
+        );
+        second.relogin = true;
+        let third = configured_entry(
+            "dev.12@astronlab.com",
+            "acct-12",
+            "free",
+            Some(true),
+            Some("2026-04-07T00:00:00.000Z"),
+        );
         write_rotate_state_json(&json!({
-            "accounts": [
-                configured_entry(
-                    "dev.10@astronlab.com",
-                    "acct-10",
-                    "free",
-                    Some(true),
-                    Some("2026-04-07T00:00:00.000Z")
-                ),
-                configured_entry(
-                    "dev.11@astronlab.com",
-                    "acct-11",
-                    "free",
-                    Some(true),
-                    Some("2026-04-07T00:00:00.000Z")
-                ),
-                configured_entry(
-                    "dev.12@astronlab.com",
-                    "acct-12",
-                    "free",
-                    Some(true),
-                    Some("2026-04-07T00:00:00.000Z")
-                )
-            ],
+            "accounts": [first, second, third],
             "active_index": 0,
             "version": 9,
             "default_create_template": "dev.{n}@astronlab.com",
@@ -2633,7 +2619,6 @@ fn rotate_next_skips_relogin_marked_accounts_and_keeps_them_in_pool() {
                     "template": "dev.{n}@astronlab.com",
                     "next_suffix": 13,
                     "max_skipped_slots": 0,
-                    "relogin": ["dev.11@astronlab.com"],
                     "last_created_email": "dev.12@astronlab.com",
                     "created_at": "2026-04-05T00:00:00.000Z",
                     "updated_at": "2026-04-05T00:00:00.000Z"

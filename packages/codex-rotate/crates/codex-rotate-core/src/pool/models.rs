@@ -74,6 +74,8 @@ pub struct AccountEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
     pub email: String,
+    #[serde(default)]
+    pub relogin: bool,
     pub account_id: String,
     pub plan_type: String,
     pub auth: CodexAuth,

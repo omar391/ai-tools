@@ -58,6 +58,7 @@ pub fn test_account(email: &str, account_id: &str, plan_type: &str) -> AccountEn
         label: format!("{email}_{plan_type}"),
         alias: None,
         email: email.to_string(),
+        relogin: false,
         account_id: account_id.to_string(),
         plan_type: plan_type.to_string(),
         auth: test_auth(email, account_id, plan_type),

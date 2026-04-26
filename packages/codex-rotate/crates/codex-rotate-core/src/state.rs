@@ -541,6 +541,7 @@ mod tests {
             label: format!("{email}_free"),
             alias: None,
             email: email.to_string(),
+            relogin: false,
             account_id: account_id.to_string(),
             plan_type: "free".to_string(),
             auth: CodexAuth {

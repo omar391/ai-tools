@@ -518,6 +518,7 @@ pub(super) fn test_account(account_id: &str, persona_id: &str) -> AccountEntry {
         label: format!("{account_id}_free"),
         alias: None,
         email: format!("{account_id}@astronlab.com"),
+        relogin: false,
         account_id: account_id.to_string(),
         plan_type: "free".to_string(),
         auth: codex_rotate_core::auth::CodexAuth {

@@ -89,6 +89,7 @@ fn make_account_entry(email: &str, account_id: &str) -> AccountEntry {
         label: format!("{email}_free"),
         alias: None,
         email: email.to_string(),
+        relogin: false,
         account_id: account_id.to_string(),
         plan_type: "free".to_string(),
         auth: make_auth(email, account_id),
@@ -1167,7 +1168,7 @@ fn compute_fresh_account_family_suffix_ignores_frontier_when_skips_are_not_reser
 }
 
 #[test]
-fn collect_known_account_emails_includes_family_relogin_entries() {
+fn collect_known_account_emails_includes_relogin_marked_pool_entries() {
     let mut store = CredentialStore::default();
     store.families.insert(
         "dev-1::dev.{n}@astronlab.com".to_string(),
@@ -1179,10 +1180,12 @@ fn collect_known_account_emails_includes_family_relogin_entries() {
             created_at: "2026-04-13T05:00:00.000Z".to_string(),
             updated_at: "2026-04-13T05:00:00.000Z".to_string(),
             last_created_email: Some("dev.9@astronlab.com".to_string()),
-            relogin: vec!["dev.2@astronlab.com".to_string()],
+            relogin: Vec::new(),
             suspend_domain_on_terminal_refresh_failure: false,
         },
     );
+    let mut relogin_marked = make_account_entry("dev.2@astronlab.com", "acct-2");
+    relogin_marked.relogin = true;
 
     let next_suffix = compute_fresh_account_family_suffix(
         store.families.get("dev-1::dev.{n}@astronlab.com"),
@@ -1190,7 +1193,10 @@ fn collect_known_account_emails_includes_family_relogin_entries() {
         collect_known_account_emails(
             &Pool {
                 active_index: 0,
-                accounts: vec![make_account_entry("dev.1@astronlab.com", "acct-1")],
+                accounts: vec![
+                    make_account_entry("dev.1@astronlab.com", "acct-1"),
+                    relogin_marked,
+                ],
             },
             &store,
         ),
@@ -3319,6 +3325,7 @@ fn add_reconciliation_moves_matching_pending_into_family_state() {
         label: "dev.24@astronlab.com_free".to_string(),
         alias: None,
         email: "dev.24@astronlab.com".to_string(),
+        relogin: false,
         account_id: "acct-24".to_string(),
         plan_type: "free".to_string(),
         auth: CodexAuth {
@@ -3392,6 +3399,7 @@ fn add_reconciliation_updates_matching_bare_gmail_family_state() {
             label: "supplyprima1@gmail.com_free".to_string(),
             alias: None,
             email: "supplyprima1@gmail.com".to_string(),
+            relogin: false,
             account_id: "acct-supplyprima1".to_string(),
             plan_type: "free".to_string(),
             auth: make_auth("supplyprima1@gmail.com", "acct-supplyprima1"),
@@ -3435,6 +3443,7 @@ fn created_pool_lookup_prefers_expected_email_over_stale_account_id_match() {
                 label: "dev.98@astronlab.com_free".to_string(),
                 alias: None,
                 email: "dev.98@astronlab.com".to_string(),
+                relogin: false,
                 account_id: "acct-shared".to_string(),
                 plan_type: "free".to_string(),
                 auth: CodexAuth {
@@ -3461,6 +3470,7 @@ fn created_pool_lookup_prefers_expected_email_over_stale_account_id_match() {
                 label: "devbench.17@astronlab.com_free".to_string(),
                 alias: None,
                 email: "devbench.17@astronlab.com".to_string(),
+                relogin: false,
                 account_id: "acct-devbench-17".to_string(),
                 plan_type: "free".to_string(),
                 auth: CodexAuth {
@@ -3501,6 +3511,7 @@ fn created_pool_lookup_distinguishes_same_email_different_plan() {
                 label: "dev.1@hotspotprime.com_team".to_string(),
                 alias: None,
                 email: "dev.1@hotspotprime.com".to_string(),
+                relogin: false,
                 account_id: "acct-team".to_string(),
                 plan_type: "team".to_string(),
                 auth: CodexAuth {
@@ -3527,6 +3538,7 @@ fn created_pool_lookup_distinguishes_same_email_different_plan() {
                 label: "dev.1@hotspotprime.com_free".to_string(),
                 alias: None,
                 email: "dev.1@hotspotprime.com".to_string(),
+                relogin: false,
                 account_id: "acct-free".to_string(),
                 plan_type: "free".to_string(),
                 auth: CodexAuth {

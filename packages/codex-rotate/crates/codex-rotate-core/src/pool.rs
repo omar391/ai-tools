@@ -213,7 +213,15 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     let Some(entry) = pool.accounts.get(index).cloned() else {
         return Ok(false);
     };
-    record_terminal_refresh_failures(&[entry.email])
+    let mut changed = false;
+    if let Some(current) = pool.accounts.get_mut(index) {
+        if !current.relogin {
+            current.relogin = true;
+            changed = true;
+        }
+    }
+    changed |= record_terminal_refresh_failures(std::slice::from_ref(&entry.email))?;
+    Ok(changed)
 }
 
 fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
@@ -380,6 +388,7 @@ pub fn cmd_add(alias: Option<&str>) -> Result<String> {
         label: label.clone(),
         alias: next_alias.filter(|value| value != &label),
         email: email.clone(),
+        relogin: false,
         account_id,
         plan_type: plan_type.clone(),
         auth,

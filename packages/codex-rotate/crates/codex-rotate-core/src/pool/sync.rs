@@ -156,6 +156,7 @@ pub(super) fn sync_pool_current_auth_from_auth(
             label: current_label,
             alias: None,
             email: current_email,
+            relogin: false,
             account_id: current_account_id,
             plan_type: current_plan_type,
             auth: current_auth,

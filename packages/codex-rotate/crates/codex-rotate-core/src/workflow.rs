@@ -217,7 +217,7 @@ pub struct CredentialFamily {
     pub created_at: String,
     pub updated_at: String,
     pub last_created_email: Option<String>,
-    #[serde(default, alias = "deleted")]
+    #[serde(default, alias = "deleted", skip_serializing)]
     pub relogin: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub suspend_domain_on_terminal_refresh_failure: bool,

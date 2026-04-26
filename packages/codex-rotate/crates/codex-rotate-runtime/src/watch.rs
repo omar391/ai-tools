@@ -1334,6 +1334,7 @@ mod tests {
                 label: "dev.2@astronlab.com_free".to_string(),
                 alias: None,
                 email: "dev.2@astronlab.com".to_string(),
+                relogin: false,
                 account_id: "acct-2".to_string(),
                 plan_type: "free".to_string(),
                 auth: codex_rotate_core::auth::CodexAuth {

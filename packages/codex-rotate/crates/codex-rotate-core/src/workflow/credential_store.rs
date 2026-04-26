@@ -69,11 +69,11 @@ pub fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
 }
 
 pub fn load_relogin_account_emails() -> Result<HashSet<String>> {
-    Ok(load_credential_store()?
-        .families
-        .into_values()
-        .flat_map(|family| family.relogin.into_iter())
-        .map(|email| normalize_email_key(&email))
+    Ok(load_pool()?
+        .accounts
+        .into_iter()
+        .filter(|entry| entry.relogin)
+        .map(|entry| normalize_email_key(&entry.email))
         .collect())
 }
 
@@ -706,31 +706,9 @@ pub(super) fn serialize_stored_credential(record: &StoredCredential) -> Value {
 pub fn record_removed_account(email: &str) -> Result<bool> {
     let normalized_email = normalize_email_key(email);
     let mut store = load_credential_store()?;
-    let Some(family_match) = select_family_for_account_email(&store, &normalized_email) else {
-        let removed_pending = store.pending.remove(&normalized_email).is_some();
-        let removed_skipped = store.skipped.remove(&normalized_email);
-        if removed_pending || removed_skipped {
-            save_credential_store(&store)?;
-            return Ok(true);
-        }
-        return Ok(false);
-    };
-
     let removed_pending = store.pending.remove(&normalized_email).is_some();
     let removed_skipped = store.skipped.remove(&normalized_email);
-    let mut dirty = removed_pending || removed_skipped;
-    if let Some(family) = store.families.get_mut(&family_match.key) {
-        if !family
-            .relogin
-            .iter()
-            .any(|entry| normalize_email_key(entry) == normalized_email)
-        {
-            family.relogin.push(normalized_email.clone());
-            family.relogin.sort();
-            family.relogin.dedup();
-            dirty = true;
-        }
-    }
+    let dirty = removed_pending || removed_skipped;
     if dirty {
         save_credential_store(&store)?;
     }

@@ -170,6 +170,7 @@ pub(super) fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -
     let changed = entry.label != next_label
         || entry.alias != next_alias
         || entry.email != next_email
+        || entry.relogin
         || entry.plan_type != next_plan
         || entry.account_id != next_account_id
         || entry.auth != auth;
@@ -185,6 +186,7 @@ pub(super) fn apply_auth_to_account(entry: &mut AccountEntry, auth: CodexAuth) -
         entry.alias = None;
     }
     entry.email = next_email;
+    entry.relogin = false;
     entry.plan_type = next_plan;
     entry.account_id = next_account_id;
     entry.auth = auth;

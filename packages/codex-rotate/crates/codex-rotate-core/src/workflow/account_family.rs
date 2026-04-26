@@ -350,9 +350,6 @@ pub(super) fn collect_known_account_emails(pool: &Pool, store: &CredentialStore)
         .map(|entry| entry.email.clone())
         .collect::<Vec<_>>();
     emails.extend(store.pending.keys().cloned());
-    for family in store.families.values() {
-        emails.extend(family.relogin.iter().cloned());
-    }
     emails
 }
 
