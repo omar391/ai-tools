@@ -369,10 +369,7 @@ fn spawn_watch_loop(daemon: SharedDaemon) {
         }
         match should_defer_background_watch_tick(&daemon) {
             Ok(Some(reason)) => {
-                if reason.should_publish_message() {
-                    daemon.set_progress_message(reason.message());
-                }
-                sleep_until_next_watch_tick(&daemon);
+                sleep_after_deferred_background_watch_tick(&daemon, &reason);
                 continue;
             }
             Ok(None) => {}
@@ -405,10 +402,6 @@ enum BackgroundWatchDeferReason {
 }
 
 impl BackgroundWatchDeferReason {
-    fn should_publish_message(&self) -> bool {
-        matches!(self, Self::ActiveCodexThreads(_))
-    }
-
     fn message(&self) -> String {
         match self {
             Self::InvokeInFlight => {
@@ -453,6 +446,45 @@ fn sleep_until_next_watch_tick(daemon: &SharedDaemon) {
     let interval = next_watch_interval(daemon.snapshot().current_quota_percent);
     daemon.set_next_tick(next_tick_label(interval));
     thread::sleep(interval);
+}
+
+fn sleep_after_deferred_background_watch_tick(
+    daemon: &SharedDaemon,
+    reason: &BackgroundWatchDeferReason,
+) {
+    match reason {
+        BackgroundWatchDeferReason::ActiveCodexThreads(_) => {
+            match refresh_snapshot_for_deferred_watch_tick(daemon, reason.message()) {
+                Ok(interval) => {
+                    thread::sleep(interval);
+                }
+                Err(error) => {
+                    daemon.set_error_message(format!("deferred watch refresh failed: {error}"));
+                    sleep_until_next_watch_tick(daemon);
+                }
+            }
+        }
+        BackgroundWatchDeferReason::InvokeInFlight => {
+            sleep_until_next_watch_tick(daemon);
+        }
+    }
+}
+
+fn refresh_snapshot_for_deferred_watch_tick(
+    daemon: &SharedDaemon,
+    message: String,
+) -> Result<Duration> {
+    log_daemon_info(&message);
+    let interval = daemon.with_state_mut(|state| {
+        refresh_static_snapshot(state);
+        refresh_quota_state(state, false);
+        set_snapshot_message(&mut state.snapshot, SnapshotMessageKind::Progress, message);
+        let interval = next_watch_interval(state.snapshot.current_quota_percent);
+        state.snapshot.next_tick_at = Some(next_tick_label(interval));
+        Ok(interval)
+    })?;
+    daemon.publish_state_snapshot();
+    Ok(interval)
 }
 
 fn spawn_local_source_refresh_loop(daemon: SharedDaemon) {
@@ -2251,6 +2283,94 @@ mod tests {
 
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
         assert_eq!(state.snapshot.current_quota.as_deref(), Some("5h 60% left"));
+    }
+
+    #[test]
+    fn deferred_watch_tick_refreshes_stale_quota_snapshot() {
+        let _guard = env_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rotate_home = tempdir.path().join("rotate");
+        let codex_home = tempdir.path().join("codex");
+        fs::create_dir_all(&rotate_home).expect("create rotate home");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_wham = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+        let body = r#"{"user_id":"user-1","account_id":"acct-123","email":"dev.audit@astronlab.com","plan_type":"team","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":25.0,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1775185200},"secondary_window":{"used_percent":20.0,"limit_window_seconds":604800,"reset_after_seconds":86400,"reset_at":1775271600}},"code_review_rate_limit":null,"additional_rate_limits":null,"credits":null,"promo":null}"#.to_string();
+        let (wham_url, request_count, stop_server) = spawn_quota_server(body);
+
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_HOME", &rotate_home);
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &wham_url);
+        }
+
+        write_codex_auth(&codex_home.join("auth.json"), &make_test_auth("acct-123"))
+            .expect("write auth");
+
+        let daemon = SharedDaemon::new();
+        daemon
+            .with_state_mut(|state| {
+                state.snapshot.current_quota = Some("5h 92% left".to_string());
+                state.snapshot.current_quota_percent = Some(92);
+                state.quota_cache = Some(CachedQuotaState {
+                    account_id: "acct-123".to_string(),
+                    fetched_at: "2026-04-03T11:00:00.000Z".to_string(),
+                    next_refresh_at: "2026-04-03T11:00:30.000Z".to_string(),
+                    summary: "5h 92% left".to_string(),
+                    usable: true,
+                    blocker: None,
+                    primary_quota_left_percent: Some(92),
+                    error: None,
+                });
+                Ok(())
+            })
+            .expect("seed daemon state");
+
+        let interval = refresh_snapshot_for_deferred_watch_tick(
+            &daemon,
+            "Auto rotation deferred until the active Codex conversation goes idle.".to_string(),
+        )
+        .expect("deferred refresh");
+
+        stop_server.store(true, Ordering::Relaxed);
+
+        match previous_rotate_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_ROTATE_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_HOME") },
+        }
+        match previous_codex_home {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        match previous_wham {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", value)
+            },
+            None => unsafe { std::env::remove_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE") },
+        }
+
+        let snapshot = daemon.snapshot();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(interval, Duration::from_secs(30));
+        assert_eq!(snapshot.current_quota_percent, Some(75));
+        assert!(snapshot
+            .current_quota
+            .as_deref()
+            .is_some_and(|quota| quota.contains("5h 75% left")));
+        assert_eq!(
+            snapshot.last_message.as_deref(),
+            Some("Auto rotation deferred until the active Codex conversation goes idle.")
+        );
+        assert_eq!(
+            snapshot.last_message_kind,
+            Some(SnapshotMessageKind::Progress)
+        );
+        assert!(snapshot.next_tick_at.is_some());
     }
 
     #[test]

@@ -250,7 +250,6 @@ pub fn quota_cache_ttl(
         return chrono::Duration::seconds(15);
     }
     match assessment.primary_quota_left_percent.unwrap_or(0.0) {
-        value if value > 20.0 => chrono::Duration::seconds(60),
         value if value > 10.0 => chrono::Duration::seconds(30),
         _ => chrono::Duration::seconds(15),
     }
@@ -335,7 +334,6 @@ fn quota_refresh_interval_from_usage(usage: &UsageResponse) -> chrono::Duration 
         .map(|value| value.round() as u8)
         .unwrap_or(0)
     {
-        value if value > 20 => chrono::Duration::seconds(60),
         value if value > 10 => chrono::Duration::seconds(30),
         _ => chrono::Duration::seconds(15),
     }
@@ -603,7 +601,7 @@ mod tests {
         };
         assert_eq!(
             quota_cache_ttl(Some(&assessment), None),
-            chrono::Duration::seconds(60)
+            chrono::Duration::seconds(30)
         );
 
         let assessment = QuotaAssessment {
@@ -648,6 +646,21 @@ mod tests {
             ..fresh
         };
         assert!(quota_cache_is_stale(Some(&expired), "acct-123", now));
+    }
+
+    #[test]
+    fn healthy_quota_refreshes_after_thirty_seconds() {
+        let fetched_at = DateTime::parse_from_rfc3339("2026-04-03T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = make_usage(25.0);
+
+        assert_eq!(
+            quota_next_refresh_at(Some(&usage), None, fetched_at),
+            DateTime::parse_from_rfc3339("2026-04-03T12:00:30.000Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
     }
 
     #[test]
