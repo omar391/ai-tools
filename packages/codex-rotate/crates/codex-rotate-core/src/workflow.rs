@@ -60,8 +60,6 @@ pub use self::create_flow::{
     is_auto_create_retry_stopped_for_reusable_account, is_create_already_in_progress_error,
     reconcile_added_account_credential_state,
 };
-#[cfg(test)]
-pub(crate) use self::credential_store::family_suspends_domain_on_terminal_refresh_failure;
 pub use self::credential_store::{
     auto_disable_domain_for_account, extract_email_domain, load_disabled_rotation_domains,
     load_relogin_account_emails, record_removed_account,

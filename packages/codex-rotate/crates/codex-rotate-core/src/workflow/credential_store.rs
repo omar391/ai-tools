@@ -780,18 +780,6 @@ pub(crate) fn record_terminal_refresh_failures(emails: &[String]) -> Result<bool
     Ok(dirty)
 }
 
-#[cfg(test)]
-pub(crate) fn family_suspends_domain_on_terminal_refresh_failure(email: &str) -> Result<bool> {
-    let store = load_credential_store()?;
-    Ok(select_family_for_account_email(&store, email)
-        .map(|family_match| {
-            family_match
-                .family
-                .suspend_domain_on_terminal_refresh_failure
-        })
-        .unwrap_or(false))
-}
-
 pub fn extract_email_domain(email: &str) -> Option<String> {
     let normalized = normalize_email_key(email);
     let (_, domain) = normalized.split_once('@')?;

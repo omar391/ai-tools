@@ -138,6 +138,13 @@ fn account_marked_for_relogin(relogin_accounts: &HashSet<String>, email: &str) -
     relogin_accounts.contains(&normalize_email_for_label(email))
 }
 
+fn account_entry_marked_for_relogin(
+    relogin_accounts: &HashSet<String>,
+    entry: &AccountEntry,
+) -> bool {
+    entry.relogin || account_marked_for_relogin(relogin_accounts, &entry.email)
+}
+
 fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
     !account_requires_terminal_cleanup(entry)
         && account_rotation_enabled(disabled_domains, &entry.email)
@@ -226,14 +233,20 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
 
 fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
     let relogin_accounts = load_relogin_account_emails()?;
-    let emails = pool
+    let indices = pool
         .accounts
         .iter()
-        .filter(|entry| account_requires_terminal_cleanup(entry))
-        .filter(|entry| !account_marked_for_relogin(&relogin_accounts, &entry.email))
-        .map(|entry| entry.email.clone())
+        .enumerate()
+        .filter(|(_, entry)| account_requires_terminal_cleanup(entry))
+        .filter(|(_, entry)| !account_entry_marked_for_relogin(&relogin_accounts, entry))
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    record_terminal_refresh_failures(&emails)
+
+    let mut changed = false;
+    for index in indices {
+        changed |= cleanup_terminal_account(pool, index)?;
+    }
+    Ok(changed)
 }
 
 fn disabled_rotation_target_error(domains: &[String]) -> anyhow::Error {

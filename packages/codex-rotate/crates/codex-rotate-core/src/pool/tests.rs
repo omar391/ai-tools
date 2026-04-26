@@ -1,6 +1,5 @@
 use super::*;
 use crate::test_support::{RotateHomeGuard, ENV_MUTEX};
-use crate::workflow::family_suspends_domain_on_terminal_refresh_failure;
 use base64::Engine;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -212,14 +211,17 @@ fn terminal_cleanup_account(email: &str) -> AccountEntry {
     let mut entry = stored_entry(Some(false), Some("2026-04-07T01:00:00.000Z"));
     entry.email = email.to_string();
     entry.account_id = "acct-terminal".to_string();
+    entry.auth = make_auth(email, "acct-terminal", "free");
     entry.last_quota_blocker = Some("refresh token has been invalidated".to_string());
     entry
 }
 
 fn write_terminal_cleanup_state(
-    relogin: Vec<&str>,
+    relogin: bool,
     suspend_domain_on_terminal_refresh_failure: bool,
 ) -> Result<()> {
+    let mut account = terminal_cleanup_account("dev.1@astronlab.com");
+    account.relogin = relogin;
     let family = json!({
         "profile_name": "dev-1",
         "template": "dev.{n}@astronlab.com",
@@ -227,11 +229,11 @@ fn write_terminal_cleanup_state(
         "created_at": "2026-04-05T00:00:00.000Z",
         "updated_at": "2026-04-05T00:00:00.000Z",
         "last_created_email": "dev.1@astronlab.com",
-        "relogin": relogin,
+        "relogin": [],
         "suspend_domain_on_terminal_refresh_failure": suspend_domain_on_terminal_refresh_failure,
     });
     write_rotate_state_json(&json!({
-        "accounts": [terminal_cleanup_account("dev.1@astronlab.com")],
+        "accounts": [account],
         "active_index": 0,
         "version": 7,
         "default_create_template": "dev.{n}@astronlab.com",
@@ -385,7 +387,7 @@ fn load_codex_mode_config_merges_defaults_with_custom_profiles() {
 #[test]
 fn prune_terminal_accounts_does_not_disable_domain_for_relogin_only_families() {
     let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-relogin-only");
-    write_terminal_cleanup_state(Vec::new(), false).expect("write relogin-only state");
+    write_terminal_cleanup_state(false, false).expect("write relogin-only state");
 
     let mut pool = Pool {
         active_index: 0,
@@ -406,7 +408,7 @@ fn prune_terminal_accounts_does_not_disable_domain_for_relogin_only_families() {
 #[test]
 fn prune_terminal_accounts_disables_domain_for_suspend_flagged_families() {
     let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-suspend-flag");
-    write_terminal_cleanup_state(Vec::new(), true).expect("write suspend-flag state");
+    write_terminal_cleanup_state(false, true).expect("write suspend-flag state");
 
     let mut pool = Pool {
         active_index: 0,
@@ -427,30 +429,20 @@ fn prune_terminal_accounts_disables_domain_for_suspend_flagged_families() {
 #[test]
 fn prune_terminal_accounts_skips_accounts_already_marked_for_relogin() {
     let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-already-relogin");
-    write_terminal_cleanup_state(vec!["dev.1@astronlab.com"], false)
-        .expect("write relogin-marked state");
+    write_terminal_cleanup_state(true, false).expect("write relogin-marked state");
 
+    let mut account = terminal_cleanup_account("dev.1@astronlab.com");
+    account.relogin = true;
     let mut pool = Pool {
         active_index: 0,
-        accounts: vec![terminal_cleanup_account("dev.1@astronlab.com")],
+        accounts: vec![account],
     };
 
     let changed = prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
     assert!(!changed);
     assert_eq!(pool.accounts.len(), 1);
     assert_eq!(pool.accounts[0].email, "dev.1@astronlab.com");
-
-    let state = load_rotate_state_json().expect("load rotate state");
-    assert_eq!(
-        state["families"]["dev-1::dev.{n}@astronlab.com"]["relogin"]
-            .as_array()
-            .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
-        Some(vec!["dev.1@astronlab.com"])
-    );
-    assert_eq!(
-        state["domain"]["astronlab.com"]["rotation_enabled"],
-        json!(true)
-    );
+    assert!(pool.accounts[0].relogin);
 }
 
 #[test]

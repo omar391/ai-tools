@@ -38,7 +38,7 @@ pub fn prepare_next_rotation_with_progress(
             break;
         };
         round_robin_steps += 1;
-        if account_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index].email) {
+        if account_entry_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index]) {
             cursor_index = candidate_index;
             continue;
         }
@@ -416,7 +416,7 @@ pub fn rotate_next_internal_with_progress(
             break;
         };
         round_robin_steps += 1;
-        if account_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index].email) {
+        if account_entry_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index]) {
             cursor_index = candidate_index;
             continue;
         }

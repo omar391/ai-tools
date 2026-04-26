@@ -89,7 +89,7 @@ pub(crate) fn find_next_usable_account(
         if skip_indices.contains(&index) {
             continue;
         }
-        if account_marked_for_relogin(relogin_accounts, &pool.accounts[index].email) {
+        if account_entry_marked_for_relogin(relogin_accounts, &pool.accounts[index]) {
             reasons.push(format!(
                 "{}: scheduled for relogin",
                 pool.accounts[index].label
