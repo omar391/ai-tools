@@ -816,6 +816,49 @@ pub(super) fn copy_thread_jsonl_with_cow_and_localization(
     localize_thread_jsonl_file(target, source_thread_id, target_thread_id)
 }
 
+pub(super) fn copy_path_best_effort_cow(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("Failed to inspect {}.", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        let resolved = existing_symlink_target(source)?
+            .ok_or_else(|| anyhow!("Failed to resolve symlink {}.", source.display()))?;
+        return copy_path_best_effort_cow(&resolved, target);
+    }
+    if metadata.is_dir() {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}.", parent.display()))?;
+        }
+        let temp_path = temporary_copy_path(target);
+        remove_path_if_exists(&temp_path)?;
+        fs::create_dir_all(&temp_path)
+            .with_context(|| format!("Failed to create {}.", temp_path.display()))?;
+        if let Err(error) = copy_dir_contents_best_effort_cow(source, &temp_path) {
+            remove_path_if_exists(&temp_path).ok();
+            return Err(error);
+        }
+        remove_path_if_exists(target)?;
+        return fs::rename(&temp_path, target).with_context(|| {
+            format!(
+                "Failed to move {} to {}.",
+                temp_path.display(),
+                target.display()
+            )
+        });
+    }
+    copy_file_best_effort_cow(source, target)
+}
+
+fn copy_dir_contents_best_effort_cow(source: &Path, target: &Path) -> Result<()> {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("Failed to read {}.", source.display()))?
+    {
+        let entry = entry?;
+        copy_path_best_effort_cow(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
 pub(super) fn copy_file_best_effort_cow(source: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)

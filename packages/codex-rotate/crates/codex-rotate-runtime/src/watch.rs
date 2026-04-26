@@ -7,9 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use codex_rotate_core::auth::{load_codex_auth, summarize_codex_auth, AuthSummary, CodexAuth};
 use codex_rotate_core::fs_security::write_private_string;
-use codex_rotate_core::pool::{
-    load_pool, other_usable_account_exists, restore_codex_auth_from_active_pool, NextResult, Pool,
-};
+use codex_rotate_core::pool::{load_pool, restore_codex_auth_from_active_pool, NextResult, Pool};
 use codex_rotate_core::quota::{
     build_cached_quota_state, inspect_quota, quota_cache_is_stale, CachedQuotaState,
 };
@@ -38,7 +36,6 @@ use crate::thread_recovery::{
     RecoveryIterationOptions, ThreadRecoveryEvent,
 };
 
-pub const LOW_QUOTA_ROTATION_THRESHOLD_PERCENT: u8 = 20;
 pub const DEFAULT_COOLDOWN_MS: u64 = 15_000;
 const SIGNAL_CURSOR_RESET_LOOKBACK_LOGS: i64 = 2_000;
 const THREAD_RECOVERY_BOOTSTRAP_LOOKBACK_LOGS: i64 = 2_000;
@@ -296,7 +293,6 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         after_signal_id,
         previous_account_state.quota.as_ref(),
         options.force_quota_refresh,
-        previous_state.auto_create_enabled,
     )?;
     let source_quota_cache = quota_cache.clone();
     if signal_log_cursor_reset && decision.signals.is_empty() {
@@ -900,7 +896,6 @@ fn decide_rotation(
     after_signal_id: Option<i64>,
     previous_cache: Option<&CachedQuotaState>,
     force_quota_refresh: bool,
-    auto_create_enabled: bool,
 ) -> Result<(RotationDecision, Option<CachedQuotaState>)> {
     let paths = resolve_paths()?;
     let signals = read_codex_signals(&paths.codex_logs_db_file, after_signal_id, 50)?;
@@ -959,19 +954,7 @@ fn decide_rotation(
             primary_quota_left_percent: cache.primary_quota_left_percent,
         });
     let assessment_error = quota_cache.as_ref().and_then(|cache| cache.error.clone());
-    let has_usable_other_account = assessment
-        .as_ref()
-        .and_then(|value| value.primary_quota_left_percent)
-        .map(|value| value <= LOW_QUOTA_ROTATION_THRESHOLD_PERCENT)
-        .unwrap_or(false)
-        && other_usable_account_exists()?;
-
-    let plan = plan_rotation(
-        assessment.as_ref(),
-        &signals,
-        has_usable_other_account,
-        auto_create_enabled,
-    );
+    let plan = plan_rotation(assessment.as_ref(), &signals);
     Ok((
         RotationDecision {
             last_signal_id,
@@ -1013,8 +996,6 @@ fn quota_cache_invalidated(
 fn plan_rotation(
     assessment: Option<&DecisionQuotaAssessment>,
     signals: &[CodexLogSignal],
-    has_usable_other_account: bool,
-    auto_create_enabled: bool,
 ) -> (bool, Option<String>, Option<RotationCommand>, Vec<String>) {
     let Some(assessment) = assessment else {
         return (
@@ -1029,7 +1010,7 @@ fn plan_rotation(
         );
     };
 
-    if !assessment.usable {
+    if assessment_has_exhausted_quota(assessment) {
         return (
             true,
             assessment.blocker.clone(),
@@ -1038,39 +1019,16 @@ fn plan_rotation(
         );
     }
 
-    if assessment
-        .primary_quota_left_percent
-        .map(|value| value <= LOW_QUOTA_ROTATION_THRESHOLD_PERCENT)
-        .unwrap_or(false)
-    {
-        let percent = assessment.primary_quota_left_percent.unwrap();
-        if !auto_create_enabled {
-            return (
-                false,
-                Some(format!("quota low: {percent}% left, auto create disabled")),
-                None,
-                Vec::new(),
-            );
-        }
-        if has_usable_other_account {
-            return (
-                false,
-                Some(format!(
-                    "quota low: {percent}% left, but another account already has usable quota"
-                )),
-                None,
-                Vec::new(),
-            );
-        }
-        return (
-            true,
-            Some(format!("quota low: {percent}% left")),
-            Some(RotationCommand::Create),
-            vec!["--ignore-current".to_string()],
-        );
-    }
-
     (false, None, None, Vec::new())
+}
+
+fn assessment_has_exhausted_quota(assessment: &DecisionQuotaAssessment) -> bool {
+    assessment
+        .blocker
+        .as_deref()
+        .map(|blocker| blocker.contains("quota exhausted"))
+        .unwrap_or(false)
+        || assessment.primary_quota_left_percent == Some(0)
 }
 
 fn cooldown_active(state: &WatchState, cooldown_ms: u64) -> bool {
@@ -1142,60 +1100,55 @@ mod tests {
     }
 
     #[test]
-    fn plan_rotation_uses_create_for_low_quota() {
+    fn plan_rotation_skips_low_quota_until_exhausted() {
         let assessment = DecisionQuotaAssessment {
             summary: "5h 20% left".to_string(),
             usable: true,
             blocker: None,
             primary_quota_left_percent: Some(20),
         };
-        let plan = plan_rotation(Some(&assessment), &[], false, true);
-        assert!(plan.0);
-        assert_eq!(plan.2, Some(RotationCommand::Create));
-        assert_eq!(plan.3, vec!["--ignore-current".to_string()]);
+        let plan = plan_rotation(Some(&assessment), &[]);
+        assert!(!plan.0);
+        assert_eq!(plan.2, None);
     }
 
     #[test]
-    fn plan_rotation_uses_next_for_unusable_quota() {
+    fn plan_rotation_uses_next_for_exhausted_quota() {
         let assessment = DecisionQuotaAssessment {
             summary: "5h 0% left".to_string(),
             usable: false,
             blocker: Some("5h quota exhausted".to_string()),
             primary_quota_left_percent: Some(0),
         };
-        let plan = plan_rotation(Some(&assessment), &[], false, true);
+        let plan = plan_rotation(Some(&assessment), &[]);
         assert!(plan.0);
         assert_eq!(plan.2, Some(RotationCommand::Next));
     }
 
     #[test]
-    fn plan_rotation_skips_create_for_low_quota_when_other_account_is_usable() {
+    fn plan_rotation_skips_non_exhausted_unusable_quota() {
         let assessment = DecisionQuotaAssessment {
-            summary: "5h 20% left".to_string(),
-            usable: true,
-            blocker: None,
-            primary_quota_left_percent: Some(20),
+            summary: "7d 67% left".to_string(),
+            usable: false,
+            blocker: Some("usage limit reached".to_string()),
+            primary_quota_left_percent: Some(67),
         };
-        let plan = plan_rotation(Some(&assessment), &[], true, true);
+        let plan = plan_rotation(Some(&assessment), &[]);
         assert!(!plan.0);
         assert_eq!(plan.2, None);
     }
 
     #[test]
-    fn plan_rotation_skips_create_when_auto_create_is_disabled() {
+    fn plan_rotation_uses_next_for_exhausted_secondary_quota() {
         let assessment = DecisionQuotaAssessment {
-            summary: "5h 20% left".to_string(),
-            usable: true,
-            blocker: None,
-            primary_quota_left_percent: Some(20),
+            summary: "5h 100% left | week 0% left".to_string(),
+            usable: false,
+            blocker: Some("7d quota exhausted, resets in 6d".to_string()),
+            primary_quota_left_percent: Some(100),
         };
-        let plan = plan_rotation(Some(&assessment), &[], false, false);
-        assert!(!plan.0);
-        assert_eq!(plan.2, None);
-        assert_eq!(
-            plan.1.as_deref(),
-            Some("quota low: 20% left, auto create disabled")
-        );
+        let plan = plan_rotation(Some(&assessment), &[]);
+        assert!(plan.0);
+        assert_eq!(plan.2, Some(RotationCommand::Next));
     }
 
     #[test]

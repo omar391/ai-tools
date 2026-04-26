@@ -405,13 +405,13 @@ impl BackgroundWatchDeferReason {
     fn message(&self) -> String {
         match self {
             Self::InvokeInFlight => {
-                "Auto rotation deferred while a Codex Rotate command is running.".to_string()
+                "Quota watch paused while a Codex Rotate command is running.".to_string()
             }
             Self::ActiveCodexThreads(1) => {
-                "Auto rotation deferred until the active Codex conversation goes idle.".to_string()
+                "Quota watch paused until the active Codex conversation goes idle.".to_string()
             }
             Self::ActiveCodexThreads(count) => {
-                format!("Auto rotation deferred until {count} active Codex conversations go idle.")
+                format!("Quota watch paused until {count} active Codex conversations go idle.")
             }
         }
     }
@@ -478,7 +478,7 @@ fn refresh_snapshot_for_deferred_watch_tick(
     let interval = daemon.with_state_mut(|state| {
         refresh_static_snapshot(state);
         refresh_quota_state(state, false);
-        set_snapshot_message(&mut state.snapshot, SnapshotMessageKind::Progress, message);
+        set_snapshot_message(&mut state.snapshot, SnapshotMessageKind::Status, message);
         let interval = next_watch_interval(state.snapshot.current_quota_percent);
         state.snapshot.next_tick_at = Some(next_tick_label(interval));
         Ok(interval)
@@ -2333,7 +2333,7 @@ mod tests {
 
         let interval = refresh_snapshot_for_deferred_watch_tick(
             &daemon,
-            "Auto rotation deferred until the active Codex conversation goes idle.".to_string(),
+            "Quota watch paused until the active Codex conversation goes idle.".to_string(),
         )
         .expect("deferred refresh");
 
@@ -2364,11 +2364,11 @@ mod tests {
             .is_some_and(|quota| quota.contains("5h 75% left")));
         assert_eq!(
             snapshot.last_message.as_deref(),
-            Some("Auto rotation deferred until the active Codex conversation goes idle.")
+            Some("Quota watch paused until the active Codex conversation goes idle.")
         );
         assert_eq!(
             snapshot.last_message_kind,
-            Some(SnapshotMessageKind::Progress)
+            Some(SnapshotMessageKind::Status)
         );
         assert!(snapshot.next_tick_at.is_some());
     }

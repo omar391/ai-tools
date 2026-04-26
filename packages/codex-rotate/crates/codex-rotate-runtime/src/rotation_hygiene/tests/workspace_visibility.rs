@@ -87,13 +87,17 @@ fn switch_host_persona_does_not_resurrect_deleted_projects_from_thread_history()
     switch_host_persona(&paths, &source, &target, false).expect("switch");
     switch_host_persona(&paths, &target, &source, false).expect("switch back");
 
-    assert_eq!(
-        fs::read_link(source_paths.codex_home.join("config.toml")).expect("source config link"),
-        host_shared_codex_home_root(&paths).join("config.toml")
+    assert!(
+        !fs::symlink_metadata(source_paths.codex_home.join("config.toml"))
+            .expect("source config metadata")
+            .file_type()
+            .is_symlink()
     );
-    assert_eq!(
-        fs::read_link(target_paths.codex_home.join("config.toml")).expect("target config link"),
-        host_shared_codex_home_root(&paths).join("config.toml")
+    assert!(
+        !fs::symlink_metadata(target_paths.codex_home.join("config.toml"))
+            .expect("target config metadata")
+            .file_type()
+            .is_symlink()
     );
 
     for config_path in [
@@ -152,7 +156,7 @@ fn switch_host_persona_does_not_resurrect_deleted_projects_from_thread_history()
 }
 
 #[test]
-fn switch_host_persona_keeps_config_projects_in_shared_state_only() {
+fn switch_host_persona_syncs_config_projects_from_source_only() {
     let temp = tempdir().expect("tempdir");
     let paths = test_runtime_paths(temp.path());
     let source = test_account("acct-source", "persona-source");
@@ -244,9 +248,11 @@ fn switch_host_persona_keeps_config_projects_in_shared_state_only() {
     let target_config =
         fs::read_to_string(target_paths.codex_home.join("config.toml")).expect("target config");
     assert_eq!(source_config, target_config);
-    assert_eq!(
-        fs::read_link(target_paths.codex_home.join("config.toml")).expect("target config link"),
-        host_shared_codex_home_root(&paths).join("config.toml")
+    assert!(
+        !fs::symlink_metadata(target_paths.codex_home.join("config.toml"))
+            .expect("target config metadata")
+            .file_type()
+            .is_symlink()
     );
 
     assert!(source_config.contains("model = \"gpt-5.3-codex\""));

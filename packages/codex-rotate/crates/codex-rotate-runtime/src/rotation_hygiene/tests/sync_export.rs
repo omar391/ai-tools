@@ -391,8 +391,10 @@ fn export_skips_stale_or_unmaterialized_handoff_candidates() {
     let paths = test_runtime_paths(temp.path());
 
     let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
     unsafe {
         std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        std::env::set_var("CODEX_HOME", paths.codex_home.clone());
     }
 
     struct ExportUnavailableTransport;
@@ -461,6 +463,7 @@ fn export_skips_stale_or_unmaterialized_handoff_candidates() {
     );
 
     restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    restore_env("CODEX_HOME", previous_codex_home);
 }
 
 #[test]
@@ -703,6 +706,124 @@ fn export_handoff_preserves_full_mapped_history() {
 }
 
 #[test]
+fn response_items_from_thread_rollout_preserves_full_response_stream() {
+    let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let paths = test_runtime_paths(temp.path());
+
+    let rollout_dir = paths.codex_home.join("sessions/2026/04/26");
+    std::fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+    let rollout_path = rollout_dir.join("rollout-2026-04-26T11-59-08-thread-source.jsonl");
+    let rollout_lines = vec![
+        json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "managed instructions" }]
+            }
+        }),
+        json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{}",
+                "call_id": "call-1"
+            }
+        }),
+        json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "ok"
+            }
+        }),
+    ];
+    let rollout_contents = rollout_lines
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).expect("serialize rollout value"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&rollout_path, format!("{rollout_contents}\n")).expect("write rollout");
+
+    let items = response_items_from_thread_rollout(&paths.codex_home, "thread-source")
+        .expect("read rollout items")
+        .expect("rollout items");
+
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["role"], "developer");
+    assert_eq!(items[1]["type"], "function_call");
+    assert_eq!(items[2]["type"], "function_call_output");
+}
+
+#[test]
+fn export_handoff_prefers_rollout_items_over_lossy_thread_mapping() {
+    let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempdir().expect("tempdir");
+    let paths = test_runtime_paths(temp.path());
+
+    let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", paths.rotate_home.clone());
+        std::env::set_var("CODEX_HOME", paths.codex_home.clone());
+    }
+
+    let rollout_dir = paths.codex_home.join("sessions/2026/04/26");
+    std::fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+    let rollout_path = rollout_dir.join("rollout-2026-04-26T11-59-08-thread-source.jsonl");
+    std::fs::write(
+        &rollout_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                    "call_id": "call-1"
+                }
+            }))
+            .expect("serialize rollout value")
+        ),
+    )
+    .expect("write rollout");
+
+    let handoff = export_single_thread_handoff_from_response(
+        json!({
+            "thread": {
+                "id": "thread-source",
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "items": [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{ "type": "input_text", "text": "fallback user message" }]
+                            }
+                        ]
+                    }
+                ]
+            }
+        }),
+        "thread-source",
+        "source-sync",
+    )
+    .expect("export")
+    .expect("handoff");
+
+    assert_eq!(handoff.items.len(), 1);
+    assert_eq!(handoff.items[0]["type"], "function_call");
+
+    restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+    restore_env("CODEX_HOME", previous_codex_home);
+}
+
+#[test]
 fn export_handoff_captures_projectless_ui_metadata() {
     let _env_guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempdir().expect("tempdir");
@@ -770,6 +891,26 @@ fn export_handoff_captures_projectless_ui_metadata() {
     );
 
     restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
+}
+
+#[test]
+fn map_thread_item_to_response_item_preserves_developer_messages() {
+    let developer_item = json!({
+        "type": "message",
+        "role": "developer",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "developer guidance"
+            }
+        ]
+    });
+
+    let mapped = map_thread_item_to_response_item(&developer_item).expect("mapped developer");
+    assert_eq!(mapped["type"], "message");
+    assert_eq!(mapped["role"], "developer");
+    assert_eq!(mapped["content"][0]["type"], "input_text");
+    assert_eq!(mapped["content"][0]["text"], "developer guidance");
 }
 
 #[test]

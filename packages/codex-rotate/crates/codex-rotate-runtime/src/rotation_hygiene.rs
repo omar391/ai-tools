@@ -110,13 +110,13 @@ const ROTATION_THREAD_RECOVERY_LOOKBACK_LOGS: i64 = 2_000;
 const LINEAGE_CLAIM_PREFIX: &str = "__pending_lineage_claim__:";
 const LINEAGE_CLAIM_STALE_AFTER_NANOS: u128 = 10 * 60 * 1_000_000_000;
 const SHARED_CODEX_HOME_ENTRIES: &[&str] = &[
-    "config.toml",
     CODEX_GLOBAL_STATE_FILE_NAME,
     "AGENTS.md",
     "rules",
     "skills",
     "vendor_imports",
 ];
+const PERSONA_LOCAL_CODEX_HOME_ENTRIES: &[&str] = &["config.toml", "memory"];
 const CODEX_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
 #[cfg(test)]
 const ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";

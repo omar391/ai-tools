@@ -131,10 +131,10 @@ pub(super) fn export_single_thread_handoff_from_response(
         .get("cwd")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let items = mapped_response_items_from_thread(thread);
-    let metadata = thread_handoff_metadata_from_thread(thread_id, thread, &items);
-
     let paths = crate::paths::resolve_paths()?;
+    let items = response_items_from_thread_rollout(&paths.codex_home, thread_id)?
+        .unwrap_or_else(|| mapped_response_items_from_thread(thread));
+    let metadata = thread_handoff_metadata_from_thread(thread_id, thread, &items);
     let mut store = ConversationSyncStore::new(&paths.conversation_sync_db_file)?;
     let lineage_id = match store.get_lineage_id(sync_identity, thread_id)? {
         Some(lineage_id) => lineage_id,
@@ -183,6 +183,38 @@ pub(super) fn mapped_response_items_from_thread(thread: &Value) -> Vec<Value> {
         })
         .filter_map(map_thread_item_to_response_item)
         .collect()
+}
+
+pub(super) fn response_items_from_thread_rollout(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<Option<Vec<Value>>> {
+    let Some(path) = find_thread_rollout_path(codex_home, thread_id) else {
+        return Ok(None);
+    };
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}.", path.display()))?;
+    let mut items = Vec::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if !payload.is_object() {
+            continue;
+        }
+        items.push(payload.clone());
+    }
+    if items.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(items))
+    }
 }
 
 pub(super) fn mapped_response_items_from_thread_read_response(
@@ -1900,8 +1932,8 @@ pub(super) fn message_item_to_response_item(item: &Value) -> Option<Value> {
     if text.trim().is_empty() {
         return None;
     }
-    if role == "user" {
-        return Some(json!({
+    match role {
+        "user" => Some(json!({
             "type": "message",
             "role": "user",
             "content": [
@@ -1910,9 +1942,19 @@ pub(super) fn message_item_to_response_item(item: &Value) -> Option<Value> {
                     "text": normalize_handoff_item_text(&text),
                 }
             ]
-        }));
+        })),
+        "developer" => Some(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": normalize_handoff_item_text(&text),
+                }
+            ]
+        })),
+        _ => Some(assistant_message_item(&text)),
     }
-    Some(assistant_message_item(&text))
 }
 
 pub(super) fn assistant_message_item(text: &str) -> Value {

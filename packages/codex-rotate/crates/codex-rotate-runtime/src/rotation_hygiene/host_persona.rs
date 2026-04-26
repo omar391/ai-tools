@@ -31,6 +31,7 @@ pub(super) fn provision_host_persona(
         fs::create_dir_all(&target.codex_home)?;
     }
     ensure_host_persona_shared_codex_home_links(paths, &target)?;
+    ensure_host_persona_local_codex_home_entries(paths, &target)?;
 
     // Materialize BrowserForge-backed browser persona defaults if missing
     if entry
@@ -79,6 +80,7 @@ pub(super) fn ensure_live_root_bindings(paths: &RuntimePaths, entry: &AccountEnt
     migrate_live_root_if_needed(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
     migrate_live_root_if_needed(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
     ensure_host_persona_shared_codex_home_links(paths, &persona)?;
+    ensure_host_persona_local_codex_home_entries(paths, &persona)?;
     ensure_symlink_dir(&paths.codex_home, &persona.codex_home)?;
     ensure_symlink_dir(&paths.codex_app_support_dir, &persona.codex_app_support_dir)?;
     ensure_symlink_dir(&paths.debug_profile_dir, &persona.debug_profile_dir)?;
@@ -117,6 +119,9 @@ pub(super) fn switch_host_persona(
     )?;
     ensure_host_persona_shared_codex_home_links(paths, &source)?;
     ensure_host_persona_shared_codex_home_links(paths, &target)?;
+    ensure_host_persona_local_codex_home_entries(paths, &source)?;
+    ensure_host_persona_local_codex_home_entries(paths, &target)?;
+    sync_host_persona_local_codex_home_entries(&source.codex_home, &target.codex_home)?;
     fs::create_dir_all(&target.codex_app_support_dir).with_context(|| {
         format!(
             "Failed to create {}.",
@@ -148,6 +153,89 @@ pub(super) fn ensure_host_persona_shared_codex_home_links(
         )?;
     }
     Ok(())
+}
+
+pub(super) fn ensure_host_persona_local_codex_home_entries(
+    paths: &RuntimePaths,
+    persona: &HostPersonaPaths,
+) -> Result<()> {
+    fs::create_dir_all(&persona.codex_home)
+        .with_context(|| format!("Failed to create {}.", persona.codex_home.display()))?;
+    for entry in PERSONA_LOCAL_CODEX_HOME_ENTRIES {
+        ensure_persona_local_codex_home_entry(paths, entry, &persona.codex_home.join(entry))?;
+    }
+    Ok(())
+}
+
+fn ensure_persona_local_codex_home_entry(
+    paths: &RuntimePaths,
+    entry: &str,
+    persona_path: &Path,
+) -> Result<()> {
+    if let Some(link_target) = existing_symlink_target(persona_path)? {
+        let seed_path = if path_exists_or_symlink(&link_target) {
+            Some(link_target)
+        } else {
+            resolve_persona_local_codex_home_seed_path(paths, entry)
+        };
+        remove_path_if_exists(persona_path)?;
+        if let Some(seed_path) = seed_path {
+            copy_path_best_effort_cow(&seed_path, persona_path)?;
+        } else {
+            materialize_persona_local_codex_home_default(entry, persona_path)?;
+        }
+    } else if !path_exists_or_symlink(persona_path) {
+        if let Some(seed_path) = resolve_persona_local_codex_home_seed_path(paths, entry) {
+            copy_path_best_effort_cow(&seed_path, persona_path)?;
+        } else {
+            materialize_persona_local_codex_home_default(entry, persona_path)?;
+        }
+    }
+
+    ensure_persona_local_codex_home_entry_shape(entry, persona_path)
+}
+
+fn resolve_persona_local_codex_home_seed_path(
+    paths: &RuntimePaths,
+    entry: &str,
+) -> Option<PathBuf> {
+    [
+        host_shared_codex_home_root(paths).join(entry),
+        legacy_host_shared_codex_home_root(paths).join(entry),
+    ]
+    .into_iter()
+    .find(|candidate| path_exists_or_symlink(candidate))
+}
+
+pub(super) fn sync_host_persona_local_codex_home_entries(
+    source_codex_home: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    if source_codex_home == target_codex_home {
+        return Ok(());
+    }
+    for entry in PERSONA_LOCAL_CODEX_HOME_ENTRIES {
+        sync_host_persona_local_codex_home_entry(
+            entry,
+            &source_codex_home.join(entry),
+            &target_codex_home.join(entry),
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_host_persona_local_codex_home_entry(
+    entry: &str,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<()> {
+    if path_exists_or_symlink(source_path) {
+        copy_path_best_effort_cow(source_path, target_path)?;
+    } else {
+        remove_path_if_exists(target_path)?;
+        materialize_persona_local_codex_home_default(entry, target_path)?;
+    }
+    ensure_persona_local_codex_home_entry_shape(entry, target_path)
 }
 
 pub(super) fn read_thread_handoff_candidate_ids_from_state_db(
@@ -197,6 +285,15 @@ pub(super) fn host_shared_codex_home_root(paths: &RuntimePaths) -> PathBuf {
         .join("codex-home")
 }
 
+pub(super) fn legacy_host_shared_codex_home_root(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .rotate_home
+        .join("personas")
+        .join("host")
+        .join("shared-data")
+        .join("codex-home")
+}
+
 pub(super) fn ensure_shared_codex_home_entry_link(
     entry: &str,
     persona_path: &Path,
@@ -232,12 +329,10 @@ pub(super) fn materialize_shared_codex_home_default(entry: &str, shared_path: &P
             .with_context(|| format!("Failed to create {}.", parent.display()))?;
     }
     match shared_codex_home_entry_kind(entry) {
-        SharedCodexHomeEntryKind::Directory => fs::create_dir_all(shared_path)
+        CodexHomeEntryKind::Directory => fs::create_dir_all(shared_path)
             .with_context(|| format!("Failed to create {}.", shared_path.display())),
-        SharedCodexHomeEntryKind::File(default_contents) => {
-            fs::write(shared_path, default_contents)
-                .with_context(|| format!("Failed to write {}.", shared_path.display()))
-        }
+        CodexHomeEntryKind::File(default_contents) => fs::write(shared_path, default_contents)
+            .with_context(|| format!("Failed to write {}.", shared_path.display())),
     }
 }
 
@@ -245,13 +340,13 @@ pub(super) fn ensure_shared_codex_home_entry_shape(entry: &str, shared_path: &Pa
     let metadata = fs::symlink_metadata(shared_path)
         .with_context(|| format!("Failed to inspect {}.", shared_path.display()))?;
     match shared_codex_home_entry_kind(entry) {
-        SharedCodexHomeEntryKind::Directory if metadata.is_dir() => Ok(()),
-        SharedCodexHomeEntryKind::File(_) if metadata.is_file() => Ok(()),
-        SharedCodexHomeEntryKind::Directory => Err(anyhow!(
+        CodexHomeEntryKind::Directory if metadata.is_dir() => Ok(()),
+        CodexHomeEntryKind::File(_) if metadata.is_file() => Ok(()),
+        CodexHomeEntryKind::Directory => Err(anyhow!(
             "Expected shared Codex-home path {} for {entry} to be a directory.",
             shared_path.display()
         )),
-        SharedCodexHomeEntryKind::File(_) => Err(anyhow!(
+        CodexHomeEntryKind::File(_) => Err(anyhow!(
             "Expected shared Codex-home path {} for {entry} to be a file.",
             shared_path.display()
         )),
@@ -259,16 +354,53 @@ pub(super) fn ensure_shared_codex_home_entry_shape(entry: &str, shared_path: &Pa
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum SharedCodexHomeEntryKind {
+pub(super) enum CodexHomeEntryKind {
     File(&'static str),
     Directory,
 }
 
-pub(super) fn shared_codex_home_entry_kind(entry: &str) -> SharedCodexHomeEntryKind {
+pub(super) fn shared_codex_home_entry_kind(entry: &str) -> CodexHomeEntryKind {
     match entry {
-        "rules" | "skills" | "vendor_imports" => SharedCodexHomeEntryKind::Directory,
-        CODEX_GLOBAL_STATE_FILE_NAME => SharedCodexHomeEntryKind::File("{}\n"),
-        _ => SharedCodexHomeEntryKind::File(""),
+        "rules" | "skills" | "vendor_imports" => CodexHomeEntryKind::Directory,
+        CODEX_GLOBAL_STATE_FILE_NAME => CodexHomeEntryKind::File("{}\n"),
+        _ => CodexHomeEntryKind::File(""),
+    }
+}
+
+fn materialize_persona_local_codex_home_default(entry: &str, persona_path: &Path) -> Result<()> {
+    if let Some(parent) = persona_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}.", parent.display()))?;
+    }
+    match persona_local_codex_home_entry_kind(entry) {
+        CodexHomeEntryKind::Directory => fs::create_dir_all(persona_path)
+            .with_context(|| format!("Failed to create {}.", persona_path.display())),
+        CodexHomeEntryKind::File(default_contents) => fs::write(persona_path, default_contents)
+            .with_context(|| format!("Failed to write {}.", persona_path.display())),
+    }
+}
+
+fn ensure_persona_local_codex_home_entry_shape(entry: &str, persona_path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(persona_path)
+        .with_context(|| format!("Failed to inspect {}.", persona_path.display()))?;
+    match persona_local_codex_home_entry_kind(entry) {
+        CodexHomeEntryKind::Directory if metadata.is_dir() => Ok(()),
+        CodexHomeEntryKind::File(_) if metadata.is_file() => Ok(()),
+        CodexHomeEntryKind::Directory => Err(anyhow!(
+            "Expected persona-local Codex-home path {} for {entry} to be a directory.",
+            persona_path.display()
+        )),
+        CodexHomeEntryKind::File(_) => Err(anyhow!(
+            "Expected persona-local Codex-home path {} for {entry} to be a file.",
+            persona_path.display()
+        )),
+    }
+}
+
+fn persona_local_codex_home_entry_kind(entry: &str) -> CodexHomeEntryKind {
+    match entry {
+        "memory" => CodexHomeEntryKind::Directory,
+        _ => CodexHomeEntryKind::File(""),
     }
 }
 
