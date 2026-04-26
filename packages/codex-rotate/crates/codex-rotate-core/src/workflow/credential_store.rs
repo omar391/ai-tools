@@ -68,6 +68,15 @@ pub fn load_disabled_rotation_domains() -> Result<HashSet<String>> {
         .collect())
 }
 
+pub fn load_relogin_account_emails() -> Result<HashSet<String>> {
+    Ok(load_credential_store()?
+        .families
+        .into_values()
+        .flat_map(|family| family.relogin.into_iter())
+        .map(|email| normalize_email_key(&email))
+        .collect())
+}
+
 pub(super) fn save_credential_store(store: &CredentialStore) -> Result<()> {
     let credential_state = serialize_credential_store(store);
     let mut dropped_non_dev_pending = Vec::new();

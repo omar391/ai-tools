@@ -62,7 +62,7 @@ pub use self::create_flow::{
 };
 pub use self::credential_store::{
     auto_disable_domain_for_account, extract_email_domain, load_disabled_rotation_domains,
-    record_removed_account,
+    load_relogin_account_emails, record_removed_account,
 };
 pub(crate) use self::credential_store::{
     family_suspends_domain_on_terminal_refresh_failure, migrate_rotate_state_credential_sections,

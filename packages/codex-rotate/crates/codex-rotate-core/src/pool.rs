@@ -31,7 +31,7 @@ use crate::workflow::{
     create_next_fallback_options, extract_email_domain,
     family_suspends_domain_on_terminal_refresh_failure,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
-    reconcile_added_account_credential_state, record_removed_account,
+    load_relogin_account_emails, reconcile_added_account_credential_state, record_removed_account,
 };
 
 mod identity;
@@ -133,6 +133,10 @@ fn account_rotation_enabled(disabled_domains: &HashSet<String>, email: &str) -> 
     extract_email_domain(email)
         .map(|domain| !disabled_domains.contains(&domain))
         .unwrap_or(true)
+}
+
+fn account_marked_for_relogin(relogin_accounts: &HashSet<String>, email: &str) -> bool {
+    relogin_accounts.contains(&normalize_email_for_label(email))
 }
 
 fn inventory_account_visible(disabled_domains: &HashSet<String>, entry: &AccountEntry) -> bool {
@@ -510,6 +514,7 @@ pub fn other_usable_account_exists() -> Result<bool> {
     }
 
     let disabled_domains = load_disabled_rotation_domains()?;
+    let relogin_accounts = load_relogin_account_emails()?;
     let mut reasons = Vec::new();
     let skip_indices = HashSet::new();
     let (candidate, candidate_dirty) = find_next_usable_account(
@@ -520,6 +525,7 @@ pub fn other_usable_account_exists() -> Result<bool> {
         dirty,
         &skip_indices,
         &disabled_domains,
+        &relogin_accounts,
     )?;
     if candidate_dirty {
         save_pool(&pool)?;

@@ -23,6 +23,7 @@ pub fn prepare_next_rotation_with_progress(
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     let disabled_domains = load_disabled_rotation_domains()?;
+    let relogin_accounts = load_relogin_account_emails()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -37,6 +38,10 @@ pub fn prepare_next_rotation_with_progress(
             break;
         };
         round_robin_steps += 1;
+        if account_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index].email) {
+            cursor_index = candidate_index;
+            continue;
+        }
         if !account_rotation_enabled(&disabled_domains, &pool.accounts[candidate_index].email) {
             cursor_index = candidate_index;
             continue;
@@ -122,6 +127,7 @@ pub fn prepare_next_rotation_with_progress(
         dirty,
         &inspected_later_indices,
         &disabled_domains,
+        &relogin_accounts,
     )?;
     dirty = result.1;
 
@@ -395,6 +401,7 @@ pub fn rotate_next_internal_with_progress(
         return Err(anyhow!("No accounts in pool. Run: codex-rotate add"));
     }
     let disabled_domains = load_disabled_rotation_domains()?;
+    let relogin_accounts = load_relogin_account_emails()?;
 
     let previous_index = pool.active_index;
     let previous = pool.accounts[previous_index].clone();
@@ -409,6 +416,10 @@ pub fn rotate_next_internal_with_progress(
             break;
         };
         round_robin_steps += 1;
+        if account_marked_for_relogin(&relogin_accounts, &pool.accounts[candidate_index].email) {
+            cursor_index = candidate_index;
+            continue;
+        }
         if !account_rotation_enabled(&disabled_domains, &pool.accounts[candidate_index].email) {
             cursor_index = candidate_index;
             continue;
@@ -475,6 +486,7 @@ pub fn rotate_next_internal_with_progress(
         dirty,
         &inspected_later_indices,
         &disabled_domains,
+        &relogin_accounts,
     )?;
     dirty = result.1;
 

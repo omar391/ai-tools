@@ -2545,6 +2545,134 @@ fn rotate_next_skips_disabled_domain_accounts() {
 }
 
 #[test]
+fn rotate_next_skips_relogin_marked_accounts_and_keeps_them_in_pool() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempdir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+    let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    let previous_usage_url = std::env::var_os("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE");
+
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+        std::env::set_var("CODEX_HOME", &codex_home);
+    }
+
+    let result = (|| -> Result<()> {
+        let paths = resolve_paths()?;
+        if let Some(parent) = paths.codex_auth_file.parent() {
+            std::fs::create_dir_all(parent).expect("create auth parent");
+        }
+        write_codex_auth(
+            &paths.codex_auth_file,
+            &make_auth("dev.10@astronlab.com", "acct-10", "free"),
+        )?;
+
+        write_rotate_state_json(&json!({
+            "accounts": [
+                configured_entry(
+                    "dev.10@astronlab.com",
+                    "acct-10",
+                    "free",
+                    Some(true),
+                    Some("2026-04-07T00:00:00.000Z")
+                ),
+                configured_entry(
+                    "dev.11@astronlab.com",
+                    "acct-11",
+                    "free",
+                    Some(true),
+                    Some("2026-04-07T00:00:00.000Z")
+                ),
+                configured_entry(
+                    "dev.12@astronlab.com",
+                    "acct-12",
+                    "free",
+                    Some(true),
+                    Some("2026-04-07T00:00:00.000Z")
+                )
+            ],
+            "active_index": 0,
+            "version": 9,
+            "default_create_template": "dev.{n}@astronlab.com",
+            "families": {
+                "dev-1::dev.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "template": "dev.{n}@astronlab.com",
+                    "next_suffix": 13,
+                    "max_skipped_slots": 0,
+                    "relogin": ["dev.11@astronlab.com"],
+                    "last_created_email": "dev.12@astronlab.com",
+                    "created_at": "2026-04-05T00:00:00.000Z",
+                    "updated_at": "2026-04-05T00:00:00.000Z"
+                }
+            }
+        }))?;
+
+        let (usage_url, handle) = spawn_usage_server(
+            json!({
+                "user_id": "user-12",
+                "account_id": "acct-12",
+                "email": "dev.12@astronlab.com",
+                "plan_type": "free",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 20.0,
+                        "limit_window_seconds": 18000,
+                        "reset_after_seconds": 7200,
+                        "reset_at": 0
+                    },
+                    "secondary_window": null
+                },
+                "code_review_rate_limit": null,
+                "additional_rate_limits": null,
+                "credits": null,
+                "promo": null
+            })
+            .to_string(),
+        );
+        unsafe {
+            std::env::set_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", &usage_url);
+        }
+
+        let output = rotate_next_internal_with_progress(None)?;
+        handle.join().expect("usage server should finish");
+
+        match output {
+            NextResult::Rotated { summary, .. } => {
+                assert_eq!(summary.email, "dev.12@astronlab.com");
+            }
+            _ => panic!("expected rotation result"),
+        }
+
+        let refreshed = load_pool()?;
+        assert_eq!(refreshed.active_index, 2);
+        assert_eq!(
+            refreshed
+                .accounts
+                .iter()
+                .map(|entry| entry.email.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "dev.10@astronlab.com",
+                "dev.11@astronlab.com",
+                "dev.12@astronlab.com"
+            ]
+        );
+        Ok(())
+    })();
+
+    restore_env_var("CODEX_ROTATE_WHAM_USAGE_URL_OVERRIDE", previous_usage_url);
+    restore_env_var("CODEX_HOME", previous_codex_home);
+    restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+    result.expect("next should skip relogin-marked accounts");
+}
+
+#[test]
 fn rotate_next_fails_when_only_disabled_targets_remain() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");

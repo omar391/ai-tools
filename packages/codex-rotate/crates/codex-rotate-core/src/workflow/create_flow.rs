@@ -146,6 +146,7 @@ pub fn cmd_create_with_progress(
     let _lock = acquire_create_execution_lock(&options, progress.as_ref())?;
     let paths = resolve_paths()?;
     let disabled_domains = load_disabled_rotation_domains()?;
+    let relogin_accounts = load_relogin_account_emails()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -172,6 +173,7 @@ pub fn cmd_create_with_progress(
             dirty,
             &skip_indices,
             &disabled_domains,
+            &relogin_accounts,
         )?;
         dirty = candidate_dirty;
 
@@ -421,6 +423,7 @@ pub(super) fn reusable_account_exists_for_auto_create_retry(
 ) -> Result<bool> {
     let paths = resolve_paths()?;
     let disabled_domains = load_disabled_rotation_domains()?;
+    let relogin_accounts = load_relogin_account_emails()?;
     let mut pool = load_pool()?;
     let mut dirty = normalize_pool_entries(&mut pool);
     dirty |= sync_pool_active_account_from_codex(&mut pool, &paths.codex_auth_file)?;
@@ -447,6 +450,7 @@ pub(super) fn reusable_account_exists_for_auto_create_retry(
         dirty,
         &skip_indices,
         &disabled_domains,
+        &relogin_accounts,
     )?;
     if candidate_dirty {
         save_pool(&pool)?;
