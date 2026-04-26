@@ -345,6 +345,20 @@ pub fn rotate_next(
     rotate_next_with_options(port, progress, RotationCommandOptions::default())
 }
 
+pub fn rotate_next_without_create(
+    port: Option<u16>,
+    progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> Result<NextResult> {
+    let _lock = RotationLock::acquire()?;
+    rotate_next_impl(
+        select_rotation_backend()?.as_ref(),
+        port.unwrap_or(DEFAULT_PORT),
+        progress,
+        false,
+        RotationCommandOptions::default(),
+    )
+}
+
 pub fn rotate_next_with_options(
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,

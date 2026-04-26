@@ -29,7 +29,9 @@ use crate::logs::{
     CodexLogsAvailability, CodexSignalKind,
 };
 use crate::paths::resolve_paths;
-use crate::rotation_hygiene::rotate_next as run_shared_next;
+use crate::rotation_hygiene::{
+    rotate_next as run_shared_next, rotate_next_without_create as run_shared_next_without_create,
+};
 use crate::runtime_log::log_daemon_error;
 use crate::thread_recovery::{
     read_latest_recoverable_turn_failure_log_id, run_thread_recovery_iteration,
@@ -338,6 +340,7 @@ pub fn run_watch_iteration(options: WatchIterationOptions) -> Result<WatchIterat
         rotation_execution = execute_watch_rotation(
             &decision,
             decision.rotation_command,
+            previous_state.auto_create_enabled,
             Some(port),
             options.progress.clone(),
         )?;
@@ -553,38 +556,57 @@ fn normalize_log_cursor(
 fn execute_watch_rotation(
     decision: &RotationDecision,
     command: Option<RotationCommand>,
+    auto_create_enabled: bool,
     port: Option<u16>,
     progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
 ) -> Result<WatchRotationExecution> {
     let port = port.unwrap_or(9333);
     match command {
-        Some(RotationCommand::Next) => match run_shared_next(Some(port), progress.clone()) {
-            Ok(next_result) => Ok(match next_result {
-                NextResult::Rotated { summary, .. } | NextResult::Created { summary, .. } => {
-                    WatchRotationExecution {
-                        changed: true,
-                        summary: Some(summary),
-                        rotation_reason: Some(watch_rotation_reason(decision)),
-                        status_message: Some(watch_changed_status_message(decision)),
+        Some(RotationCommand::Next) => {
+            let next_result = if auto_create_enabled {
+                run_shared_next(Some(port), progress.clone())
+            } else {
+                run_shared_next_without_create(Some(port), progress.clone())
+            };
+
+            match next_result {
+                Ok(next_result) => Ok(match next_result {
+                    NextResult::Rotated { summary, .. } | NextResult::Created { summary, .. } => {
+                        WatchRotationExecution {
+                            changed: true,
+                            summary: Some(summary),
+                            rotation_reason: Some(watch_rotation_reason(decision)),
+                            status_message: Some(watch_changed_status_message(decision)),
+                        }
                     }
+                    NextResult::Stayed { message, .. } => WatchRotationExecution {
+                        changed: false,
+                        summary: None,
+                        rotation_reason: None,
+                        status_message: Some(first_line(&message)),
+                    },
+                }),
+                Err(error) if is_disabled_rotation_blocked_error(&error) => {
+                    Ok(WatchRotationExecution {
+                        changed: false,
+                        summary: None,
+                        rotation_reason: None,
+                        status_message: Some(watch_blocked_status_message(decision)),
+                    })
                 }
-                NextResult::Stayed { message, .. } => WatchRotationExecution {
-                    changed: false,
-                    summary: None,
-                    rotation_reason: None,
-                    status_message: Some(first_line(&message)),
-                },
-            }),
-            Err(error) if is_disabled_rotation_blocked_error(&error) => {
-                Ok(WatchRotationExecution {
-                    changed: false,
-                    summary: None,
-                    rotation_reason: None,
-                    status_message: Some(watch_blocked_status_message(decision)),
-                })
+                Err(error) if !auto_create_enabled && is_next_create_required_error(&error) => {
+                    Ok(WatchRotationExecution {
+                        changed: false,
+                        summary: None,
+                        rotation_reason: None,
+                        status_message: Some(
+                            "rotation needs a new account, but auto create is disabled".to_string(),
+                        ),
+                    })
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
         Some(RotationCommand::Create) => {
             if let Some(progress) = progress.as_ref() {
                 progress("Auto rotation is creating a replacement account.".to_string());
@@ -742,6 +764,10 @@ fn is_disabled_rotation_blocked_error(error: &anyhow::Error) -> bool {
         message.contains("No rotation target is available because rotation is disabled")
             || message.contains("is in a disabled domain and cannot be activated")
     })
+}
+
+fn is_next_create_required_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("requires creating a replacement account")
 }
 
 fn recover_completed_watch_create(
@@ -1190,6 +1216,14 @@ mod tests {
     fn retryable_watch_create_error_ignores_non_transient_failures() {
         let error = anyhow!("quota inspection unavailable");
         assert!(!is_retryable_watch_create_error(&error));
+    }
+
+    #[test]
+    fn next_create_required_error_detects_auto_create_gate() {
+        let error = anyhow!(
+            "Auto rotation requires creating a replacement account, but the retry budget is exhausted."
+        );
+        assert!(is_next_create_required_error(&error));
     }
 
     #[test]
