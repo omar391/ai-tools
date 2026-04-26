@@ -316,12 +316,20 @@ fn translate_recovery_events_preserves_unresolved_source_entries() {
         next_source_state.thread_recovery_pending_events[0].thread_id,
         unresolved_source_event.thread_id
     );
+    assert_eq!(
+        next_source_state.thread_recovery_pending_events[0].source_log_id,
+        unresolved_source_event.source_log_id
+    );
 
     assert!(next_target_state.thread_recovery_pending);
     assert_eq!(next_target_state.thread_recovery_pending_events.len(), 1);
     assert_eq!(
         next_target_state.thread_recovery_pending_events[0].thread_id,
         "target-thread-bound"
+    );
+    assert_eq!(
+        next_target_state.thread_recovery_pending_events[0].source_log_id,
+        0
     );
 
     restore_env("CODEX_ROTATE_HOME", previous_rotate_home);
@@ -401,16 +409,16 @@ fn translate_recovery_events_keeps_translated_entries_for_same_account_personas(
 
     let next_watch_state = crate::watch::read_watch_state().expect("read watch state");
     let next_shared_state = next_watch_state.account_state("acct-shared");
-    let thread_ids = next_shared_state
+    let translated_events = next_shared_state
         .thread_recovery_pending_events
         .iter()
-        .map(|event| event.thread_id.as_str())
+        .map(|event| (event.thread_id.as_str(), event.source_log_id))
         .collect::<Vec<_>>();
 
     assert!(next_shared_state.thread_recovery_pending);
     assert_eq!(
-        thread_ids,
-        vec!["source-thread-unbound", "target-thread-bound"]
+        translated_events,
+        vec![("source-thread-unbound", 101), ("target-thread-bound", 0)]
     );
 
     restore_env("CODEX_ROTATE_HOME", previous_rotate_home);

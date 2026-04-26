@@ -1,5 +1,9 @@
 use super::*;
 
+// Translated recovery events point at target-local threads, so the source
+// account log cursor is not meaningful on the target side.
+const TRANSLATED_RECOVERY_SOURCE_LOG_ID: i64 = 0;
+
 pub(super) fn ensure_no_rotation_drift(prepared: &PreparedRotation) -> Result<()> {
     let pool = load_pool()?;
     if pool.active_index != prepared.previous_index {
@@ -343,6 +347,7 @@ pub(super) fn translate_recovery_events_after_rotation_with_identity(
         };
         if let Some(target_thread_id) = target_thread_id {
             event.thread_id = target_thread_id;
+            event.source_log_id = TRANSLATED_RECOVERY_SOURCE_LOG_ID;
             if let Some(handoff) = exported_handoff {
                 event.rehydration = Some(ThreadRecoveryRehydration {
                     lineage_id: handoff.lineage_id,
