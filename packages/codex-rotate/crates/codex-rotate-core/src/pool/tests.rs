@@ -1901,7 +1901,7 @@ fn normalize_pool_entries_marks_weekly_exhausted_cached_accounts_unusable() {
 }
 
 #[test]
-fn normalize_pool_entries_marks_sub_two_percent_cached_accounts_unusable() {
+fn normalize_pool_entries_marks_sub_three_percent_cached_accounts_unusable() {
     let mut pool = Pool {
         active_index: 0,
         accounts: vec![AccountEntry {
@@ -1913,10 +1913,10 @@ fn normalize_pool_entries_marks_sub_two_percent_cached_accounts_unusable() {
             auth: make_auth("dev.5@hotspotprime.com", "acct-5", "team"),
             added_at: "2026-04-18T00:00:00.000Z".to_string(),
             last_quota_usable: Some(true),
-            last_quota_summary: Some("5h 1.9% left, 8m | week 94% left, 6d 11h".to_string()),
+            last_quota_summary: Some("5h 2.9% left, 8m | week 94% left, 6d 11h".to_string()),
             last_quota_blocker: None,
             last_quota_checked_at: Some("2026-04-18T02:01:57.804Z".to_string()),
-            last_quota_primary_left_percent: Some(1),
+            last_quota_primary_left_percent: Some(3),
             last_quota_next_refresh_at: Some("2026-04-18T02:02:57.804Z".to_string()),
             persona: None,
         }],
