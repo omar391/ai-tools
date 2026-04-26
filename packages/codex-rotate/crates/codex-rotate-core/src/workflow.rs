@@ -60,12 +60,14 @@ pub use self::create_flow::{
     is_auto_create_retry_stopped_for_reusable_account, is_create_already_in_progress_error,
     reconcile_added_account_credential_state,
 };
+#[cfg(test)]
+pub(crate) use self::credential_store::family_suspends_domain_on_terminal_refresh_failure;
 pub use self::credential_store::{
     auto_disable_domain_for_account, extract_email_domain, load_disabled_rotation_domains,
     load_relogin_account_emails, record_removed_account,
 };
 pub(crate) use self::credential_store::{
-    family_suspends_domain_on_terminal_refresh_failure, migrate_rotate_state_credential_sections,
+    migrate_rotate_state_credential_sections, record_terminal_refresh_failures,
 };
 pub use self::login_bridge::cmd_generate_browser_fingerprint;
 pub use self::relogin_flow::{cmd_relogin, cmd_relogin_with_progress};

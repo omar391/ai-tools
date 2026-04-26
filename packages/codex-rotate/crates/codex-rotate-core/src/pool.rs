@@ -27,11 +27,10 @@ use crate::quota::{
 use crate::state::write_rotate_state_json;
 use crate::state::{load_rotate_state_json, update_rotate_state_json, RotateStateOwner};
 use crate::workflow::{
-    auto_disable_domain_for_account, cmd_create, cmd_create_with_progress,
-    create_next_fallback_options, extract_email_domain,
-    family_suspends_domain_on_terminal_refresh_failure,
+    cmd_create, cmd_create_with_progress, create_next_fallback_options, extract_email_domain,
     is_auto_create_retry_stopped_for_reusable_account, load_disabled_rotation_domains,
     load_relogin_account_emails, reconcile_added_account_credential_state, record_removed_account,
+    record_terminal_refresh_failures,
 };
 
 mod identity;
@@ -214,28 +213,19 @@ fn cleanup_terminal_account(pool: &mut Pool, index: usize) -> Result<bool> {
     let Some(entry) = pool.accounts.get(index).cloned() else {
         return Ok(false);
     };
-    let should_disable_domain = family_suspends_domain_on_terminal_refresh_failure(&entry.email)?;
-    let deleted = record_removed_account(&entry.email)?;
-    if deleted && should_disable_domain {
-        auto_disable_domain_for_account(&entry.email)?;
-    }
-    Ok(true)
+    record_terminal_refresh_failures(&[entry.email])
 }
 
 fn prune_terminal_accounts_from_pool(pool: &mut Pool) -> Result<bool> {
-    let mut indices = pool
+    let relogin_accounts = load_relogin_account_emails()?;
+    let emails = pool
         .accounts
         .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| account_requires_terminal_cleanup(entry).then_some(index))
+        .filter(|entry| account_requires_terminal_cleanup(entry))
+        .filter(|entry| !account_marked_for_relogin(&relogin_accounts, &entry.email))
+        .map(|entry| entry.email.clone())
         .collect::<Vec<_>>();
-    indices.sort_unstable();
-    indices.dedup();
-    let mut changed = false;
-    for index in indices.into_iter().rev() {
-        changed |= cleanup_terminal_account(pool, index)?;
-    }
-    Ok(changed)
+    record_terminal_refresh_failures(&emails)
 }
 
 fn disabled_rotation_target_error(domains: &[String]) -> anyhow::Error {

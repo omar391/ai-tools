@@ -737,6 +737,72 @@ pub fn record_removed_account(email: &str) -> Result<bool> {
     Ok(dirty)
 }
 
+pub(crate) fn record_terminal_refresh_failures(emails: &[String]) -> Result<bool> {
+    if emails.is_empty() {
+        return Ok(false);
+    }
+
+    let mut store = load_credential_store()?;
+    let reactivate_at = (Utc::now() + chrono::Duration::days(AUTO_DOMAIN_REACTIVATION_DAYS))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut dirty = false;
+    let mut seen = HashSet::new();
+
+    for email in emails {
+        let normalized_email = normalize_email_key(email);
+        if !seen.insert(normalized_email.clone()) {
+            continue;
+        }
+
+        let family_match = select_family_for_account_email(&store, &normalized_email);
+        let removed_pending = store.pending.remove(&normalized_email).is_some();
+        let removed_skipped = store.skipped.remove(&normalized_email);
+        dirty |= removed_pending || removed_skipped;
+
+        let Some(family_match) = family_match else {
+            continue;
+        };
+
+        if let Some(family) = store.families.get_mut(&family_match.key) {
+            if !family
+                .relogin
+                .iter()
+                .any(|entry| normalize_email_key(entry) == normalized_email)
+            {
+                family.relogin.push(normalized_email.clone());
+                family.relogin.sort();
+                family.relogin.dedup();
+                dirty = true;
+            }
+        }
+
+        if family_match
+            .family
+            .suspend_domain_on_terminal_refresh_failure
+        {
+            let Some(domain) = extract_email_domain(email) else {
+                continue;
+            };
+            let config = store.domain.entry(domain).or_insert(DomainConfig {
+                rotation_enabled: true,
+                max_suffix_per_family: None,
+                reactivate_at: None,
+            });
+            let domain_changed = config.rotation_enabled
+                || config.reactivate_at.as_deref() != Some(reactivate_at.as_str());
+            config.rotation_enabled = false;
+            config.reactivate_at = Some(reactivate_at.clone());
+            dirty |= domain_changed;
+        }
+    }
+
+    if dirty {
+        save_credential_store(&store)?;
+    }
+    Ok(dirty)
+}
+
+#[cfg(test)]
 pub(crate) fn family_suspends_domain_on_terminal_refresh_failure(email: &str) -> Result<bool> {
     let store = load_credential_store()?;
     Ok(select_family_for_account_email(&store, email)

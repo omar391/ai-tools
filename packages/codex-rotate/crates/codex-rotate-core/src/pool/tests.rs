@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{RotateHomeGuard, ENV_MUTEX};
+use crate::workflow::family_suspends_domain_on_terminal_refresh_failure;
 use base64::Engine;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -416,6 +417,35 @@ fn prune_terminal_accounts_disables_domain_for_suspend_flagged_families() {
     assert_eq!(
         state["domain"]["astronlab.com"]["rotation_enabled"],
         json!(false)
+    );
+}
+
+#[test]
+fn prune_terminal_accounts_skips_accounts_already_marked_for_relogin() {
+    let _guard = RotateHomeGuard::enter("codex-rotate-terminal-cleanup-already-relogin");
+    write_terminal_cleanup_state(vec!["dev.1@astronlab.com"], false)
+        .expect("write relogin-marked state");
+
+    let mut pool = Pool {
+        active_index: 0,
+        accounts: vec![terminal_cleanup_account("dev.1@astronlab.com")],
+    };
+
+    let changed = prune_terminal_accounts_from_pool(&mut pool).expect("prune terminal accounts");
+    assert!(!changed);
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(pool.accounts[0].email, "dev.1@astronlab.com");
+
+    let state = load_rotate_state_json().expect("load rotate state");
+    assert_eq!(
+        state["families"]["dev-1::dev.{n}@astronlab.com"]["relogin"]
+            .as_array()
+            .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["dev.1@astronlab.com"])
+    );
+    assert_eq!(
+        state["domain"]["astronlab.com"]["rotation_enabled"],
+        json!(true)
     );
 }
 
