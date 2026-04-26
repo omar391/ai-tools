@@ -1149,12 +1149,14 @@ fn task_started_is_stalled_turn_eligible(payload: &Value) -> bool {
 }
 
 fn is_terminal_thread_recovery_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_lowercase();
-    message.contains("no rollout found for thread id")
-        || message.contains("thread not found")
-        || message.contains("no thread found")
-        || message.contains("unknown thread")
-        || message.contains("does not exist")
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_lowercase();
+        message.contains("no rollout found for thread id")
+            || message.contains("thread not found")
+            || message.contains("no thread found")
+            || message.contains("unknown thread")
+            || message.contains("does not exist")
+    })
 }
 
 impl ThreadRecoveryKind {
@@ -2399,6 +2401,12 @@ create table logs (
         assert!(is_terminal_thread_recovery_error(&anyhow!(
             "Codex thread/resume request failed: {{\"code\":-32600,\"message\":\"no rollout found for thread id thread-123\"}}"
         )));
+        assert!(is_terminal_thread_recovery_error(
+            &anyhow!(
+                "Codex thread/resume request failed: {{\"code\":-32600,\"message\":\"no rollout found for thread id thread-123\"}}"
+            )
+            .context("Failed to resume thread thread-123 before continue.")
+        ));
         assert!(!is_terminal_thread_recovery_error(&anyhow!(
             "Timed out waiting for thread/resume response from Codex."
         )));
