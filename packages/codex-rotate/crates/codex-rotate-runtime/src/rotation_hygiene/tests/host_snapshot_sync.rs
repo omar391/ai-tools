@@ -280,3 +280,109 @@ fn host_conversation_snapshot_moves_thread_between_active_and_archive_roots() {
         .expect("read target index");
     assert_eq!(target_index.matches(target_thread_id).count(), 1);
 }
+
+#[test]
+fn host_conversation_snapshot_preserves_existing_target_rollout_path() {
+    let temp = tempdir().expect("tempdir");
+    let paths = test_runtime_paths(temp.path());
+    let source = test_account("acct-source", "persona-source");
+    let target = test_account("acct-target", "persona-target");
+
+    provision_host_persona(&paths, &source, None).expect("provision source");
+    provision_host_persona(&paths, &target, None).expect("provision target");
+
+    let source_paths = host_persona_paths(&paths, source.persona.as_ref().unwrap()).unwrap();
+    let target_paths = host_persona_paths(&paths, target.persona.as_ref().unwrap()).unwrap();
+    let source_db = source_paths.codex_home.join("state_5.sqlite");
+    let target_db = target_paths.codex_home.join("state_5.sqlite");
+    let source_thread_id = "019dc844-ca36-7113-ab78-1318e5c22ceb";
+    let target_thread_id = "019dc844-ca36-7113-ab78-1318e5c22ceb";
+
+    let source_rollout = source_paths.codex_home.join(
+        "sessions/2026/04/26/rollout-2026-04-26T11-30-44-019dc844-ca36-7113-ab78-1318e5c22ceb.jsonl",
+    );
+    fs::create_dir_all(source_rollout.parent().unwrap()).expect("create source rollout parent");
+    fs::write(
+        &source_rollout,
+        format!(
+            "{{\"id\":\"{source_thread_id}\",\"thread_id\":\"{source_thread_id}\",\"payload\":{{\"type\":\"user_message\",\"message\":\"resume me\"}}}}\n"
+        ),
+    )
+    .expect("write source rollout");
+    let source_rollout_string = source_rollout.display().to_string();
+    seed_threads_table(
+        &source_db,
+        &[(source_thread_id, source_rollout_string.as_str(), 100)],
+    );
+
+    let target_rollout = target_paths.codex_home.join(
+        "sessions/2026/04/26/rollout-2026-04-26T10-28-35-019dc844-ca36-7113-ab78-1318e5c22ceb.jsonl",
+    );
+    fs::create_dir_all(target_rollout.parent().unwrap()).expect("create target rollout parent");
+    fs::write(
+        &target_rollout,
+        format!(
+            "{{\"id\":\"{target_thread_id}\",\"thread_id\":\"{target_thread_id}\",\"payload\":{{\"type\":\"user_message\",\"message\":\"stale target copy\"}}}}\n"
+        ),
+    )
+    .expect("write target rollout");
+    let target_rollout_string = target_rollout.display().to_string();
+    seed_threads_table(
+        &target_db,
+        &[(target_thread_id, target_rollout_string.as_str(), 90)],
+    );
+
+    let mut store =
+        ConversationSyncStore::new(&paths.conversation_sync_db_file).expect("open sync store");
+    store
+        .bind_local_thread_id(
+            &conversation_sync_identity(&source),
+            source_thread_id,
+            source_thread_id,
+        )
+        .expect("bind source");
+    store
+        .bind_local_thread_id(
+            &conversation_sync_identity(&target),
+            source_thread_id,
+            target_thread_id,
+        )
+        .expect("bind target");
+
+    sync_host_persona_conversation_snapshot(
+        &source_paths.codex_home,
+        &conversation_sync_identity(&source),
+        &target_paths.codex_home,
+        &conversation_sync_identity(&target),
+        &paths.conversation_sync_db_file,
+    )
+    .expect("sync snapshot");
+
+    assert!(
+        target_rollout.exists(),
+        "existing target rollout path should remain stable"
+    );
+    assert!(
+        !target_paths
+            .codex_home
+            .join(
+                "sessions/2026/04/26/rollout-2026-04-26T11-30-44-019dc844-ca36-7113-ab78-1318e5c22ceb.jsonl"
+            )
+            .exists(),
+        "sync should not rewrite the target thread to a new source-derived filename"
+    );
+
+    let connection = rusqlite::Connection::open(&target_db).expect("open target db");
+    let synced_rollout_path = connection
+        .query_row(
+            "select rollout_path from threads where id = ?1",
+            [target_thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query target rollout path");
+    assert_eq!(synced_rollout_path, target_rollout_string);
+
+    let contents = fs::read_to_string(&target_rollout).expect("read synced target rollout");
+    assert!(contents.contains(&format!("\"id\":\"{target_thread_id}\"")));
+    assert!(contents.contains("\"message\":\"resume me\""));
+}

@@ -43,6 +43,7 @@ pub(super) fn sync_host_persona_conversation_snapshot(
         .with_context(|| format!("Failed to create {}.", target_codex_home.display()))?;
 
     let state_snapshot = read_thread_state_db_snapshot(source_codex_home)?;
+    let target_state_snapshot = read_thread_state_db_snapshot(target_codex_home)?;
     let session_index_entries = read_session_index_entries(source_codex_home)?;
     let mut source_thread_ids = BTreeSet::new();
     if let Some(state_snapshot) = state_snapshot.as_ref() {
@@ -112,6 +113,16 @@ pub(super) fn sync_host_persona_conversation_snapshot(
             state_row.as_ref(),
             archived,
         );
+        // Preserve a target-local rollout filename when one already exists so a running
+        // Codex instance does not keep an in-memory thread bound to a different path.
+        let existing_target_state_row = target_state_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.rows.get(&target_thread_id));
+        let existing_target_rollout_path = resolve_existing_target_thread_rollout_path(
+            target_codex_home,
+            &target_thread_id,
+            existing_target_state_row,
+        );
         let target_rollout_path = source_rollout_path.as_ref().map(|source_rollout_path| {
             target_thread_rollout_path(
                 source_codex_home,
@@ -119,6 +130,7 @@ pub(super) fn sync_host_persona_conversation_snapshot(
                 source_rollout_path,
                 &source_thread_id,
                 &target_thread_id,
+                existing_target_rollout_path.as_deref(),
                 archived,
             )
         });
@@ -408,14 +420,59 @@ pub(super) fn resolve_source_thread_rollout_path(
         .or_else(|| find_thread_rollout_path(source_codex_home, source_thread_id))
 }
 
+pub(super) fn resolve_existing_target_thread_rollout_path(
+    target_codex_home: &Path,
+    target_thread_id: &str,
+    state_row: Option<&ThreadStateDbRow>,
+) -> Option<PathBuf> {
+    let mut fallback = None::<PathBuf>;
+    if let Some(path) = state_row
+        .and_then(|row| row_string(row, "rollout_path"))
+        .map(PathBuf::from)
+    {
+        if path.exists() {
+            return Some(path);
+        }
+        if let Some((root, relative_path)) = thread_artifact_relative_path(target_codex_home, &path)
+        {
+            let candidate = target_codex_home.join(root).join(&relative_path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            fallback = Some(candidate);
+        } else {
+            fallback = Some(path);
+        }
+    }
+
+    find_thread_rollout_path(&target_codex_home.join("sessions"), target_thread_id)
+        .or_else(|| {
+            find_thread_rollout_path(
+                &target_codex_home.join("archived_sessions"),
+                target_thread_id,
+            )
+        })
+        .or(fallback)
+}
+
 pub(super) fn target_thread_rollout_path(
     source_codex_home: &Path,
     target_codex_home: &Path,
     source_rollout_path: &Path,
     source_thread_id: &str,
     target_thread_id: &str,
+    existing_target_rollout_path: Option<&Path>,
     archived: bool,
 ) -> PathBuf {
+    if let Some(existing_target_rollout_path) = existing_target_rollout_path {
+        if let Some((_, relative_path)) =
+            thread_artifact_relative_path(target_codex_home, existing_target_rollout_path)
+        {
+            return target_codex_home
+                .join(preferred_thread_artifact_root(archived))
+                .join(relative_path);
+        }
+    }
     let relative_path = thread_artifact_relative_path(source_codex_home, source_rollout_path)
         .map(|(_, relative_path)| relative_path)
         .unwrap_or_else(|| {
@@ -426,12 +483,16 @@ pub(super) fn target_thread_rollout_path(
         });
     let localized = localize_path_thread_id(&relative_path, source_thread_id, target_thread_id);
     target_codex_home
-        .join(if archived {
-            "archived_sessions"
-        } else {
-            "sessions"
-        })
+        .join(preferred_thread_artifact_root(archived))
         .join(localized)
+}
+
+fn preferred_thread_artifact_root(archived: bool) -> &'static str {
+    if archived {
+        "archived_sessions"
+    } else {
+        "sessions"
+    }
 }
 
 pub(super) fn thread_artifact_relative_path(
