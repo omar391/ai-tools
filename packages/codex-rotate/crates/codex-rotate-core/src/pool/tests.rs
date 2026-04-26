@@ -874,6 +874,12 @@ fn list_quota_refresh_limit_uses_env_override() {
     let previous_limit = std::env::var_os(LIST_QUOTA_REFRESH_LIMIT_ENV);
 
     unsafe {
+        std::env::remove_var(LIST_QUOTA_REFRESH_LIMIT_ENV);
+    }
+    assert_eq!(DEFAULT_LIST_QUOTA_REFRESH_LIMIT, 8);
+    assert_eq!(list_quota_refresh_limit(), 8);
+
+    unsafe {
         std::env::set_var(LIST_QUOTA_REFRESH_LIMIT_ENV, "2");
     }
     assert_eq!(list_quota_refresh_limit(), 2);
@@ -1263,6 +1269,68 @@ fn cmd_list_prunes_invalidated_refresh_token_accounts_and_suspends_domain() {
     restore_env_var("CODEX_HOME", previous_codex_home);
     restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
     result.expect("list should prune invalidated refresh-token accounts");
+}
+
+#[test]
+fn cmd_list_prunes_token_expired_refresh_token_accounts_for_relogin() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempdir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+    let previous_rotate_home = std::env::var_os("CODEX_ROTATE_HOME");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+
+    unsafe {
+        std::env::set_var("CODEX_ROTATE_HOME", tempdir.path());
+        std::env::set_var("CODEX_HOME", &codex_home);
+    }
+
+    let result = (|| -> Result<()> {
+        let mut expired = stored_entry(None, Some("2026-04-14T06:08:54.124Z"));
+        expired.label = "devbench.15@astronlab.com_free".to_string();
+        expired.email = "devbench.15@astronlab.com".to_string();
+        expired.account_id = "acct-token-expired".to_string();
+        expired.auth = make_auth("devbench.15@astronlab.com", "acct-token-expired", "free");
+        expired.auth.tokens.account_id = "acct-token-expired".to_string();
+        expired.last_quota_blocker = Some("Token refresh failed (401): token_expired: Could not validate your token. Please try signing in again.".to_string());
+        expired.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
+
+        write_rotate_state_json(&json!({
+            "families": {
+                "dev-1::devbench.{n}@astronlab.com": {
+                    "profile_name": "dev-1",
+                    "template": "devbench.{n}@astronlab.com",
+                    "next_suffix": 16,
+                    "max_skipped_slots": 0,
+                    "created_at": "2026-04-13T05:00:00.000Z",
+                    "updated_at": "2026-04-14T06:11:25.913Z",
+                    "last_created_email": "devbench.15@astronlab.com",
+                    "relogin": []
+                }
+            }
+        }))?;
+        save_pool(&Pool {
+            active_index: 0,
+            accounts: vec![expired],
+        })?;
+
+        let output = strip_ansi(&cmd_list()?);
+        assert!(!output.contains("devbench.15@astronlab.com_free"));
+
+        let state = load_rotate_state_json()?;
+        assert_eq!(
+            state["families"]["dev-1::devbench.{n}@astronlab.com"]["relogin"]
+                .as_array()
+                .map(|entries| entries.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["devbench.15@astronlab.com"])
+        );
+        Ok(())
+    })();
+
+    restore_env_var("CODEX_HOME", previous_codex_home);
+    restore_env_var("CODEX_ROTATE_HOME", previous_rotate_home);
+    result.expect("list should prune token-expired refresh-token accounts");
 }
 
 #[test]

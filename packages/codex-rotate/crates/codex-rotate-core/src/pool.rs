@@ -194,6 +194,7 @@ fn is_terminal_refresh_error(message: &str) -> bool {
         || message.contains("refresh token has been invalidated")
         || message.contains("refresh token already rotated")
         || message.contains("refresh_token_reused")
+        || message.contains("token_expired")
 }
 
 fn account_requires_terminal_cleanup(entry: &AccountEntry) -> bool {

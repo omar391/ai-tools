@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) const LIST_QUOTA_REFRESH_LIMIT_ENV: &str = "CODEX_ROTATE_LIST_QUOTA_REFRESH_LIMIT";
-pub(super) const DEFAULT_LIST_QUOTA_REFRESH_LIMIT: usize = 4;
+pub(super) const DEFAULT_LIST_QUOTA_REFRESH_LIMIT: usize = 8;
 
 struct LineEmitter<'a> {
     writer: Option<&'a mut dyn Write>,
