@@ -1947,6 +1947,51 @@ fn sync_pool_active_account_prefers_existing_active_match_over_duplicate() {
 }
 
 #[test]
+fn sync_pool_active_account_prefers_exact_identity_over_stale_same_email_duplicate() {
+    let mut stale = configured_entry(
+        "dev.1@astronlab.com",
+        "acct-stale",
+        "free",
+        Some(true),
+        Some("2026-04-07T00:00:00.000Z"),
+    );
+    stale.relogin = true;
+    let exact = configured_entry(
+        "dev.1@astronlab.com",
+        "acct-current",
+        "free",
+        Some(true),
+        Some("2026-04-07T00:00:00.000Z"),
+    );
+    let other = configured_entry(
+        "dev.2@astronlab.com",
+        "acct-2",
+        "free",
+        Some(true),
+        Some("2026-04-07T00:00:00.000Z"),
+    );
+
+    let mut pool = Pool {
+        active_index: 1,
+        accounts: vec![stale, other, exact],
+    };
+
+    let changed = sync_pool_current_auth_from_auth(
+        &mut pool,
+        make_auth("dev.1@astronlab.com", "acct-current", "free"),
+        true,
+    )
+    .expect("sync should succeed");
+
+    assert!(changed);
+    assert_eq!(pool.active_index, 2);
+    assert_eq!(pool.accounts[0].account_id, "acct-stale");
+    assert!(pool.accounts[0].relogin);
+    assert_eq!(pool.accounts[2].account_id, "acct-current");
+    assert!(!pool.accounts[2].relogin);
+}
+
+#[test]
 fn sync_pool_active_account_from_current_auth_persists_missing_auth_into_pool() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");

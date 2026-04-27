@@ -53,8 +53,7 @@ use self::selection::*;
 use self::sync::*;
 
 pub(crate) use self::identity::{
-    account_entry_matches_auth_identity, account_entry_matches_identity,
-    format_account_summary_for_display,
+    account_entry_matches_auth_identity, format_account_summary_for_display,
 };
 pub use self::list_status::{
     cmd_list, cmd_list_stream, cmd_list_stream_with_options, cmd_list_with_options, cmd_status,
