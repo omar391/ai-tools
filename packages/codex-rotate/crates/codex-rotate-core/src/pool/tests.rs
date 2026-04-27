@@ -703,6 +703,31 @@ fn pool_identity_lookup_prefers_exact_email_match() {
 }
 
 #[test]
+fn pool_identity_lookup_prefers_compound_identity_over_same_slot_duplicate() {
+    let mut stale = stored_entry(Some(true), None);
+    stale.email = "dev.26@astronlab.com".to_string();
+    stale.label = "dev.26@astronlab.com_free".to_string();
+    stale.account_id = "acct-stale".to_string();
+    stale.auth = make_auth("dev.26@astronlab.com", "acct-stale", "free");
+
+    let mut current = stored_entry(Some(true), None);
+    current.email = "dev.26@astronlab.com".to_string();
+    current.label = "dev.26@astronlab.com_free".to_string();
+    current.account_id = "acct-current".to_string();
+    current.auth = make_auth("dev.26@astronlab.com", "acct-current", "free");
+
+    let pool = Pool {
+        active_index: 0,
+        accounts: vec![stale, current],
+    };
+
+    assert_eq!(
+        find_pool_account_index_by_identity(&pool, "acct-current", "dev.26@astronlab.com", "free",),
+        Some(1)
+    );
+}
+
+#[test]
 fn pool_identity_lookup_falls_back_to_email_match() {
     let mut first = stored_entry(Some(true), None);
     first.email = "dev.26@astronlab.com".to_string();
@@ -1256,18 +1281,24 @@ fn cmd_list_prints_total_and_healthy_sections_separately() {
     }
 
     let result = (|| -> Result<()> {
-        let mut healthy = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
-        healthy.label = "dev.healthy@astronlab.com_free".to_string();
-        healthy.email = "dev.healthy@astronlab.com".to_string();
-        healthy.account_id = "acct-healthy".to_string();
+        let mut healthy = configured_entry(
+            "dev.healthy@astronlab.com",
+            "acct-healthy",
+            "free",
+            Some(true),
+            Some("2026-04-09T02:00:00.000Z"),
+        );
         healthy.last_quota_summary = Some("7d 88% left".to_string());
         healthy.last_quota_primary_left_percent = Some(88);
         healthy.last_quota_next_refresh_at = Some("2099-01-01T00:00:00.000Z".to_string());
 
-        let mut exhausted = stored_entry(Some(false), Some("2026-04-09T02:00:00.000Z"));
-        exhausted.label = "dev.exhausted@astronlab.com_free".to_string();
-        exhausted.email = "dev.exhausted@astronlab.com".to_string();
-        exhausted.account_id = "acct-exhausted".to_string();
+        let mut exhausted = configured_entry(
+            "dev.exhausted@astronlab.com",
+            "acct-exhausted",
+            "free",
+            Some(false),
+            Some("2026-04-09T02:00:00.000Z"),
+        );
         exhausted.last_quota_summary = Some("7d 0% left".to_string());
         exhausted.last_quota_blocker = Some("7d quota exhausted, resets in 6d".to_string());
         exhausted.last_quota_primary_left_percent = Some(0);
@@ -1655,23 +1686,32 @@ fn cmd_list_sorts_total_accounts_by_quota_refresh_eta() {
     }
 
     let result = (|| -> Result<()> {
-        let mut later = stored_entry(Some(true), Some("2026-04-09T02:00:00.000Z"));
-        later.label = "dev.later@astronlab.com_free".to_string();
-        later.email = "dev.later@astronlab.com".to_string();
-        later.account_id = "acct-later".to_string();
+        let mut later = configured_entry(
+            "dev.later@astronlab.com",
+            "acct-later",
+            "free",
+            Some(true),
+            Some("2026-04-09T02:00:00.000Z"),
+        );
         later.last_quota_summary = Some("7d 88% left".to_string());
         later.last_quota_primary_left_percent = Some(88);
         later.last_quota_next_refresh_at = Some("2099-01-03T00:00:00.000Z".to_string());
 
-        let mut unknown = stored_entry(None, None);
-        unknown.label = "dev.unknown@astronlab.com_free".to_string();
-        unknown.email = "dev.unknown@astronlab.com".to_string();
-        unknown.account_id = "acct-unknown".to_string();
+        let unknown = configured_entry(
+            "dev.unknown@astronlab.com",
+            "acct-unknown",
+            "free",
+            None,
+            None,
+        );
 
-        let mut sooner = stored_entry(Some(false), Some("2026-04-09T02:00:00.000Z"));
-        sooner.label = "dev.sooner@astronlab.com_free".to_string();
-        sooner.email = "dev.sooner@astronlab.com".to_string();
-        sooner.account_id = "acct-sooner".to_string();
+        let mut sooner = configured_entry(
+            "dev.sooner@astronlab.com",
+            "acct-sooner",
+            "free",
+            Some(false),
+            Some("2026-04-09T02:00:00.000Z"),
+        );
         sooner.last_quota_summary = Some("7d 0% left".to_string());
         sooner.last_quota_blocker = Some("7d quota exhausted, resets in 1d".to_string());
         sooner.last_quota_primary_left_percent = Some(0);
@@ -2275,6 +2315,83 @@ fn normalize_pool_entries_marks_sub_three_percent_cached_accounts_unusable() {
 }
 
 #[test]
+fn normalize_pool_entries_dedupes_same_email_plan_entries() {
+    let mut stale = configured_entry(
+        "dev.1@astronlab.com",
+        "acct-stale",
+        "free",
+        Some(true),
+        Some("2026-04-08T00:00:00.000Z"),
+    );
+    stale.relogin = true;
+    let other = configured_entry(
+        "dev.2@astronlab.com",
+        "acct-2",
+        "free",
+        Some(true),
+        Some("2026-04-07T00:00:00.000Z"),
+    );
+    let mut current = configured_entry("dev.1@astronlab.com", "acct-current", "free", None, None);
+    current.last_quota_usable = None;
+    current.last_quota_summary = None;
+    current.last_quota_checked_at = None;
+    current.last_quota_primary_left_percent = None;
+    current.last_quota_next_refresh_at = None;
+
+    let mut pool = Pool {
+        active_index: 2,
+        accounts: vec![stale, other, current],
+    };
+
+    let changed = normalize_pool_entries(&mut pool);
+
+    assert!(changed);
+    assert_eq!(pool.accounts.len(), 2);
+    assert_eq!(pool.active_index, 0);
+    assert_eq!(pool.accounts[0].account_id, "acct-current");
+    assert_eq!(pool.accounts[0].email, "dev.1@astronlab.com");
+    assert_eq!(pool.accounts[0].plan_type, "free");
+    assert_eq!(
+        pool.accounts[0].last_quota_summary.as_deref(),
+        Some("5h 90% left")
+    );
+}
+
+#[test]
+fn save_pool_dedupes_same_email_plan_entries_before_persisting() {
+    let _guard = RotateHomeGuard::enter("codex-rotate-save-pool-dedupe");
+
+    let stale = configured_entry(
+        "dev.1@astronlab.com",
+        "acct-stale",
+        "free",
+        Some(true),
+        Some("2026-04-07T00:00:00.000Z"),
+    );
+    let current = configured_entry(
+        "dev.1@astronlab.com",
+        "acct-current",
+        "free",
+        Some(true),
+        Some("2026-04-08T00:00:00.000Z"),
+    );
+
+    save_pool(&Pool {
+        active_index: 1,
+        accounts: vec![stale, current],
+    })
+    .expect("save pool");
+
+    let state = load_rotate_state_json().expect("load rotate state");
+    let accounts = state["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(state["active_index"], json!(0));
+    assert_eq!(accounts[0]["email"], json!("dev.1@astronlab.com"));
+    assert_eq!(accounts[0]["plan_type"], json!("free"));
+    assert_eq!(accounts[0]["account_id"], json!("acct-current"));
+}
+
+#[test]
 fn cmd_add_expected_email_preserves_target_email_against_provider_gmail_auth() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -2385,10 +2502,28 @@ fn current_pool_overview_counts_cached_healthy_accounts() {
         save_pool(&Pool {
             active_index: 1,
             accounts: vec![
-                stored_entry(Some(false), Some("2026-04-08T12:00:00.000Z")),
-                stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z")),
-                stored_entry(Some(true), Some("2026-04-08T12:00:00.000Z")),
-                stored_entry(None, None),
+                configured_entry(
+                    "dev.1@astronlab.com",
+                    "acct-1",
+                    "free",
+                    Some(false),
+                    Some("2026-04-08T12:00:00.000Z"),
+                ),
+                configured_entry(
+                    "dev.2@astronlab.com",
+                    "acct-2",
+                    "free",
+                    Some(true),
+                    Some("2026-04-08T12:00:00.000Z"),
+                ),
+                configured_entry(
+                    "dev.3@astronlab.com",
+                    "acct-3",
+                    "free",
+                    Some(true),
+                    Some("2026-04-08T12:00:00.000Z"),
+                ),
+                configured_entry("dev.4@astronlab.com", "acct-4", "free", None, None),
             ],
         })?;
 

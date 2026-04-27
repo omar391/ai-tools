@@ -43,8 +43,10 @@ pub fn load_rotation_environment_settings() -> Result<RotationEnvironmentSetting
 }
 
 pub fn save_pool(pool: &Pool) -> Result<()> {
-    let active_index = pool.active_index;
-    let accounts = serde_json::to_value(&pool.accounts)?;
+    let mut normalized_pool = pool.clone();
+    normalize_pool_entries(&mut normalized_pool);
+    let active_index = normalized_pool.active_index;
+    let accounts = serde_json::to_value(&normalized_pool.accounts)?;
     update_rotate_state_json(RotateStateOwner::Pool, move |state| {
         let codex_mode = load_codex_mode_config_from_state(state)?;
         if !state.is_object() {

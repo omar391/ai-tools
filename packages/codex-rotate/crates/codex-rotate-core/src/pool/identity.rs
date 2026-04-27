@@ -126,9 +126,8 @@ pub(super) fn should_preserve_expected_email(existing_email: &str, auth_email: &
         && (!normalized_existing.ends_with("@gmail.com") || existing_is_gmail_plus)
 }
 
-pub(crate) fn account_entry_matches_identity(
+pub(super) fn account_entry_matches_email_plan(
     entry: &AccountEntry,
-    account_id: &str,
     email: &str,
     plan_type: &str,
 ) -> bool {
@@ -137,13 +136,22 @@ pub(crate) fn account_entry_matches_identity(
     let target_plan = normalize_identity_plan_type(plan_type);
     let entry_plan = normalize_identity_plan_type(&entry.plan_type);
 
-    if target_email.is_some() && entry_email.as_deref() == target_email.as_deref() {
-        return match (entry_plan.as_deref(), target_plan.as_deref()) {
-            (Some(existing_plan), Some(target_plan)) => existing_plan == target_plan,
-            _ => true,
-        };
+    if target_email.is_none() || entry_email.as_deref() != target_email.as_deref() {
+        return false;
     }
 
+    match (entry_plan.as_deref(), target_plan.as_deref()) {
+        (Some(existing_plan), Some(target_plan)) => existing_plan == target_plan,
+        _ => true,
+    }
+}
+
+pub(crate) fn account_entry_matches_identity(
+    entry: &AccountEntry,
+    account_id: &str,
+    email: &str,
+    plan_type: &str,
+) -> bool {
     let normalized_account_id = account_id.trim();
     let has_matching_account_id = !normalized_account_id.is_empty()
         && (entry.account_id == normalized_account_id
@@ -151,6 +159,11 @@ pub(crate) fn account_entry_matches_identity(
     if !has_matching_account_id {
         return false;
     }
+
+    let target_email = normalize_identity_email(email);
+    let entry_email = normalize_identity_email(&entry.email);
+    let target_plan = normalize_identity_plan_type(plan_type);
+    let entry_plan = normalize_identity_plan_type(&entry.plan_type);
 
     if let (Some(existing_plan), Some(target_plan)) =
         (entry_plan.as_deref(), target_plan.as_deref())
@@ -164,7 +177,8 @@ pub(crate) fn account_entry_matches_identity(
         (_, None) => true,
         (None, Some(_)) => true,
         (Some(existing_email), Some(target_email)) => {
-            should_preserve_expected_email(existing_email, target_email)
+            existing_email == target_email
+                || should_preserve_expected_email(existing_email, target_email)
                 || should_preserve_expected_email(target_email, existing_email)
         }
     }

@@ -211,51 +211,37 @@ pub(super) fn find_pool_account_index_by_identity(
     email: &str,
     plan_type: &str,
 ) -> Option<usize> {
-    let exact_account_id_match = |entry: &AccountEntry| {
-        let normalized_account_id = account_id.trim();
-        !normalized_account_id.is_empty()
-            && (entry.account_id == normalized_account_id
-                || entry.auth.tokens.account_id == normalized_account_id)
-    };
-    let email_plan_match = |entry: &AccountEntry| {
-        let target_email = normalize_identity_email(email);
-        let entry_email = normalize_identity_email(&entry.email);
-        let target_plan = normalize_identity_plan_type(plan_type);
-        let entry_plan = normalize_identity_plan_type(&entry.plan_type);
-
-        if target_email.is_none() || entry_email.as_deref() != target_email.as_deref() {
-            return false;
-        }
-
-        match (entry_plan.as_deref(), target_plan.as_deref()) {
-            (Some(existing_plan), Some(target_plan)) => existing_plan == target_plan,
-            _ => true,
-        }
-    };
-
     if pool
         .accounts
         .get(pool.active_index)
-        .map(exact_account_id_match)
+        .map(|entry| account_entry_matches_identity(entry, account_id, email, plan_type))
         .unwrap_or(false)
     {
         return Some(pool.active_index);
     }
 
-    if let Some(index) = pool.accounts.iter().position(exact_account_id_match) {
+    if let Some(index) = pool
+        .accounts
+        .iter()
+        .position(|entry| account_entry_matches_identity(entry, account_id, email, plan_type))
+    {
         return Some(index);
     }
 
     if pool
         .accounts
         .get(pool.active_index)
-        .map(email_plan_match)
+        .map(|entry| account_entry_matches_email_plan(entry, email, plan_type))
         .unwrap_or(false)
     {
         return Some(pool.active_index);
     }
 
-    if let Some(index) = pool.accounts.iter().position(email_plan_match) {
+    if let Some(index) = pool
+        .accounts
+        .iter()
+        .position(|entry| account_entry_matches_email_plan(entry, email, plan_type))
+    {
         return Some(index);
     }
 

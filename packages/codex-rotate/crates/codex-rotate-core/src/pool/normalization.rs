@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
     let mut changed = false;
@@ -59,6 +60,8 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
         }
     }
 
+    changed |= dedupe_pool_entries(pool);
+
     let max_active_index = pool.accounts.len().saturating_sub(1);
     let normalized_active_index = pool.active_index.min(max_active_index);
     if pool.active_index != normalized_active_index {
@@ -66,6 +69,83 @@ pub(crate) fn normalize_pool_entries(pool: &mut Pool) -> bool {
         changed = true;
     }
     changed
+}
+
+fn dedupe_pool_entries(pool: &mut Pool) -> bool {
+    let original_active_index = pool.active_index;
+    let mut changed = false;
+    let mut deduped = Vec::with_capacity(pool.accounts.len());
+    let mut index_by_label = HashMap::new();
+    let mut normalized_active_index = 0usize;
+
+    for (original_index, entry) in pool.accounts.drain(..).enumerate() {
+        let label = entry.label.clone();
+        if let Some(existing_index) = index_by_label.get(&label).copied() {
+            let merged = merge_duplicate_account_entries(&deduped[existing_index], entry);
+            if deduped[existing_index] != merged {
+                deduped[existing_index] = merged;
+            }
+            if original_index == original_active_index {
+                normalized_active_index = existing_index;
+            }
+            changed = true;
+            continue;
+        }
+
+        let deduped_index = deduped.len();
+        if original_index == original_active_index {
+            normalized_active_index = deduped_index;
+        }
+        index_by_label.insert(label, deduped_index);
+        deduped.push(entry);
+    }
+
+    pool.accounts = deduped;
+    pool.active_index = normalized_active_index;
+    changed
+}
+
+fn merge_duplicate_account_entries(
+    existing: &AccountEntry,
+    incoming: AccountEntry,
+) -> AccountEntry {
+    let mut merged = incoming;
+
+    if merged.alias.is_none() {
+        merged.alias = existing.alias.clone();
+    }
+
+    if !existing.added_at.trim().is_empty()
+        && (merged.added_at.trim().is_empty() || existing.added_at < merged.added_at)
+    {
+        merged.added_at = existing.added_at.clone();
+    }
+
+    let keep_existing_quota = match (
+        existing.last_quota_checked_at.as_deref(),
+        merged.last_quota_checked_at.as_deref(),
+    ) {
+        (Some(existing_checked_at), Some(merged_checked_at)) => {
+            existing_checked_at > merged_checked_at
+        }
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if keep_existing_quota {
+        merged.last_quota_usable = existing.last_quota_usable;
+        merged.last_quota_summary = existing.last_quota_summary.clone();
+        merged.last_quota_blocker = existing.last_quota_blocker.clone();
+        merged.last_quota_checked_at = existing.last_quota_checked_at.clone();
+        merged.last_quota_primary_left_percent = existing.last_quota_primary_left_percent;
+        merged.last_quota_next_refresh_at = existing.last_quota_next_refresh_at.clone();
+    }
+
+    if merged.persona.is_none() {
+        merged.persona = existing.persona.clone();
+    }
+
+    merged.persona = Some(normalized_persona(&merged));
+    merged
 }
 
 pub(super) fn normalized_persona(entry: &AccountEntry) -> PersonaEntry {
